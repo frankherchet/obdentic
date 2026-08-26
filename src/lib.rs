@@ -108,6 +108,11 @@ impl Transaction {
         self.timestamp_ms
     }
 
+    pub fn with_timestamp_ms(mut self, timestamp_ms: u128) -> Self {
+        self.timestamp_ms = timestamp_ms;
+        self
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }

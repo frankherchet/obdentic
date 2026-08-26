@@ -155,15 +155,46 @@ async fn demo() -> Result<Transaction, String> {
 }
 
 fn demo_samples() -> Result<Vec<Transaction>, String> {
-    [
-        ("engine.rpm", vec![0x41, 0x0c, 0x1a, 0xf8]),
-        ("engine.coolant_temperature", vec![0x41, 0x05, 0x5a]),
-        ("vehicle.speed", vec![0x41, 0x0d, 0x00]),
-        ("engine.maf", vec![0x41, 0x10, 0x01, 0xf4]),
-    ]
-    .into_iter()
-    .map(|(semantic, response)| prepare_read(semantic)?.complete("demo", response))
-    .collect()
+    let mut samples = Vec::new();
+    for index in 0_u16..60 {
+        let timestamp_ms = 1_700_000_000_000 + u128::from(index) * 200 + u128::from(index % 5) * 20;
+        let rpm = 800 + index * 25;
+        samples.push(demo_sample(
+            "engine.rpm",
+            vec![0x41, 0x0c, ((rpm * 4) >> 8) as u8, (rpm * 4) as u8],
+            timestamp_ms,
+        )?);
+        if index % 2 == 0 {
+            samples.push(demo_sample(
+                "engine.coolant_temperature",
+                vec![0x41, 0x05, 120 + (index % 8) as u8],
+                timestamp_ms + 30,
+            )?);
+            samples.push(demo_sample(
+                "engine.maf",
+                vec![0x41, 0x10, 0x01, 0x90 + (index % 40) as u8],
+                timestamp_ms + 70,
+            )?);
+        }
+        if index % 3 == 0 {
+            samples.push(demo_sample(
+                "vehicle.speed",
+                vec![0x41, 0x0d, (index * 2) as u8],
+                timestamp_ms + 110,
+            )?);
+        }
+    }
+    Ok(samples)
+}
+
+fn demo_sample(
+    semantic: &str,
+    response: Vec<u8>,
+    timestamp_ms: u128,
+) -> Result<Transaction, String> {
+    Ok(prepare_read(semantic)?
+        .complete("demo", response)?
+        .with_timestamp_ms(timestamp_ms))
 }
 
 fn telemetry(transactions: &[Transaction]) -> Result<TelemetryState, String> {
@@ -297,9 +328,12 @@ mod tests {
     #[test]
     fn tui_demo_uses_only_known_decoded_signals() {
         let samples = demo_samples().unwrap();
-        assert_eq!(samples.len(), 4);
+        assert!(samples.len() > 100);
         assert!(samples.iter().all(|sample| sample.source() == "demo"));
         assert_eq!(samples[0].semantic(), "engine.rpm");
-        assert_eq!(samples[0].value(), 1726.0);
+        assert_eq!(samples[0].value(), 800.0);
+        assert!(samples
+            .windows(2)
+            .any(|pair| pair[0].timestamp_ms() != pair[1].timestamp_ms()));
     }
 }
