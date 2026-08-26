@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub mod ble;
 pub mod protocol;
+pub mod tui;
 pub mod vehicle;
 
 pub use vehicle::{supported_profiles, ProfileMetadata, SignalMetadata};

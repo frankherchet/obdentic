@@ -22,6 +22,8 @@ cargo run -- demo
 cargo run -- replay session.tsv
 cargo run -- signals
 cargo run -- scan
+cargo run -- tui demo
+cargo run -- tui replay session.tsv
 cargo test --locked
 cargo clippy --all-targets -- -D warnings
 ```
@@ -53,6 +55,10 @@ run remains RPM-only.
 `cargo run -- signals` prints the same catalog as escaped, tab-separated rows
 with semantic, profile, protocol, request, decoder, plausible range, unit,
 subsystem, provenance, confidence, hardware-validation and description columns.
+
+`tui` is an offline viewer: it renders already-decoded demo or replay samples,
+their signal metadata and raw diagnostic TX/RX. Press `q` or `Esc` to close it;
+it never opens Bluetooth or sends a diagnostic request.
 
 For MIUI Android 10 bugreports, extract the embedded Bluetooth capture with:
 

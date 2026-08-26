@@ -1,9 +1,9 @@
 use obdentic::{
-    ble, hex, prepare_read, record, replay, supported_signals, ReadRequest, Transaction,
+    ble, hex, prepare_read, record, replay, supported_signals, tui, ReadRequest, Transaction,
 };
 use std::{env, path::Path};
 
-const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv>";
+const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic tui demo | obdentic tui replay <recording.tsv>";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -16,6 +16,8 @@ enum Command {
         recording: Option<String>,
     },
     Replay(String),
+    TuiDemo,
+    TuiReplay(String),
 }
 
 #[tokio::main]
@@ -60,6 +62,8 @@ async fn run() -> Result<(), String> {
             }
         }
         Command::Replay(path) => show(&replay(Path::new(&path)).await?),
+        Command::TuiDemo => tui::run(&demo_samples()?)?,
+        Command::TuiReplay(path) => tui::run(&[replay(Path::new(&path)).await?])?,
     }
     Ok(())
 }
@@ -70,6 +74,10 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         [command] if command == "scan" => Ok(Command::Scan),
         [command] if command == "demo" => Ok(Command::Demo),
         [command, path] if command == "replay" => Ok(Command::Replay(path.clone())),
+        [command, source] if command == "tui" && source == "demo" => Ok(Command::TuiDemo),
+        [command, source, path] if command == "tui" && source == "replay" => {
+            Ok(Command::TuiReplay(path.clone()))
+        }
         [command, signal, adapter_flag, adapter_id]
             if command == "read" && adapter_flag == "--adapter" =>
         {
@@ -139,6 +147,18 @@ async fn demo() -> Result<Transaction, String> {
     prepare_read("engine.rpm")?.complete("user", vec![0x41, 0x0c, 0x1a, 0xf8])
 }
 
+fn demo_samples() -> Result<Vec<Transaction>, String> {
+    [
+        ("engine.rpm", vec![0x41, 0x0c, 0x1a, 0xf8]),
+        ("engine.coolant_temperature", vec![0x41, 0x05, 0x5a]),
+        ("vehicle.speed", vec![0x41, 0x0d, 0x00]),
+        ("engine.maf", vec![0x41, 0x10, 0x01, 0xf4]),
+    ]
+    .into_iter()
+    .map(|(semantic, response)| prepare_read(semantic)?.complete("demo", response))
+    .collect()
+}
+
 fn show(transaction: &Transaction) {
     println!("OBDentic — transparent read-only diagnostics");
     println!("source    {}", transaction.source);
@@ -163,9 +183,14 @@ mod tests {
         assert_eq!(parse_command(&args(&["signals"])), Ok(Command::Signals));
         assert_eq!(parse_command(&args(&["scan"])), Ok(Command::Scan));
         assert_eq!(parse_command(&args(&["demo"])), Ok(Command::Demo));
+        assert_eq!(parse_command(&args(&["tui", "demo"])), Ok(Command::TuiDemo));
         assert_eq!(
             parse_command(&args(&["replay", "session.tsv"])),
             Ok(Command::Replay("session.tsv".into()))
+        );
+        assert_eq!(
+            parse_command(&args(&["tui", "replay", "session.tsv"])),
+            Ok(Command::TuiReplay("session.tsv".into()))
         );
         for signal in [
             "engine.rpm",
@@ -252,5 +277,14 @@ mod tests {
             .skip(1)
             .all(|line| line.split('\t').count() == 13));
         assert!(!output.contains('\r'));
+    }
+
+    #[test]
+    fn tui_demo_uses_only_known_decoded_signals() {
+        let samples = demo_samples().unwrap();
+        assert_eq!(samples.len(), 4);
+        assert!(samples.iter().all(|sample| sample.source == "demo"));
+        assert_eq!(samples[0].semantic, "engine.rpm");
+        assert_eq!(samples[0].value, 1726.0);
     }
 }
