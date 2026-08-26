@@ -1,4 +1,4 @@
-use crate::{ReadRequest, Transaction};
+use crate::{read_transaction, DiagnosticTransport, ReadRequest, Transaction};
 use btleplug::{
     api::{
         bleuuid::uuid_from_u16, Central, CharPropFlags, Characteristic, Manager as _,
@@ -182,7 +182,10 @@ async fn run_session(
         channel,
         notifications: &mut notifications,
     };
-    run_elm_session(&mut exchange, request).await
+    let mut transport = ElmTransport {
+        exchange: &mut exchange,
+    };
+    read_transaction(&mut transport, request).await
 }
 
 trait ElmExchange {
@@ -219,7 +222,20 @@ where
     }
 }
 
-async fn run_elm_session<E>(exchange: &mut E, request: ReadRequest) -> Result<Transaction, String>
+struct ElmTransport<'a, E> {
+    exchange: &'a mut E,
+}
+
+impl<E> DiagnosticTransport for ElmTransport<'_, E>
+where
+    E: ElmExchange,
+{
+    async fn read(&mut self, request: ReadRequest) -> Result<Vec<u8>, String> {
+        run_elm_session(self.exchange, request).await
+    }
+}
+
+async fn run_elm_session<E>(exchange: &mut E, request: ReadRequest) -> Result<Vec<u8>, String>
 where
     E: ElmExchange,
 {
@@ -259,10 +275,7 @@ where
 
     let command = obd_command(request);
     let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
-    request.complete(
-        "user",
-        normalize_mode01(&response, request.pid(), request.data_len())?,
-    )
+    normalize_mode01(&response, request.pid(), request.data_len())
 }
 
 fn supports_pid(response: &[u8], pid: u8) -> bool {
@@ -627,10 +640,14 @@ mod tests {
     #[tokio::test]
     async fn replays_captured_zero_rpm_session_in_exact_command_order() {
         let mut exchange = ScriptedExchange::captured(captured_responses());
-        let transaction =
-            run_elm_session(&mut exchange, crate::prepare_read("engine.rpm").unwrap())
+        let transaction = {
+            let mut transport = ElmTransport {
+                exchange: &mut exchange,
+            };
+            read_transaction(&mut transport, crate::prepare_read("engine.rpm").unwrap())
                 .await
-                .unwrap();
+                .unwrap()
+        };
 
         assert_eq!(exchange.commands, SESSION_COMMANDS);
         assert_eq!(transaction.response, [0x41, 0x0c, 0x00, 0x00]);
@@ -642,7 +659,7 @@ mod tests {
             transaction.timestamp_ms
         ));
         crate::record(&path, &transaction).unwrap();
-        let replayed = crate::replay(&path).unwrap();
+        let replayed = crate::replay(&path).await.unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(replayed.response, transaction.response);
         assert_eq!(replayed.value, transaction.value);
@@ -666,10 +683,14 @@ mod tests {
             responses[9] = response.into();
             let mut exchange = ScriptedExchange::captured(responses);
 
-            let transaction =
-                run_elm_session(&mut exchange, crate::prepare_read(semantic).unwrap())
+            let transaction = {
+                let mut transport = ElmTransport {
+                    exchange: &mut exchange,
+                };
+                read_transaction(&mut transport, crate::prepare_read(semantic).unwrap())
                     .await
-                    .unwrap();
+                    .unwrap()
+            };
 
             assert_eq!(exchange.commands[..9], SESSION_COMMANDS[..9]);
             assert_eq!(exchange.commands[9], command);
@@ -691,11 +712,15 @@ mod tests {
             responses[index] = response.into();
             let mut exchange = ScriptedExchange::captured(responses);
 
-            assert!(
-                run_elm_session(&mut exchange, crate::prepare_read("engine.rpm").unwrap())
+            let failed = {
+                let mut transport = ElmTransport {
+                    exchange: &mut exchange,
+                };
+                read_transaction(&mut transport, crate::prepare_read("engine.rpm").unwrap())
                     .await
                     .is_err()
-            );
+            };
+            assert!(failed);
             assert_eq!(exchange.commands, SESSION_COMMANDS[..=index]);
         }
     }

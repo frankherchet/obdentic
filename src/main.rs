@@ -59,7 +59,7 @@ async fn run() -> Result<(), String> {
                 println!("recorded  {path}");
             }
         }
-        Command::Replay(path) => show(&replay(Path::new(&path))?),
+        Command::Replay(path) => show(&replay(Path::new(&path)).await?),
     }
     Ok(())
 }
@@ -107,19 +107,25 @@ fn require_uuid(value: &str) -> Result<(), String> {
 
 fn render_signals() -> String {
     let mut output = String::from(
-        "semantic\trequest\tunit\tsubsystem\tprovenance\tconfidence\thardware_validation\tdescription\n",
+        "semantic\tprofile\tprotocol\trequest\tdecoder\tminimum\tmaximum\tunit\tsubsystem\tprovenance\tconfidence\thardware_validation\tdescription\n",
     );
     for signal in supported_signals() {
+        let metadata = signal.metadata();
         output.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            escape_field(signal.semantic),
-            hex(&signal.request),
-            escape_field(signal.unit),
-            escape_field(signal.subsystem),
-            escape_field(signal.provenance),
-            escape_field(signal.confidence),
-            escape_field(signal.hardware_validation),
-            escape_field(signal.description),
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            escape_field(metadata.semantic),
+            escape_field(metadata.profile),
+            escape_field(metadata.protocol),
+            hex(&metadata.request),
+            escape_field(metadata.decoder),
+            metadata.minimum,
+            metadata.maximum,
+            escape_field(metadata.unit),
+            escape_field(metadata.subsystem),
+            escape_field(metadata.provenance),
+            escape_field(metadata.confidence),
+            escape_field(metadata.hardware_validation),
+            escape_field(metadata.description),
         ));
     }
     output
@@ -136,6 +142,7 @@ async fn demo() -> Result<Transaction, String> {
 fn show(transaction: &Transaction) {
     println!("OBDentic — transparent read-only diagnostics");
     println!("source    {}", transaction.source);
+    println!("profile   {}", transaction.profile);
     println!("semantic  {}", transaction.semantic);
     println!("tx        {}", hex(&transaction.request));
     println!("rx        {}", hex(&transaction.response));
@@ -227,7 +234,7 @@ mod tests {
         let output = render_signals();
         assert_eq!(
             output.lines().next(),
-            Some("semantic\trequest\tunit\tsubsystem\tprovenance\tconfidence\thardware_validation\tdescription")
+            Some("semantic\tprofile\tprotocol\trequest\tdecoder\tminimum\tmaximum\tunit\tsubsystem\tprovenance\tconfidence\thardware_validation\tdescription")
         );
         for semantic in [
             "engine.rpm",
@@ -243,7 +250,7 @@ mod tests {
         assert!(output
             .lines()
             .skip(1)
-            .all(|line| line.split('\t').count() == 8));
+            .all(|line| line.split('\t').count() == 13));
         assert!(!output.contains('\r'));
     }
 }

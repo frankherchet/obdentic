@@ -4,6 +4,11 @@ Transparent, local-first and read-only vehicle diagnostics.
 
 The first vertical slice reads standard OBD-II engine RPM through one diagnostic-core seam, shows the semantic request and raw bytes, records the transaction, and replays it deterministically. The Rust BLE path is implemented; its final targeted hardware acceptance is still pending.
 
+The current split is intentionally narrow: `protocol` contains Mode-01 framing and
+response validation; `vehicle` contains signal/profile metadata and deterministic
+decoders; `ble` contains the Carly transport. EA189 is a metadata-only profile
+skeleton until a read-only request and response have been evidenced.
+
 This Mac also has an obsolete MacPorts Cargo earlier in `PATH`. Activate rustup
 before running the project; `rust-toolchain.toml` then selects Rust 1.98.0:
 
@@ -46,8 +51,8 @@ their targeted hardware validation is pending. The next hardware acceptance
 run remains RPM-only.
 
 `cargo run -- signals` prints the same catalog as escaped, tab-separated rows
-with semantic, request, unit, subsystem, provenance, confidence, hardware
-validation and description columns.
+with semantic, profile, protocol, request, decoder, plausible range, unit,
+subsystem, provenance, confidence, hardware-validation and description columns.
 
 For MIUI Android 10 bugreports, extract the embedded Bluetooth capture with:
 

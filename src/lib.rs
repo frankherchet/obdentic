@@ -9,103 +9,40 @@ use std::{
 use std::os::unix::fs::OpenOptionsExt;
 
 pub mod ble;
+pub mod protocol;
+pub mod vehicle;
+
+pub use vehicle::{supported_profiles, ProfileMetadata, SignalMetadata};
 
 /// The complete, read-only request vocabulary exposed by the diagnostic core.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct ReadRequest {
-    signal: Signal,
+    signal: &'static vehicle::SignalDefinition,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct SignalMetadata {
-    pub semantic: &'static str,
-    pub request: [u8; 2],
-    pub description: &'static str,
-    pub subsystem: &'static str,
-    pub unit: &'static str,
-    pub provenance: &'static str,
-    pub confidence: &'static str,
-    pub hardware_validation: &'static str,
+impl PartialEq for ReadRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.metadata().semantic == other.metadata().semantic
+    }
 }
 
-const SIGNALS: [SignalMetadata; 4] = [
-    SignalMetadata {
-        semantic: "engine.rpm",
-        request: [0x01, 0x0c],
-        description: "Engine speed.",
-        subsystem: "powertrain",
-        unit: "rpm",
-        provenance: "SAE J1979 Mode 01 PID 0C",
-        confidence: "standards-derived/offline-tested",
-        hardware_validation: "rust-hardware-pending",
-    },
-    SignalMetadata {
-        semantic: "engine.coolant_temperature",
-        request: [0x01, 0x05],
-        description: "Engine coolant temperature.",
-        subsystem: "powertrain",
-        unit: "°C",
-        provenance: "SAE J1979 Mode 01 PID 05",
-        confidence: "standards-derived/offline-tested",
-        hardware_validation: "rust-hardware-pending",
-    },
-    SignalMetadata {
-        semantic: "vehicle.speed",
-        request: [0x01, 0x0d],
-        description: "Vehicle speed.",
-        subsystem: "powertrain",
-        unit: "km/h",
-        provenance: "SAE J1979 Mode 01 PID 0D",
-        confidence: "standards-derived/offline-tested",
-        hardware_validation: "rust-hardware-pending",
-    },
-    SignalMetadata {
-        semantic: "engine.maf",
-        request: [0x01, 0x10],
-        description: "Mass air flow rate.",
-        subsystem: "powertrain",
-        unit: "g/s",
-        provenance: "SAE J1979 Mode 01 PID 10",
-        confidence: "standards-derived/offline-tested",
-        hardware_validation: "rust-hardware-pending",
-    },
-];
-
-pub fn supported_signals() -> &'static [SignalMetadata] {
-    &SIGNALS
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Signal {
-    EngineRpm,
-    EngineCoolantTemperature,
-    VehicleSpeed,
-    EngineMaf,
-}
+impl Eq for ReadRequest {}
 
 impl ReadRequest {
     pub fn bytes(self) -> [u8; 2] {
-        self.metadata().request
+        self.signal.request().bytes()
     }
 
     pub(crate) fn pid(self) -> u8 {
-        self.metadata().request[1]
+        self.signal.request().pid()
     }
 
     pub(crate) fn data_len(self) -> usize {
-        match self.signal {
-            Signal::EngineCoolantTemperature | Signal::VehicleSpeed => 1,
-            Signal::EngineRpm | Signal::EngineMaf => 2,
-        }
+        self.signal.request().data_len()
     }
 
     pub fn metadata(self) -> &'static SignalMetadata {
-        match self.signal {
-            Signal::EngineRpm => &SIGNALS[0],
-            Signal::EngineCoolantTemperature => &SIGNALS[1],
-            Signal::VehicleSpeed => &SIGNALS[2],
-            Signal::EngineMaf => &SIGNALS[3],
-        }
+        self.signal.metadata()
     }
 
     fn semantic(self) -> &'static str {
@@ -116,21 +53,12 @@ impl ReadRequest {
         self.metadata().unit
     }
 
+    fn profile(self) -> &'static str {
+        self.metadata().profile
+    }
+
     fn value(self, response: &[u8]) -> Result<f64, String> {
-        let expected = self.data_len() + 2;
-        if response.len() != expected || response[..2] != [0x41, self.pid()] {
-            return Err(format!(
-                "invalid OBD-II {} response: {}",
-                self.semantic(),
-                hex(response)
-            ));
-        }
-        Ok(match self.signal {
-            Signal::EngineRpm => u16::from_be_bytes([response[2], response[3]]) as f64 / 4.0,
-            Signal::EngineCoolantTemperature => response[2] as f64 - 40.0,
-            Signal::VehicleSpeed => response[2] as f64,
-            Signal::EngineMaf => u16::from_be_bytes([response[2], response[3]]) as f64 / 100.0,
-        })
+        self.signal.decode(response)
     }
 
     pub fn complete(self, source: &str, response: Vec<u8>) -> Result<Transaction, String> {
@@ -141,6 +69,7 @@ impl ReadRequest {
                 .map_err(|error| error.to_string())?
                 .as_millis(),
             source: source.into(),
+            profile: self.profile(),
             semantic: self.semantic(),
             request: self.bytes().into(),
             response,
@@ -151,29 +80,20 @@ impl ReadRequest {
 }
 
 pub fn prepare_read(semantic: &str) -> Result<ReadRequest, String> {
-    match semantic {
-        "engine.rpm" => Ok(ReadRequest {
-            signal: Signal::EngineRpm,
-        }),
-        "engine.coolant_temperature" => Ok(ReadRequest {
-            signal: Signal::EngineCoolantTemperature,
-        }),
-        "vehicle.speed" => Ok(ReadRequest {
-            signal: Signal::VehicleSpeed,
-        }),
-        "engine.maf" => Ok(ReadRequest {
-            signal: Signal::EngineMaf,
-        }),
-        _ => Err(format!(
-            "read-only core rejected unsupported signal: {semantic}"
-        )),
-    }
+    vehicle::signal(semantic)
+        .map(|signal| ReadRequest { signal })
+        .ok_or_else(|| format!("read-only core rejected unsupported signal: {semantic}"))
+}
+
+pub fn supported_signals() -> &'static [vehicle::SignalDefinition] {
+    vehicle::signals()
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Transaction {
     pub timestamp_ms: u128,
     pub source: String,
+    pub profile: &'static str,
     pub semantic: &'static str,
     pub request: Vec<u8>,
     pub response: Vec<u8>,
@@ -181,13 +101,30 @@ pub struct Transaction {
     pub unit: &'static str,
 }
 
+pub(crate) trait DiagnosticTransport {
+    async fn read(&mut self, request: ReadRequest) -> Result<Vec<u8>, String>;
+}
+
+pub(crate) async fn read_transaction<T>(
+    transport: &mut T,
+    request: ReadRequest,
+) -> Result<Transaction, String>
+where
+    T: DiagnosticTransport,
+{
+    request.complete("user", transport.read(request).await?)
+}
+
 pub fn record(path: &Path, transaction: &Transaction) -> Result<(), String> {
     if transaction.source != "user" {
         return Err("recording source must be user".into());
     }
     let request = prepare_read(transaction.semantic)?;
-    if transaction.request != request.bytes() || transaction.unit != request.unit() {
-        return Err("recording request or unit does not match its semantic signal".into());
+    if transaction.profile != request.profile()
+        || transaction.request != request.bytes()
+        || transaction.unit != request.unit()
+    {
+        return Err("recording profile, request or unit does not match its semantic signal".into());
     }
     let value = request.value(&transaction.response)?;
     if transaction.value != value {
@@ -197,13 +134,15 @@ pub fn record(path: &Path, transaction: &Transaction) -> Result<(), String> {
     for (field, value) in [
         ("transport", transport),
         ("source", transaction.source.as_str()),
+        ("profile", transaction.profile),
         ("semantic", transaction.semantic),
         ("unit", transaction.unit),
     ] {
         reject_record_control(field, value)?;
     }
     let contents = format!(
-        "OBDENTIC\t1\nprofile\tobd2-v1\ntransport\t{transport}\ntimestamp_ms\t{}\nsource\t{}\nsemantic\t{}\nrequest\t{}\nresponse\t{}\nvalue\t{}\nunit\t{}\n",
+        "OBDENTIC\t1\nprofile\t{}\ntransport\t{transport}\ntimestamp_ms\t{}\nsource\t{}\nsemantic\t{}\nrequest\t{}\nresponse\t{}\nvalue\t{}\nunit\t{}\n",
+        transaction.profile,
         transaction.timestamp_ms,
         transaction.source,
         request.semantic(),
@@ -237,7 +176,7 @@ pub fn record(path: &Path, transaction: &Transaction) -> Result<(), String> {
     Ok(())
 }
 
-pub fn replay(path: &Path) -> Result<Transaction, String> {
+pub async fn replay(path: &Path) -> Result<Transaction, String> {
     let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let mut lines = contents.lines();
     if lines.next() != Some("OBDENTIC\t1") {
@@ -269,9 +208,6 @@ pub fn replay(path: &Path) -> Result<Transaction, String> {
             return Err(format!("recording contains duplicate {name}"));
         }
     }
-    if required(&fields, "profile")? != "obd2-v1" {
-        return Err("recording profile or unit is unsupported".into());
-    }
     if required(&fields, "transport")? != "ble-elm327-ffe1" {
         return Err("recording transport is unsupported".into());
     }
@@ -280,13 +216,17 @@ pub fn replay(path: &Path) -> Result<Transaction, String> {
         return Err("recording source must be user".into());
     }
     let request = prepare_read(required(&fields, "semantic")?)?;
-    if required(&fields, "request")? != hex(&request.bytes())
+    if required(&fields, "profile")? != request.profile()
+        || required(&fields, "request")? != hex(&request.bytes())
         || required(&fields, "unit")? != request.unit()
     {
-        return Err("recording request or unit does not match its semantic signal".into());
+        return Err("recording profile, request or unit does not match its semantic signal".into());
     }
     let response = parse_hex(required(&fields, "response")?)?;
-    let mut transaction = request.complete(source, response)?;
+    let mut transport = ReplayTransport {
+        response: Some(response),
+    };
+    let mut transaction = read_transaction(&mut transport, request).await?;
     let stored_value = required(&fields, "value")?
         .parse::<f64>()
         .map_err(|error| error.to_string())?;
@@ -297,6 +237,18 @@ pub fn replay(path: &Path) -> Result<Transaction, String> {
         .parse::<u128>()
         .map_err(|error| error.to_string())?;
     Ok(transaction)
+}
+
+struct ReplayTransport {
+    response: Option<Vec<u8>>,
+}
+
+impl DiagnosticTransport for ReplayTransport {
+    async fn read(&mut self, _request: ReadRequest) -> Result<Vec<u8>, String> {
+        self.response
+            .take()
+            .ok_or_else(|| "recording has no remaining response".into())
+    }
 }
 
 fn reject_record_control(field: &str, value: &str) -> Result<(), String> {
@@ -399,25 +351,53 @@ mod tests {
     #[test]
     fn supported_signal_metadata_matches_the_closed_request_vocabulary() {
         let expected = [
-            ("engine.rpm", [0x01, 0x0c], "rpm"),
-            ("engine.coolant_temperature", [0x01, 0x05], "°C"),
-            ("vehicle.speed", [0x01, 0x0d], "km/h"),
-            ("engine.maf", [0x01, 0x10], "g/s"),
+            ("engine.rpm", [0x01, 0x0c], "rpm", 0.0, 16383.75),
+            (
+                "engine.coolant_temperature",
+                [0x01, 0x05],
+                "°C",
+                -40.0,
+                215.0,
+            ),
+            ("vehicle.speed", [0x01, 0x0d], "km/h", 0.0, 255.0),
+            ("engine.maf", [0x01, 0x10], "g/s", 0.0, 655.35),
         ];
         assert_eq!(supported_signals().len(), expected.len());
 
-        for (metadata, (semantic, bytes, unit)) in supported_signals().iter().zip(expected) {
+        for (definition, (semantic, bytes, unit, minimum, maximum)) in
+            supported_signals().iter().zip(expected)
+        {
+            let metadata = definition.metadata();
             let request = prepare_read(semantic).unwrap();
             assert_eq!(request.metadata(), metadata);
             assert_eq!(request.bytes(), bytes);
             assert_eq!(metadata.semantic, semantic);
+            assert_eq!(metadata.profile, "obd2-v1");
+            assert_eq!(metadata.protocol, "OBD-II Mode 01");
             assert_eq!(metadata.unit, unit);
+            assert_eq!((metadata.minimum, metadata.maximum), (minimum, maximum));
             assert_eq!(metadata.subsystem, "powertrain");
+            assert!(!metadata.decoder.is_empty());
             assert!(metadata.description.ends_with('.'));
             assert!(metadata.provenance.starts_with("SAE J1979"));
             assert_eq!(metadata.confidence, "standards-derived/offline-tested");
             assert_eq!(metadata.hardware_validation, "rust-hardware-pending");
         }
+    }
+
+    #[test]
+    fn profile_catalog_keeps_ea189_empty_until_evidence_exists() {
+        assert_eq!(
+            supported_profiles()
+                .iter()
+                .map(|profile| profile.id)
+                .collect::<Vec<_>>(),
+            ["obd2-v1", "vw-ea189-v1"]
+        );
+        let ea189 = &supported_profiles()[1];
+        assert_eq!(ea189.confidence, "experimental");
+        assert_eq!(ea189.hardware_validation, "hardware-evidence-required");
+        assert!(prepare_read("dpf.diff_pressure").is_err());
     }
 
     #[test]
@@ -452,8 +432,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replay_recomputes_each_signal_from_raw_bytes() {
+    #[tokio::test]
+    async fn replay_recomputes_each_signal_from_raw_bytes() {
         for (semantic, request, response, value, unit) in [
             ("engine.rpm", "01 0C", "41 0C 00 00", 0.0, "rpm"),
             (
@@ -474,7 +454,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let replayed = replay(&path).unwrap();
+            let replayed = replay(&path).await.unwrap();
             assert_eq!(replayed.timestamp_ms, 1);
             assert_eq!(replayed.value, value);
             fs::remove_file(path).unwrap();
@@ -486,7 +466,7 @@ mod tests {
             "OBDENTIC\t1\nprofile\tobd2-v1\ntransport\tble-elm327-ffe1\ntimestamp_ms\t1\nsource\tuser\nsemantic\tengine.maf\nrequest\t01 0C\nresponse\t41 10 01 F4\nvalue\t5\nunit\trpm\n",
         )
         .unwrap();
-        assert!(replay(&path).is_err());
+        assert!(replay(&path).await.is_err());
         fs::remove_file(path).unwrap();
 
         let path = temp_path("wrong-value");
@@ -495,7 +475,7 @@ mod tests {
             "OBDENTIC\t1\nprofile\tobd2-v1\ntransport\tble-elm327-ffe1\ntimestamp_ms\t1\nsource\tuser\nsemantic\tengine.rpm\nrequest\t01 0C\nresponse\t41 0C 00 00\nvalue\t999\nunit\trpm\n",
         )
         .unwrap();
-        assert!(replay(&path).is_err());
+        assert!(replay(&path).await.is_err());
         fs::remove_file(path).unwrap();
     }
 
@@ -507,6 +487,7 @@ mod tests {
         let mut transaction = Transaction {
             timestamp_ms: 1,
             source: "user".into(),
+            profile: "obd2-v1",
             semantic: "engine.rpm",
             request: vec![0x01, 0x0c],
             response: vec![0x41, 0x0c, 0x00, 0x00],
@@ -541,6 +522,7 @@ mod tests {
         let transaction = Transaction {
             timestamp_ms: 1,
             source: "user\tspoof".into(),
+            profile: "obd2-v1",
             semantic: "engine.rpm",
             request: vec![0x01, 0x0c],
             response: vec![0x41, 0x0c, 0x00, 0x00],
