@@ -650,19 +650,19 @@ mod tests {
         };
 
         assert_eq!(exchange.commands, SESSION_COMMANDS);
-        assert_eq!(transaction.response, [0x41, 0x0c, 0x00, 0x00]);
-        assert_eq!(transaction.value, 0.0);
+        assert_eq!(transaction.response(), [0x41, 0x0c, 0x00, 0x00]);
+        assert_eq!(transaction.value(), 0.0);
 
         let path = std::env::temp_dir().join(format!(
             "obdentic-session-replay-{}-{}.tsv",
             std::process::id(),
-            transaction.timestamp_ms
+            transaction.timestamp_ms()
         ));
         crate::record(&path, &transaction).unwrap();
         let replayed = crate::replay(&path).await.unwrap();
         std::fs::remove_file(path).unwrap();
-        assert_eq!(replayed.response, transaction.response);
-        assert_eq!(replayed.value, transaction.value);
+        assert_eq!(replayed.response(), transaction.response());
+        assert_eq!(replayed.value(), transaction.value());
     }
 
     #[tokio::test]
@@ -694,8 +694,8 @@ mod tests {
 
             assert_eq!(exchange.commands[..9], SESSION_COMMANDS[..9]);
             assert_eq!(exchange.commands[9], command);
-            assert_eq!(transaction.value, value);
-            assert_eq!(transaction.unit, unit);
+            assert_eq!(transaction.value(), value);
+            assert_eq!(transaction.unit(), unit);
         }
     }
 

@@ -1,5 +1,6 @@
 use obdentic::{
-    ble, hex, prepare_read, record, replay, supported_signals, tui, ReadRequest, Transaction,
+    ble, hex, prepare_read, record, replay, supported_signals, telemetry::TelemetryState, tui,
+    ReadRequest, Transaction,
 };
 use std::{env, path::Path};
 
@@ -62,8 +63,14 @@ async fn run() -> Result<(), String> {
             }
         }
         Command::Replay(path) => show(&replay(Path::new(&path)).await?),
-        Command::TuiDemo => tui::run(&demo_samples()?)?,
-        Command::TuiReplay(path) => tui::run(&[replay(Path::new(&path)).await?])?,
+        Command::TuiDemo => {
+            let transactions = demo_samples()?;
+            tui::run(&telemetry(&transactions)?, &transactions)?;
+        }
+        Command::TuiReplay(path) => {
+            let transactions = [replay(Path::new(&path)).await?];
+            tui::run(&telemetry(&transactions)?, &transactions)?;
+        }
     }
     Ok(())
 }
@@ -159,14 +166,22 @@ fn demo_samples() -> Result<Vec<Transaction>, String> {
     .collect()
 }
 
+fn telemetry(transactions: &[Transaction]) -> Result<TelemetryState, String> {
+    let mut state = TelemetryState::new(600)?;
+    for transaction in transactions {
+        state.ingest(transaction);
+    }
+    Ok(state)
+}
+
 fn show(transaction: &Transaction) {
     println!("OBDentic — transparent read-only diagnostics");
-    println!("source    {}", transaction.source);
-    println!("profile   {}", transaction.profile);
-    println!("semantic  {}", transaction.semantic);
-    println!("tx        {}", hex(&transaction.request));
-    println!("rx        {}", hex(&transaction.response));
-    println!("decoded   {} {}", transaction.value, transaction.unit);
+    println!("source    {}", transaction.source());
+    println!("profile   {}", transaction.profile());
+    println!("semantic  {}", transaction.semantic());
+    println!("tx        {}", hex(transaction.request()));
+    println!("rx        {}", hex(transaction.response()));
+    println!("decoded   {} {}", transaction.value(), transaction.unit());
 }
 
 #[cfg(test)]
@@ -283,8 +298,8 @@ mod tests {
     fn tui_demo_uses_only_known_decoded_signals() {
         let samples = demo_samples().unwrap();
         assert_eq!(samples.len(), 4);
-        assert!(samples.iter().all(|sample| sample.source == "demo"));
-        assert_eq!(samples[0].semantic, "engine.rpm");
-        assert_eq!(samples[0].value, 1726.0);
+        assert!(samples.iter().all(|sample| sample.source() == "demo"));
+        assert_eq!(samples[0].semantic(), "engine.rpm");
+        assert_eq!(samples[0].value(), 1726.0);
     }
 }

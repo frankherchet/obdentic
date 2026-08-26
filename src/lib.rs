@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub mod ble;
 pub mod protocol;
+pub mod telemetry;
 pub mod tui;
 pub mod vehicle;
 
@@ -92,14 +93,48 @@ pub fn supported_signals() -> &'static [vehicle::SignalDefinition] {
 
 #[derive(Debug, PartialEq)]
 pub struct Transaction {
-    pub timestamp_ms: u128,
-    pub source: String,
-    pub profile: &'static str,
-    pub semantic: &'static str,
-    pub request: Vec<u8>,
-    pub response: Vec<u8>,
-    pub value: f64,
-    pub unit: &'static str,
+    timestamp_ms: u128,
+    source: String,
+    profile: &'static str,
+    semantic: &'static str,
+    request: Vec<u8>,
+    response: Vec<u8>,
+    value: f64,
+    unit: &'static str,
+}
+
+impl Transaction {
+    pub fn timestamp_ms(&self) -> u128 {
+        self.timestamp_ms
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn profile(&self) -> &'static str {
+        self.profile
+    }
+
+    pub fn semantic(&self) -> &'static str {
+        self.semantic
+    }
+
+    pub fn request(&self) -> &[u8] {
+        &self.request
+    }
+
+    pub fn response(&self) -> &[u8] {
+        &self.response
+    }
+
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    pub fn unit(&self) -> &'static str {
+        self.unit
+    }
 }
 
 pub(crate) trait DiagnosticTransport {

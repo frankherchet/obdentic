@@ -56,9 +56,10 @@ run remains RPM-only.
 with semantic, profile, protocol, request, decoder, plausible range, unit,
 subsystem, provenance, confidence, hardware-validation and description columns.
 
-`tui` is an offline viewer: it renders already-decoded demo or replay samples,
-their signal metadata and raw diagnostic TX/RX. Press `q` or `Esc` to close it;
-it never opens Bluetooth or sends a diagnostic request.
+`tui` is an offline viewer: it renders decoded demo or replay samples from a
+bounded per-signal telemetry history, plus their metadata and raw diagnostic
+TX/RX. Press `q` or `Esc` to close it; it never opens Bluetooth or sends a
+diagnostic request.
 
 For MIUI Android 10 bugreports, extract the embedded Bluetooth capture with:
 

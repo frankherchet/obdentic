@@ -1,4 +1,4 @@
-use crate::{hex, supported_signals, Transaction};
+use crate::{hex, supported_signals, telemetry::TelemetryState, Transaction};
 use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
@@ -19,7 +19,7 @@ use ratatui::backend::TestBackend;
 
 const LAYOUT_NAME: &str = "engine-overview";
 
-pub fn run(transactions: &[Transaction]) -> Result<(), String> {
+pub fn run(state: &TelemetryState, transactions: &[Transaction]) -> Result<(), String> {
     enable_raw_mode().map_err(|error| error.to_string())?;
     let mut stdout = io::stdout();
     if let Err(error) = execute!(stdout, EnterAlternateScreen) {
@@ -34,7 +34,7 @@ pub fn run(transactions: &[Transaction]) -> Result<(), String> {
             return Err(error.to_string());
         }
     };
-    let result = run_terminal(&mut terminal, transactions);
+    let result = run_terminal(&mut terminal, state, transactions);
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
@@ -43,11 +43,12 @@ pub fn run(transactions: &[Transaction]) -> Result<(), String> {
 
 fn run_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &TelemetryState,
     transactions: &[Transaction],
 ) -> Result<(), String> {
     loop {
         terminal
-            .draw(|frame| render(frame, transactions))
+            .draw(|frame| render(frame, state, transactions))
             .map_err(|error| error.to_string())?;
         match event::read().map_err(|error| error.to_string())? {
             Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => {
@@ -58,7 +59,7 @@ fn run_terminal(
     }
 }
 
-fn render(frame: &mut Frame, transactions: &[Transaction]) {
+fn render(frame: &mut Frame, state: &TelemetryState, transactions: &[Transaction]) {
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(15),
@@ -67,7 +68,7 @@ fn render(frame: &mut Frame, transactions: &[Transaction]) {
     .split(frame.area());
     let source = transactions
         .first()
-        .map(|transaction| transaction.source.as_str())
+        .map(|transaction| transaction.source())
         .unwrap_or("none");
     frame.render_widget(
         Paragraph::new(format!(
@@ -86,17 +87,13 @@ fn render(frame: &mut Frame, transactions: &[Transaction]) {
     .concat();
     for (area, signal) in panels.into_iter().zip(supported_signals()) {
         let metadata = signal.metadata();
-        let latest = transactions
-            .iter()
-            .rev()
-            .find(|transaction| transaction.semantic == metadata.semantic);
-        let value = latest
-            .map(|transaction| format!("{:.2} {}", transaction.value, transaction.unit))
+        let value = state
+            .current(metadata.semantic)
+            .map(|sample| format!("{:.2} {}", sample.value, sample.unit))
             .unwrap_or_else(|| "unsupported".into());
-        let samples = transactions
-            .iter()
-            .filter(|transaction| transaction.semantic == metadata.semantic)
-            .count();
+        let samples = state
+            .history(metadata.semantic)
+            .map_or(0, |history| history.len());
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(value).style(Style::default().fg(Color::Cyan)),
@@ -122,9 +119,9 @@ fn render(frame: &mut Frame, transactions: &[Transaction]) {
     let raw = transactions.iter().map(|transaction| {
         ListItem::new(format!(
             "{}  TX {}  RX {}",
-            transaction.semantic,
-            hex(&transaction.request),
-            hex(&transaction.response)
+            transaction.semantic(),
+            hex(transaction.request()),
+            hex(transaction.response())
         ))
     });
     frame.render_widget(
@@ -134,7 +131,8 @@ fn render(frame: &mut Frame, transactions: &[Transaction]) {
     let activity = transactions.iter().map(|transaction| {
         ListItem::new(format!(
             "{} -> read {}",
-            transaction.source, transaction.semantic
+            transaction.source(),
+            transaction.semantic()
         ))
     });
     frame.render_widget(
@@ -146,7 +144,7 @@ fn render(frame: &mut Frame, transactions: &[Transaction]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prepare_read;
+    use crate::{prepare_read, telemetry::TelemetryState};
 
     #[test]
     fn renders_decoded_samples_without_requesting_transport() {
@@ -154,10 +152,12 @@ mod tests {
             .unwrap()
             .complete("demo", vec![0x41, 0x0c, 0x1a, 0xf8])
             .unwrap();
+        let mut state = TelemetryState::new(2).unwrap();
+        state.ingest(&transaction);
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &[transaction]))
+            .draw(|frame| render(frame, &state, &[transaction]))
             .unwrap();
         let text: String = terminal
             .backend()
