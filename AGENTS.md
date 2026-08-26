@@ -21,3 +21,4 @@ Choose the lowest-cost worker that can reliably handle the task. Give every work
   obsolete Cargo 1.61; run Rust commands with
   `rtk env PATH=/Users/frankherchet/.cargo/bin:/opt/local/bin:/usr/bin:/bin cargo +1.98.0 ...`.
 - Before handoff, run the smallest relevant checks; for the current codebase this includes `cargo test`, `cargo clippy --all-targets -- -D warnings`, and Swift compilation when the BLE probe changes.
+- A meaningful feature or bug-fix task is complete only after its relevant checks pass, its intended changes are committed, and that commit is pushed to `main`.
