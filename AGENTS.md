@@ -8,6 +8,10 @@ Use sub-agents deliberately instead of implementing every non-trivial task in th
 
 Choose the lowest-cost worker that can reliably handle the task. Give every worker a concrete, bounded assignment and a non-overlapping write scope. Parallelize independent work only; the primary agent owns integration and final verification. Do not delegate trivial work when coordination would cost more than doing it directly.
 
+## Issue workflow
+
+When work is tracked by a GitHub issue, completing that work includes committing its intended changes and pushing the commit to `main`. Immediately after that successful push, close the implemented issue. Keep the milestone open when a separately recorded hardware acceptance remains; close it after all its issues and required acceptance work are complete.
+
 ## Project constraints
 
 - OBDentic is read-only. Never send vehicle coding, adaptation, actuator-test, DTC-clear, SecurityAccess, write-oriented UDS or arbitrary CAN commands.
