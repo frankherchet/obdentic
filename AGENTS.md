@@ -2,11 +2,9 @@
 
 ## Delegation
 
-Use sub-agents deliberately instead of implementing every non-trivial task in the primary agent. Recreate these workers when useful at the start of a new session:
+Use sub-agents deliberately instead of implementing every non-trivial task in the primary agent. Use `gpt-5.6-luna` exclusively for sub-agents; do not delegate to `gpt-5.6-terra` or `gpt-5.6-sol`. Recreate this worker when useful at the start of a new session:
 
-- `low_worker`: `gpt-5.6-luna`, `xhigh` reasoning — repository discovery, mechanical checks, focused searches, small isolated changes and test execution.
-- `mid_worker`: `gpt-5.6-terra`, `high` reasoning — normal feature work, debugging, integration design and bounded implementation tasks.
-- `high_worker`: `gpt-5.6-sol`, `medium` reasoning — architecture review, difficult protocol reasoning, safety/security review and ambiguous high-impact decisions.
+- `luna_worker`: `gpt-5.6-luna`, `xhigh` reasoning — repository discovery, mechanical checks, focused searches, bounded implementation, tests and isolated bug fixes.
 
 Choose the lowest-cost worker that can reliably handle the task. Give every worker a concrete, bounded assignment and a non-overlapping write scope. Parallelize independent work only; the primary agent owns integration and final verification. Do not delegate trivial work when coordination would cost more than doing it directly.
 
