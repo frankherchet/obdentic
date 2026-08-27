@@ -1,5 +1,6 @@
 use crate::Transaction;
 use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuditEntry {
@@ -35,6 +36,22 @@ impl AuditState {
             semantic: transaction.semantic(),
             request: transaction.request().to_vec(),
             response: transaction.response().to_vec(),
+        });
+    }
+
+    pub fn record_error(&mut self, error: &str) {
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(AuditEntry {
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            source: format!("error: {error}"),
+            semantic: "scheduler.error",
+            request: Vec::new(),
+            response: Vec::new(),
         });
     }
 

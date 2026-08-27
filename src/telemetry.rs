@@ -8,6 +8,7 @@ pub struct Sample {
     pub unit: &'static str,
 }
 
+#[derive(Clone)]
 pub struct TelemetryState {
     capacity: usize,
     samples: BTreeMap<&'static str, VecDeque<Sample>>,

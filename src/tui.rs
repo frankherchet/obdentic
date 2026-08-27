@@ -1,4 +1,5 @@
 use crate::{
+    audit::{AuditEntry, AuditState},
     hex,
     telemetry::{Sample, TelemetryState},
     Transaction,
@@ -23,6 +24,8 @@ use std::{
     fs,
     io::{self, Write},
     path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -225,6 +228,16 @@ pub fn run(
     state: &TelemetryState,
     transactions: &[Transaction],
 ) -> Result<(), String> {
+    let audit = transactions
+        .iter()
+        .map(|transaction| AuditEntry {
+            timestamp_ms: transaction.timestamp_ms(),
+            source: transaction.source().into(),
+            semantic: transaction.semantic(),
+            request: transaction.request().to_vec(),
+            response: transaction.response().to_vec(),
+        })
+        .collect::<Vec<_>>();
     enable_raw_mode().map_err(|error| error.to_string())?;
     let mut stdout = io::stdout();
     if let Err(error) = execute!(stdout, EnterAlternateScreen) {
@@ -239,7 +252,44 @@ pub fn run(
             return Err(error.to_string());
         }
     };
-    let result = run_terminal(&mut terminal, layout, state, transactions);
+    let result = run_terminal(&mut terminal, layout, state, &audit);
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    result
+}
+
+pub fn run_live(
+    layout: &DashboardLayout,
+    telemetry: Arc<Mutex<TelemetryState>>,
+    audit: Arc<Mutex<AuditState>>,
+) -> Result<(), String> {
+    enable_raw_mode().map_err(|error| error.to_string())?;
+    let mut stdout = io::stdout();
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(error.to_string());
+    }
+    let mut terminal =
+        Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| error.to_string())?;
+    let result = loop {
+        let state = telemetry
+            .lock()
+            .map_err(|_| "telemetry state lock poisoned")?
+            .clone();
+        let audit = audit
+            .lock()
+            .map_err(|_| "audit state lock poisoned")?
+            .snapshot();
+        terminal
+            .draw(|frame| render(frame, layout, &state, &audit))
+            .map_err(|error| error.to_string())?;
+        if event::poll(Duration::from_millis(100)).map_err(|error| error.to_string())?
+            && matches!(event::read().map_err(|error| error.to_string())?, Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc))
+        {
+            break Ok(());
+        }
+    };
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
@@ -250,11 +300,11 @@ fn run_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     layout: &DashboardLayout,
     state: &TelemetryState,
-    transactions: &[Transaction],
+    audit: &[AuditEntry],
 ) -> Result<(), String> {
     loop {
         terminal
-            .draw(|frame| render(frame, layout, state, transactions))
+            .draw(|frame| render(frame, layout, state, audit))
             .map_err(|error| error.to_string())?;
         match event::read().map_err(|error| error.to_string())? {
             Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => {
@@ -269,7 +319,7 @@ fn render(
     frame: &mut Frame,
     layout: &DashboardLayout,
     state: &TelemetryState,
-    transactions: &[Transaction],
+    audit: &[AuditEntry],
 ) {
     let areas = Layout::vertical([
         Constraint::Length(3),
@@ -277,9 +327,9 @@ fn render(
         Constraint::Length(6),
     ])
     .split(frame.area());
-    let source = transactions
+    let source = audit
         .first()
-        .map(|transaction| transaction.source())
+        .map(|entry| entry.source.as_str())
         .unwrap_or("none");
     frame.render_widget(
         Paragraph::new(format!(
@@ -293,25 +343,21 @@ fn render(
     render_panels(frame, areas[1], layout, state);
     let bottom = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(areas[2]);
-    let raw = transactions.iter().map(|transaction| {
+    let raw = audit.iter().map(|entry| {
         ListItem::new(format!(
             "{}  TX {}  RX {}",
-            transaction.semantic(),
-            hex(transaction.request()),
-            hex(transaction.response())
+            entry.semantic,
+            hex(&entry.request),
+            hex(&entry.response)
         ))
     });
     frame.render_widget(
         List::new(raw).block(Block::default().borders(Borders::ALL).title("Raw TX/RX")),
         bottom[0],
     );
-    let activity = transactions.iter().map(|transaction| {
-        ListItem::new(format!(
-            "{} -> read {}",
-            transaction.source(),
-            transaction.semantic()
-        ))
-    });
+    let activity = audit
+        .iter()
+        .map(|entry| ListItem::new(format!("{} -> read {}", entry.source, entry.semantic)));
     frame.render_widget(
         List::new(activity).block(Block::default().borders(Borders::ALL).title("Activity")),
         bottom[1],
@@ -595,6 +641,19 @@ mod tests {
         }
     }
 
+    fn audit(transactions: &[&Transaction]) -> Vec<AuditEntry> {
+        transactions
+            .iter()
+            .map(|transaction| AuditEntry {
+                timestamp_ms: transaction.timestamp_ms(),
+                source: transaction.source().into(),
+                semantic: transaction.semantic(),
+                request: transaction.request().to_vec(),
+                response: transaction.response().to_vec(),
+            })
+            .collect()
+    }
+
     #[test]
     fn renders_decoded_samples_without_requesting_transport() {
         let transaction = prepare_read("engine.rpm")
@@ -611,8 +670,9 @@ mod tests {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         let layout = engine_overview();
+        let audit = audit(&[&transaction, &maf]);
         terminal
-            .draw(|frame| render(frame, &layout, &state, &[transaction, maf]))
+            .draw(|frame| render(frame, &layout, &state, &audit))
             .unwrap();
         let text: String = terminal
             .backend()
@@ -703,9 +763,10 @@ mod tests {
         let mut state = TelemetryState::new(2).unwrap();
         state.ingest(&transaction);
         let layout = custom_layout();
+        let audit = audit(&[&transaction]);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
-            .draw(|frame| render(frame, &layout, &state, &[transaction]))
+            .draw(|frame| render(frame, &layout, &state, &audit))
             .unwrap();
         let text: String = terminal
             .backend()
@@ -760,9 +821,10 @@ mod tests {
             .unwrap();
         let mut state = TelemetryState::new(1).unwrap();
         state.ingest(&transaction);
+        let audit = audit(&[&transaction]);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, &layout, &state, &[transaction]))
+            .draw(|frame| render(frame, &layout, &state, &audit))
             .unwrap();
         let text: String = terminal
             .backend()

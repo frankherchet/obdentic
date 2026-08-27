@@ -100,11 +100,18 @@ async fn run(
             }
         }
     };
-    match (result, session.shutdown().await) {
+    let result = match (result, session.shutdown().await) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    };
+    if let Err(error) = &result {
+        audit
+            .lock()
+            .map_err(|_| "audit state lock poisoned")?
+            .record_error(error);
     }
+    result
 }
 
 #[cfg(test)]

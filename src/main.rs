@@ -1,10 +1,19 @@
 use obdentic::{
-    ble, hex, prepare_read, record, replay, supported_signals, telemetry::TelemetryState, tui,
-    ReadRequest, Transaction,
+    audit::AuditState,
+    ble, hex, prepare_read, record, replay,
+    scheduler::{Subscription, TelemetryScheduler},
+    supported_signals,
+    telemetry::TelemetryState,
+    tui, ReadRequest, Transaction,
 };
-use std::{env, path::Path};
+use std::{
+    env,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv]";
+const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -21,6 +30,10 @@ enum Command {
     TuiDemo(Option<String>),
     TuiReplay {
         recording: String,
+        layout: Option<String>,
+    },
+    TuiLive {
+        adapter_id: String,
         layout: Option<String>,
     },
 }
@@ -81,8 +94,35 @@ async fn run() -> Result<(), String> {
             let layout = load_layout(layout.as_deref())?;
             tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
         }
+        Command::TuiLive { adapter_id, layout } => {
+            let telemetry = Arc::new(Mutex::new(TelemetryState::new(600)?));
+            let audit = Arc::new(Mutex::new(AuditState::new(600)?));
+            let scheduler = TelemetryScheduler::start(
+                &adapter_id,
+                live_subscriptions()?,
+                telemetry.clone(),
+                audit.clone(),
+            )
+            .await?;
+            let result = tui::run_live(&load_layout(layout.as_deref())?, telemetry, audit);
+            let stopped = scheduler.stop().await;
+            result?;
+            stopped?;
+        }
     }
     Ok(())
+}
+
+fn live_subscriptions() -> Result<Vec<Subscription>, String> {
+    [
+        ("engine.rpm", 200),
+        ("engine.maf", 500),
+        ("engine.coolant_temperature", 1_000),
+        ("vehicle.speed", 1_000),
+    ]
+    .into_iter()
+    .map(|(signal, milliseconds)| Subscription::new(signal, Duration::from_millis(milliseconds)))
+    .collect()
 }
 
 fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
@@ -120,6 +160,27 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         {
             Ok(Command::TuiReplay {
                 recording: recording.clone(),
+                layout: Some(path.clone()),
+            })
+        }
+        [command, source, adapter_flag, adapter_id]
+            if command == "tui" && source == "live" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::TuiLive {
+                adapter_id: adapter_id.clone(),
+                layout: None,
+            })
+        }
+        [command, source, adapter_flag, adapter_id, layout_flag, path]
+            if command == "tui"
+                && source == "live"
+                && adapter_flag == "--adapter"
+                && layout_flag == "--layout" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::TuiLive {
+                adapter_id: adapter_id.clone(),
                 layout: Some(path.clone()),
             })
         }
