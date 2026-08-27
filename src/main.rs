@@ -1,7 +1,7 @@
 use obdentic::{
     audit::AuditState,
     ble, capture,
-    capture_events::{CaptureSubscription, SubscriptionFilterOutcome},
+    capture_events::{CaptureEvent, CaptureSubscription, SubscriptionFilterOutcome},
     capture_report, hex, jsonl_capture, prepare_read, record, replay,
     scheduler::{Subscription, TelemetryScheduler},
     supported_signals,
@@ -12,7 +12,7 @@ use std::{
     env,
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
@@ -214,6 +214,7 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
     {
         Ok(scheduler) => scheduler,
         Err(error) => {
+            record_capture_start_failure(&sender, profile.name(), &error).await?;
             finish_capture(Some(sender), Some(writer)).await?;
             return Err(error);
         }
@@ -279,6 +280,30 @@ async fn finish_capture(
         (None, None) => Ok(()),
         _ => Err("JSONL recorder has incomplete ownership".into()),
     }
+}
+
+async fn record_capture_start_failure(
+    sender: &jsonl_capture::Sender,
+    profile: &str,
+    error: &str,
+) -> Result<(), String> {
+    let wallclock_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "wall clock timestamp exceeds supported range")?;
+    for event in [
+        CaptureEvent::capture_started(Some(wallclock_ms), Some(profile.into())),
+        CaptureEvent::session_error(error),
+        CaptureEvent::SessionStopped { offset_us: 0 },
+    ] {
+        sender
+            .send(event)
+            .await
+            .map_err(|_| "capture recorder is closed".to_string())?;
+    }
+    Ok(())
 }
 
 fn live_subscriptions() -> Result<Vec<Subscription>, String> {
@@ -571,6 +596,30 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).into()).collect()
+    }
+
+    #[tokio::test]
+    async fn startup_failure_is_preserved_in_the_capture_event_stream() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
+        record_capture_start_failure(&sender, "engine-baseline", "Carly setup timed out")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(CaptureEvent::CaptureStarted {
+                profile: Some(profile),
+                ..
+            }) if profile == "engine-baseline"
+        ));
+        assert_eq!(
+            receiver.recv().await,
+            Some(CaptureEvent::session_error("Carly setup timed out"))
+        );
+        assert_eq!(
+            receiver.recv().await,
+            Some(CaptureEvent::SessionStopped { offset_us: 0 })
+        );
     }
 
     #[test]
