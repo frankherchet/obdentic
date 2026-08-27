@@ -190,29 +190,22 @@ async fn run(
                             }
                         }
                         Err(error) => {
-                            let failed = CaptureEvent::read_failed(
+                            if let Err(error) = record_read_failure(
+                                &audit,
+                                &recorder,
                                 subscription.semantic(),
                                 subscription.interval_us,
-                                Some(timing),
-                                Some(subscription.request.bytes().into()),
-                                error.clone(),
-                            );
-                            if let Err(recorder_error) = emit(&recorder, failed) {
-                                break 'scheduler Err(recorder_error);
+                                timing,
+                                subscription.request.bytes().into(),
+                                &error,
+                            ) {
+                                break 'scheduler Err(error);
                             }
-                            let _ = emit(&recorder, CaptureEvent::session_error(error.clone()));
-                            break 'scheduler Err(error);
                         }
                     }
-                    *due += subscription.interval;
-                    let first_skipped = *due;
-                    let mut skipped = 0_u64;
-                    while *due <= Instant::now() {
-                        skipped += 1;
-                        *due += subscription.interval;
-                    }
-                    if skipped > 0 {
-                        let last_skipped = *due - subscription.interval;
+                    if let Some((skipped, first_skipped, last_skipped)) =
+                        advance_due(due, subscription.interval, Instant::now())
+                    {
                         if let Err(error) = emit(
                             &recorder,
                             CaptureEvent::slots_skipped(
@@ -268,6 +261,47 @@ fn offset_us(origin: Instant, at: Instant) -> CaptureTimeUs {
         .unwrap_or(CaptureTimeUs::MAX)
 }
 
+fn advance_due(
+    due: &mut Instant,
+    interval: Duration,
+    now: Instant,
+) -> Option<(u64, Instant, Instant)> {
+    *due += interval;
+    let first_skipped = *due;
+    let mut skipped = 0_u64;
+    while *due <= now {
+        skipped += 1;
+        *due += interval;
+    }
+    (skipped > 0).then_some((skipped, first_skipped, *due - interval))
+}
+
+fn record_read_failure(
+    audit: &Arc<Mutex<AuditState>>,
+    recorder: &Option<mpsc::Sender<CaptureEvent>>,
+    semantic: &'static str,
+    interval_us: CaptureTimeUs,
+    timing: ReadTiming,
+    request_payload: Vec<u8>,
+    error: &str,
+) -> Result<(), String> {
+    emit(
+        recorder,
+        CaptureEvent::read_failed(
+            semantic,
+            interval_us,
+            Some(timing),
+            Some(request_payload),
+            error,
+        ),
+    )?;
+    audit
+        .lock()
+        .map_err(|_| "audit state lock poisoned".to_string())?
+        .record_error(error);
+    Ok(())
+}
+
 fn emit(recorder: &Option<mpsc::Sender<CaptureEvent>>, event: CaptureEvent) -> Result<(), String> {
     let Some(recorder) = recorder else {
         return Ok(());
@@ -310,5 +344,56 @@ mod tests {
             emit(&Some(sender), CaptureEvent::SessionStopped { offset_us: 0 }),
             Err("capture recorder is closed".into())
         );
+    }
+
+    #[test]
+    fn advancing_due_skips_missed_slots_without_backfill() {
+        let origin = Instant::now();
+        let interval = Duration::from_millis(100);
+        let mut due = origin;
+
+        assert_eq!(
+            advance_due(&mut due, interval, origin + Duration::from_millis(350)),
+            Some((
+                3,
+                origin + Duration::from_millis(100),
+                origin + Duration::from_millis(300),
+            ))
+        );
+        assert_eq!(due, origin + Duration::from_millis(400));
+    }
+
+    #[test]
+    fn read_failures_are_emitted_and_audited_without_a_session_error() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let audit = Arc::new(Mutex::new(AuditState::new(2).unwrap()));
+        let subscription = Subscription::new("engine.rpm", Duration::from_millis(250)).unwrap();
+        let timing = ReadTiming::new(1, 2, 3);
+
+        record_read_failure(
+            &audit,
+            &Some(sender),
+            subscription.semantic(),
+            subscription.interval_us(),
+            timing,
+            subscription.request.bytes().into(),
+            "conflicting 010C responses",
+        )
+        .unwrap();
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            CaptureEvent::ReadFailed {
+                semantic: "engine.rpm".into(),
+                requested_interval_us: 250_000,
+                timing: Some(timing),
+                request_payload: Some(vec![0x01, 0x0c]),
+                error: "conflicting 010C responses".into(),
+            }
+        );
+        let entries = audit.lock().unwrap().snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].semantic, "scheduler.error");
+        assert!(entries[0].source.contains("conflicting 010C responses"));
     }
 }
