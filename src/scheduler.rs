@@ -93,7 +93,7 @@ async fn run(
                     };
                     telemetry.lock().map_err(|_| "telemetry state lock poisoned")?.ingest(&transaction);
                     audit.lock().map_err(|_| "audit state lock poisoned")?.ingest(&transaction);
-                    while *due <= now {
+                    while *due <= Instant::now() {
                         *due += subscription.interval;
                     }
                 }
