@@ -1,8 +1,9 @@
 //! A small, local-only cache of already collected vehicle evidence.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -10,6 +11,8 @@ use std::{
 use std::os::unix::fs::OpenOptionsExt;
 
 const HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t1";
+const INDEX_HEADER: &str = "OBDENTIC-VEHICLE-INDEX\t1";
+const INDEX_NAME: &str = ".identity-index";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VehicleCache {
@@ -118,9 +121,188 @@ impl CacheStore {
         parse(&contents, local_key).map(Some)
     }
 
+    pub fn load_all(&self) -> Result<Vec<VehicleCache>, String> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut paths = entries
+            .map(|entry| entry.map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|entry| {
+                (entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("tsv"))
+                .then_some(entry.path())
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        paths
+            .into_iter()
+            .map(|path| {
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| "vehicle cache filename is not valid UTF-8".to_string())?;
+                let local_key = decode_hex(stem)?;
+                self.load(&local_key)?.ok_or_else(|| {
+                    format!("vehicle cache disappeared while loading {}", path.display())
+                })
+            })
+            .collect()
+    }
+
     fn path_for(&self, local_key: &str) -> PathBuf {
         self.root.join(format!("{}.tsv", hex(local_key.as_bytes())))
     }
+}
+
+/// Private VIN-to-key correlation kept separate from vehicle cache records.
+/// The VIN is intentionally present only in this 0600 index file.
+pub struct VehicleIndex {
+    path: PathBuf,
+}
+
+impl VehicleIndex {
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            path: root.as_ref().join(INDEX_NAME),
+        }
+    }
+
+    pub fn key_for(&self, vin: &crate::Vin) -> Result<Option<String>, String> {
+        Ok(self.read()?.get(vin.as_str()).cloned())
+    }
+
+    pub fn key_for_or_create(&self, vin: &crate::Vin) -> Result<(String, bool), String> {
+        let mut entries = self.read()?;
+        if let Some(key) = entries.get(vin.as_str()) {
+            return Ok((key.clone(), false));
+        }
+
+        let key = random_key()?;
+        entries.insert(vin.as_str().into(), key.clone());
+        self.write(&entries)?;
+        Ok((key, true))
+    }
+
+    fn read(&self) -> Result<BTreeMap<String, String>, String> {
+        let contents = match fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new())
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        parse_index(&contents)
+    }
+
+    fn write(&self, entries: &BTreeMap<String, String>) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let temporary = self.path.with_extension("tmp");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        let result = (|| {
+            writeln!(file, "{INDEX_HEADER}")?;
+            for (vin, key) in entries {
+                writeln!(file, "{}\t{}", escape(vin), escape(key))?;
+            }
+            file.flush()?;
+            file.sync_all()
+        })();
+        if let Err(error) = result {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+}
+
+fn parse_index(contents: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut lines = contents.lines();
+    if lines.next() != Some(INDEX_HEADER) {
+        return Err("unsupported vehicle index format".into());
+    }
+    let mut entries = BTreeMap::new();
+    let mut keys = BTreeSet::new();
+    for line in lines {
+        let (encoded_vin, encoded_key) = line
+            .split_once('\t')
+            .ok_or_else(|| "malformed vehicle index field".to_string())?;
+        let vin = unescape(encoded_vin)?;
+        crate::Vin::parse(&vin).map_err(|error| format!("invalid vehicle index VIN: {error}"))?;
+        let key = unescape(encoded_key)?;
+        validate_text("local key", &key)?;
+        if !keys.insert(key.clone()) {
+            return Err("vehicle index maps multiple VINs to one local key".into());
+        }
+        if entries.insert(vin, key).is_some() {
+            return Err("vehicle index contains duplicate VIN".into());
+        }
+    }
+    Ok(entries)
+}
+
+fn decode_hex(value: &str) -> Result<String, String> {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return Err("vehicle cache filename is not hexadecimal".into());
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().as_chunks::<2>().0 {
+        let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+        bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| "vehicle cache filename is not hexadecimal".to_string())?,
+        );
+    }
+    String::from_utf8(bytes).map_err(|_| "vehicle cache filename is not UTF-8".into())
+}
+
+fn random_key() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    fs::File::open("/dev/urandom")
+        .map_err(|error| format!("unable to generate vehicle key: {error}"))?
+        .read_exact(&mut bytes)
+        .map_err(|error| format!("unable to generate vehicle key: {error}"))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    ))
 }
 
 fn parse(contents: &str, requested_key: &str) -> Result<VehicleCache, String> {
@@ -339,6 +521,66 @@ mod tests {
         )
         .unwrap();
         assert!(store.load("local-key").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_all_cache_records_in_filename_order() {
+        let root = root("all");
+        let store = CacheStore::new(&root);
+        store
+            .save(&VehicleCache::new("second", 2, 2, Vec::new()))
+            .unwrap();
+        store
+            .save(&VehicleCache::new("first", 1, 1, Vec::new()))
+            .unwrap();
+
+        let caches = store.load_all().unwrap();
+        assert_eq!(
+            caches
+                .iter()
+                .map(VehicleCache::local_key)
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_index_reuses_keys_and_keeps_vin_out_of_cache_records() {
+        let root = root("index");
+        let store = CacheStore::new(&root);
+        let index = VehicleIndex::new(&root);
+        let vin = crate::Vin::parse("WVWZZZ1JZXW000001").unwrap();
+        let (key, created) = index.key_for_or_create(&vin).unwrap();
+        assert!(created);
+        assert_eq!(index.key_for(&vin).unwrap(), Some(key.clone()));
+        assert_eq!(index.key_for_or_create(&vin).unwrap(), (key.clone(), false));
+
+        store
+            .save(&VehicleCache::new(key, 1, 1, vec!["responder=7E8".into()]))
+            .unwrap();
+        let cache_path = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("tsv"))
+            .unwrap();
+        assert!(!cache_path.to_string_lossy().contains(vin.as_str()));
+        assert!(!fs::read_to_string(cache_path)
+            .unwrap()
+            .contains(vin.as_str()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root.join(INDEX_NAME))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub mod audit;
 pub mod ble;
+pub mod cache_validation;
 pub mod capability;
 pub mod capture;
 pub mod capture_events;

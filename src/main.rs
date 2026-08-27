@@ -1,3 +1,4 @@
+use obdentic::vehicle_cache::VehicleCache;
 use obdentic::{
     audit::AuditState,
     ble, capture,
@@ -15,7 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -27,6 +28,13 @@ enum Command {
     VehicleIdentify {
         adapter_id: String,
     },
+    VehicleDiscover {
+        adapter_id: String,
+    },
+    VehicleRefresh {
+        adapter_id: String,
+    },
+    VehicleShow,
     Demo,
     Capture {
         adapter_id: String,
@@ -88,6 +96,9 @@ async fn run() -> Result<(), String> {
             let identity = ble::identify(&adapter_id).await?;
             println!("VIN       {}", identity.vin());
         }
+        Command::VehicleDiscover { adapter_id } => run_vehicle_discover(&adapter_id).await?,
+        Command::VehicleRefresh { adapter_id } => run_vehicle_discover(&adapter_id).await?,
+        Command::VehicleShow => run_vehicle_show()?,
         Command::Capture {
             adapter_id,
             profile,
@@ -171,6 +182,152 @@ async fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+async fn run_vehicle_discover(adapter_id: &str) -> Result<(), String> {
+    let identity = ble::identify(adapter_id).await?;
+    let root = vehicle_cache_root()?;
+    let store = obdentic::vehicle_cache::CacheStore::new(&root);
+    let index = obdentic::vehicle_cache::VehicleIndex::new(&root);
+    let existing_key = index.key_for(identity.vin())?;
+    let existing = existing_key
+        .as_deref()
+        .map(|key| store.load(key))
+        .transpose()?
+        .flatten();
+
+    let session = ble::start_session(adapter_id).await?;
+    let discovery = obdentic::functional_discovery::discover_functional_responders(&session).await;
+    let shutdown = session.shutdown().await;
+    let discovery = discovery?;
+    shutdown?;
+
+    let (local_key, _) = index.key_for_or_create(identity.vin())?;
+    let now = wallclock_ms()?;
+    let first_seen = existing
+        .as_ref()
+        .map(VehicleCache::first_seen_ms)
+        .unwrap_or(now);
+    let observed_evidence = discovery_evidence(&discovery);
+    let cache_state =
+        existing.as_ref().map(|cache| {
+            match obdentic::cache_validation::validate_cache(cache, Ok(observed_evidence.clone())) {
+                obdentic::cache_validation::CacheValidation::Validated => "validated",
+                obdentic::cache_validation::CacheValidation::StaleMissingExpected(_) => {
+                    "stale-missing"
+                }
+                obdentic::cache_validation::CacheValidation::StaleUnexpected(_) => {
+                    "stale-unexpected"
+                }
+                obdentic::cache_validation::CacheValidation::TransportError(_) => {
+                    "validation-error"
+                }
+            }
+        });
+    let mut evidence = existing
+        .as_ref()
+        .map(|cache| cache.evidence().to_vec())
+        .unwrap_or_default();
+    evidence.extend(observed_evidence);
+    store.save(&VehicleCache::new(
+        local_key.clone(),
+        first_seen,
+        now,
+        evidence,
+    ))?;
+
+    println!("vehicle discovery");
+    println!("local_id\t{local_key}");
+    println!("cache\t{}", cache_state.unwrap_or("miss"));
+    println!("responders\t{}", discovery.responders().len());
+    for responder in discovery.responders() {
+        println!(
+            "responder\t{}",
+            responder.value().unwrap_or("unknown").escape_default()
+        );
+    }
+    println!("evidence\t{}", discovery.observations().len());
+    Ok(())
+}
+
+fn run_vehicle_show() -> Result<(), String> {
+    let caches = obdentic::vehicle_cache::CacheStore::new(vehicle_cache_root()?).load_all()?;
+    print!("{}", render_vehicle_summaries(&caches));
+    Ok(())
+}
+
+fn vehicle_cache_root() -> Result<std::path::PathBuf, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("obdentic")
+        .join("vehicles"))
+}
+
+fn wallclock_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "wall clock timestamp exceeds supported range".into())
+}
+
+fn discovery_evidence(
+    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
+) -> Vec<String> {
+    let mut evidence = discovery
+        .observations()
+        .iter()
+        .map(|observation| {
+            format!(
+                "functional request={} responder={} payload={} provenance={} confidence={:?}",
+                hex(&observation.request()),
+                observation.responder().value().unwrap_or("unknown"),
+                hex(observation.payload()),
+                observation.provenance().source(),
+                observation.provenance().confidence(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for capability in discovery.capabilities() {
+        let responder = capability.responder().value().unwrap_or("unknown");
+        let statuses = supported_signals()
+            .iter()
+            .filter_map(|signal| {
+                capability
+                    .status(signal.metadata().semantic)
+                    .ok()
+                    .map(|status| format!("{}={status:?}", signal.metadata().semantic))
+            })
+            .collect::<Vec<_>>();
+        evidence.push(format!(
+            "capabilities responder={} pages={} {}",
+            responder,
+            capability.mode01_pages().len(),
+            statuses.join(",")
+        ));
+    }
+    evidence
+}
+
+fn render_vehicle_summaries(caches: &[obdentic::vehicle_cache::VehicleCache]) -> String {
+    if caches.is_empty() {
+        return "no cached vehicles\n".into();
+    }
+    let mut output = String::new();
+    for cache in caches {
+        output.push_str("vehicle\n");
+        output.push_str(&format!("local_id\t{}\n", cache.local_key()));
+        output.push_str(&format!("first_seen_ms\t{}\n", cache.first_seen_ms()));
+        output.push_str(&format!("last_seen_ms\t{}\n", cache.last_seen_ms()));
+        output.push_str(&format!("evidence\t{}\n", cache.evidence().len()));
+        for evidence in cache.evidence() {
+            output.push_str(&format!("  {}\n", evidence.escape_default()));
+        }
+    }
+    output
 }
 
 async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Result<(), String> {
@@ -355,6 +512,23 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 adapter_id: adapter_id.clone(),
             })
         }
+        [command, action, adapter_flag, adapter_id]
+            if command == "vehicle"
+                && (action == "discover" || action == "refresh")
+                && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(if action == "discover" {
+                Command::VehicleDiscover {
+                    adapter_id: adapter_id.clone(),
+                }
+            } else {
+                Command::VehicleRefresh {
+                    adapter_id: adapter_id.clone(),
+                }
+            })
+        }
+        [command, action] if command == "vehicle" && action == "show" => Ok(Command::VehicleShow),
         [command] if command == "demo" => Ok(Command::Demo),
         [command, adapter_flag, adapter_id, profile_flag, profile_name, record_flag, path]
             if command == "capture"
@@ -655,6 +829,22 @@ mod tests {
                 adapter_id: uuid.into(),
             })
         );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "discover", "--adapter", uuid,])),
+            Ok(Command::VehicleDiscover {
+                adapter_id: uuid.into(),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "refresh", "--adapter", uuid,])),
+            Ok(Command::VehicleRefresh {
+                adapter_id: uuid.into(),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "show"])),
+            Ok(Command::VehicleShow)
+        );
         assert_eq!(parse_command(&args(&["demo"])), Ok(Command::Demo));
         assert_eq!(
             parse_command(&args(&["capture", "inspect", "capture.jsonl"])),
@@ -810,6 +1000,18 @@ mod tests {
         );
         assert_eq!(
             parse_command(&args(&["vehicle", "identify", "--adapter"])),
+            Err(USAGE.into())
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "discover", "--adapter", "UUID"])),
+            Err("adapter must be a CoreBluetooth UUID".into())
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "discover", "--adapter"])),
+            Err(USAGE.into())
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "show", "extra"])),
             Err(USAGE.into())
         );
         assert_eq!(
