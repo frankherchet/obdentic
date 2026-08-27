@@ -4,7 +4,7 @@ use obdentic::{
 };
 use std::{env, path::Path};
 
-const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic tui demo | obdentic tui replay <recording.tsv>";
+const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -17,8 +17,12 @@ enum Command {
         recording: Option<String>,
     },
     Replay(String),
-    TuiDemo,
-    TuiReplay(String),
+    LayoutSave(String),
+    TuiDemo(Option<String>),
+    TuiReplay {
+        recording: String,
+        layout: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -63,24 +67,29 @@ async fn run() -> Result<(), String> {
             }
         }
         Command::Replay(path) => show(&replay(Path::new(&path)).await?),
-        Command::TuiDemo => {
-            let transactions = demo_samples()?;
-            tui::run(
-                tui::engine_overview(),
-                &telemetry(&transactions)?,
-                &transactions,
-            )?;
+        Command::LayoutSave(path) => {
+            tui::save_layout(Path::new(&path), &tui::engine_overview())?;
+            println!("saved layout  {path}");
         }
-        Command::TuiReplay(path) => {
-            let transactions = [replay(Path::new(&path)).await?];
-            tui::run(
-                tui::engine_overview(),
-                &telemetry(&transactions)?,
-                &transactions,
-            )?;
+        Command::TuiDemo(layout_path) => {
+            let transactions = demo_samples()?;
+            let layout = load_layout(layout_path.as_deref())?;
+            tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
+        }
+        Command::TuiReplay { recording, layout } => {
+            let transactions = [replay(Path::new(&recording)).await?];
+            let layout = load_layout(layout.as_deref())?;
+            tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
         }
     }
     Ok(())
+}
+
+fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
+    path.map_or_else(
+        || Ok(tui::engine_overview()),
+        |path| tui::load_layout(Path::new(path)),
+    )
 }
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
@@ -89,9 +98,30 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         [command] if command == "scan" => Ok(Command::Scan),
         [command] if command == "demo" => Ok(Command::Demo),
         [command, path] if command == "replay" => Ok(Command::Replay(path.clone())),
-        [command, source] if command == "tui" && source == "demo" => Ok(Command::TuiDemo),
+        [command, action, name, path]
+            if command == "layout" && action == "save" && name == "engine-overview" =>
+        {
+            Ok(Command::LayoutSave(path.clone()))
+        }
+        [command, source] if command == "tui" && source == "demo" => Ok(Command::TuiDemo(None)),
+        [command, source, layout_flag, path]
+            if command == "tui" && source == "demo" && layout_flag == "--layout" =>
+        {
+            Ok(Command::TuiDemo(Some(path.clone())))
+        }
         [command, source, path] if command == "tui" && source == "replay" => {
-            Ok(Command::TuiReplay(path.clone()))
+            Ok(Command::TuiReplay {
+                recording: path.clone(),
+                layout: None,
+            })
+        }
+        [command, source, recording, layout_flag, path]
+            if command == "tui" && source == "replay" && layout_flag == "--layout" =>
+        {
+            Ok(Command::TuiReplay {
+                recording: recording.clone(),
+                layout: Some(path.clone()),
+            })
         }
         [command, signal, adapter_flag, adapter_id]
             if command == "read" && adapter_flag == "--adapter" =>
@@ -237,14 +267,41 @@ mod tests {
         assert_eq!(parse_command(&args(&["signals"])), Ok(Command::Signals));
         assert_eq!(parse_command(&args(&["scan"])), Ok(Command::Scan));
         assert_eq!(parse_command(&args(&["demo"])), Ok(Command::Demo));
-        assert_eq!(parse_command(&args(&["tui", "demo"])), Ok(Command::TuiDemo));
+        assert_eq!(
+            parse_command(&args(&["tui", "demo"])),
+            Ok(Command::TuiDemo(None))
+        );
+        assert_eq!(
+            parse_command(&args(&["tui", "demo", "--layout", "custom.tsv"])),
+            Ok(Command::TuiDemo(Some("custom.tsv".into())))
+        );
+        assert_eq!(
+            parse_command(&args(&["layout", "save", "engine-overview", "saved.tsv"])),
+            Ok(Command::LayoutSave("saved.tsv".into()))
+        );
         assert_eq!(
             parse_command(&args(&["replay", "session.tsv"])),
             Ok(Command::Replay("session.tsv".into()))
         );
         assert_eq!(
             parse_command(&args(&["tui", "replay", "session.tsv"])),
-            Ok(Command::TuiReplay("session.tsv".into()))
+            Ok(Command::TuiReplay {
+                recording: "session.tsv".into(),
+                layout: None
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "tui",
+                "replay",
+                "session.tsv",
+                "--layout",
+                "custom.tsv",
+            ])),
+            Ok(Command::TuiReplay {
+                recording: "session.tsv".into(),
+                layout: Some("custom.tsv".into()),
+            })
         );
         for signal in [
             "engine.rpm",
@@ -304,6 +361,10 @@ mod tests {
         assert_eq!(parse_command(&args(&["scan", "extra"])), Err(USAGE.into()));
         assert_eq!(
             parse_command(&args(&["demo", "session.tsv"])),
+            Err(USAGE.into())
+        );
+        assert_eq!(
+            parse_command(&args(&["layout", "save", "unknown", "saved.tsv"])),
             Err(USAGE.into())
         );
     }

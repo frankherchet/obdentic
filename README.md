@@ -64,8 +64,16 @@ opens Bluetooth or sends a diagnostic request.
 
 The built-in `engine-overview` is a declarative layout: panels name only a
 view (`Value`, `Sparkline`, `TimeSeries` or `Compare`) and semantic signals.
-It is intentionally in-memory only; saving layouts and sampling control are
-future slices.
+Save it to a new local file and load it for an offline TUI run with:
+
+```sh
+cargo run -- layout save engine-overview engine-overview.tsv
+cargo run -- tui demo --layout engine-overview.tsv
+```
+
+Layout files are private (`0600` on macOS), atomically created without
+overwriting an existing file, and contain only names, views and semantic
+signals. Sampling control remains a future slice.
 
 For MIUI Android 10 bugreports, extract the embedded Bluetooth capture with:
 

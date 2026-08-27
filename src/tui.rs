@@ -18,10 +18,18 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use std::{collections::VecDeque, io};
+use std::{
+    collections::VecDeque,
+    fs,
+    io::{self, Write},
+    path::Path,
+};
 
 #[cfg(test)]
 use ratatui::backend::TestBackend;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -31,59 +39,185 @@ pub enum View {
     Compare,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Panel {
-    pub title: &'static str,
+    pub title: String,
     pub view: View,
-    pub signals: &'static [&'static str],
+    pub signals: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DashboardLayout {
-    pub name: &'static str,
-    pub panels: &'static [Panel],
+    pub name: String,
+    pub panels: Vec<Panel>,
 }
 
-const ENGINE_OVERVIEW_PANELS: [Panel; 6] = [
-    Panel {
-        title: "Engine RPM",
-        view: View::Value,
-        signals: &["engine.rpm"],
-    },
-    Panel {
-        title: "RPM history",
-        view: View::Sparkline,
-        signals: &["engine.rpm"],
-    },
-    Panel {
-        title: "Coolant temperature",
-        view: View::Value,
-        signals: &["engine.coolant_temperature"],
-    },
-    Panel {
-        title: "Air flow",
-        view: View::TimeSeries,
-        signals: &["engine.maf"],
-    },
-    Panel {
-        title: "Road speed",
-        view: View::Value,
-        signals: &["vehicle.speed"],
-    },
-    Panel {
-        title: "RPM / MAF",
-        view: View::Compare,
-        signals: &["engine.rpm", "engine.maf"],
-    },
-];
+pub fn engine_overview() -> DashboardLayout {
+    DashboardLayout {
+        name: "engine-overview".into(),
+        panels: vec![
+            panel("Engine RPM", View::Value, &["engine.rpm"]),
+            panel("RPM history", View::Sparkline, &["engine.rpm"]),
+            panel(
+                "Coolant temperature",
+                View::Value,
+                &["engine.coolant_temperature"],
+            ),
+            panel("Air flow", View::TimeSeries, &["engine.maf"]),
+            panel("Road speed", View::Value, &["vehicle.speed"]),
+            panel("RPM / MAF", View::Compare, &["engine.rpm", "engine.maf"]),
+        ],
+    }
+}
 
-const ENGINE_OVERVIEW: DashboardLayout = DashboardLayout {
-    name: "engine-overview",
-    panels: &ENGINE_OVERVIEW_PANELS,
-};
+fn panel(title: &str, view: View, signals: &[&str]) -> Panel {
+    Panel {
+        title: title.into(),
+        view,
+        signals: signals.iter().map(|signal| (*signal).into()).collect(),
+    }
+}
 
-pub fn engine_overview() -> &'static DashboardLayout {
-    &ENGINE_OVERVIEW
+pub fn save_layout(path: &Path, layout: &DashboardLayout) -> Result<(), String> {
+    validate_layout(layout)?;
+    let mut contents = format!("OBDENTIC-LAYOUT\t1\nname\t{}\n", layout.name);
+    for panel in &layout.panels {
+        contents.push_str(&format!(
+            "panel\t{}\t{}\t{}\n",
+            panel.title,
+            view_name(panel.view),
+            panel.signals.join(",")
+        ));
+    }
+    write_private_new(path, &contents)
+}
+
+pub fn load_layout(path: &Path) -> Result<DashboardLayout, String> {
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut lines = contents.lines();
+    if lines.next() != Some("OBDENTIC-LAYOUT\t1") {
+        return Err("unsupported layout format".into());
+    }
+    let name = layout_field(lines.next(), "name")?.into();
+    let mut panels = Vec::new();
+    for line in lines {
+        let fields: Vec<_> = line.split('\t').collect();
+        let ["panel", title, view, signals] = fields.as_slice() else {
+            return Err("malformed layout panel".into());
+        };
+        panels.push(Panel {
+            title: (*title).into(),
+            view: parse_view(view)?,
+            signals: signals.split(',').map(str::to_owned).collect(),
+        });
+    }
+    let layout = DashboardLayout { name, panels };
+    validate_layout(&layout)?;
+    Ok(layout)
+}
+
+fn layout_field<'a>(line: Option<&'a str>, name: &str) -> Result<&'a str, String> {
+    let Some(line) = line else {
+        return Err(format!("layout is missing {name}"));
+    };
+    let Some((actual, value)) = line.split_once('\t') else {
+        return Err(format!("malformed layout {name}"));
+    };
+    (actual == name)
+        .then_some(value)
+        .ok_or_else(|| format!("layout is missing {name}"))
+}
+
+fn view_name(view: View) -> &'static str {
+    match view {
+        View::Value => "value",
+        View::Sparkline => "sparkline",
+        View::TimeSeries => "time-series",
+        View::Compare => "compare",
+    }
+}
+
+fn parse_view(value: &str) -> Result<View, String> {
+    match value {
+        "value" => Ok(View::Value),
+        "sparkline" => Ok(View::Sparkline),
+        "time-series" => Ok(View::TimeSeries),
+        "compare" => Ok(View::Compare),
+        _ => Err(format!("unsupported layout view {value}")),
+    }
+}
+
+fn validate_layout(layout: &DashboardLayout) -> Result<(), String> {
+    layout_text("name", &layout.name)?;
+    if layout.panels.is_empty() {
+        return Err("layout has no panels".into());
+    }
+    for panel in &layout.panels {
+        layout_text("panel title", &panel.title)?;
+        let expected_signals = match panel.view {
+            View::Compare => 2,
+            View::Value | View::Sparkline | View::TimeSeries => 1,
+        };
+        if panel.signals.len() != expected_signals {
+            return Err(format!(
+                "{} requires {expected_signals} semantic signal(s)",
+                panel.title
+            ));
+        }
+        for signal in &panel.signals {
+            if signal.is_empty()
+                || !signal.contains('.')
+                || !signal
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(format!(
+                    "{} contains an invalid semantic signal",
+                    panel.title
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn layout_text(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b'\t' | b'\r' | b'\n'))
+    {
+        return Err(format!(
+            "layout {field} is empty or contains a tab or newline"
+        ));
+    }
+    Ok(())
+}
+
+fn write_private_new(path: &Path, contents: &str) -> Result<(), String> {
+    let temporary = path.with_extension("tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    drop(file);
+    let result = fs::hard_link(&temporary, path).and_then(|_| fs::remove_file(&temporary));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 pub fn run(
@@ -208,8 +342,8 @@ fn render_panel(frame: &mut Frame, area: Rect, state: &TelemetryState, panel: &P
     }
 }
 
-fn one_signal(panel: &Panel) -> Option<&'static str> {
-    match panel.signals {
+fn one_signal(panel: &Panel) -> Option<&str> {
+    match panel.signals.as_slice() {
         [signal] => Some(signal),
         _ => None,
     }
@@ -217,8 +351,11 @@ fn one_signal(panel: &Panel) -> Option<&'static str> {
 
 fn unsupported(frame: &mut Frame, area: Rect, panel: &Panel, message: impl Into<String>) {
     frame.render_widget(
-        Paragraph::new(format!("unsupported: {}", message.into()))
-            .block(Block::default().borders(Borders::ALL).title(panel.title)),
+        Paragraph::new(format!("unsupported: {}", message.into())).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(panel.title.as_str()),
+        ),
         area,
     );
 }
@@ -237,7 +374,11 @@ fn render_value(frame: &mut Frame, area: Rect, state: &TelemetryState, panel: &P
                 Line::from(signal),
             ])
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(panel.title)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(panel.title.as_str()),
+            ),
             area,
         ),
         None => unsupported(frame, area, panel, signal),
@@ -255,7 +396,11 @@ fn render_sparkline(frame: &mut Frame, area: Rect, state: &TelemetryState, panel
         Sparkline::default()
             .data(sparkline_values(Some(history)))
             .style(Style::default().fg(Color::Green))
-            .block(Block::default().borders(Borders::ALL).title(panel.title)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(panel.title.as_str()),
+            ),
         area,
     );
 }
@@ -274,7 +419,11 @@ fn render_time_series(frame: &mut Frame, area: Rect, state: &TelemetryState, pan
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Cyan))
         .data(&points)])
-    .block(Block::default().borders(Borders::ALL).title(panel.title))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(panel.title.as_str()),
+    )
     .x_axis(
         Axis::default()
             .title("seconds")
@@ -326,7 +475,7 @@ fn time_points_from(history: &VecDeque<Sample>, origin: u128) -> Vec<(f64, f64)>
 }
 
 fn render_compare(frame: &mut Frame, area: Rect, state: &TelemetryState, panel: &Panel) {
-    let &[left, right] = panel.signals else {
+    let [left, right] = panel.signals.as_slice() else {
         return unsupported(frame, area, panel, "Compare requires two signals");
     };
     let (Some(left_history), Some(right_history)) = (state.history(left), state.history(right))
@@ -342,7 +491,11 @@ fn render_compare(frame: &mut Frame, area: Rect, state: &TelemetryState, panel: 
                 "incompatible units: {} vs {}",
                 left_unit.unit, right_unit.unit
             ))
-            .block(Block::default().borders(Borders::ALL).title(panel.title)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(panel.title.as_str()),
+            ),
             area,
         );
         return;
@@ -353,17 +506,21 @@ fn render_compare(frame: &mut Frame, area: Rect, state: &TelemetryState, panel: 
     let (x_minimum, x_maximum, y_minimum, y_maximum) = chart_bounds(&left_points, &right_points);
     let chart = Chart::new(vec![
         Dataset::default()
-            .name(left)
+            .name(left.as_str())
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Cyan))
             .data(&left_points),
         Dataset::default()
-            .name(right)
+            .name(right.as_str())
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Yellow))
             .data(&right_points),
     ])
-    .block(Block::default().borders(Borders::ALL).title(panel.title))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(panel.title.as_str()),
+    )
     .x_axis(
         Axis::default()
             .title("seconds")
@@ -404,33 +561,39 @@ mod tests {
     use super::*;
     use crate::{prepare_read, telemetry::TelemetryState};
 
-    const COMPATIBLE_COMPARE: Panel = Panel {
-        title: "RPM comparison",
-        view: View::Compare,
-        signals: &["engine.rpm", "engine.rpm"],
-    };
-    const CUSTOM_PANELS: [Panel; 4] = [
-        Panel {
-            title: "Custom value",
-            view: View::Value,
-            signals: &["engine.rpm"],
-        },
-        Panel {
-            title: "Custom sparkline",
-            view: View::Sparkline,
-            signals: &["engine.rpm"],
-        },
-        Panel {
-            title: "Custom time series",
-            view: View::TimeSeries,
-            signals: &["engine.rpm"],
-        },
-        COMPATIBLE_COMPARE,
-    ];
-    const CUSTOM_LAYOUT: DashboardLayout = DashboardLayout {
-        name: "custom",
-        panels: &CUSTOM_PANELS,
-    };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "obdentic-{label}-{}-{nonce}.layout",
+            std::process::id()
+        ))
+    }
+
+    fn compatible_compare() -> Panel {
+        panel(
+            "RPM comparison",
+            View::Compare,
+            &["engine.rpm", "engine.rpm"],
+        )
+    }
+
+    fn custom_layout() -> DashboardLayout {
+        DashboardLayout {
+            name: "custom".into(),
+            panels: vec![
+                panel("Custom value", View::Value, &["engine.rpm"]),
+                panel("Custom sparkline", View::Sparkline, &["engine.rpm"]),
+                panel("Custom time series", View::TimeSeries, &["engine.rpm"]),
+                compatible_compare(),
+            ],
+        }
+    }
 
     #[test]
     fn renders_decoded_samples_without_requesting_transport() {
@@ -447,8 +610,9 @@ mod tests {
         state.ingest(&maf);
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
+        let layout = engine_overview();
         terminal
-            .draw(|frame| render(frame, engine_overview(), &state, &[transaction, maf]))
+            .draw(|frame| render(frame, &layout, &state, &[transaction, maf]))
             .unwrap();
         let text: String = terminal
             .backend()
@@ -511,11 +675,12 @@ mod tests {
         let mut state = TelemetryState::new(2).unwrap();
         state.ingest(&first);
         state.ingest(&second);
+        let layout = compatible_compare();
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_compare(frame, area, &state, &COMPATIBLE_COMPARE)
+                render_compare(frame, area, &state, &layout)
             })
             .unwrap();
         let text: String = terminal
@@ -537,9 +702,10 @@ mod tests {
             .unwrap();
         let mut state = TelemetryState::new(2).unwrap();
         state.ingest(&transaction);
+        let layout = custom_layout();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
-            .draw(|frame| render(frame, &CUSTOM_LAYOUT, &state, &[transaction]))
+            .draw(|frame| render(frame, &layout, &state, &[transaction]))
             .unwrap();
         let text: String = terminal
             .backend()
@@ -556,5 +722,55 @@ mod tests {
         ] {
             assert!(text.contains(title));
         }
+    }
+
+    #[test]
+    fn saves_and_loads_private_semantic_layouts_without_overwriting() {
+        let path = temp_path("layout");
+        let layout = engine_overview();
+        save_layout(&path, &layout).unwrap();
+        assert_eq!(load_layout(&path).unwrap(), layout);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .starts_with("OBDENTIC-LAYOUT\t1\n"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(save_layout(&path, &layout).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_non_semantic_layout_content_and_renders_missing_signals() {
+        let invalid = DashboardLayout {
+            name: "invalid".into(),
+            panels: vec![panel("Raw PID", View::Value, &["010C"])],
+        };
+        assert!(validate_layout(&invalid).is_err());
+
+        let layout = DashboardLayout {
+            name: "missing".into(),
+            panels: vec![panel("Future signal", View::Value, &["future.signal"])],
+        };
+        let transaction = prepare_read("engine.rpm")
+            .unwrap()
+            .complete("demo", vec![0x41, 0x0c, 0x1a, 0xf8])
+            .unwrap();
+        let mut state = TelemetryState::new(1).unwrap();
+        state.ingest(&transaction);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &layout, &state, &[transaction]))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("unsupported: future.signal"));
     }
 }
