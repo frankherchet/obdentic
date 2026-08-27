@@ -380,7 +380,31 @@ where
 {
     let command = obd_command(request);
     let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
-    normalize_mode01(&response, request.pid(), request.data_len())
+    match normalize_mode01(&response, request.pid(), request.data_len()) {
+        Ok(payload) => Ok(payload),
+        Err(error) if error == format!("conflicting 01{:02X} responses", request.pid()) => {
+            let retry_response =
+                exchange
+                    .exchange(&command, COMMAND_TIMEOUT)
+                    .await
+                    .map_err(|retry_error| {
+                        format!(
+                            "{error}; first ELM response={}; retry failed: {retry_error}",
+                            response.escape_default()
+                        )
+                    })?;
+            normalize_mode01(&retry_response, request.pid(), request.data_len()).map_err(
+                |retry_error| {
+                    format!(
+                        "{retry_error}; first ELM response={}; retry ELM response={}",
+                        response.escape_default(),
+                        retry_response.escape_default()
+                    )
+                },
+            )
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn supports_pid(response: &[u8], pid: u8) -> bool {
@@ -849,6 +873,53 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert_eq!(replayed.response(), transaction.response());
         assert_eq!(replayed.value(), transaction.value());
+    }
+
+    #[tokio::test]
+    async fn retries_conflicting_response_once_and_accepts_a_valid_retry() {
+        let mut responses = captured_responses();
+        responses[9] = "410C0000\r410C0004\r>".into();
+        responses.push("410C0000\r>".into());
+        let mut exchange = ScriptedExchange::captured(responses);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+        let supported = initialize_elm(&mut exchange).await.unwrap();
+        assert!(supports_pid(&supported, request.pid()));
+
+        assert_eq!(
+            read_elm(&mut exchange, request).await.unwrap(),
+            vec![0x41, 0x0c, 0x00, 0x00]
+        );
+        assert_eq!(&exchange.commands[9..], ["010C\r", "010C\r"]);
+    }
+
+    #[tokio::test]
+    async fn reports_raw_responses_after_one_conflict_retry() {
+        let conflict = "410C0000\r410C0004\r>";
+        let mut responses = captured_responses();
+        responses[9] = conflict.into();
+        responses.push(conflict.into());
+        let mut exchange = ScriptedExchange::captured(responses);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+        let supported = initialize_elm(&mut exchange).await.unwrap();
+        assert!(supports_pid(&supported, request.pid()));
+
+        let error = read_elm(&mut exchange, request).await.unwrap_err();
+        assert!(error.contains("conflicting 010C responses"));
+        assert!(error.contains("410C0000\\r410C0004\\r>"), "{error}");
+        assert_eq!(&exchange.commands[9..], ["010C\r", "010C\r"]);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_other_normalization_errors() {
+        let mut responses = captured_responses();
+        responses[9] = "NO DATA\r>".into();
+        let mut exchange = ScriptedExchange::captured(responses);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+        let supported = initialize_elm(&mut exchange).await.unwrap();
+        assert!(supports_pid(&supported, request.pid()));
+
+        assert!(read_elm(&mut exchange, request).await.is_err());
+        assert_eq!(&exchange.commands[9..], ["010C\r"]);
     }
 
     #[tokio::test]
