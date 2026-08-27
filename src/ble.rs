@@ -73,9 +73,10 @@ pub struct SignalSupport {
     pub status: SignalSupportStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupportDiscovery {
     pub request: [u8; 2],
+    pub responder: Option<ResponderIdentity>,
     pub response: [u8; 6],
 }
 
@@ -956,16 +957,12 @@ where
     let highest_page = highest_catalog_page();
     let mut page = 0_u8;
     loop {
-        let request = [0x01, page];
         let command = format!("01{page:02X}\r");
         let response = exchange.exchange(&command, Duration::from_secs(10)).await?;
-        let normalized = normalize_pid_support_page(&response, page)?;
+        let (normalized, observations) = normalize_pid_support_page_with_evidence(&response, page)?;
         let bitmap = u32::from_be_bytes(normalized[2..].try_into().unwrap());
         pages.push(bitmap);
-        discovery.push(SupportDiscovery {
-            request,
-            response: normalized,
-        });
+        discovery.extend(observations);
 
         if page >= highest_page {
             break;
@@ -1392,13 +1389,38 @@ fn normalize_mode09_segments(response: &str) -> Result<Vec<Vec<u8>>, String> {
         .ok_or_else(|| "0902 response not found".into())
 }
 
+#[cfg(test)]
 fn normalize_pid_support_page(response: &str, page: u8) -> Result<[u8; 6], String> {
+    normalize_pid_support_page_with_evidence(response, page).map(|(normalized, _)| normalized)
+}
+
+fn normalize_pid_support_page_with_evidence(
+    response: &str,
+    page: u8,
+) -> Result<([u8; 6], Vec<SupportDiscovery>), String> {
     let matches = normalize_mode01_responses(response, page, 4)?;
-    let bitmap = matches.as_slice().iter().fold(0_u32, |bitmap, value| {
-        bitmap | u32::from_be_bytes(value.payload[2..].try_into().unwrap())
+    let mut bitmap = 0_u32;
+    let mut observations = Vec::new();
+    for value in matches.as_slice() {
+        bitmap |= u32::from_be_bytes(value.payload[2..].try_into().unwrap());
+        observations.push(SupportDiscovery {
+            request: [0x01, page],
+            responder: value.responder.clone(),
+            response: value.payload.as_slice().try_into().unwrap(),
+        });
+    }
+    observations.sort_by(|left, right| {
+        left.responder
+            .as_ref()
+            .map(ResponderIdentity::as_str)
+            .cmp(&right.responder.as_ref().map(ResponderIdentity::as_str))
+            .then_with(|| left.response.cmp(&right.response))
     });
     let bytes = bitmap.to_be_bytes();
-    Ok([0x41, page, bytes[0], bytes[1], bytes[2], bytes[3]])
+    Ok((
+        [0x41, page, bytes[0], bytes[1], bytes[2], bytes[3]],
+        observations,
+    ))
 }
 
 fn highest_catalog_page() -> u8 {
@@ -1676,6 +1698,7 @@ mod tests {
         let (sender, mut commands) = mpsc::channel(1);
         let discovery = vec![SupportDiscovery {
             request: [0x01, 0x00],
+            responder: None,
             response: [0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
         }];
         let expected = discovery.clone();
@@ -1896,18 +1919,47 @@ mod tests {
             [
                 SupportDiscovery {
                     request: [0x01, 0x00],
+                    responder: None,
                     response: [0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
                 },
                 SupportDiscovery {
                     request: [0x01, 0x20],
+                    responder: None,
                     response: [0x41, 0x20, 0x80, 0x00, 0x00, 0x01],
                 },
                 SupportDiscovery {
                     request: [0x01, 0x40],
+                    responder: None,
                     response: [0x41, 0x40, 0x80, 0x00, 0x00, 0x01],
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn support_discovery_preserves_each_responder_and_payload() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>".into(),
+        ]);
+
+        let support = discover_pid_support(&mut exchange).await.unwrap();
+
+        assert_eq!(
+            support.discovery,
+            [
+                SupportDiscovery {
+                    request: [0x01, 0x00],
+                    responder: Some(ResponderIdentity::ElmHeader("7E8".into())),
+                    response: [0x41, 0x00, 0x80, 0x00, 0x00, 0x00],
+                },
+                SupportDiscovery {
+                    request: [0x01, 0x00],
+                    responder: Some(ResponderIdentity::ElmHeader("7E9".into())),
+                    response: [0x41, 0x00, 0x00, 0x00, 0x00, 0x00],
+                },
+            ]
+        );
+        assert_eq!(support.status(0x01), SignalSupportStatus::Supported);
     }
 
     #[test]

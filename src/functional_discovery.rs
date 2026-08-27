@@ -247,9 +247,8 @@ impl FunctionalResponderDiscovery {
         Self { observations }
     }
 
-    /// Use the page data already collected by `SessionClient`.  The current
-    /// session API exposes normalized payloads without responder metadata, so
-    /// those observations remain explicitly unknown rather than guessed.
+    /// Use the page data already collected by `SessionClient`.  A missing
+    /// responder field remains explicitly unknown rather than guessed.
     pub fn from_support_discovery(pages: &[SupportDiscovery]) -> Result<Self, DiscoveryError> {
         let context = functional_context();
         let provenance = Provenance::new("Mode 01 functional support discovery", Confidence::High)
@@ -259,7 +258,12 @@ impl FunctionalResponderDiscovery {
             .map(|page| {
                 FunctionalPageObservation::new(
                     page.request,
-                    ResponderIdentity::unknown(context.clone()),
+                    match page.responder.as_ref() {
+                        Some(responder) => {
+                            ResponderIdentity::opaque(context.clone(), responder.as_str())
+                        }
+                        None => ResponderIdentity::unknown(context.clone()),
+                    },
                     page.response.to_vec(),
                     provenance.clone(),
                 )
@@ -591,10 +595,45 @@ mod tests {
     fn support_discovery_without_identity_remains_unknown() {
         let discovery = FunctionalResponderDiscovery::from_support_discovery(&[SupportDiscovery {
             request: [0x01, 0],
+            responder: None,
             response: [0x41, 0, 0, 0, 0, 0],
         }])
         .unwrap();
         assert!(discovery.responders()[0].value().is_none());
+    }
+
+    #[test]
+    fn support_discovery_preserves_actual_responder_headers_and_payloads() {
+        let discovery = FunctionalResponderDiscovery::from_support_discovery(&[
+            SupportDiscovery {
+                request: [0x01, 0],
+                responder: Some(crate::ble::ResponderIdentity::ElmHeader("7E8".into())),
+                response: [0x41, 0, 0x80, 0, 0, 0],
+            },
+            SupportDiscovery {
+                request: [0x01, 0],
+                responder: Some(crate::ble::ResponderIdentity::ElmHeader("7E9".into())),
+                response: [0x41, 0, 0, 0x40, 0, 0],
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            discovery
+                .responders()
+                .iter()
+                .map(|responder| responder.value().unwrap())
+                .collect::<Vec<_>>(),
+            ["7E8", "7E9"]
+        );
+        assert_eq!(
+            discovery.observations()[0].payload(),
+            [0x41, 0, 0x80, 0, 0, 0]
+        );
+        assert_eq!(
+            discovery.observations()[1].payload(),
+            [0x41, 0, 0x00, 0x40, 0, 0]
+        );
     }
 
     #[test]
