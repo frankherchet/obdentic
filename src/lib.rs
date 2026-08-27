@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub mod audit;
 pub mod ble;
+pub mod evidence;
 pub mod protocol;
 pub mod scheduler;
 pub mod telemetry;

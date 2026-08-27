@@ -1,4 +1,5 @@
 /target/
 /captures/
+/evidence/
 *.btsnoop
 *.tmp

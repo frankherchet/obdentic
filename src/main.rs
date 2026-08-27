@@ -1,6 +1,6 @@
 use obdentic::{
     audit::AuditState,
-    ble, hex, prepare_read, record, replay,
+    ble, evidence, hex, prepare_read, record, replay,
     scheduler::{Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv]";
+const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record evidence.tsv]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -35,6 +35,7 @@ enum Command {
     TuiLive {
         adapter_id: String,
         layout: Option<String>,
+        recording: Option<String>,
     },
 }
 
@@ -94,23 +95,53 @@ async fn run() -> Result<(), String> {
             let layout = load_layout(layout.as_deref())?;
             tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
         }
-        Command::TuiLive { adapter_id, layout } => {
+        Command::TuiLive {
+            adapter_id,
+            layout,
+            recording,
+        } => {
             let telemetry = Arc::new(Mutex::new(TelemetryState::new(600)?));
             let audit = Arc::new(Mutex::new(AuditState::new(600)?));
-            let scheduler = TelemetryScheduler::start(
+            let (recorder, writer) = match recording.as_deref() {
+                Some(path) => {
+                    let (sender, writer) = evidence::start(Path::new(path))?;
+                    (Some(sender), Some(writer))
+                }
+                None => (None, None),
+            };
+            let scheduler = match TelemetryScheduler::start(
                 &adapter_id,
                 live_subscriptions()?,
                 telemetry.clone(),
                 audit.clone(),
+                recorder,
             )
-            .await?;
+            .await
+            {
+                Ok(scheduler) => scheduler,
+                Err(error) => {
+                    finish_evidence(writer).await?;
+                    return Err(error);
+                }
+            };
             let result = tui::run_live(&load_layout(layout.as_deref())?, telemetry, audit);
             let stopped = scheduler.stop().await;
+            let recorded = finish_evidence(writer).await;
             result?;
             stopped?;
+            recorded?;
         }
     }
     Ok(())
+}
+
+async fn finish_evidence(writer: Option<evidence::Writer>) -> Result<(), String> {
+    match writer {
+        Some(writer) => writer
+            .await
+            .map_err(|error| format!("evidence recorder stopped unexpectedly: {error}"))?,
+        None => Ok(()),
+    }
 }
 
 fn live_subscriptions() -> Result<Vec<Subscription>, String> {
@@ -170,6 +201,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             Ok(Command::TuiLive {
                 adapter_id: adapter_id.clone(),
                 layout: None,
+                recording: None,
             })
         }
         [command, source, adapter_flag, adapter_id, layout_flag, path]
@@ -182,6 +214,34 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             Ok(Command::TuiLive {
                 adapter_id: adapter_id.clone(),
                 layout: Some(path.clone()),
+                recording: None,
+            })
+        }
+        [command, source, adapter_flag, adapter_id, record_flag, path]
+            if command == "tui"
+                && source == "live"
+                && adapter_flag == "--adapter"
+                && record_flag == "--record" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::TuiLive {
+                adapter_id: adapter_id.clone(),
+                layout: None,
+                recording: Some(path.clone()),
+            })
+        }
+        [command, source, adapter_flag, adapter_id, layout_flag, layout, record_flag, recording]
+            if command == "tui"
+                && source == "live"
+                && adapter_flag == "--adapter"
+                && layout_flag == "--layout"
+                && record_flag == "--record" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::TuiLive {
+                adapter_id: adapter_id.clone(),
+                layout: Some(layout.clone()),
+                recording: Some(recording.clone()),
             })
         }
         [command, signal, adapter_flag, adapter_id]
@@ -362,6 +422,38 @@ mod tests {
             Ok(Command::TuiReplay {
                 recording: "session.tsv".into(),
                 layout: Some("custom.tsv".into()),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "tui",
+                "live",
+                "--adapter",
+                uuid,
+                "--record",
+                "evidence.tsv",
+            ])),
+            Ok(Command::TuiLive {
+                adapter_id: uuid.into(),
+                layout: None,
+                recording: Some("evidence.tsv".into()),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "tui",
+                "live",
+                "--adapter",
+                uuid,
+                "--layout",
+                "custom.tsv",
+                "--record",
+                "evidence.tsv",
+            ])),
+            Ok(Command::TuiLive {
+                adapter_id: uuid.into(),
+                layout: Some("custom.tsv".into()),
+                recording: Some("evidence.tsv".into()),
             })
         );
         for signal in [

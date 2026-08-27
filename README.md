@@ -56,11 +56,25 @@ run remains RPM-only.
 with semantic, profile, protocol, request, decoder, plausible range, unit,
 subsystem, provenance, confidence, hardware-validation and description columns.
 
-`tui` is an offline viewer: `tui demo` provides an irregularly-timestamped
-`demo` history for sparklines and time-series checks; `tui replay` renders a
-decoded recording. Both consume only bounded per-signal telemetry history,
-metadata and raw diagnostic TX/RX. Press `q` or `Esc` to close it; neither
-opens Bluetooth or sends a diagnostic request.
+`tui demo` provides an irregularly-timestamped `demo` history and `tui replay`
+renders a decoded recording. `tui live` opens one read-only Carly session and
+uses the fixed benchmark subscriptions: RPM at 200 ms, MAF at 500 ms, coolant
+and speed at 1000 ms. Press `q` or `Esc` to close it cleanly.
+
+Use the rustup Cargo explicitly on this Mac, then record a live benchmark:
+
+```sh
+mkdir -p evidence
+/Users/frankherchet/.cargo/bin/cargo +1.98.0 run -- tui live \
+  --adapter "$ADAPTER_UUID" \
+  --record evidence/02-idle.tsv
+```
+
+Evidence files are new private (`0600`) append-only files, never overwrite an
+existing path, and are ignored by Git. They contain the session subscriptions
+and monotonic per-read scheduling/latency timings, canonical read-only TX/RX,
+decoder result and orderly session stop; they contain no adapter UUID, device
+name, initialization transcript, VIN or authentication data.
 
 The built-in `engine-overview` is a declarative layout: panels name only a
 view (`Value`, `Sparkline`, `TimeSeries` or `Compare`) and semantic signals.
