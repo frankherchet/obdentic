@@ -65,11 +65,19 @@ async fn run() -> Result<(), String> {
         Command::Replay(path) => show(&replay(Path::new(&path)).await?),
         Command::TuiDemo => {
             let transactions = demo_samples()?;
-            tui::run(&telemetry(&transactions)?, &transactions)?;
+            tui::run(
+                tui::engine_overview(),
+                &telemetry(&transactions)?,
+                &transactions,
+            )?;
         }
         Command::TuiReplay(path) => {
             let transactions = [replay(Path::new(&path)).await?];
-            tui::run(&telemetry(&transactions)?, &transactions)?;
+            tui::run(
+                tui::engine_overview(),
+                &telemetry(&transactions)?,
+                &transactions,
+            )?;
         }
     }
     Ok(())

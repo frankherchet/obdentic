@@ -62,6 +62,11 @@ decoded recording. Both consume only bounded per-signal telemetry history,
 metadata and raw diagnostic TX/RX. Press `q` or `Esc` to close it; neither
 opens Bluetooth or sends a diagnostic request.
 
+The built-in `engine-overview` is a declarative layout: panels name only a
+view (`Value`, `Sparkline`, `TimeSeries` or `Compare`) and semantic signals.
+It is intentionally in-memory only; saving layouts and sampling control are
+future slices.
+
 For MIUI Android 10 bugreports, extract the embedded Bluetooth capture with:
 
 ```sh

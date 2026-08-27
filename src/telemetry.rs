@@ -25,14 +25,20 @@ impl TelemetryState {
 
     pub fn ingest(&mut self, transaction: &Transaction) {
         let samples = self.samples.entry(transaction.semantic()).or_default();
-        if samples.len() == self.capacity {
-            samples.pop_front();
-        }
-        samples.push_back(Sample {
+        let sample = Sample {
             timestamp_ms: transaction.timestamp_ms(),
             value: transaction.value(),
             unit: transaction.unit(),
-        });
+        };
+        // ponytail: histories cap at 600 samples; use a time-indexed store if much larger out-of-order streams arrive.
+        let position = samples
+            .iter()
+            .position(|current| current.timestamp_ms > sample.timestamp_ms)
+            .unwrap_or(samples.len());
+        samples.insert(position, sample);
+        if samples.len() > self.capacity {
+            samples.pop_front();
+        }
     }
 
     pub fn current(&self, semantic: &str) -> Option<&Sample> {
@@ -96,5 +102,24 @@ mod tests {
         assert!(state.current("dpf.diff_pressure").is_none());
         assert!(state.history("dpf.diff_pressure").is_none());
         assert!(TelemetryState::new(0).is_err());
+    }
+
+    #[test]
+    fn keeps_history_chronological_when_samples_arrive_out_of_order() {
+        let mut state = TelemetryState::new(2).unwrap();
+        state.ingest(&transaction(3, vec![0x41, 0x0c, 0x00, 0x0c]));
+        state.ingest(&transaction(1, vec![0x41, 0x0c, 0x00, 0x04]));
+        state.ingest(&transaction(2, vec![0x41, 0x0c, 0x00, 0x08]));
+
+        assert_eq!(
+            state
+                .history("engine.rpm")
+                .unwrap()
+                .iter()
+                .map(|sample| sample.timestamp_ms)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(state.current("engine.rpm").unwrap().value, 3.0);
     }
 }
