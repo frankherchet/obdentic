@@ -15,6 +15,7 @@ pub mod capture;
 pub mod capture_events;
 pub mod capture_report;
 pub mod evidence;
+pub mod functional_discovery;
 pub mod identity;
 pub mod jsonl_capture;
 pub mod protocol;

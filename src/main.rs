@@ -15,7 +15,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -24,6 +24,9 @@ enum Command {
         adapter_id: String,
     },
     Scan,
+    VehicleIdentify {
+        adapter_id: String,
+    },
     Demo,
     Capture {
         adapter_id: String,
@@ -80,6 +83,10 @@ async fn run() -> Result<(), String> {
                     rssi
                 );
             }
+        }
+        Command::VehicleIdentify { adapter_id } => {
+            let identity = ble::identify(&adapter_id).await?;
+            println!("VIN       {}", identity.vin());
         }
         Command::Capture {
             adapter_id,
@@ -340,6 +347,14 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             })
         }
         [command] if command == "scan" => Ok(Command::Scan),
+        [command, action, adapter_flag, adapter_id]
+            if command == "vehicle" && action == "identify" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::VehicleIdentify {
+                adapter_id: adapter_id.clone(),
+            })
+        }
         [command] if command == "demo" => Ok(Command::Demo),
         [command, adapter_flag, adapter_id, profile_flag, profile_name, record_flag, path]
             if command == "capture"
@@ -634,6 +649,12 @@ mod tests {
             })
         );
         assert_eq!(parse_command(&args(&["scan"])), Ok(Command::Scan));
+        assert_eq!(
+            parse_command(&args(&["vehicle", "identify", "--adapter", uuid,])),
+            Ok(Command::VehicleIdentify {
+                adapter_id: uuid.into(),
+            })
+        );
         assert_eq!(parse_command(&args(&["demo"])), Ok(Command::Demo));
         assert_eq!(
             parse_command(&args(&["capture", "inspect", "capture.jsonl"])),
@@ -783,6 +804,14 @@ mod tests {
             Err("adapter must be a CoreBluetooth UUID".into())
         );
         assert_eq!(parse_command(&args(&["scan", "extra"])), Err(USAGE.into()));
+        assert_eq!(
+            parse_command(&args(&["vehicle", "identify", "--adapter", "UUID"])),
+            Err("adapter must be a CoreBluetooth UUID".into())
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "identify", "--adapter"])),
+            Err(USAGE.into())
+        );
         assert_eq!(
             parse_command(&args(&[
                 "capture",

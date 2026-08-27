@@ -1,4 +1,7 @@
-use crate::{ReadRequest, Transaction};
+use crate::{
+    topology::AddressingContext, topology::Protocol, topology::RequestTarget, ReadRequest,
+    Transaction,
+};
 use btleplug::{
     api::{
         bleuuid::uuid_from_u16, Central, CharPropFlags, Characteristic, Manager as _,
@@ -84,12 +87,80 @@ pub enum ResponderIdentity {
     ElmHeader(String),
 }
 
+/// A read-only request with an explicitly targeted physical OBD-II address.
+/// The semantic request remains the closed `ReadRequest` vocabulary; callers
+/// cannot inject an arbitrary payload through this type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedReadRequest {
+    request: ReadRequest,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
+impl TargetedReadRequest {
+    pub fn new(
+        request: ReadRequest,
+        target: RequestTarget,
+        expected_responder: ResponderIdentity,
+    ) -> Result<Self, String> {
+        validate_request_target(&target)?;
+        validate_elm_header(&expected_responder, "expected responder")?;
+        Ok(Self {
+            request,
+            target,
+            expected_responder: ResponderIdentity::ElmHeader(
+                expected_responder.as_str().to_ascii_uppercase(),
+            ),
+        })
+    }
+
+    pub fn request(&self) -> ReadRequest {
+        self.request
+    }
+
+    pub fn target(&self) -> &RequestTarget {
+        &self.target
+    }
+
+    pub fn expected_responder(&self) -> &ResponderIdentity {
+        &self.expected_responder
+    }
+}
+
 impl ResponderIdentity {
     pub fn as_str(&self) -> &str {
         match self {
             Self::ElmHeader(header) => header,
         }
     }
+}
+
+fn validate_request_target(target: &RequestTarget) -> Result<(), String> {
+    if target.context().protocol() != &Protocol::Obd2
+        || target.context().addressing() != &AddressingContext::Physical
+    {
+        return Err("targeted reads require physical OBD-II addressing".into());
+    }
+    let address = target
+        .address()
+        .ok_or_else(|| "targeted reads require a concrete request address".to_string())?;
+    if address.namespace() != "elm-header" {
+        return Err("targeted reads require an elm-header request address".into());
+    }
+    validate_header_value(address.value(), "request address")
+}
+
+fn validate_elm_header(identity: &ResponderIdentity, label: &str) -> Result<(), String> {
+    validate_header_value(identity.as_str(), label)
+}
+
+fn validate_header_value(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{label} must be exactly three hexadecimal characters"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,6 +349,35 @@ pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction,
     }
 }
 
+pub async fn read_targeted(
+    adapter_id: &str,
+    request: TargetedReadRequest,
+) -> Result<Transaction, String> {
+    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
+    let result = tokio::select! {
+        outcome = session.read_targeted(request) => outcome,
+        _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
+    };
+    match (result, session.disconnect().await) {
+        (Ok(transaction), Ok(())) => Ok(transaction),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
+pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
+    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
+    let result = tokio::select! {
+        identity = session.identify() => identity,
+        _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
+    };
+    match (result, session.disconnect().await) {
+        (Ok(identity), Ok(())) => Ok(identity),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
 pub async fn supported_signals(adapter_id: &str) -> Result<Vec<SignalSupport>, String> {
     let mut session = DiagnosticSession::connect(adapter_id).await?;
     let result = Ok(session.signal_support());
@@ -320,6 +420,26 @@ impl SessionClient {
             .map_err(|_| "diagnostic session stopped before responding".to_string())?
     }
 
+    pub async fn read_targeted(&self, request: TargetedReadRequest) -> Result<Transaction, String> {
+        self.read_targeted_with_evidence(request)
+            .await?
+            .into_transaction()
+    }
+
+    async fn read_targeted_with_evidence(
+        &self,
+        request: TargetedReadRequest,
+    ) -> Result<ReadOutcome, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::ReadTargeted { request, reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
     pub async fn shutdown(self) -> Result<(), String> {
         let (reply, result) = oneshot::channel();
         self.sender
@@ -348,6 +468,10 @@ enum SessionCommand {
         request: ReadRequest,
         reply: oneshot::Sender<Result<ReadOutcome, String>>,
     },
+    ReadTargeted {
+        request: TargetedReadRequest,
+        reply: oneshot::Sender<Result<ReadOutcome, String>>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -370,31 +494,29 @@ async fn session_actor(
                     continue;
                 }
                 let outcome = session.read_with_evidence(request).await;
-                match outcome {
-                    ReadOutcome::Succeeded { .. } => {
-                        health.success();
-                        let _ = reply.send(Ok(outcome));
-                    }
-                    ReadOutcome::Failed {
-                        error,
-                        observations,
-                    } => {
-                        if health.observe(&error) {
-                            let fatal = health.unhealthy().unwrap().to_owned();
-                            session.disconnect_best_effort().await;
-                            disconnect_done = true;
-                            let _ = reply.send(Ok(ReadOutcome::Failed {
-                                error: fatal,
-                                observations,
-                            }));
-                        } else {
-                            let _ = reply.send(Ok(ReadOutcome::Failed {
-                                error,
-                                observations,
-                            }));
-                        }
-                    }
+                process_read_outcome(
+                    &mut session,
+                    &mut health,
+                    &mut disconnect_done,
+                    outcome,
+                    reply,
+                )
+                .await;
+            }
+            SessionCommand::ReadTargeted { request, reply } => {
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
                 }
+                let outcome = session.read_targeted_with_evidence(request).await;
+                process_read_outcome(
+                    &mut session,
+                    &mut health,
+                    &mut disconnect_done,
+                    outcome,
+                    reply,
+                )
+                .await;
             }
             SessionCommand::Shutdown { reply } => {
                 if !disconnect_done {
@@ -410,6 +532,44 @@ async fn session_actor(
     }
     if !disconnect_done {
         session.disconnect_best_effort().await;
+    }
+}
+
+async fn process_read_outcome(
+    session: &mut DiagnosticSession,
+    health: &mut SessionHealth,
+    disconnect_done: &mut bool,
+    outcome: ReadOutcome,
+    reply: oneshot::Sender<Result<ReadOutcome, String>>,
+) {
+    if let Some(error) = health.unhealthy() {
+        let _ = reply.send(Err(error.to_owned()));
+        return;
+    }
+    match outcome {
+        ReadOutcome::Succeeded { .. } => {
+            health.success();
+            let _ = reply.send(Ok(outcome));
+        }
+        ReadOutcome::Failed {
+            error,
+            observations,
+        } => {
+            if health.observe(&error) {
+                let fatal = health.unhealthy().unwrap().to_owned();
+                session.disconnect_best_effort().await;
+                *disconnect_done = true;
+                let _ = reply.send(Ok(ReadOutcome::Failed {
+                    error: fatal,
+                    observations,
+                }));
+            } else {
+                let _ = reply.send(Ok(ReadOutcome::Failed {
+                    error,
+                    observations,
+                }));
+            }
+        }
     }
 }
 
@@ -527,6 +687,27 @@ impl DiagnosticSession {
         self.read_with_evidence(request).await.into_transaction()
     }
 
+    pub async fn read_targeted(
+        &mut self,
+        request: TargetedReadRequest,
+    ) -> Result<Transaction, String> {
+        self.read_targeted_with_evidence(request)
+            .await
+            .into_transaction()
+    }
+
+    pub async fn identify(&mut self) -> Result<crate::identity::VehicleIdentity, String> {
+        let mut exchange = LiveExchange {
+            peripheral: &self.peripheral,
+            channel: &self.channel,
+            notifications: &mut self.notifications,
+            show_adapter_io: self.show_adapter_io,
+        };
+        let response = exchange.exchange("0902\r", COMMAND_TIMEOUT).await?;
+        let segments = normalize_mode09_segments(&response)?;
+        crate::identity::decode_mode09_pid02(&segments).map_err(|error| error.to_string())
+    }
+
     async fn read_with_evidence(&mut self, request: ReadRequest) -> ReadOutcome {
         if !supports_pid(&self.supported, request.pid()) {
             return ReadOutcome::Failed {
@@ -548,6 +729,34 @@ impl DiagnosticSession {
         };
         match read {
             Ok(read) => match request.complete("user", read.payload) {
+                Ok(transaction) => ReadOutcome::Succeeded {
+                    transaction,
+                    observations: read.observations,
+                },
+                Err(error) => ReadOutcome::Failed {
+                    error,
+                    observations: read.observations,
+                },
+            },
+            Err(error) => ReadOutcome::Failed {
+                error: error.error,
+                observations: error.observations,
+            },
+        }
+    }
+
+    async fn read_targeted_with_evidence(&mut self, request: TargetedReadRequest) -> ReadOutcome {
+        let read = {
+            let mut exchange = LiveExchange {
+                peripheral: &self.peripheral,
+                channel: &self.channel,
+                notifications: &mut self.notifications,
+                show_adapter_io: self.show_adapter_io,
+            };
+            read_elm_targeted_with_evidence(&mut exchange, &request).await
+        };
+        match read {
+            Ok(read) => match request.request().complete("user", read.payload) {
                 Ok(transaction) => ReadOutcome::Succeeded {
                     transaction,
                     observations: read.observations,
@@ -860,6 +1069,126 @@ where
     }
 }
 
+async fn read_elm_targeted_with_evidence<E>(
+    exchange: &mut E,
+    request: &TargetedReadRequest,
+) -> Result<ReadEvidence, ReadEvidenceError>
+where
+    E: ElmExchange,
+{
+    if let Err(error) = configure_target(exchange, request).await {
+        let restore = restore_functional(exchange).await;
+        return Err(ReadEvidenceError {
+            error: combine_setup_errors(error, restore),
+            observations: Vec::new(),
+        });
+    }
+
+    let read = match read_elm_responses(exchange, request.request()).await {
+        Ok(responses) => match targeted_payload(&responses, request.expected_responder()) {
+            Ok(payload) => Ok(ReadEvidence {
+                payload,
+                observations: vec![responses.observation(None)],
+            }),
+            Err(error) => Err(ReadEvidenceError {
+                error: error.clone(),
+                observations: vec![responses.observation(Some(error))],
+            }),
+        },
+        Err(error) => Err(ReadEvidenceError {
+            error,
+            observations: Vec::new(),
+        }),
+    };
+    let restore = restore_functional(exchange).await;
+    match (read, restore) {
+        (Ok(read), Ok(())) => Ok(read),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(read), Err(error)) => Err(ReadEvidenceError {
+            error: format!(
+                "targeted read succeeded; restoring functional addressing failed: {error}"
+            ),
+            observations: read.observations,
+        }),
+        (Err(mut error), Err(restore)) => {
+            error.error = format!(
+                "{}; restoring functional addressing failed: {restore}",
+                error.error
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn configure_target<E>(exchange: &mut E, request: &TargetedReadRequest) -> Result<(), String>
+where
+    E: ElmExchange,
+{
+    let address = request
+        .target()
+        .address()
+        .expect("validated targeted request has a concrete address");
+    let target_header = address.value().to_ascii_uppercase();
+    let expected_header = request.expected_responder().as_str();
+    for (command, error) in [
+        (
+            format!("ATSH {target_header}\r"),
+            "target request header setup failed",
+        ),
+        (
+            format!("ATCRA {expected_header}\r"),
+            "target response filter setup failed",
+        ),
+    ] {
+        let response = exchange.exchange(&command, Duration::from_secs(3)).await?;
+        require_response(&response, "OK", true, error)?;
+    }
+    Ok(())
+}
+
+async fn restore_functional<E>(exchange: &mut E) -> Result<(), String>
+where
+    E: ElmExchange,
+{
+    for (command, error) in [
+        ("ATSP0\r", "functional protocol reset failed"),
+        ("ATSH 7DF\r", "functional request header reset failed"),
+        ("ATCRA\r", "functional response filter reset failed"),
+    ] {
+        let response = exchange.exchange(command, Duration::from_secs(3)).await?;
+        require_response(&response, "OK", true, error)?;
+    }
+    Ok(())
+}
+
+fn combine_setup_errors(error: String, restore: Result<(), String>) -> String {
+    match restore {
+        Ok(()) => error,
+        Err(restore) => format!("{error}; restoring functional addressing failed: {restore}"),
+    }
+}
+
+fn targeted_payload(
+    responses: &DiagnosticResponses,
+    expected: &ResponderIdentity,
+) -> Result<Vec<u8>, String> {
+    if let Some(unexpected) = responses
+        .as_slice()
+        .iter()
+        .find(|response| response.responder.as_ref() != Some(expected))
+    {
+        let observed = unexpected
+            .responder
+            .as_ref()
+            .map_or("unknown", ResponderIdentity::as_str);
+        return Err(format!(
+            "unexpected responder {observed} for targeted read; expected {}",
+            expected.as_str()
+        ));
+    }
+    responses.select(expected)
+}
+
 pub(crate) async fn read_elm_responses<E>(
     exchange: &mut E,
     request: ReadRequest,
@@ -1012,6 +1341,55 @@ pub(crate) fn normalize_mode01_responses(
         mode01_responses(response, pid, data_len)?,
         response,
     ))
+}
+
+fn normalize_mode09_segments(response: &str) -> Result<Vec<Vec<u8>>, String> {
+    let mut segments = Vec::new();
+    for raw_line in response.split(['\r', '\n']) {
+        let line = raw_line.trim().trim_end_matches('>').trim();
+        if line.is_empty()
+            || line.eq_ignore_ascii_case("0902")
+            || line.to_ascii_uppercase().starts_with("SEARCHING")
+            || line.to_ascii_uppercase().starts_with("BUS INIT")
+        {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        if upper == "?"
+            || ["NO DATA", "STOPPED", "UNABLE TO CONNECT", "ERROR"]
+                .iter()
+                .any(|status| upper.contains(status))
+        {
+            return Err(format!("ELM327 rejected 0902: {line}"));
+        }
+        let mut tokens = line.split_ascii_whitespace();
+        let has_header = tokens
+            .next()
+            .filter(|token| token.len() == 3 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .is_some();
+        if !has_header {
+            tokens = line.split_ascii_whitespace();
+        }
+        let mut bytes = Vec::new();
+        for token in tokens {
+            if token.is_empty()
+                || token.len() % 2 != 0
+                || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!("malformed ELM327 Mode 09 response line: {line:?}"));
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+                bytes.push(u8::from_str_radix(pair, 16).map_err(|error| error.to_string())?);
+            }
+        }
+        if !bytes.is_empty() {
+            segments.push(bytes);
+        }
+    }
+    (!segments.is_empty())
+        .then_some(segments)
+        .ok_or_else(|| "0902 response not found".into())
 }
 
 fn normalize_pid_support_page(response: &str, page: u8) -> Result<[u8; 6], String> {
@@ -1206,6 +1584,21 @@ mod tests {
         .collect()
     }
 
+    fn targeted_request() -> TargetedReadRequest {
+        TargetedReadRequest::new(
+            crate::prepare_read("engine.rpm").unwrap(),
+            crate::topology::RequestTarget::concrete(
+                crate::topology::ProtocolContext::new(
+                    crate::topology::Protocol::Obd2,
+                    crate::topology::AddressingContext::Physical,
+                ),
+                crate::topology::RequestAddress::new("elm-header", "7e0"),
+            ),
+            ResponderIdentity::ElmHeader("7e8".into()),
+        )
+        .unwrap()
+    }
+
     fn channel() -> Characteristic {
         Characteristic {
             uuid: uuid_from_u16(CARLY_CHANNEL),
@@ -1241,6 +1634,9 @@ mod tests {
                             transaction: request.complete("user", response).unwrap(),
                             observations: Vec::new(),
                         }));
+                    }
+                    SessionCommand::ReadTargeted { reply, .. } => {
+                        let _ = reply.send(Err("targeted test request not scripted".into()));
                     }
                     SessionCommand::Shutdown { reply } => {
                         let _ = reply.send(Ok(()));
@@ -1597,6 +1993,94 @@ mod tests {
             vec![0x41, 0x0c, 0x00, 0x00]
         );
         assert_eq!(&exchange.commands[9..], ["010C\r", "010C\r"]);
+    }
+
+    #[tokio::test]
+    async fn targeted_read_configures_expected_headers_and_restores_functional_state() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "7E8 04 41 0C 00 00 00 00\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "410C0000\r>".into(),
+        ]);
+        let request = targeted_request();
+
+        let read = read_elm_targeted_with_evidence(&mut exchange, &request)
+            .await
+            .unwrap();
+        let functional = read_elm(&mut exchange, crate::prepare_read("engine.rpm").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(read.payload, vec![0x41, 0x0c, 0x00, 0x00]);
+        assert_eq!(functional, vec![0x41, 0x0c, 0x00, 0x00]);
+        assert_eq!(
+            exchange.commands,
+            [
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "010C\r",
+                "ATSP0\r",
+                "ATSH 7DF\r",
+                "ATCRA\r",
+                "010C\r",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_read_rejects_an_unexpected_responder() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "7E9 04 41 0C 00 00 00 00\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+        ]);
+
+        let error = read_elm_targeted_with_evidence(&mut exchange, &targeted_request())
+            .await
+            .unwrap_err()
+            .error;
+
+        assert!(error.contains("unexpected responder 7E9"));
+        assert_eq!(
+            &exchange.commands[..3],
+            ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r"]
+        );
+        assert_eq!(
+            &exchange.commands[3..],
+            ["ATSP0\r", "ATSH 7DF\r", "ATCRA\r"]
+        );
+    }
+
+    #[test]
+    fn targeted_request_cannot_escape_the_read_allowlist_or_address_namespace() {
+        let request = crate::prepare_read("engine.rpm").unwrap();
+        let context = crate::topology::ProtocolContext::new(
+            crate::topology::Protocol::Obd2,
+            crate::topology::AddressingContext::Physical,
+        );
+        assert!(TargetedReadRequest::new(
+            request,
+            crate::topology::RequestTarget::functional(context.clone()),
+            ResponderIdentity::ElmHeader("7E8".into()),
+        )
+        .is_err());
+        assert!(TargetedReadRequest::new(
+            request,
+            crate::topology::RequestTarget::concrete(
+                context,
+                crate::topology::RequestAddress::new("raw-can", "7E0"),
+            ),
+            ResponderIdentity::ElmHeader("7E8".into()),
+        )
+        .is_err());
+        assert!(crate::prepare_read("dtc.clear").is_err());
     }
 
     #[tokio::test]
