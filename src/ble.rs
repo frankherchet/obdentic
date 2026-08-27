@@ -8,6 +8,7 @@ use btleplug::{
 };
 use futures_util::{Stream, StreamExt};
 use std::{pin::Pin, time::Duration};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 
 const CARLY_SERVICE: u16 = 0xFFE0;
@@ -69,6 +70,70 @@ pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction,
         (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
     }
+}
+
+pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
+    let session = DiagnosticSession::connect(adapter_id).await?;
+    let (sender, receiver) = mpsc::channel(16);
+    tokio::spawn(session_actor(session, receiver));
+    Ok(SessionClient { sender })
+}
+
+#[derive(Clone)]
+pub struct SessionClient {
+    sender: mpsc::Sender<SessionCommand>,
+}
+
+impl SessionClient {
+    pub async fn read(&self, request: ReadRequest) -> Result<Transaction, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::Read { request, reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
+    pub async fn shutdown(self) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::Shutdown { reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before disconnecting".to_string())?
+    }
+}
+
+enum SessionCommand {
+    Read {
+        request: ReadRequest,
+        reply: oneshot::Sender<Result<Transaction, String>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+async fn session_actor(
+    mut session: DiagnosticSession,
+    mut commands: mpsc::Receiver<SessionCommand>,
+) {
+    while let Some(command) = commands.recv().await {
+        match command {
+            SessionCommand::Read { request, reply } => {
+                let _ = reply.send(session.read(request).await);
+            }
+            SessionCommand::Shutdown { reply } => {
+                let _ = reply.send(session.disconnect().await);
+                return;
+            }
+        }
+    }
+    let _ = session.disconnect().await;
 }
 
 type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
@@ -572,6 +637,63 @@ mod tests {
             service_uuid: uuid_from_u16(CARLY_SERVICE),
             value: value.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn session_client_serializes_read_commands_and_shutdown() {
+        let (sender, mut commands) = mpsc::channel(4);
+        let actor = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(command) = commands.recv().await {
+                match command {
+                    SessionCommand::Read { request, reply } => {
+                        seen.push(request.bytes());
+                        let response = match request.bytes() {
+                            [0x01, 0x0c] => vec![0x41, 0x0c, 0x00, 0x00],
+                            [0x01, 0x05] => vec![0x41, 0x05, 0x5a],
+                            _ => unreachable!("closed test request vocabulary"),
+                        };
+                        let _ = reply.send(request.complete("user", response));
+                    }
+                    SessionCommand::Shutdown { reply } => {
+                        let _ = reply.send(Ok(()));
+                        return seen;
+                    }
+                }
+            }
+            seen
+        });
+        let client = SessionClient { sender };
+
+        assert_eq!(
+            client
+                .read(crate::prepare_read("engine.rpm").unwrap())
+                .await
+                .unwrap()
+                .value(),
+            0.0
+        );
+        assert_eq!(
+            client
+                .read(crate::prepare_read("engine.coolant_temperature").unwrap())
+                .await
+                .unwrap()
+                .value(),
+            50.0
+        );
+        client.shutdown().await.unwrap();
+        assert_eq!(actor.await.unwrap(), vec![[0x01, 0x0c], [0x01, 0x05]]);
+    }
+
+    #[tokio::test]
+    async fn session_client_reports_a_closed_actor() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let client = SessionClient { sender };
+        assert!(client
+            .read(crate::prepare_read("engine.rpm").unwrap())
+            .await
+            .is_err());
     }
 
     #[test]

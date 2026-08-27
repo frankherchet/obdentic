@@ -8,8 +8,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+pub mod audit;
 pub mod ble;
 pub mod protocol;
+pub mod scheduler;
 pub mod telemetry;
 pub mod tui;
 pub mod vehicle;
