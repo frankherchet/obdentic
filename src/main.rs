@@ -1,6 +1,6 @@
 use obdentic::{
     audit::AuditState,
-    ble, evidence, hex, prepare_read, record, replay,
+    ble, capture, hex, jsonl_capture, prepare_read, record, replay,
     scheduler::{Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
@@ -13,13 +13,21 @@ use std::{
     time::Duration,
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record evidence.tsv]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Signals,
+    SupportedSignals {
+        adapter_id: String,
+    },
     Scan,
     Demo,
+    Capture {
+        adapter_id: String,
+        profile: String,
+        recording: String,
+    },
     Read {
         request: ReadRequest,
         adapter_id: String,
@@ -51,6 +59,10 @@ async fn run() -> Result<(), String> {
     let args: Vec<_> = env::args().skip(1).collect();
     match parse_command(&args)? {
         Command::Signals => print!("{}", render_signals()),
+        Command::SupportedSignals { adapter_id } => {
+            let support = ble::supported_signals(&adapter_id).await?;
+            print!("{}", render_supported_signals(&support));
+        }
         Command::Scan => {
             for candidate in ble::scan().await? {
                 let rssi = candidate
@@ -65,6 +77,11 @@ async fn run() -> Result<(), String> {
                 );
             }
         }
+        Command::Capture {
+            adapter_id,
+            profile,
+            recording,
+        } => run_capture(&adapter_id, &profile, Path::new(&recording)).await?,
         Command::Demo => show(&demo().await?),
         Command::Read {
             request,
@@ -104,7 +121,7 @@ async fn run() -> Result<(), String> {
             let audit = Arc::new(Mutex::new(AuditState::new(600)?));
             let (recorder, writer) = match recording.as_deref() {
                 Some(path) => {
-                    let (sender, writer) = evidence::start(Path::new(path))?;
+                    let (sender, writer) = jsonl_capture::start(Path::new(path))?;
                     (Some(sender), Some(writer))
                 }
                 None => (None, None),
@@ -114,19 +131,20 @@ async fn run() -> Result<(), String> {
                 live_subscriptions()?,
                 telemetry.clone(),
                 audit.clone(),
-                recorder,
+                recorder.clone(),
+                None,
             )
             .await
             {
                 Ok(scheduler) => scheduler,
                 Err(error) => {
-                    finish_evidence(writer).await?;
+                    finish_capture(recorder, writer).await?;
                     return Err(error);
                 }
             };
             let result = tui::run_live(&load_layout(layout.as_deref())?, telemetry, audit);
             let stopped = scheduler.stop().await;
-            let recorded = finish_evidence(writer).await;
+            let recorded = finish_capture(recorder, writer).await;
             result?;
             stopped?;
             recorded?;
@@ -135,12 +153,81 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
-async fn finish_evidence(writer: Option<evidence::Writer>) -> Result<(), String> {
-    match writer {
-        Some(writer) => writer
-            .await
-            .map_err(|error| format!("evidence recorder stopped unexpectedly: {error}"))?,
-        None => Ok(()),
+async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Result<(), String> {
+    let profile = capture::profile(profile_name)?;
+    let configured = profile.subscriptions()?;
+    let advertised = ble::supported_signals(adapter_id).await?;
+    let total = configured.len();
+    let subscriptions = configured
+        .into_iter()
+        .filter(|subscription| {
+            advertised.iter().any(|signal| {
+                signal.semantic == subscription.semantic()
+                    && signal.status == ble::SignalSupportStatus::Supported
+            })
+        })
+        .collect::<Vec<_>>();
+    if subscriptions.is_empty() {
+        return Err(format!(
+            "capture profile {profile_name} has no signals supported by the adapter"
+        ));
+    }
+
+    let (sender, writer) = jsonl_capture::start(path)?;
+    println!("capture profile  {profile_name}");
+    println!(
+        "capture signals  {}/{} supported",
+        subscriptions.len(),
+        total
+    );
+    println!("capture record   {}", path.display());
+    println!("capture running  press Ctrl-C to stop");
+
+    let scheduler = match TelemetryScheduler::start(
+        adapter_id,
+        subscriptions,
+        Arc::new(Mutex::new(TelemetryState::new(600)?)),
+        Arc::new(Mutex::new(AuditState::new(600)?)),
+        Some(sender.clone()),
+        Some(profile.name().into()),
+    )
+    .await
+    {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            finish_capture(Some(sender), Some(writer)).await?;
+            return Err(error);
+        }
+    };
+
+    let wait_result = tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal
+            .map_err(|error| format!("Ctrl-C listener failed: {error}")),
+        _ = wait_for_scheduler(&scheduler) => Err("capture session stopped unexpectedly".into()),
+    };
+    let stopped = scheduler.stop().await;
+    let recorded = finish_capture(Some(sender), Some(writer)).await;
+    stopped?;
+    wait_result?;
+    recorded?;
+    println!("capture stopped");
+    Ok(())
+}
+
+async fn wait_for_scheduler(scheduler: &TelemetryScheduler) {
+    while !scheduler.is_finished() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn finish_capture(
+    sender: Option<jsonl_capture::Sender>,
+    writer: Option<jsonl_capture::Writer>,
+) -> Result<(), String> {
+    match (sender, writer) {
+        (Some(sender), Some(writer)) => jsonl_capture::close(sender, writer).await,
+        (None, None) => Ok(()),
+        _ => Err("JSONL recorder has incomplete ownership".into()),
     }
 }
 
@@ -166,8 +253,32 @@ fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
 fn parse_command(args: &[String]) -> Result<Command, String> {
     match args {
         [command] if command == "signals" => Ok(Command::Signals),
+        [command, adapter_flag, adapter_id, supported_flag]
+            if command == "signals"
+                && adapter_flag == "--adapter"
+                && supported_flag == "--supported" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::SupportedSignals {
+                adapter_id: adapter_id.clone(),
+            })
+        }
         [command] if command == "scan" => Ok(Command::Scan),
         [command] if command == "demo" => Ok(Command::Demo),
+        [command, adapter_flag, adapter_id, profile_flag, profile_name, record_flag, path]
+            if command == "capture"
+                && adapter_flag == "--adapter"
+                && profile_flag == "--profile"
+                && record_flag == "--record" =>
+        {
+            require_uuid(adapter_id)?;
+            capture::profile(profile_name)?;
+            Ok(Command::Capture {
+                adapter_id: adapter_id.clone(),
+                profile: profile_name.clone(),
+                recording: path.clone(),
+            })
+        }
         [command, path] if command == "replay" => Ok(Command::Replay(path.clone())),
         [command, action, name, path]
             if command == "layout" && action == "save" && name == "engine-overview" =>
@@ -305,6 +416,30 @@ fn render_signals() -> String {
     output
 }
 
+fn render_supported_signals(support: &[ble::SignalSupport]) -> String {
+    let mut output = String::from("semantic\tstatus\thardware_validation\n");
+    for signal in supported_signals() {
+        let metadata = signal.metadata();
+        let status = match support
+            .iter()
+            .find(|reported| reported.semantic == metadata.semantic)
+            .map(|reported| reported.status)
+            .unwrap_or(ble::SignalSupportStatus::Unknown)
+        {
+            ble::SignalSupportStatus::Supported => "supported",
+            ble::SignalSupportStatus::Unsupported => "unsupported",
+            ble::SignalSupportStatus::Unknown => "unknown",
+        };
+        output.push_str(&escape_field(metadata.semantic));
+        output.push('\t');
+        output.push_str(status);
+        output.push('\t');
+        output.push_str(&escape_field(metadata.hardware_validation));
+        output.push('\n');
+    }
+    output
+}
+
 fn escape_field(value: &str) -> String {
     value.escape_default().collect()
 }
@@ -386,8 +521,30 @@ mod tests {
     fn parses_approved_forms() {
         let uuid = "00000000-0000-4000-8000-000000000000";
         assert_eq!(parse_command(&args(&["signals"])), Ok(Command::Signals));
+        assert_eq!(
+            parse_command(&args(&["signals", "--adapter", uuid, "--supported",])),
+            Ok(Command::SupportedSignals {
+                adapter_id: uuid.into(),
+            })
+        );
         assert_eq!(parse_command(&args(&["scan"])), Ok(Command::Scan));
         assert_eq!(parse_command(&args(&["demo"])), Ok(Command::Demo));
+        assert_eq!(
+            parse_command(&args(&[
+                "capture",
+                "--adapter",
+                uuid,
+                "--profile",
+                "engine-baseline",
+                "--record",
+                "capture.jsonl",
+            ])),
+            Ok(Command::Capture {
+                adapter_id: uuid.into(),
+                profile: "engine-baseline".into(),
+                recording: "capture.jsonl".into(),
+            })
+        );
         assert_eq!(
             parse_command(&args(&["tui", "demo"])),
             Ok(Command::TuiDemo(None))
@@ -513,6 +670,32 @@ mod tests {
         );
         assert_eq!(parse_command(&args(&["scan", "extra"])), Err(USAGE.into()));
         assert_eq!(
+            parse_command(&args(&[
+                "capture",
+                "--adapter",
+                "00000000-0000-4000-8000-000000000000",
+                "--profile",
+                "unknown",
+                "--record",
+                "capture.jsonl",
+            ])),
+            Err("unknown capture profile: unknown".into())
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "capture",
+                "--adapter",
+                "00000000-0000-4000-8000-000000000000",
+                "--profile",
+                "engine-baseline",
+            ])),
+            Err(USAGE.into())
+        );
+        assert_eq!(
+            parse_command(&args(&["signals", "--adapter", "UUID", "--supported",])),
+            Err("adapter must be a CoreBluetooth UUID".into())
+        );
+        assert_eq!(
             parse_command(&args(&["demo", "session.tsv"])),
             Err(USAGE.into())
         );
@@ -545,6 +728,34 @@ mod tests {
             .skip(1)
             .all(|line| line.split('\t').count() == 13));
         assert!(!output.contains('\r'));
+    }
+
+    #[test]
+    fn renders_support_and_hardware_validation_in_catalog_order() {
+        let output = render_supported_signals(&[
+            ble::SignalSupport {
+                semantic: "engine.rpm",
+                status: ble::SignalSupportStatus::Supported,
+            },
+            ble::SignalSupport {
+                semantic: "engine.maf",
+                status: ble::SignalSupportStatus::Unsupported,
+            },
+        ]);
+        assert_eq!(
+            output.lines().next(),
+            Some("semantic\tstatus\thardware_validation")
+        );
+        assert!(output
+            .lines()
+            .any(|line| line.starts_with("engine.rpm\tsupported\t")));
+        assert!(output
+            .lines()
+            .any(|line| line.starts_with("engine.maf\tunsupported\t")));
+        assert!(output
+            .lines()
+            .any(|line| line.starts_with("engine.load\tunknown\t")));
+        assert_eq!(output.lines().count(), supported_signals().len() + 1);
     }
 
     #[test]

@@ -10,7 +10,10 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub mod audit;
 pub mod ble;
+pub mod capture;
+pub mod capture_events;
 pub mod evidence;
+pub mod jsonl_capture;
 pub mod protocol;
 pub mod scheduler;
 pub mod telemetry;
@@ -405,6 +408,41 @@ mod tests {
             ),
             ("vehicle.speed", [0x01, 0x0d], "km/h", 0.0, 255.0),
             ("engine.maf", [0x01, 0x10], "g/s", 0.0, 655.35),
+            ("engine.load", [0x01, 0x04], "%", 0.0, 100.0),
+            (
+                "engine.intake_manifold_pressure",
+                [0x01, 0x0b],
+                "kPa",
+                0.0,
+                255.0,
+            ),
+            (
+                "engine.intake_air_temperature",
+                [0x01, 0x0f],
+                "°C",
+                -40.0,
+                215.0,
+            ),
+            ("engine.egr.commanded", [0x01, 0x2c], "%", 0.0, 100.0),
+            ("engine.egr.error", [0x01, 0x2d], "%", -100.0, 99.21875),
+            ("engine.runtime", [0x01, 0x1f], "s", 0.0, 65535.0),
+            ("vehicle.accelerator_pedal_d", [0x01, 0x49], "%", 0.0, 100.0),
+            ("vehicle.accelerator_pedal_e", [0x01, 0x4a], "%", 0.0, 100.0),
+            ("engine.relative_throttle", [0x01, 0x45], "%", 0.0, 100.0),
+            (
+                "engine.barometric_pressure",
+                [0x01, 0x33],
+                "kPa",
+                0.0,
+                255.0,
+            ),
+            (
+                "engine.control_module_voltage",
+                [0x01, 0x42],
+                "V",
+                0.0,
+                65.535,
+            ),
         ];
         assert_eq!(supported_signals().len(), expected.len());
 

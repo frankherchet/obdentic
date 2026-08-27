@@ -20,11 +20,55 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE: usize = 8 * 1024;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PidSupport {
+    pages: Vec<u32>,
+    discovery: Vec<SupportDiscovery>,
+}
+
+impl PidSupport {
+    fn supports_pid(&self, pid: u8) -> bool {
+        self.status(pid) == SignalSupportStatus::Supported
+    }
+
+    fn status(&self, pid: u8) -> SignalSupportStatus {
+        if pid == 0 {
+            return SignalSupportStatus::Unknown;
+        }
+        let index = (pid as usize - 1) / 0x20;
+        let offset = (pid as usize - 1) % 0x20 + 1;
+        match self.pages.get(index) {
+            Some(bitmap) if bitmap & (1 << (32 - offset)) != 0 => SignalSupportStatus::Supported,
+            Some(_) => SignalSupportStatus::Unsupported,
+            None => SignalSupportStatus::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct AdapterCandidate {
     pub id: String,
     pub name: String,
     pub rssi: Option<i16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalSupportStatus {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalSupport {
+    pub semantic: &'static str,
+    pub status: SignalSupportStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupportDiscovery {
+    pub request: [u8; 2],
+    pub response: [u8; 6],
 }
 
 pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
@@ -72,6 +116,17 @@ pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction,
     }
 }
 
+pub async fn supported_signals(adapter_id: &str) -> Result<Vec<SignalSupport>, String> {
+    let mut session = DiagnosticSession::connect(adapter_id).await?;
+    let result = Ok(session.signal_support());
+    match (result, session.disconnect().await) {
+        (Ok(support), Ok(())) => Ok(support),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
 pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
     let session = DiagnosticSession::connect(adapter_id).await?;
     let (sender, receiver) = mpsc::channel(16);
@@ -106,6 +161,17 @@ impl SessionClient {
             .await
             .map_err(|_| "diagnostic session stopped before disconnecting".to_string())?
     }
+
+    pub async fn support_discovery(&self) -> Result<Vec<SupportDiscovery>, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::SupportDiscovery { reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())
+    }
 }
 
 enum SessionCommand {
@@ -115,6 +181,9 @@ enum SessionCommand {
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    SupportDiscovery {
+        reply: oneshot::Sender<Vec<SupportDiscovery>>,
     },
 }
 
@@ -131,6 +200,9 @@ async fn session_actor(
                 let _ = reply.send(session.disconnect().await);
                 return;
             }
+            SessionCommand::SupportDiscovery { reply } => {
+                let _ = reply.send(session.supported.discovery.clone());
+            }
         }
     }
     let _ = session.disconnect().await;
@@ -144,7 +216,7 @@ pub struct DiagnosticSession {
     peripheral: Peripheral,
     channel: Characteristic,
     notifications: Notifications,
-    supported: Vec<u8>,
+    supported: PidSupport,
     show_adapter_io: bool,
 }
 
@@ -183,7 +255,7 @@ impl DiagnosticSession {
                 peripheral,
                 channel,
                 notifications,
-                supported: Vec::new(),
+                supported: PidSupport::default(),
                 show_adapter_io,
             };
             session.initialize().await?;
@@ -234,6 +306,16 @@ impl DiagnosticSession {
         };
         self.supported = supported;
         Ok(())
+    }
+
+    fn signal_support(&self) -> Vec<SignalSupport> {
+        crate::vehicle::signals()
+            .iter()
+            .map(|signal| SignalSupport {
+                semantic: signal.metadata().semantic,
+                status: self.supported.status(signal.request().pid()),
+            })
+            .collect()
     }
 }
 
@@ -341,7 +423,7 @@ where
     }
 }
 
-async fn initialize_elm<E>(exchange: &mut E) -> Result<Vec<u8>, String>
+async fn initialize_elm<E>(exchange: &mut E) -> Result<PidSupport, String>
 where
     E: ElmExchange,
 {
@@ -370,8 +452,41 @@ where
         let response = exchange.exchange(command, Duration::from_secs(3)).await?;
         require_response(&response, "OK", true, &format!("{} failed", command.trim()))?;
     }
-    let protocols = exchange.exchange("0100\r", Duration::from_secs(10)).await?;
-    normalize_pid_support(&protocols)
+    discover_pid_support(exchange).await
+}
+
+async fn discover_pid_support<E>(exchange: &mut E) -> Result<PidSupport, String>
+where
+    E: ElmExchange,
+{
+    let mut pages = Vec::new();
+    let mut discovery = Vec::new();
+    let highest_page = highest_catalog_page();
+    let mut page = 0_u8;
+    loop {
+        let request = [0x01, page];
+        let command = format!("01{page:02X}\r");
+        let response = exchange.exchange(&command, Duration::from_secs(10)).await?;
+        let normalized = normalize_pid_support_page(&response, page)?;
+        let bitmap = u32::from_be_bytes(normalized[2..].try_into().unwrap());
+        pages.push(bitmap);
+        discovery.push(SupportDiscovery {
+            request,
+            response: normalized,
+        });
+
+        if page >= highest_page {
+            break;
+        }
+        let Some(next_page) = page.checked_add(0x20) else {
+            break;
+        };
+        if !bitmap_supports_pid(bitmap, next_page) {
+            break;
+        }
+        page = next_page;
+    }
+    Ok(PidSupport { pages, discovery })
 }
 
 async fn read_elm<E>(exchange: &mut E, request: ReadRequest) -> Result<Vec<u8>, String>
@@ -407,12 +522,14 @@ where
     }
 }
 
-fn supports_pid(response: &[u8], pid: u8) -> bool {
-    if response.len() != 6 || response[..2] != [0x41, 0x00] || !(1..=0x20).contains(&pid) {
-        return false;
-    }
-    let bitmap = u32::from_be_bytes([response[2], response[3], response[4], response[5]]);
-    bitmap & (1 << (32 - pid)) != 0
+fn supports_pid(support: &PidSupport, pid: u8) -> bool {
+    support.supports_pid(pid)
+}
+
+fn bitmap_supports_pid(bitmap: u32, pid: u8) -> bool {
+    let offset = pid & 0x1f;
+    let shift = if offset == 0 { 0 } else { 32 - offset };
+    bitmap & (1 << shift) != 0
 }
 
 async fn elm_exchange<S>(
@@ -540,14 +657,21 @@ fn normalize_mode01(response: &str, pid: u8, data_len: usize) -> Result<Vec<u8>,
     Ok(first)
 }
 
-fn normalize_pid_support(response: &str) -> Result<Vec<u8>, String> {
-    let matches = mode01_responses(response, 0x00, 4)?;
+fn normalize_pid_support_page(response: &str, page: u8) -> Result<[u8; 6], String> {
+    let matches = mode01_responses(response, page, 4)?;
     let bitmap = matches.iter().fold(0_u32, |bitmap, value| {
         bitmap | u32::from_be_bytes([value[2], value[3], value[4], value[5]])
     });
-    let mut normalized = vec![0x41, 0x00];
-    normalized.extend_from_slice(&bitmap.to_be_bytes());
-    Ok(normalized)
+    let bytes = bitmap.to_be_bytes();
+    Ok([0x41, page, bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn highest_catalog_page() -> u8 {
+    crate::vehicle::signals()
+        .iter()
+        .map(|signal| signal.request().pid().saturating_sub(1) & !0x1f)
+        .max()
+        .unwrap_or(0)
 }
 
 fn mode01_responses(response: &str, pid: u8, data_len: usize) -> Result<Vec<Vec<u8>>, String> {
@@ -664,7 +788,8 @@ mod tests {
             "OK\r>",
             "OK\r>",
             "OK\r>",
-            "4100BE3EB813\r>",
+            // Keep the fixture on the first page; continuation is tested separately.
+            "4100BE3EB812\r>",
             "410C0000\r>",
         ]
         .into_iter()
@@ -709,6 +834,9 @@ mod tests {
                         let _ = reply.send(Ok(()));
                         return seen;
                     }
+                    SessionCommand::SupportDiscovery { reply } => {
+                        let _ = reply.send(Vec::new());
+                    }
                 }
             }
             seen
@@ -733,6 +861,25 @@ mod tests {
         );
         client.shutdown().await.unwrap();
         assert_eq!(actor.await.unwrap(), vec![[0x01, 0x0c], [0x01, 0x05]]);
+    }
+
+    #[tokio::test]
+    async fn session_client_returns_a_clone_of_support_discovery() {
+        let (sender, mut commands) = mpsc::channel(1);
+        let discovery = vec![SupportDiscovery {
+            request: [0x01, 0x00],
+            response: [0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
+        }];
+        let expected = discovery.clone();
+        let actor = tokio::spawn(async move {
+            if let Some(SessionCommand::SupportDiscovery { reply }) = commands.recv().await {
+                let _ = reply.send(discovery);
+            }
+        });
+        let client = SessionClient { sender };
+
+        assert_eq!(client.support_discovery().await.unwrap(), expected);
+        actor.await.unwrap();
     }
 
     #[tokio::test]
@@ -796,15 +943,61 @@ mod tests {
     #[test]
     fn mode01_support_bitmap_gates_target_pids() {
         let response = [0x41, 0x00, 0x08, 0x18, 0x00, 0x00];
-        assert!(supports_pid(&response, 0x05));
-        assert!(supports_pid(&response, 0x0c));
-        assert!(supports_pid(&response, 0x0d));
-        assert!(!supports_pid(&response, 0x10));
-        assert!(!supports_pid(&response, 0x00));
+        let support = PidSupport {
+            pages: vec![u32::from_be_bytes(response[2..].try_into().unwrap())],
+            discovery: Vec::new(),
+        };
+        assert!(supports_pid(&support, 0x05));
+        assert!(supports_pid(&support, 0x0c));
+        assert!(supports_pid(&support, 0x0d));
+        assert!(!supports_pid(&support, 0x10));
+        assert!(!supports_pid(&support, 0x00));
 
-        let combined = normalize_pid_support("410008180000\r410000010000\r>").unwrap();
+        let combined = normalize_pid_support_page("410008180000\r410000010000\r>", 0x00).unwrap();
+        assert_eq!(combined, [0x41, 0x00, 0x08, 0x19, 0x00, 0x00]);
+        let combined = PidSupport {
+            pages: vec![u32::from_be_bytes(combined[2..].try_into().unwrap())],
+            discovery: Vec::new(),
+        };
         assert!(supports_pid(&combined, 0x05));
         assert!(supports_pid(&combined, 0x10));
+    }
+
+    #[tokio::test]
+    async fn follows_support_pages_only_when_the_continuation_bit_is_set() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "410080000001\r>".into(),
+            "412080000001\r>".into(),
+            "414080000001\r>".into(),
+        ]);
+
+        let support = discover_pid_support(&mut exchange).await.unwrap();
+
+        assert_eq!(exchange.commands, ["0100\r", "0120\r", "0140\r"]);
+        assert_eq!(support.status(0x01), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x20), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x21), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x40), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x41), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x42), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0x61), SignalSupportStatus::Unknown);
+        assert_eq!(
+            support.discovery,
+            [
+                SupportDiscovery {
+                    request: [0x01, 0x00],
+                    response: [0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
+                },
+                SupportDiscovery {
+                    request: [0x01, 0x20],
+                    response: [0x41, 0x20, 0x80, 0x00, 0x00, 0x01],
+                },
+                SupportDiscovery {
+                    request: [0x01, 0x40],
+                    response: [0x41, 0x40, 0x80, 0x00, 0x00, 0x01],
+                },
+            ]
+        );
     }
 
     #[test]

@@ -39,22 +39,16 @@ decoded   1726 rpm
 
 The core only accepts known read-only semantic signals. Unsupported or mutating requests are rejected before a transport can be called.
 
-Supported standard Mode 01 read-only signals:
+`cargo run -- signals` is the canonical full read-only signal catalog. It lists
+generic OBD-II Mode 01 signals and their request, decoder, unit, range,
+provenance and validation metadata. The catalog contains no VW/EA189-specific
+interpretation; such vehicle knowledge requires separately evidenced requests.
 
-| Semantic | Request | Formula | Unit |
-| --- | --- | --- | --- |
-| `engine.rpm` | `01 0C` | `((A × 256) + B) / 4` | rpm |
-| `engine.coolant_temperature` | `01 05` | `A - 40` | °C |
-| `vehicle.speed` | `01 0D` | `A` | km/h |
-| `engine.maf` | `01 10` | `((A × 256) + B) / 100` | g/s |
-
-Decoder and replay coverage for the three additions is offline-only for now;
-their targeted hardware validation is pending. The next hardware acceptance
-run remains RPM-only.
-
-`cargo run -- signals` prints the same catalog as escaped, tab-separated rows
-with semantic, profile, protocol, request, decoder, plausible range, unit,
-subsystem, provenance, confidence, hardware-validation and description columns.
+The current hardware milestone is capture-first: collect bounded, privacy-safe
+read-only evidence from the Carly transport before making claims about vehicle
+capability or adding manufacturer-specific signals. Offline decoder and replay
+tests remain the primary validation seam until targeted hardware acceptance is
+complete.
 
 `tui demo` provides an irregularly-timestamped `demo` history and `tui replay`
 renders a decoded recording. `tui live` opens one read-only Carly session and
@@ -74,7 +68,8 @@ Evidence files are new private (`0600`) append-only files, never overwrite an
 existing path, and are ignored by Git. They contain the session subscriptions
 and monotonic per-read scheduling/latency timings, canonical read-only TX/RX,
 decoder result and orderly session stop; they contain no adapter UUID, device
-name, initialization transcript, VIN or authentication data.
+name, initialization transcript, VIN or authentication data. Keep raw Bluetooth
+captures under `captures/` local and untracked; never publish them.
 
 The built-in `engine-overview` is a declarative layout: panels name only a
 view (`Value`, `Sparkline`, `TimeSeries` or `Compare`) and semantic signals.

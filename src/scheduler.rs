@@ -1,7 +1,7 @@
 use crate::{
     audit::AuditState,
     ble::{start_session, SessionClient},
-    evidence::EvidenceEvent,
+    capture_events::{CaptureEvent, CaptureTimeUs, ReadTiming},
     prepare_read,
     telemetry::TelemetryState,
     ReadRequest,
@@ -20,7 +20,7 @@ use tokio::{
 pub struct Subscription {
     request: ReadRequest,
     interval: Duration,
-    interval_ms: u64,
+    interval_us: CaptureTimeUs,
 }
 
 impl Subscription {
@@ -31,12 +31,16 @@ impl Subscription {
         Ok(Self {
             request: prepare_read(semantic)?,
             interval,
-            interval_ms: duration_ms(interval)?,
+            interval_us: duration_us(interval)?,
         })
     }
 
     pub fn semantic(self) -> &'static str {
         self.request.metadata().semantic
+    }
+
+    pub fn interval(self) -> Duration {
+        self.interval
     }
 }
 
@@ -51,24 +55,45 @@ impl TelemetryScheduler {
         subscriptions: Vec<Subscription>,
         telemetry: Arc<Mutex<TelemetryState>>,
         audit: Arc<Mutex<AuditState>>,
-        recorder: Option<mpsc::Sender<EvidenceEvent>>,
+        recorder: Option<mpsc::Sender<CaptureEvent>>,
+        capture_profile: Option<String>,
     ) -> Result<Self, String> {
         if subscriptions.is_empty() {
             return Err("telemetry scheduler needs at least one subscription".into());
         }
         let session = start_session(adapter_id).await?;
         let session_start = Instant::now();
-        let started = EvidenceEvent::SessionStart {
-            unix_timestamp_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_millis(),
-            subscriptions: subscriptions
-                .iter()
-                .map(|subscription| (subscription.semantic(), subscription.interval_ms))
-                .collect(),
+        let started = CaptureEvent::capture_started(
+            Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|error| error.to_string())?
+                    .as_millis()
+                    .try_into()
+                    .map_err(|_| "wall clock timestamp exceeds supported range")?,
+            ),
+            capture_profile,
+        );
+        let configured = subscriptions.iter().map(|subscription| {
+            CaptureEvent::subscription_configured(subscription.semantic(), subscription.interval_us)
+        });
+        let discovery = match session.support_discovery().await {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                let cleanup = session.shutdown().await;
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
+                };
+            }
         };
-        if let Err(error) = emit(&recorder, started) {
+        let mut events = std::iter::once(started)
+            .chain(std::iter::once(CaptureEvent::SessionInitialized))
+            .chain(configured)
+            .chain(discovery.into_iter().map(|page| {
+                CaptureEvent::support_discovery(page.request.into(), page.response.into())
+            }));
+        if let Err(error) = events.try_for_each(|event| emit(&recorder, event)) {
             let cleanup = session.shutdown().await;
             return match cleanup {
                 Ok(()) => Err(error),
@@ -94,6 +119,10 @@ impl TelemetryScheduler {
             .await
             .map_err(|error| format!("telemetry scheduler stopped unexpectedly: {error}"))?
     }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
 async fn run(
@@ -101,7 +130,7 @@ async fn run(
     subscriptions: Vec<Subscription>,
     telemetry: Arc<Mutex<TelemetryState>>,
     audit: Arc<Mutex<AuditState>>,
-    recorder: Option<mpsc::Sender<EvidenceEvent>>,
+    recorder: Option<mpsc::Sender<CaptureEvent>>,
     session_start: Instant,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<(), String> {
@@ -112,52 +141,73 @@ async fn run(
     let result = 'scheduler: loop {
         let next = schedule.iter().map(|(_, due)| *due).min().unwrap();
         tokio::select! {
-            _ = &mut cancelled => break Ok(()),
+            _ = &mut cancelled => {
+                if let Err(error) = emit(&recorder, CaptureEvent::ShutdownRequested) {
+                    break Err(error);
+                }
+                break Ok(())
+            },
             _ = sleep_until(next) => {
                 let now = Instant::now();
                 for (subscription, due) in &mut schedule {
                     if *due > now {
                         continue;
                     }
-                    let scheduled_offset_ms = due.duration_since(session_start).as_millis();
-                    let read_started_offset_ms = Instant::now().duration_since(session_start).as_millis();
+                    let due_us = offset_us(session_start, *due);
+                    let read_started = Instant::now();
+                    let started_us = offset_us(session_start, read_started);
                     let outcome = session.read(subscription.request).await;
-                    let read_finished_offset_ms = Instant::now().duration_since(session_start).as_millis();
-                    let read_duration_ms = read_finished_offset_ms.saturating_sub(read_started_offset_ms);
-                    let requested_interval_ms = subscription.interval_ms;
+                    let read_finished = Instant::now();
+                    let finished_us = offset_us(session_start, read_finished);
+                    let timing = ReadTiming::new(due_us, started_us, finished_us);
                     match outcome {
                         Ok(transaction) => {
                             telemetry.lock().map_err(|_| "telemetry state lock poisoned")?.ingest(&transaction);
                             audit.lock().map_err(|_| "audit state lock poisoned")?.ingest(&transaction);
-                            if let Err(error) = emit(&recorder, EvidenceEvent::Read {
-                                semantic: subscription.semantic(),
-                                requested_interval_ms,
-                                scheduled_offset_ms,
-                                read_started_offset_ms,
-                                read_finished_offset_ms,
-                                read_duration_ms,
-                                transaction,
-                            }) {
+                            let event = CaptureEvent::read_succeeded_from_transaction(
+                                &transaction,
+                                subscription.interval_us,
+                                timing,
+                            )?;
+                            if let Err(error) = emit(&recorder, event) {
                                 break 'scheduler Err(error);
                             }
                         }
                         Err(error) => {
-                            if let Err(recorder_error) = emit(&recorder, EvidenceEvent::ReadError {
-                                semantic: subscription.semantic(),
-                                requested_interval_ms,
-                                scheduled_offset_ms,
-                                read_started_offset_ms,
-                                read_finished_offset_ms,
-                                read_duration_ms,
-                                error: error.clone(),
-                            }) {
+                            let failed = CaptureEvent::read_failed(
+                                subscription.semantic(),
+                                subscription.interval_us,
+                                Some(timing),
+                                Some(subscription.request.bytes().into()),
+                                error.clone(),
+                            );
+                            if let Err(recorder_error) = emit(&recorder, failed) {
                                 break 'scheduler Err(recorder_error);
                             }
+                            let _ = emit(&recorder, CaptureEvent::session_error(error.clone()));
                             break 'scheduler Err(error);
                         }
                     }
+                    *due += subscription.interval;
+                    let first_skipped = *due;
+                    let mut skipped = 0_u64;
                     while *due <= Instant::now() {
+                        skipped += 1;
                         *due += subscription.interval;
+                    }
+                    if skipped > 0 {
+                        let last_skipped = *due - subscription.interval;
+                        if let Err(error) = emit(
+                            &recorder,
+                            CaptureEvent::slots_skipped(
+                                subscription.semantic(),
+                                skipped,
+                                offset_us(session_start, first_skipped),
+                                offset_us(session_start, last_skipped),
+                            ),
+                        ) {
+                            break 'scheduler Err(error);
+                        }
                     }
                 }
             }
@@ -165,8 +215,8 @@ async fn run(
     };
     let stopped = emit(
         &recorder,
-        EvidenceEvent::SessionStop {
-            offset_ms: Instant::now().duration_since(session_start).as_millis(),
+        CaptureEvent::SessionStopped {
+            offset_us: offset_us(session_start, Instant::now()),
         },
     );
     let result = match (result, stopped) {
@@ -188,23 +238,27 @@ async fn run(
     result
 }
 
-fn duration_ms(duration: Duration) -> Result<u64, String> {
+fn duration_us(duration: Duration) -> Result<CaptureTimeUs, String> {
     duration
-        .as_millis()
+        .as_micros()
         .try_into()
-        .map_err(|_| "subscription interval exceeds supported milliseconds".into())
+        .map_err(|_| "subscription interval exceeds supported microseconds".into())
 }
 
-fn emit(
-    recorder: &Option<mpsc::Sender<EvidenceEvent>>,
-    event: EvidenceEvent,
-) -> Result<(), String> {
+fn offset_us(origin: Instant, at: Instant) -> CaptureTimeUs {
+    at.saturating_duration_since(origin)
+        .as_micros()
+        .try_into()
+        .unwrap_or(CaptureTimeUs::MAX)
+}
+
+fn emit(recorder: &Option<mpsc::Sender<CaptureEvent>>, event: CaptureEvent) -> Result<(), String> {
     let Some(recorder) = recorder else {
         return Ok(());
     };
     recorder.try_send(event).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(_) => "evidence recorder is full".into(),
-        mpsc::error::TrySendError::Closed(_) => "evidence recorder is closed".into(),
+        mpsc::error::TrySendError::Full(_) => "capture recorder is full".into(),
+        mpsc::error::TrySendError::Closed(_) => "capture recorder is closed".into(),
     })
 }
 
@@ -228,17 +282,17 @@ mod tests {
     fn evidence_emission_rejects_full_or_closed_recorders() {
         let (sender, _receiver) = mpsc::channel(1);
         let recorder = Some(sender);
-        emit(&recorder, EvidenceEvent::SessionStop { offset_ms: 0 }).unwrap();
+        emit(&recorder, CaptureEvent::SessionStopped { offset_us: 0 }).unwrap();
         assert_eq!(
-            emit(&recorder, EvidenceEvent::SessionStop { offset_ms: 1 }),
-            Err("evidence recorder is full".into())
+            emit(&recorder, CaptureEvent::SessionStopped { offset_us: 1 }),
+            Err("capture recorder is full".into())
         );
 
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         assert_eq!(
-            emit(&Some(sender), EvidenceEvent::SessionStop { offset_ms: 0 }),
-            Err("evidence recorder is closed".into())
+            emit(&Some(sender), CaptureEvent::SessionStopped { offset_us: 0 }),
+            Err("capture recorder is closed".into())
         );
     }
 }
