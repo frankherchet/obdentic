@@ -25,6 +25,7 @@ pub mod telemetry;
 pub mod topology;
 pub mod tui;
 pub mod vehicle;
+pub mod vehicle_knowledge;
 
 pub use identity::{
     decode_mode09_pid02, IdentityDecodeError, IdentitySource, Provenance, VehicleIdentity, Vin,
