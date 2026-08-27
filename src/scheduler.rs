@@ -1,6 +1,6 @@
 use crate::{
     audit::AuditState,
-    ble::{start_session, SessionClient},
+    ble::{is_session_unhealthy, start_session, SessionClient},
     capture_events::{
         CaptureEvent, CaptureSubscription, CaptureTimeUs, ReadTiming, SubscriptionFilterOutcome,
     },
@@ -190,6 +190,21 @@ async fn run(
                             }
                         }
                         Err(error) => {
+                            if is_session_unhealthy(&error) {
+                                let fatal = error.clone();
+                                if let Err(record_error) = record_fatal_read_failure(
+                                    &audit,
+                                    &recorder,
+                                    subscription.semantic(),
+                                    subscription.interval_us(),
+                                    timing,
+                                    subscription.request.bytes().into(),
+                                    &error,
+                                ) {
+                                    break 'scheduler Err(record_error);
+                                }
+                                break 'scheduler Err(fatal);
+                            }
                             if let Err(error) = record_read_failure(
                                 &audit,
                                 &recorder,
@@ -302,6 +317,27 @@ fn record_read_failure(
     Ok(())
 }
 
+fn record_fatal_read_failure(
+    audit: &Arc<Mutex<AuditState>>,
+    recorder: &Option<mpsc::Sender<CaptureEvent>>,
+    semantic: &'static str,
+    interval_us: CaptureTimeUs,
+    timing: ReadTiming,
+    request_payload: Vec<u8>,
+    error: &str,
+) -> Result<(), String> {
+    record_read_failure(
+        audit,
+        recorder,
+        semantic,
+        interval_us,
+        timing,
+        request_payload,
+        error,
+    )?;
+    emit(recorder, CaptureEvent::session_error(error))
+}
+
 fn emit(recorder: &Option<mpsc::Sender<CaptureEvent>>, event: CaptureEvent) -> Result<(), String> {
     let Some(recorder) = recorder else {
         return Ok(());
@@ -395,5 +431,36 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].semantic, "scheduler.error");
         assert!(entries[0].source.contains("conflicting 010C responses"));
+    }
+
+    #[test]
+    fn fatal_read_failure_keeps_read_evidence_and_emits_session_error() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let audit = Arc::new(Mutex::new(AuditState::new(2).unwrap()));
+        let subscription = Subscription::new("engine.rpm", Duration::from_millis(250)).unwrap();
+        let timing = ReadTiming::new(1, 2, 3);
+        let error = "diagnostic session became unresponsive after repeated transport failures: Carly write timed out: 010C";
+
+        record_fatal_read_failure(
+            &audit,
+            &Some(sender),
+            subscription.semantic(),
+            subscription.interval_us(),
+            timing,
+            subscription.request.bytes().into(),
+            error,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CaptureEvent::ReadFailed { error: value, .. } if value == error
+        ));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            CaptureEvent::SessionError {
+                error: error.into()
+            }
+        );
     }
 }

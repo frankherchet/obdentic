@@ -2,7 +2,7 @@ use obdentic::{
     audit::AuditState,
     ble, capture,
     capture_events::{CaptureSubscription, SubscriptionFilterOutcome},
-    hex, jsonl_capture, prepare_read, record, replay,
+    capture_report, hex, jsonl_capture, prepare_read, record, replay,
     scheduler::{Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -30,6 +30,8 @@ enum Command {
         profile: String,
         recording: String,
     },
+    CaptureInspect(String),
+    CaptureCapability(String),
     Read {
         request: ReadRequest,
         adapter_id: String,
@@ -84,6 +86,14 @@ async fn run() -> Result<(), String> {
             profile,
             recording,
         } => run_capture(&adapter_id, &profile, Path::new(&recording)).await?,
+        Command::CaptureInspect(path) => {
+            let capture = jsonl_capture::read(Path::new(&path))?;
+            print!("{}", capture_report::render_inspection(&path, &capture));
+        }
+        Command::CaptureCapability(path) => {
+            let capture = jsonl_capture::read(Path::new(&path))?;
+            print!("{}", capture_report::render_capability(&path, &capture));
+        }
         Command::Demo => show(&demo().await?),
         Command::Read {
             request,
@@ -318,6 +328,12 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 profile: profile_name.clone(),
                 recording: path.clone(),
             })
+        }
+        [command, action, path] if command == "capture" && action == "inspect" => {
+            Ok(Command::CaptureInspect(path.clone()))
+        }
+        [command, action, path] if command == "capture" && action == "capability" => {
+            Ok(Command::CaptureCapability(path.clone()))
         }
         [command, path] if command == "replay" => Ok(Command::Replay(path.clone())),
         [command, action, name, path]
@@ -569,6 +585,14 @@ mod tests {
         );
         assert_eq!(parse_command(&args(&["scan"])), Ok(Command::Scan));
         assert_eq!(parse_command(&args(&["demo"])), Ok(Command::Demo));
+        assert_eq!(
+            parse_command(&args(&["capture", "inspect", "capture.jsonl"])),
+            Ok(Command::CaptureInspect("capture.jsonl".into()))
+        );
+        assert_eq!(
+            parse_command(&args(&["capture", "capability", "capture.jsonl"])),
+            Ok(Command::CaptureCapability("capture.jsonl".into()))
+        );
         assert_eq!(
             parse_command(&args(&[
                 "capture",

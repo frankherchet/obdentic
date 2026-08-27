@@ -14,6 +14,23 @@ pub struct ReadTiming {
     pub finished_us: CaptureTimeUs,
 }
 
+/// One responder/payload pair preserved for offline re-analysis. The
+/// responder string is an adapter-level identity, not an asserted CAN ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponderEvidence {
+    pub responder: Option<String>,
+    pub payload: Vec<u8>,
+}
+
+impl ResponderEvidence {
+    pub fn new(responder: Option<String>, payload: Vec<u8>) -> Result<Self, String> {
+        if payload.is_empty() {
+            return Err("responder evidence payload must not be empty".into());
+        }
+        Ok(Self { responder, payload })
+    }
+}
+
 impl ReadTiming {
     pub const fn new(
         due_us: CaptureTimeUs,
@@ -114,6 +131,15 @@ pub enum CaptureEvent {
         request_payload: Vec<u8>,
         response_payload: Vec<u8>,
     },
+    /// Preserves every normalized response before semantic selection. This
+    /// event may accompany either a successful read or an explicit ambiguity.
+    ResponsesObserved {
+        semantic: String,
+        request_payload: Vec<u8>,
+        responses: Vec<ResponderEvidence>,
+        selected_responder: Option<String>,
+        selection_error: Option<String>,
+    },
     ReadSucceeded {
         semantic: String,
         requested_interval_us: CaptureTimeUs,
@@ -176,6 +202,28 @@ impl CaptureEvent {
             request_payload,
             response_payload,
         }
+    }
+
+    pub fn responses_observed(
+        semantic: impl Into<String>,
+        request_payload: Vec<u8>,
+        responses: Vec<ResponderEvidence>,
+        selected_responder: Option<String>,
+        selection_error: Option<String>,
+    ) -> Result<Self, String> {
+        if request_payload.is_empty() {
+            return Err("observed response request payload must not be empty".into());
+        }
+        if responses.is_empty() {
+            return Err("observed response list must not be empty".into());
+        }
+        Ok(Self::ResponsesObserved {
+            semantic: semantic.into(),
+            request_payload,
+            responses,
+            selected_responder,
+            selection_error,
+        })
     }
 
     /// Copy a completed read into an owned event without rebuilding its

@@ -20,6 +20,10 @@ const SHUTDOWN_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE: usize = 8 * 1024;
+// Two consecutive transport failures stop a live session; data failures reset the count.
+const TRANSPORT_FAILURE_THRESHOLD: u8 = 2;
+const SESSION_UNHEALTHY_PREFIX: &str =
+    "diagnostic session became unresponsive after repeated transport failures";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PidSupport {
@@ -70,6 +74,117 @@ pub struct SignalSupport {
 pub struct SupportDiscovery {
     pub request: [u8; 2],
     pub response: [u8; 6],
+}
+
+/// Identity exposed by ELM header output. This is deliberately not called a
+/// CAN identifier: ELM may be speaking a non-CAN protocol and the text alone
+/// does not prove a wire-level CAN frame.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ResponderIdentity {
+    ElmHeader(String),
+}
+
+impl ResponderIdentity {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::ElmHeader(header) => header,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticResponse {
+    pub responder: Option<ResponderIdentity>,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticResponses {
+    responses: Vec<DiagnosticResponse>,
+    raw_response: String,
+}
+
+impl DiagnosticResponses {
+    fn new(responses: Vec<DiagnosticResponse>, raw_response: &str) -> Self {
+        Self {
+            responses,
+            raw_response: raw_response.into(),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[DiagnosticResponse] {
+        &self.responses
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.responses.is_empty()
+    }
+
+    pub fn raw_response(&self) -> &str {
+        &self.raw_response
+    }
+
+    pub fn capture_evidence(&self) -> Vec<crate::capture_events::ResponderEvidence> {
+        self.responses
+            .iter()
+            .map(|response| crate::capture_events::ResponderEvidence {
+                responder: response
+                    .responder
+                    .as_ref()
+                    .map(|identity| identity.as_str().to_owned()),
+                payload: response.payload.clone(),
+            })
+            .collect()
+    }
+
+    /// Select only a known responder. No value-based fallback is permitted.
+    pub fn select(&self, target: &ResponderIdentity) -> Result<Vec<u8>, String> {
+        let matches = self
+            .responses
+            .iter()
+            .filter(|response| response.responder.as_ref() == Some(target))
+            .collect::<Vec<_>>();
+        let first = matches
+            .first()
+            .ok_or_else(|| format!("responder {} did not answer", target.as_str()))?;
+        if matches
+            .iter()
+            .any(|response| response.payload != first.payload)
+        {
+            return Err(format!(
+                "conflicting responses from responder {}",
+                target.as_str()
+            ));
+        }
+        Ok(first.payload.clone())
+    }
+
+    fn unambiguous_payload(&self, pid: u8) -> Result<Vec<u8>, String> {
+        let first = self
+            .responses
+            .first()
+            .ok_or_else(|| format!("01{pid:02X} response not found"))?;
+        if self
+            .responses
+            .iter()
+            .any(|response| response.payload != first.payload)
+        {
+            return Err(format!(
+                "conflicting 01{pid:02X} responses (responders: {})",
+                self.responses
+                    .iter()
+                    .map(|response| {
+                        response
+                            .responder
+                            .as_ref()
+                            .map_or("unknown", ResponderIdentity::as_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(first.payload.clone())
+    }
 }
 
 pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
@@ -192,13 +307,36 @@ async fn session_actor(
     mut session: DiagnosticSession,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
+    let mut health = SessionHealth::default();
+    let mut disconnect_done = false;
     while let Some(command) = commands.recv().await {
         match command {
             SessionCommand::Read { request, reply } => {
-                let _ = reply.send(session.read(request).await);
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
+                }
+                match session.read(request).await {
+                    Ok(transaction) => {
+                        health.success();
+                        let _ = reply.send(Ok(transaction));
+                    }
+                    Err(error) => {
+                        if health.observe(&error) {
+                            let fatal = health.unhealthy().unwrap().to_owned();
+                            session.disconnect_best_effort().await;
+                            disconnect_done = true;
+                            let _ = reply.send(Err(fatal));
+                        } else {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
             }
             SessionCommand::Shutdown { reply } => {
-                session.disconnect_best_effort().await;
+                if !disconnect_done {
+                    session.disconnect_best_effort().await;
+                }
                 let _ = reply.send(Ok(()));
                 return;
             }
@@ -207,7 +345,59 @@ async fn session_actor(
             }
         }
     }
-    session.disconnect_best_effort().await;
+    if !disconnect_done {
+        session.disconnect_best_effort().await;
+    }
+}
+
+#[derive(Default)]
+struct SessionHealth {
+    consecutive_transport_failures: u8,
+    unhealthy: Option<String>,
+}
+
+impl SessionHealth {
+    fn success(&mut self) {
+        self.consecutive_transport_failures = 0;
+    }
+
+    /// Returns true only when this error crosses the fatal transport threshold.
+    fn observe(&mut self, error: &str) -> bool {
+        if self.unhealthy.is_some() {
+            return false;
+        }
+        if !is_transport_failure(error) {
+            self.consecutive_transport_failures = 0;
+            return false;
+        }
+        self.consecutive_transport_failures = self.consecutive_transport_failures.saturating_add(1);
+        if self.consecutive_transport_failures < TRANSPORT_FAILURE_THRESHOLD {
+            return false;
+        }
+        self.unhealthy = Some(format!("{SESSION_UNHEALTHY_PREFIX}: {error}"));
+        true
+    }
+
+    fn unhealthy(&self) -> Option<&str> {
+        self.unhealthy.as_deref()
+    }
+}
+
+pub(crate) fn is_session_unhealthy(error: &str) -> bool {
+    error.starts_with(SESSION_UNHEALTHY_PREFIX)
+}
+
+fn is_transport_failure(error: &str) -> bool {
+    [
+        "Carly write timed out:",
+        "Carly write failed:",
+        "Carly command timed out:",
+        "Carly notification stream ended",
+        "diagnostic session is closed",
+        "diagnostic session stopped before responding",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
@@ -393,7 +583,7 @@ fn carly_channel(peripheral: &Peripheral) -> Result<Characteristic, String> {
     Ok(channel)
 }
 
-trait ElmExchange {
+pub(crate) trait ElmExchange {
     async fn exchange(
         &mut self,
         command: &str,
@@ -454,7 +644,9 @@ where
         false,
         "ATZ did not reset an ELM327 adapter",
     )?;
-    for command in ["ATE0\r", "ATL0\r", "ATS0\r", "ATH0\r", "ATSP0\r"] {
+    // Keep separators and adapter headers so responder identity survives the
+    // ELM normalization boundary. No identity is synthesized when absent.
+    for command in ["ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r"] {
         let response = exchange.exchange(command, Duration::from_secs(3)).await?;
         require_response(&response, "OK", true, &format!("{} failed", command.trim()))?;
     }
@@ -499,33 +691,44 @@ async fn read_elm<E>(exchange: &mut E, request: ReadRequest) -> Result<Vec<u8>, 
 where
     E: ElmExchange,
 {
-    let command = obd_command(request);
-    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
-    match normalize_mode01(&response, request.pid(), request.data_len()) {
+    let first = read_elm_responses(exchange, request).await?;
+    match first.unambiguous_payload(request.pid()) {
         Ok(payload) => Ok(payload),
-        Err(error) if error == format!("conflicting 01{:02X} responses", request.pid()) => {
-            let retry_response =
-                exchange
-                    .exchange(&command, COMMAND_TIMEOUT)
-                    .await
-                    .map_err(|retry_error| {
-                        format!(
-                            "{error}; first ELM response={}; retry failed: {retry_error}",
-                            response.escape_default()
-                        )
-                    })?;
-            normalize_mode01(&retry_response, request.pid(), request.data_len()).map_err(
-                |retry_error| {
+        Err(error)
+            if error.starts_with(&format!("conflicting 01{:02X} responses", request.pid())) =>
+        {
+            let retry = read_elm_responses(exchange, request)
+                .await
+                .map_err(|retry_error| {
+                    format!(
+                        "{error}; first ELM response={}; retry failed: {retry_error}",
+                        first.raw_response().escape_default()
+                    )
+                })?;
+            retry
+                .unambiguous_payload(request.pid())
+                .map_err(|retry_error| {
                     format!(
                         "{retry_error}; first ELM response={}; retry ELM response={}",
-                        response.escape_default(),
-                        retry_response.escape_default()
+                        first.raw_response().escape_default(),
+                        retry.raw_response().escape_default()
                     )
-                },
-            )
+                })
         }
         Err(error) => Err(error),
     }
+}
+
+pub(crate) async fn read_elm_responses<E>(
+    exchange: &mut E,
+    request: ReadRequest,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let command = obd_command(request);
+    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    normalize_mode01_responses(&response, request.pid(), request.data_len())
 }
 
 fn supports_pid(support: &PidSupport, pid: u8) -> bool {
@@ -654,19 +857,26 @@ fn require_response(
         .ok_or_else(|| format!("{error}: {response:?}"))
 }
 
+#[cfg(test)]
 fn normalize_mode01(response: &str, pid: u8, data_len: usize) -> Result<Vec<u8>, String> {
-    let matches = mode01_responses(response, pid, data_len)?;
-    let first = matches[0].clone();
-    if matches.iter().any(|value| value != &first) {
-        return Err(format!("conflicting 01{pid:02X} responses"));
-    }
-    Ok(first)
+    normalize_mode01_responses(response, pid, data_len)?.unambiguous_payload(pid)
+}
+
+pub(crate) fn normalize_mode01_responses(
+    response: &str,
+    pid: u8,
+    data_len: usize,
+) -> Result<DiagnosticResponses, String> {
+    Ok(DiagnosticResponses::new(
+        mode01_responses(response, pid, data_len)?,
+        response,
+    ))
 }
 
 fn normalize_pid_support_page(response: &str, page: u8) -> Result<[u8; 6], String> {
-    let matches = mode01_responses(response, page, 4)?;
-    let bitmap = matches.iter().fold(0_u32, |bitmap, value| {
-        bitmap | u32::from_be_bytes([value[2], value[3], value[4], value[5]])
+    let matches = normalize_mode01_responses(response, page, 4)?;
+    let bitmap = matches.as_slice().iter().fold(0_u32, |bitmap, value| {
+        bitmap | u32::from_be_bytes(value.payload[2..].try_into().unwrap())
     });
     let bytes = bitmap.to_be_bytes();
     Ok([0x41, page, bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -680,7 +890,11 @@ fn highest_catalog_page() -> u8 {
         .unwrap_or(0)
 }
 
-fn mode01_responses(response: &str, pid: u8, data_len: usize) -> Result<Vec<Vec<u8>>, String> {
+fn mode01_responses(
+    response: &str,
+    pid: u8,
+    data_len: usize,
+) -> Result<Vec<DiagnosticResponse>, String> {
     let mut matches = Vec::new();
     for raw_line in response.split(['\r', '\n']) {
         let line = raw_line.trim().trim_end_matches('>').trim();
@@ -688,7 +902,7 @@ fn mode01_responses(response: &str, pid: u8, data_len: usize) -> Result<Vec<Vec<
             continue;
         }
         let upper = line.to_ascii_uppercase();
-        let compact = upper.replace(' ', "");
+        let compact = upper.split_ascii_whitespace().collect::<String>();
         if compact == format!("01{pid:02X}")
             || upper.starts_with("SEARCHING")
             || (upper.starts_with("BUS INIT") && !upper.contains("ERROR"))
@@ -702,22 +916,40 @@ fn mode01_responses(response: &str, pid: u8, data_len: usize) -> Result<Vec<Vec<
         {
             return Err(format!("ELM327 rejected 01{pid:02X}: {line}"));
         }
-        if compact.len() % 2 != 0 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let has_separators = tokens.len() > 1;
+        let header_token = tokens.first().filter(|token| token.len() == 3).copied();
+        if header_token.is_none()
+            && (compact.len() % 2 != 0 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
             return Err(format!("malformed ELM327 response line: {line:?}"));
         }
-        let bytes = compact
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                std::str::from_utf8(pair)
-                    .map_err(|error| error.to_string())
-                    .and_then(|pair| {
-                        u8::from_str_radix(pair, 16).map_err(|error| error.to_string())
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if header_token.is_some()
+            && !header_token
+                .unwrap()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format!("malformed ELM327 responder header: {line:?}"));
+        }
+        let mut bytes = Vec::new();
+        for (index, token) in tokens.iter().enumerate() {
+            if index == 0 && header_token.is_some() {
+                continue;
+            }
+            if token.len() % 2 != 0 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(if index == 0 && has_separators {
+                    format!("malformed ELM327 responder header: {line:?}")
+                } else {
+                    format!("malformed ELM327 response line: {line:?}")
+                });
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+                bytes.push(u8::from_str_radix(pair, 16).map_err(|error| error.to_string())?);
+            }
+        }
+        let expected_len = data_len + 2;
         let negative = if bytes.len() > 1 && bytes[1] == 0x7f && (bytes[0] as usize) < bytes.len() {
             &bytes[1..]
         } else {
@@ -726,22 +958,52 @@ fn mode01_responses(response: &str, pid: u8, data_len: usize) -> Result<Vec<Vec<
         if negative.first() == Some(&0x7f) {
             return Err(format!("negative OBD-II response: {line}"));
         }
-        let expected_len = data_len + 2;
-        let payload = if bytes.first() == Some(&(expected_len as u8)) {
-            &bytes[1..]
-        } else {
-            &bytes[..]
-        };
-        if payload.len() < expected_len || payload[..2] != [0x41, pid] {
-            continue;
-        }
-        if payload[expected_len..]
-            .iter()
-            .any(|byte| !matches!(byte, 0x00 | 0xaa))
+        let mut search_from = 0;
+        while let Some(relative) = bytes[search_from..]
+            .windows(2)
+            .position(|pair| pair == [0x41, pid])
         {
-            return Err(format!("unexpected bytes after OBD-II response: {line}"));
+            let payload_start = search_from + relative;
+            let Some(payload_end) = payload_start.checked_add(expected_len) else {
+                break;
+            };
+            if payload_end > bytes.len() {
+                break;
+            }
+            let frame_start = if payload_start > 0 && bytes[payload_start - 1] == expected_len as u8
+            {
+                payload_start - 1
+            } else if payload_start == 0 {
+                payload_start
+            } else {
+                search_from = payload_end;
+                continue;
+            };
+            if bytes[payload_end..]
+                .iter()
+                .any(|byte| !matches!(byte, 0x00 | 0xaa))
+            {
+                return Err(format!("unexpected bytes after OBD-II response: {line}"));
+            }
+            let responder = if let Some(header) = header_token {
+                Some(ResponderIdentity::ElmHeader(header.to_ascii_uppercase()))
+            } else if has_separators && frame_start > 0 {
+                Some(ResponderIdentity::ElmHeader(
+                    tokens[..frame_start]
+                        .iter()
+                        .map(|token| token.to_ascii_uppercase())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ))
+            } else {
+                None
+            };
+            matches.push(DiagnosticResponse {
+                responder,
+                payload: bytes[payload_start..payload_end].to_vec(),
+            });
+            search_from = payload_end;
         }
-        matches.push(payload[..expected_len].to_vec());
     }
     (!matches.is_empty())
         .then_some(matches)
@@ -754,7 +1016,7 @@ mod tests {
     use std::collections::{BTreeSet, VecDeque};
 
     const INIT_COMMANDS: [&str; 9] = [
-        "ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS0\r", "ATH0\r", "ATSP0\r", "0100\r",
+        "ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r", "0100\r",
     ];
 
     struct ScriptedExchange {
@@ -900,6 +1162,51 @@ mod tests {
     }
 
     #[test]
+    fn transport_health_stops_after_two_consecutive_transport_failures() {
+        let mut health = SessionHealth::default();
+
+        assert!(!health.observe("Carly write timed out: 010C"));
+        assert!(health.observe("Carly command timed out: 010D"));
+
+        let error = health.unhealthy().unwrap();
+        assert!(is_session_unhealthy(error));
+        assert!(error.contains("Carly command timed out: 010D"));
+        assert!(!health.observe("Carly write timed out: 0105"));
+    }
+
+    #[test]
+    fn recoverable_read_errors_reset_transport_failure_count() {
+        let mut health = SessionHealth::default();
+
+        assert!(!health.observe("Carly write timed out: 010C"));
+        assert!(!health.observe("conflicting 010C responses"));
+        assert!(!health.observe("Carly write timed out: 010D"));
+        assert!(health.unhealthy().is_none());
+        assert!(!is_transport_failure("conflicting 010C responses"));
+    }
+
+    #[test]
+    fn unhealthy_health_gate_prevents_a_third_transport_request() {
+        let mut health = SessionHealth::default();
+        let mut dispatched = 0;
+
+        for error in [
+            "Carly write timed out: 010C",
+            "Carly write timed out: 010D",
+            "Carly write timed out: 0105",
+        ] {
+            if health.unhealthy().is_some() {
+                break;
+            }
+            dispatched += 1;
+            health.observe(error);
+        }
+
+        assert_eq!(dispatched, 2);
+        assert!(health.unhealthy().is_some());
+    }
+
+    #[test]
     fn normalizes_prompt_terminated_rpm_response() {
         assert_eq!(
             normalize_mode01("010C\r410C1AF8\r>", 0x0c, 2),
@@ -917,6 +1224,63 @@ mod tests {
             normalize_mode01("SEARCHING...\r064100BE3EB813\r>", 0x00, 4),
             Ok(vec![0x41, 0x00, 0xbe, 0x3e, 0xb8, 0x13])
         );
+    }
+
+    #[test]
+    fn preserves_elm_header_identity_without_calling_it_a_can_id() {
+        let responses = normalize_mode01_responses(
+            "7E8 04 41 0C 00 00 00 00\r7E9 04 41 0C 00 00 AA AA\r>",
+            0x0c,
+            2,
+        )
+        .unwrap();
+        assert_eq!(responses.as_slice()[0].payload, [0x41, 0x0c, 0x00, 0x00]);
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+        assert_eq!(
+            responses.as_slice()[1].responder,
+            Some(ResponderIdentity::ElmHeader("7E9".into()))
+        );
+        assert!(
+            normalize_mode01("7E8 04 41 0C 00 00\r7E9 04 41 0C 00 04\r>", 0x0c, 2)
+                .unwrap_err()
+                .contains("responders: 7E8, 7E9")
+        );
+    }
+
+    #[test]
+    fn accepts_duplicate_payloads_but_selects_only_a_matching_responder() {
+        let responses =
+            normalize_mode01_responses("7E8 04 41 0C 00 00\r7E9 04 41 0C 00 00\r>", 0x0c, 2)
+                .unwrap();
+        assert_eq!(responses.as_slice().len(), 2);
+        assert_eq!(
+            responses
+                .select(&ResponderIdentity::ElmHeader("7E9".into()))
+                .unwrap(),
+            [0x41, 0x0c, 0x00, 0x00]
+        );
+        assert!(responses
+            .select(&ResponderIdentity::ElmHeader("7EA".into()))
+            .is_err());
+    }
+
+    #[test]
+    fn preserves_multi_byte_elm_headers_when_the_length_prefix_is_present() {
+        let responses = normalize_mode01_responses("48 6B 10 04 41 0C 00 00\r>", 0x0c, 2).unwrap();
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("48 6B 10".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_elm_header_explicitly() {
+        assert!(normalize_mode01_responses("7XZ 04 41 0C 00 00\r>", 0x0c, 2)
+            .unwrap_err()
+            .contains("responder header"));
     }
 
     #[test]

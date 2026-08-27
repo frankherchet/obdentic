@@ -10,12 +10,15 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub mod audit;
 pub mod ble;
+pub mod capability;
 pub mod capture;
 pub mod capture_events;
+pub mod capture_report;
 pub mod evidence;
 pub mod jsonl_capture;
 pub mod protocol;
 pub mod scheduler;
+pub mod subscription_policy;
 pub mod telemetry;
 pub mod tui;
 pub mod vehicle;

@@ -11,9 +11,20 @@ pub struct AuditEntry {
     pub response: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseAuditEntry {
+    pub timestamp_ms: u128,
+    pub semantic: String,
+    pub request: Vec<u8>,
+    pub responses: Vec<crate::capture_events::ResponderEvidence>,
+    pub selected_responder: Option<String>,
+    pub selection_error: Option<String>,
+}
+
 pub struct AuditState {
     capacity: usize,
     entries: VecDeque<AuditEntry>,
+    response_entries: VecDeque<ResponseAuditEntry>,
 }
 
 impl AuditState {
@@ -22,6 +33,7 @@ impl AuditState {
             .then_some(Self {
                 capacity,
                 entries: VecDeque::with_capacity(capacity),
+                response_entries: VecDeque::with_capacity(capacity),
             })
             .ok_or_else(|| "audit capacity must be greater than zero".into())
     }
@@ -57,6 +69,39 @@ impl AuditState {
 
     pub fn snapshot(&self) -> Vec<AuditEntry> {
         self.entries.iter().cloned().collect()
+    }
+
+    pub fn ingest_responses(
+        &mut self,
+        timestamp_ms: u128,
+        semantic: impl Into<String>,
+        request: Vec<u8>,
+        responses: Vec<crate::capture_events::ResponderEvidence>,
+        selected_responder: Option<String>,
+        selection_error: Option<String>,
+    ) -> Result<(), String> {
+        if request.is_empty() {
+            return Err("response audit request must not be empty".into());
+        }
+        if responses.is_empty() {
+            return Err("response audit list must not be empty".into());
+        }
+        if self.response_entries.len() == self.capacity {
+            self.response_entries.pop_front();
+        }
+        self.response_entries.push_back(ResponseAuditEntry {
+            timestamp_ms,
+            semantic: semantic.into(),
+            request,
+            responses,
+            selected_responder,
+            selection_error,
+        });
+        Ok(())
+    }
+
+    pub fn response_snapshot(&self) -> Vec<ResponseAuditEntry> {
+        self.response_entries.iter().cloned().collect()
     }
 
     pub fn len(&self) -> usize {
@@ -119,5 +164,40 @@ mod tests {
     #[test]
     fn rejects_zero_capacity() {
         assert!(AuditState::new(0).is_err());
+    }
+
+    #[test]
+    fn preserves_all_responder_payloads_for_offline_inspection() {
+        let mut state = AuditState::new(1).unwrap();
+        state
+            .ingest_responses(
+                42,
+                "engine.rpm",
+                vec![0x01, 0x0c],
+                vec![
+                    crate::capture_events::ResponderEvidence::new(
+                        Some("7E8".into()),
+                        vec![0x41, 0x0c, 0x1a, 0xf8],
+                    )
+                    .unwrap(),
+                    crate::capture_events::ResponderEvidence::new(
+                        Some("7E9".into()),
+                        vec![0x41, 0x0c, 0x1a, 0xf4],
+                    )
+                    .unwrap(),
+                ],
+                None,
+                Some("ambiguous responders".into()),
+            )
+            .unwrap();
+
+        let entries = state.response_snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].responses.len(), 2);
+        assert_eq!(entries[0].selected_responder, None);
+        assert_eq!(
+            entries[0].selection_error.as_deref(),
+            Some("ambiguous responders")
+        );
     }
 }

@@ -162,6 +162,35 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             object.push_str(",\"response_payload\":");
             push_string(&mut object, &hex(response_payload));
         }
+        CaptureEvent::ResponsesObserved {
+            semantic,
+            request_payload,
+            responses,
+            selected_responder,
+            selection_error,
+        } => {
+            object.push_str("\"responses_observed\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"semantic\":");
+            push_string(&mut object, semantic);
+            object.push_str(",\"request_payload\":");
+            push_string(&mut object, &hex(request_payload));
+            object.push_str(",\"responses\":[");
+            for (index, response) in responses.iter().enumerate() {
+                if index > 0 {
+                    object.push(',');
+                }
+                object.push_str("{\"responder\":");
+                push_option_string(&mut object, response.responder.as_deref());
+                object.push_str(",\"payload\":");
+                push_string(&mut object, &hex(&response.payload));
+                object.push('}');
+            }
+            object.push_str("],\"selected_responder\":");
+            push_option_string(&mut object, selected_responder.as_deref());
+            object.push_str(",\"selection_error\":");
+            push_option_string(&mut object, selection_error.as_deref());
+        }
         CaptureEvent::ReadSucceeded {
             semantic,
             requested_interval_us,
@@ -512,6 +541,47 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 )?,
             })
         }
+        "responses_observed" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "semantic",
+                    "request_payload",
+                    "responses",
+                    "selected_responder",
+                    "selection_error",
+                ],
+                line_number,
+            )?;
+            let responses = match object.get("responses") {
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .map(|value| parse_responder_evidence(value, line_number))
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => return Err(format!("line {line_number}: responses must be an array")),
+            };
+            if responses.is_empty() {
+                return Err(format!("line {line_number}: responses must not be empty"));
+            }
+            Ok(CaptureEvent::ResponsesObserved {
+                semantic: string_field(object, "semantic", line_number)?,
+                request_payload: parse_hex(
+                    &string_field(object, "request_payload", line_number)?,
+                    line_number,
+                )?,
+                responses,
+                selected_responder: optional_string_field(
+                    object,
+                    "selected_responder",
+                    line_number,
+                )?,
+                selection_error: optional_string_field(object, "selection_error", line_number)?,
+            })
+        }
         "read_succeeded" => {
             fields_exact(
                 object,
@@ -738,6 +808,25 @@ fn parse_value(value: &Value, line_number: usize) -> Result<CaptureValue, String
     }
 }
 
+fn parse_responder_evidence(
+    value: &Value,
+    line_number: usize,
+) -> Result<crate::capture_events::ResponderEvidence, String> {
+    let object = match value {
+        Value::Object(object) => object,
+        _ => {
+            return Err(format!(
+                "line {line_number}: responder evidence must be an object"
+            ))
+        }
+    };
+    fields_exact(object, &["responder", "payload"], line_number)?;
+    crate::capture_events::ResponderEvidence::new(
+        optional_string_field(object, "responder", line_number)?,
+        parse_hex(&string_field(object, "payload", line_number)?, line_number)?,
+    )
+}
+
 fn fields_exact(object: &Object, fields: &[&str], line_number: usize) -> Result<(), String> {
     if object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field)) {
         return Err(format!(
@@ -860,6 +949,7 @@ enum Value {
     Number(String),
     String(String),
     Object(Object),
+    Array(Vec<Value>),
 }
 
 type Object = BTreeMap<String, Value>;
@@ -900,6 +990,7 @@ impl<'a> Parser<'a> {
             Some(b'f') => self.literal(b"false", Value::Bool(false)),
             Some(b'"') => self.string().map(Value::String),
             Some(b'{') => self.object().map(Value::Object),
+            Some(b'[') => self.array().map(Value::Array),
             Some(byte) if byte == b'-' || byte.is_ascii_digit() => self.number(),
             _ => Err(self.error("expected a JSON value")),
         }
@@ -923,6 +1014,23 @@ impl<'a> Parser<'a> {
             self.whitespace();
             if self.consume(b'}') {
                 return Ok(object);
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    fn array(&mut self) -> Result<Vec<Value>, String> {
+        self.expect(b'[')?;
+        self.whitespace();
+        let mut values = Vec::new();
+        if self.consume(b']') {
+            return Ok(values);
+        }
+        loop {
+            values.push(self.value()?);
+            self.whitespace();
+            if self.consume(b']') {
+                return Ok(values);
             }
             self.expect(b',')?;
         }
@@ -1130,6 +1238,25 @@ mod tests {
                 vec![0x01, 0x00],
                 vec![0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
             ),
+            CaptureEvent::responses_observed(
+                "engine.rpm",
+                vec![0x01, 0x0c],
+                vec![
+                    crate::capture_events::ResponderEvidence::new(
+                        Some("7E8".into()),
+                        vec![0x41, 0x0c, 0x1a, 0xf8],
+                    )
+                    .unwrap(),
+                    crate::capture_events::ResponderEvidence::new(
+                        Some("7E9".into()),
+                        vec![0x41, 0x0c, 0x1a, 0xf4],
+                    )
+                    .unwrap(),
+                ],
+                None,
+                Some("ambiguous responders".into()),
+            )
+            .unwrap(),
             CaptureEvent::ReadSucceeded {
                 semantic: "engine.rpm".into(),
                 requested_interval_us: 250_000,
