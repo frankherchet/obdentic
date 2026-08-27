@@ -16,6 +16,7 @@ const CARLY_CHANNEL: u16 = 0xFFE1;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 const FIND_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE: usize = 8 * 1024;
@@ -197,7 +198,8 @@ async fn session_actor(
                 let _ = reply.send(session.read(request).await);
             }
             SessionCommand::Shutdown { reply } => {
-                let _ = reply.send(session.disconnect().await);
+                session.disconnect_best_effort().await;
+                let _ = reply.send(Ok(()));
                 return;
             }
             SessionCommand::SupportDiscovery { reply } => {
@@ -205,7 +207,7 @@ async fn session_actor(
             }
         }
     }
-    let _ = session.disconnect().await;
+    session.disconnect_best_effort().await;
 }
 
 type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
@@ -292,6 +294,10 @@ impl DiagnosticSession {
             .await
             .map_err(|_| "Bluetooth disconnect timed out".to_string())?
             .map_err(|error| format!("Bluetooth disconnect failed: {error}"))
+    }
+
+    async fn disconnect_best_effort(&mut self) {
+        let _ = timeout(SHUTDOWN_DISCONNECT_TIMEOUT, self.peripheral.disconnect()).await;
     }
 
     async fn initialize(&mut self) -> Result<(), String> {

@@ -210,8 +210,10 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
     };
 
     let wait_result = tokio::select! {
-        signal = tokio::signal::ctrl_c() => signal
-            .map_err(|error| format!("Ctrl-C listener failed: {error}")),
+        signal = tokio::signal::ctrl_c() => {
+            println!("capture stopping...");
+            signal.map_err(|error| format!("Ctrl-C listener failed: {error}"))
+        },
         _ = wait_for_scheduler(&scheduler) => Err("capture session stopped unexpectedly".into()),
     };
     let stopped = scheduler.stop().await;
