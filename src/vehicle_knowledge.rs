@@ -203,10 +203,35 @@ pub enum RoutingDecision {
     },
 }
 
+/// The closed request shape a polling plan may execute.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadRouting {
+    Functional(ReadRequest),
+    Targeted(TargetedReadRequest),
+}
+
+impl ReadRouting {
+    pub fn request(&self) -> ReadRequest {
+        match self {
+            Self::Functional(request) => *request,
+            Self::Targeted(request) => request.request(),
+        }
+    }
+
+    pub fn from_decision(decision: RoutingDecision) -> Result<Self, RoutingError> {
+        match decision {
+            RoutingDecision::Targeted { request, .. } => Ok(Self::Targeted(request)),
+            RoutingDecision::FunctionalFallback { request, .. } => Ok(Self::Functional(request)),
+            RoutingDecision::Ambiguous { .. } => Err(RoutingError::AmbiguousFallback),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoutingError {
     UnsupportedSemantic(String),
     InvalidTargetEvidence(String),
+    AmbiguousFallback,
 }
 
 impl std::fmt::Display for RoutingError {
@@ -220,6 +245,9 @@ impl std::fmt::Display for RoutingError {
             }
             Self::InvalidTargetEvidence(reason) => {
                 write!(formatter, "invalid ECU target evidence: {reason}")
+            }
+            Self::AmbiguousFallback => {
+                formatter.write_str("polling routing requires an explicit functional fallback")
             }
         }
     }
@@ -396,5 +424,38 @@ mod tests {
         assert!(knowledge
             .route("dtc.clear", Some(&first), true, FallbackPolicy::Functional)
             .is_err());
+    }
+
+    #[test]
+    fn polling_routing_is_closed_and_requires_functional_fallback() {
+        let mapping = mapping(EcuRole::Engine, "7E0", "7E8");
+        let targeted = VehicleKnowledge::generic_obd2()
+            .route(
+                "engine.rpm",
+                Some(&mapping),
+                true,
+                FallbackPolicy::Functional,
+            )
+            .unwrap();
+        assert!(matches!(
+            ReadRouting::from_decision(targeted),
+            Ok(ReadRouting::Targeted(_))
+        ));
+
+        let fallback = VehicleKnowledge::generic_obd2()
+            .route("engine.rpm", None, true, FallbackPolicy::Functional)
+            .unwrap();
+        assert!(matches!(
+            ReadRouting::from_decision(fallback),
+            Ok(ReadRouting::Functional(_))
+        ));
+
+        let ambiguous = VehicleKnowledge::generic_obd2()
+            .route("engine.rpm", None, true, FallbackPolicy::Ambiguous)
+            .unwrap();
+        assert_eq!(
+            ReadRouting::from_decision(ambiguous),
+            Err(RoutingError::AmbiguousFallback)
+        );
     }
 }

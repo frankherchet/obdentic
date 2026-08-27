@@ -7,10 +7,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::{
+    functional_discovery::EcuCapability,
+    topology::{
+        AddressingContext, Confidence, EcuRole, EcuTopology, ObservationWindow, Protocol,
+        ProtocolContext, Provenance, RequestAddress, RequestTarget, RequestTargetEvidence,
+        ResponderIdentity, RoleAssignment,
+    },
+};
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-const HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t1";
+const HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t3";
+const V2_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t2";
+const LEGACY_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t1";
 const INDEX_HEADER: &str = "OBDENTIC-VEHICLE-INDEX\t1";
 const INDEX_NAME: &str = ".identity-index";
 
@@ -19,7 +30,8 @@ pub struct VehicleCache {
     local_key: String,
     first_seen_ms: u64,
     last_seen_ms: u64,
-    evidence: Vec<String>,
+    snapshot: VehicleCacheSnapshot,
+    history: Vec<String>,
 }
 
 impl VehicleCache {
@@ -27,15 +39,42 @@ impl VehicleCache {
         local_key: impl Into<String>,
         first_seen_ms: u64,
         last_seen_ms: u64,
-        mut evidence: Vec<String>,
+        history: Vec<String>,
     ) -> Self {
-        evidence.sort_unstable();
+        Self::with_snapshot(
+            local_key,
+            first_seen_ms,
+            last_seen_ms,
+            VehicleCacheSnapshot::default(),
+            history,
+        )
+    }
+
+    pub fn with_snapshot(
+        local_key: impl Into<String>,
+        first_seen_ms: u64,
+        last_seen_ms: u64,
+        snapshot: VehicleCacheSnapshot,
+        mut history: Vec<String>,
+    ) -> Self {
+        history.sort_unstable();
         Self {
             local_key: local_key.into(),
             first_seen_ms,
             last_seen_ms,
-            evidence,
+            snapshot,
+            history,
         }
+    }
+
+    pub fn new_with_snapshot(
+        local_key: impl Into<String>,
+        first_seen_ms: u64,
+        last_seen_ms: u64,
+        snapshot: VehicleCacheSnapshot,
+        history: Vec<String>,
+    ) -> Self {
+        Self::with_snapshot(local_key, first_seen_ms, last_seen_ms, snapshot, history)
     }
 
     pub fn local_key(&self) -> &str {
@@ -51,7 +90,364 @@ impl VehicleCache {
     }
 
     pub fn evidence(&self) -> &[String] {
-        &self.evidence
+        &self.history
+    }
+
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
+    pub fn snapshot(&self) -> &VehicleCacheSnapshot {
+        &self.snapshot
+    }
+}
+
+/// The current, typed state of one vehicle.  Historical text is deliberately
+/// not part of this value and therefore cannot become validation input.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct VehicleCacheSnapshot {
+    topology: Vec<TopologyObservation>,
+    ecu_capabilities: Vec<EcuCapabilitySnapshot>,
+    target_mappings: Vec<TargetMappingSnapshot>,
+}
+
+impl VehicleCacheSnapshot {
+    pub fn new(
+        topology: impl IntoIterator<Item = TopologyObservation>,
+        ecu_capabilities: impl IntoIterator<Item = EcuCapabilitySnapshot>,
+        target_mappings: impl IntoIterator<Item = TargetMappingSnapshot>,
+    ) -> Self {
+        let mut snapshot = Self {
+            topology: topology.into_iter().collect(),
+            ecu_capabilities: ecu_capabilities.into_iter().collect(),
+            target_mappings: target_mappings.into_iter().collect(),
+        };
+        snapshot.topology.sort();
+        snapshot.ecu_capabilities.sort();
+        snapshot.target_mappings.sort();
+        snapshot
+    }
+
+    pub fn from_topology(topology: &EcuTopology) -> Self {
+        let mut observations = Vec::new();
+        let mut mappings = Vec::new();
+        for node in topology.nodes() {
+            for responder in node.observed_responders() {
+                observations.push(TopologyObservation::from_responder(
+                    node.context().clone(),
+                    responder,
+                ));
+                if let Some(target) = node.request_target() {
+                    mappings.push(TargetMappingSnapshot::new(
+                        node.role().cloned(),
+                        Some(responder.identity().clone()),
+                        target.target().clone(),
+                        target.provenance().clone(),
+                    ));
+                }
+            }
+            if node.observed_responders().is_empty() {
+                if let Some(target) = node.request_target() {
+                    mappings.push(TargetMappingSnapshot::new(
+                        node.role().cloned(),
+                        None,
+                        target.target().clone(),
+                        target.provenance().clone(),
+                    ));
+                }
+            }
+        }
+        Self::new(observations, [], mappings)
+    }
+
+    pub fn from_discovery(topology: &EcuTopology, capabilities: &[EcuCapability]) -> Self {
+        let mut snapshot = Self::from_topology(topology);
+        snapshot.ecu_capabilities = capabilities
+            .iter()
+            .map(EcuCapabilitySnapshot::from_capability)
+            .collect();
+        snapshot.ecu_capabilities.sort();
+        snapshot
+    }
+
+    pub fn topology(&self) -> &[TopologyObservation] {
+        &self.topology
+    }
+
+    pub fn topology_observations(&self) -> &[TopologyObservation] {
+        self.topology()
+    }
+
+    pub fn ecu_capabilities(&self) -> &[EcuCapabilitySnapshot] {
+        &self.ecu_capabilities
+    }
+
+    pub fn capabilities(&self) -> &[EcuCapabilitySnapshot] {
+        self.ecu_capabilities()
+    }
+
+    pub fn target_mappings(&self) -> &[TargetMappingSnapshot] {
+        &self.target_mappings
+    }
+
+    pub fn validation_signature(&self) -> ValidationSignature {
+        let topology = self
+            .topology
+            .iter()
+            .filter(|observation| {
+                observation
+                    .payload()
+                    .is_some_and(|payload| payload.starts_with(&[0x41, 0x00]))
+            })
+            .cloned()
+            .collect();
+        let ecu_capabilities = self
+            .ecu_capabilities
+            .iter()
+            .filter_map(|capability| {
+                let pages = capability
+                    .pages
+                    .iter()
+                    .filter(|page| page.request == [0x01, 0x00])
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!pages.is_empty())
+                    .then(|| EcuCapabilitySnapshot::new(capability.responder.clone(), pages))
+            })
+            .collect();
+        ValidationSignature {
+            topology,
+            ecu_capabilities,
+            target_mappings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TopologyObservation {
+    context: ProtocolContext,
+    responder: ResponderIdentity,
+    payload: Option<Vec<u8>>,
+    observation: Option<ObservationWindow>,
+    provenance: Provenance,
+}
+
+impl TopologyObservation {
+    pub fn new(
+        context: ProtocolContext,
+        responder: ResponderIdentity,
+        payload: Option<Vec<u8>>,
+        observation: Option<ObservationWindow>,
+        provenance: Provenance,
+    ) -> Self {
+        Self {
+            context,
+            responder,
+            payload,
+            observation,
+            provenance,
+        }
+    }
+
+    fn from_responder(
+        context: ProtocolContext,
+        responder: &crate::topology::ObservedResponder,
+    ) -> Self {
+        Self::new(
+            context,
+            responder.identity().clone(),
+            responder.payload().map(<[u8]>::to_vec),
+            responder.observation(),
+            responder.provenance().clone(),
+        )
+    }
+
+    pub fn context(&self) -> &ProtocolContext {
+        &self.context
+    }
+
+    pub fn responder(&self) -> &ResponderIdentity {
+        &self.responder
+    }
+
+    pub fn payload(&self) -> Option<&[u8]> {
+        self.payload.as_deref()
+    }
+
+    pub fn observation(&self) -> Option<ObservationWindow> {
+        self.observation
+    }
+
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityPageSnapshot {
+    request: [u8; 2],
+    payload: Vec<u8>,
+    provenance: Provenance,
+}
+
+impl CapabilityPageSnapshot {
+    pub fn new(request: [u8; 2], payload: Vec<u8>, provenance: Provenance) -> Self {
+        Self {
+            request,
+            payload,
+            provenance,
+        }
+    }
+
+    pub fn request(&self) -> [u8; 2] {
+        self.request
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct EcuCapabilitySnapshot {
+    responder: ResponderIdentity,
+    pages: Vec<CapabilityPageSnapshot>,
+}
+
+impl EcuCapabilitySnapshot {
+    pub fn new(
+        responder: ResponderIdentity,
+        pages: impl IntoIterator<Item = CapabilityPageSnapshot>,
+    ) -> Self {
+        let mut pages = pages.into_iter().collect::<Vec<_>>();
+        pages.sort();
+        Self { responder, pages }
+    }
+
+    fn from_capability(capability: &EcuCapability) -> Self {
+        Self::new(
+            capability.responder().clone(),
+            capability.mode01_pages().iter().map(|page| {
+                CapabilityPageSnapshot::new(
+                    page.request(),
+                    page.payload().to_vec(),
+                    page.provenance().clone(),
+                )
+            }),
+        )
+    }
+
+    pub fn responder(&self) -> &ResponderIdentity {
+        &self.responder
+    }
+
+    pub fn pages(&self) -> &[CapabilityPageSnapshot] {
+        &self.pages
+    }
+
+    pub fn mode01_pages(&self) -> &[CapabilityPageSnapshot] {
+        self.pages()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TargetMappingSnapshot {
+    role: Option<RoleAssignment>,
+    responder: Option<ResponderIdentity>,
+    target: RequestTarget,
+    provenance: Provenance,
+}
+
+impl TargetMappingSnapshot {
+    pub fn new(
+        role: Option<RoleAssignment>,
+        responder: Option<ResponderIdentity>,
+        target: RequestTarget,
+        provenance: Provenance,
+    ) -> Self {
+        Self {
+            role,
+            responder,
+            target,
+            provenance,
+        }
+    }
+
+    pub fn role(&self) -> Option<&RoleAssignment> {
+        self.role.as_ref()
+    }
+
+    pub fn responder(&self) -> Option<&ResponderIdentity> {
+        self.responder.as_ref()
+    }
+
+    pub fn target(&self) -> &RequestTarget {
+        &self.target
+    }
+
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    pub const fn confidence(&self) -> Confidence {
+        self.provenance.confidence()
+    }
+
+    pub fn to_vehicle_knowledge_mapping(
+        &self,
+    ) -> Option<crate::vehicle_knowledge::EcuTargetMapping> {
+        Some(crate::vehicle_knowledge::EcuTargetMapping::new(
+            self.role.clone()?,
+            RequestTargetEvidence::new(self.target.clone(), self.provenance.clone()),
+            self.responder.clone()?,
+        ))
+    }
+}
+
+/// A bounded, typed value used for cache validation.  It intentionally omits
+/// timestamps, identity and historical evidence.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ValidationSignature {
+    topology: Vec<TopologyObservation>,
+    ecu_capabilities: Vec<EcuCapabilitySnapshot>,
+    target_mappings: Vec<TargetMappingSnapshot>,
+}
+
+impl ValidationSignature {
+    pub fn topology(&self) -> &[TopologyObservation] {
+        &self.topology
+    }
+
+    pub fn ecu_capabilities(&self) -> &[EcuCapabilitySnapshot] {
+        &self.ecu_capabilities
+    }
+
+    pub fn target_mappings(&self) -> &[TargetMappingSnapshot] {
+        &self.target_mappings
+    }
+
+    pub(crate) fn entries(&self) -> Vec<String> {
+        let mut entries = self
+            .topology
+            .iter()
+            .map(|observation| format!("topology:{observation:?}"))
+            .chain(
+                self.ecu_capabilities
+                    .iter()
+                    .map(|capability| format!("capability:{capability:?}")),
+            )
+            .chain(
+                self.target_mappings
+                    .iter()
+                    .map(|mapping| format!("target_mapping:{mapping:?}")),
+            )
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        entries
     }
 }
 
@@ -67,7 +463,7 @@ impl CacheStore {
     }
 
     pub fn save(&self, cache: &VehicleCache) -> Result<(), String> {
-        validate_cache(cache)?;
+        validate_record(cache)?;
         fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
 
         let path = self.path_for(&cache.local_key);
@@ -88,8 +484,30 @@ impl CacheStore {
             file.write_all(cache.first_seen_ms.to_string().as_bytes())?;
             file.write_all(b"\nlast_seen_ms\t")?;
             file.write_all(cache.last_seen_ms.to_string().as_bytes())?;
-            for line in &cache.evidence {
-                file.write_all(b"\nevidence\t")?;
+            for observation in &cache.snapshot.topology {
+                file.write_all(b"\ntopology\t")?;
+                file.write_all(encode_topology_observation(observation).as_bytes())?;
+            }
+            for (index, capability) in cache.snapshot.ecu_capabilities.iter().enumerate() {
+                file.write_all(b"\ncapability\t")?;
+                file.write_all(index.to_string().as_bytes())?;
+                file.write_all(b"\t")?;
+                file.write_all(
+                    encode_fields(&encode_responder_fields(capability.responder())).as_bytes(),
+                )?;
+                for page in &capability.pages {
+                    file.write_all(b"\ncapability_page\t")?;
+                    file.write_all(index.to_string().as_bytes())?;
+                    file.write_all(b"\t")?;
+                    file.write_all(encode_capability_page(page).as_bytes())?;
+                }
+            }
+            for mapping in &cache.snapshot.target_mappings {
+                file.write_all(b"\ntarget_mapping\t")?;
+                file.write_all(encode_target_mapping(mapping).as_bytes())?;
+            }
+            for line in &cache.history {
+                file.write_all(b"\nhistory\t")?;
                 file.write_all(escape(line).as_bytes())?;
             }
             file.write_all(b"\n")?;
@@ -305,16 +723,314 @@ fn random_key() -> Result<String, String> {
     ))
 }
 
+fn encode_topology_observation(observation: &TopologyObservation) -> String {
+    let mut fields = encode_context(observation.context()).to_vec();
+    fields.extend(encode_responder_fields(observation.responder()));
+    fields.push(
+        if observation.payload.is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(payload) = observation.payload() {
+        fields.push(hex(payload));
+    }
+    fields.push(
+        if observation.observation.is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(window) = observation.observation {
+        fields.push(window.first_observed_ms().to_string());
+        fields.push(window.last_observed_ms().to_string());
+    }
+    fields.extend(encode_provenance(observation.provenance()));
+    encode_fields(&fields)
+}
+
+fn encode_capability_page(page: &CapabilityPageSnapshot) -> String {
+    let fields = [
+        page.request[0].to_string(),
+        page.request[1].to_string(),
+        hex(&page.payload),
+        page.provenance.source().into(),
+        encode_confidence(page.provenance.confidence()).into(),
+    ];
+    encode_fields(&fields)
+}
+
+fn encode_target_mapping(mapping: &TargetMappingSnapshot) -> String {
+    let mut fields = vec![if mapping.role.is_some() { "1" } else { "0" }.into()];
+    if let Some(role) = mapping.role() {
+        fields.extend(encode_role_assignment(role));
+    }
+    fields.push(
+        if mapping.responder.is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(responder) = mapping.responder() {
+        fields.extend(encode_responder_fields(responder));
+    }
+    fields.extend(encode_target(mapping.target()));
+    fields.extend(encode_provenance(mapping.provenance()));
+    encode_fields(&fields)
+}
+
+fn encode_role_assignment(role: &RoleAssignment) -> Vec<String> {
+    let mut fields = vec![encode_role(role.role())];
+    fields.extend(encode_provenance(role.provenance()));
+    fields
+}
+
+fn encode_role(role: &EcuRole) -> String {
+    match role {
+        EcuRole::Engine => "engine".into(),
+        EcuRole::Transmission => "transmission".into(),
+        EcuRole::Gateway => "gateway".into(),
+        EcuRole::Unknown => "unknown".into(),
+        EcuRole::VendorSpecific(value) => format!("vendor:{value}"),
+    }
+}
+
+fn encode_context(context: &ProtocolContext) -> [String; 2] {
+    [
+        encode_protocol(context.protocol()),
+        encode_addressing(context.addressing()),
+    ]
+}
+
+fn encode_responder_fields(responder: &ResponderIdentity) -> Vec<String> {
+    let context = encode_context(responder.context());
+    let (kind, value) = match responder {
+        ResponderIdentity::Address { value, .. } => ("address", value.as_str()),
+        ResponderIdentity::Opaque { value, .. } => ("opaque", value.as_str()),
+        ResponderIdentity::Unknown { .. } => ("unknown", ""),
+    };
+    vec![
+        context[0].clone(),
+        context[1].clone(),
+        kind.into(),
+        value.into(),
+    ]
+}
+
+fn encode_target(target: &RequestTarget) -> Vec<String> {
+    let context = encode_context(target.context());
+    let mut fields = vec![context[0].clone(), context[1].clone()];
+    if let Some(address) = target.address() {
+        fields.extend([
+            "1".into(),
+            address.namespace().into(),
+            address.value().into(),
+        ]);
+    } else {
+        fields.push("0".into());
+    }
+    fields
+}
+
+fn encode_provenance(provenance: &Provenance) -> [String; 2] {
+    [
+        provenance.source().into(),
+        encode_confidence(provenance.confidence()).into(),
+    ]
+}
+
+fn encode_protocol(protocol: &Protocol) -> String {
+    match protocol {
+        Protocol::Obd2 => "obd2".into(),
+        Protocol::Uds => "uds".into(),
+        Protocol::Can => "can".into(),
+        Protocol::Doip => "doip".into(),
+        Protocol::Unknown => "unknown".into(),
+        Protocol::VendorSpecific(value) => format!("vendor:{value}"),
+    }
+}
+
+fn encode_addressing(addressing: &AddressingContext) -> String {
+    match addressing {
+        AddressingContext::Functional => "functional".into(),
+        AddressingContext::Physical => "physical".into(),
+        AddressingContext::Unknown => "unknown".into(),
+        AddressingContext::VendorSpecific(value) => format!("vendor:{value}"),
+    }
+}
+
+fn encode_confidence(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::Unknown => "unknown",
+        Confidence::Low => "low",
+        Confidence::Medium => "medium",
+        Confidence::High => "high",
+        Confidence::Verified => "verified",
+    }
+}
+
+fn encode_fields(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|field| escape(field))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+fn parse_fields(line: &str) -> Result<(&str, Vec<String>), String> {
+    let mut fields = line.split('\t');
+    let tag = fields.next().unwrap_or_default();
+    if tag.is_empty() {
+        return Err("malformed vehicle cache field".into());
+    }
+    Ok((tag, fields.map(unescape).collect::<Result<Vec<_>, _>>()?))
+}
+
+fn field<'a>(fields: &'a [String], index: &mut usize, name: &str) -> Result<&'a str, String> {
+    let value = fields
+        .get(*index)
+        .ok_or_else(|| format!("vehicle cache {name} is missing"))?;
+    *index += 1;
+    Ok(value)
+}
+
+fn finish_fields(fields: &[String], index: usize) -> Result<(), String> {
+    if index == fields.len() {
+        Ok(())
+    } else {
+        Err("vehicle cache contains an extra field".into())
+    }
+}
+
+fn parse_context(fields: &[String], index: &mut usize) -> Result<ProtocolContext, String> {
+    Ok(ProtocolContext::new(
+        parse_protocol(field(fields, index, "protocol")?)?,
+        parse_addressing(field(fields, index, "addressing")?)?,
+    ))
+}
+
+fn parse_responder(fields: &[String], index: &mut usize) -> Result<ResponderIdentity, String> {
+    let context = parse_context(fields, index)?;
+    let kind = field(fields, index, "responder kind")?;
+    let value = field(fields, index, "responder value")?;
+    match kind {
+        "address" => Ok(ResponderIdentity::address(context, value)),
+        "opaque" => Ok(ResponderIdentity::opaque(context, value)),
+        "unknown" if value.is_empty() => Ok(ResponderIdentity::unknown(context)),
+        _ => Err("vehicle cache contains an invalid responder kind".into()),
+    }
+}
+
+fn parse_provenance(fields: &[String], index: &mut usize) -> Result<Provenance, String> {
+    let source = field(fields, index, "provenance source")?;
+    let confidence = parse_confidence(field(fields, index, "confidence")?)?;
+    Provenance::new(source, confidence).map_err(|error| error.to_string())
+}
+
+fn parse_protocol(value: &str) -> Result<Protocol, String> {
+    Ok(match value {
+        "obd2" => Protocol::Obd2,
+        "uds" => Protocol::Uds,
+        "can" => Protocol::Can,
+        "doip" => Protocol::Doip,
+        "unknown" => Protocol::Unknown,
+        value => value
+            .strip_prefix("vendor:")
+            .map(|value| Protocol::VendorSpecific(value.into()))
+            .ok_or_else(|| "vehicle cache contains an invalid protocol".to_string())?,
+    })
+}
+
+fn parse_addressing(value: &str) -> Result<AddressingContext, String> {
+    Ok(match value {
+        "functional" => AddressingContext::Functional,
+        "physical" => AddressingContext::Physical,
+        "unknown" => AddressingContext::Unknown,
+        value => value
+            .strip_prefix("vendor:")
+            .map(|value| AddressingContext::VendorSpecific(value.into()))
+            .ok_or_else(|| "vehicle cache contains an invalid addressing context".to_string())?,
+    })
+}
+
+fn parse_confidence(value: &str) -> Result<Confidence, String> {
+    match value {
+        "unknown" => Ok(Confidence::Unknown),
+        "low" => Ok(Confidence::Low),
+        "medium" => Ok(Confidence::Medium),
+        "high" => Ok(Confidence::High),
+        "verified" => Ok(Confidence::Verified),
+        _ => Err("vehicle cache contains an invalid confidence".into()),
+    }
+}
+
+fn parse_bytes(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("vehicle cache contains an odd-length byte string".into());
+    }
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| "vehicle cache contains invalid hexadecimal bytes".to_string())
+        })
+        .collect()
+}
+
+fn parse_optional_flag(fields: &[String], index: &mut usize, name: &str) -> Result<bool, String> {
+    match field(fields, index, name)? {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(format!("vehicle cache {name} flag is invalid")),
+    }
+}
+
+fn parse_target(fields: &[String], index: &mut usize) -> Result<RequestTarget, String> {
+    let context = parse_context(fields, index)?;
+    let has_address = parse_optional_flag(fields, index, "target address")?;
+    let address = if has_address {
+        Some(RequestAddress::new(
+            field(fields, index, "target namespace")?,
+            field(fields, index, "target value")?,
+        ))
+    } else {
+        None
+    };
+    Ok(match address {
+        Some(address) => RequestTarget::concrete(context, address),
+        None => RequestTarget::functional(context),
+    })
+}
+
 fn parse(contents: &str, requested_key: &str) -> Result<VehicleCache, String> {
     let mut lines = contents.lines();
-    if lines.next() != Some(HEADER) {
-        return Err("unsupported vehicle cache format".into());
+    match lines.next() {
+        Some(HEADER) => parse_v3(lines, requested_key),
+        Some(V2_HEADER) => parse_v2(lines, requested_key),
+        Some(LEGACY_HEADER) => parse_v1(lines, requested_key),
+        _ => Err("unsupported vehicle cache format".into()),
     }
+}
 
+fn parse_v1<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    requested_key: &str,
+) -> Result<VehicleCache, String> {
     let mut local_key = None;
     let mut first_seen_ms = None;
     let mut last_seen_ms = None;
-    let mut evidence = Vec::new();
+    let mut history = Vec::new();
     for line in lines {
         let (field, encoded) = line
             .split_once('\t')
@@ -330,24 +1046,114 @@ fn parse(contents: &str, requested_key: &str) -> Result<VehicleCache, String> {
                 if first_seen_ms.is_some() {
                     return Err("vehicle cache contains duplicate first_seen_ms".into());
                 }
-                first_seen_ms = Some(
-                    encoded
-                        .parse::<u64>()
-                        .map_err(|error| format!("invalid first_seen_ms: {error}"))?,
-                );
+                first_seen_ms = Some(parse_timestamp(encoded, "first_seen_ms")?);
             }
             "last_seen_ms" => {
                 if last_seen_ms.is_some() {
                     return Err("vehicle cache contains duplicate last_seen_ms".into());
                 }
-                last_seen_ms = Some(
-                    encoded
-                        .parse::<u64>()
-                        .map_err(|error| format!("invalid last_seen_ms: {error}"))?,
-                );
+                last_seen_ms = Some(parse_timestamp(encoded, "last_seen_ms")?);
             }
-            "evidence" => evidence.push(unescape(encoded)?),
+            "evidence" => history.push(unescape(encoded)?),
             _ => return Err(format!("vehicle cache contains unsupported field {field}")),
+        }
+    }
+    let cache = VehicleCache::new(
+        local_key.ok_or_else(|| "vehicle cache is missing local_key".to_string())?,
+        first_seen_ms.ok_or_else(|| "vehicle cache is missing first_seen_ms".to_string())?,
+        last_seen_ms.ok_or_else(|| "vehicle cache is missing last_seen_ms".to_string())?,
+        history,
+    );
+    finish_cache(cache, requested_key)
+}
+
+fn parse_v2<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    requested_key: &str,
+) -> Result<VehicleCache, String> {
+    parse_versioned(lines, requested_key, false)
+}
+
+fn parse_v3<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    requested_key: &str,
+) -> Result<VehicleCache, String> {
+    parse_versioned(lines, requested_key, true)
+}
+
+fn parse_versioned<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    requested_key: &str,
+    has_role: bool,
+) -> Result<VehicleCache, String> {
+    let mut local_key = None;
+    let mut first_seen_ms = None;
+    let mut last_seen_ms = None;
+    let mut topology = Vec::new();
+    let mut capabilities = BTreeMap::new();
+    let mut target_mappings = Vec::new();
+    let mut history = Vec::new();
+    for line in lines {
+        let (tag, fields) = parse_fields(line)?;
+        match tag {
+            "local_key" => {
+                if local_key.is_some() {
+                    return Err("vehicle cache contains duplicate local_key".into());
+                }
+                local_key = Some(one_field(&fields, "local_key")?.to_owned());
+            }
+            "first_seen_ms" => {
+                if first_seen_ms.is_some() {
+                    return Err("vehicle cache contains duplicate first_seen_ms".into());
+                }
+                first_seen_ms = Some(parse_timestamp(
+                    one_field(&fields, "first_seen_ms")?,
+                    "first_seen_ms",
+                )?);
+            }
+            "last_seen_ms" => {
+                if last_seen_ms.is_some() {
+                    return Err("vehicle cache contains duplicate last_seen_ms".into());
+                }
+                last_seen_ms = Some(parse_timestamp(
+                    one_field(&fields, "last_seen_ms")?,
+                    "last_seen_ms",
+                )?);
+            }
+            "topology" => topology.push(parse_topology_observation(&fields)?),
+            "capability" => {
+                let mut index = 0;
+                let capability_index = field(&fields, &mut index, "capability index")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid capability index: {error}"))?;
+                let responder = parse_responder(&fields, &mut index)?;
+                finish_fields(&fields, index)?;
+                if capabilities
+                    .insert(capability_index, EcuCapabilitySnapshot::new(responder, []))
+                    .is_some()
+                {
+                    return Err("vehicle cache contains duplicate capability".into());
+                }
+            }
+            "capability_page" => {
+                let mut index = 0;
+                let capability_index = field(&fields, &mut index, "capability index")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid capability index: {error}"))?;
+                let page = parse_capability_page(&fields, &mut index)?;
+                finish_fields(&fields, index)?;
+                let capability = capabilities.get_mut(&capability_index).ok_or_else(|| {
+                    "vehicle cache capability page precedes its capability".to_string()
+                })?;
+                capability.pages.push(page);
+                capability.pages.sort();
+            }
+            "target_mapping" => {
+                target_mappings.push(parse_target_mapping_with_role(&fields, has_role)?);
+            }
+            "history" => history.push(one_field(&fields, "history")?.to_owned()),
+            "evidence" => history.push(one_field(&fields, "evidence")?.to_owned()),
+            _ => return Err(format!("vehicle cache contains unsupported field {tag}")),
         }
     }
 
@@ -355,24 +1161,212 @@ fn parse(contents: &str, requested_key: &str) -> Result<VehicleCache, String> {
         local_key.ok_or_else(|| "vehicle cache is missing local_key".to_string())?,
         first_seen_ms.ok_or_else(|| "vehicle cache is missing first_seen_ms".to_string())?,
         last_seen_ms.ok_or_else(|| "vehicle cache is missing last_seen_ms".to_string())?,
-        evidence,
+        history,
     );
-    validate_cache(&cache)?;
+    let cache = VehicleCache::with_snapshot(
+        cache.local_key,
+        cache.first_seen_ms,
+        cache.last_seen_ms,
+        VehicleCacheSnapshot::new(topology, capabilities.into_values(), target_mappings),
+        cache.history,
+    );
+    finish_cache(cache, requested_key)
+}
+
+fn finish_cache(cache: VehicleCache, requested_key: &str) -> Result<VehicleCache, String> {
+    validate_record(&cache)?;
     if cache.local_key != requested_key {
         return Err("vehicle cache local_key does not match its path".into());
     }
     Ok(cache)
 }
 
-fn validate_cache(cache: &VehicleCache) -> Result<(), String> {
+fn one_field<'a>(fields: &'a [String], name: &str) -> Result<&'a str, String> {
+    if fields.len() == 1 {
+        Ok(&fields[0])
+    } else {
+        Err(format!("vehicle cache {name} must contain one field"))
+    }
+}
+
+fn parse_timestamp(value: &str, name: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {name}: {error}"))
+}
+
+fn parse_topology_observation(fields: &[String]) -> Result<TopologyObservation, String> {
+    let mut index = 0;
+    let context = parse_context(fields, &mut index)?;
+    let responder = parse_responder(fields, &mut index)?;
+    let payload = if parse_optional_flag(fields, &mut index, "payload")? {
+        Some(parse_bytes(field(fields, &mut index, "payload bytes")?)?)
+    } else {
+        None
+    };
+    let observation = if parse_optional_flag(fields, &mut index, "observation")? {
+        Some(
+            ObservationWindow::new(
+                parse_timestamp(
+                    field(fields, &mut index, "observation start")?,
+                    "observation start",
+                )?,
+                parse_timestamp(
+                    field(fields, &mut index, "observation end")?,
+                    "observation end",
+                )?,
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let provenance = parse_provenance(fields, &mut index)?;
+    finish_fields(fields, index)?;
+    Ok(TopologyObservation::new(
+        context,
+        responder,
+        payload,
+        observation,
+        provenance,
+    ))
+}
+
+fn parse_capability_page(
+    fields: &[String],
+    index: &mut usize,
+) -> Result<CapabilityPageSnapshot, String> {
+    let request = [
+        field(fields, index, "capability mode")?
+            .parse::<u8>()
+            .map_err(|error| format!("invalid capability mode: {error}"))?,
+        field(fields, index, "capability PID")?
+            .parse::<u8>()
+            .map_err(|error| format!("invalid capability PID: {error}"))?,
+    ];
+    let payload = parse_bytes(field(fields, index, "capability payload")?)?;
+    let provenance = parse_provenance(fields, index)?;
+    Ok(CapabilityPageSnapshot::new(request, payload, provenance))
+}
+
+fn parse_target_mapping_with_role(
+    fields: &[String],
+    has_role: bool,
+) -> Result<TargetMappingSnapshot, String> {
+    let mut index = 0;
+    let role = if has_role && parse_optional_flag(fields, &mut index, "mapping role")? {
+        Some(parse_role_assignment(fields, &mut index)?)
+    } else {
+        None
+    };
+    let responder = if parse_optional_flag(fields, &mut index, "mapping responder")? {
+        Some(parse_responder(fields, &mut index)?)
+    } else {
+        None
+    };
+    let target = parse_target(fields, &mut index)?;
+    let provenance = parse_provenance(fields, &mut index)?;
+    finish_fields(fields, index)?;
+    Ok(TargetMappingSnapshot::new(
+        role, responder, target, provenance,
+    ))
+}
+
+fn parse_role_assignment(fields: &[String], index: &mut usize) -> Result<RoleAssignment, String> {
+    let role = parse_role(field(fields, index, "mapping role")?)?;
+    let provenance = parse_provenance(fields, index)?;
+    Ok(RoleAssignment::new(role, provenance))
+}
+
+fn parse_role(value: &str) -> Result<EcuRole, String> {
+    Ok(match value {
+        "engine" => EcuRole::Engine,
+        "transmission" => EcuRole::Transmission,
+        "gateway" => EcuRole::Gateway,
+        "unknown" => EcuRole::Unknown,
+        value => value
+            .strip_prefix("vendor:")
+            .map(|value| EcuRole::VendorSpecific(value.into()))
+            .ok_or_else(|| "vehicle cache contains an invalid ECU role".to_string())?,
+    })
+}
+
+fn validate_record(cache: &VehicleCache) -> Result<(), String> {
     validate_text("local key", &cache.local_key)?;
     if cache.last_seen_ms < cache.first_seen_ms {
         return Err("vehicle cache last_seen_ms precedes first_seen_ms".into());
     }
-    for line in &cache.evidence {
+    validate_snapshot(&cache.snapshot)?;
+    for line in &cache.history {
         validate_text("evidence", line)?;
     }
     Ok(())
+}
+
+fn validate_snapshot(snapshot: &VehicleCacheSnapshot) -> Result<(), String> {
+    for observation in &snapshot.topology {
+        validate_context(observation.context())?;
+        validate_responder(observation.responder())?;
+        if let Some(payload) = observation.payload() {
+            if payload.len() > 4096 {
+                return Err("vehicle cache topology payload is too large".into());
+            }
+        }
+        validate_provenance(observation.provenance())?;
+    }
+    for capability in &snapshot.ecu_capabilities {
+        validate_responder(capability.responder())?;
+        for page in capability.pages() {
+            validate_provenance(page.provenance())?;
+            if page.payload().len() > 4096 {
+                return Err("vehicle cache capability payload is too large".into());
+            }
+        }
+    }
+    for mapping in &snapshot.target_mappings {
+        if let Some(role) = mapping.role() {
+            validate_role(role)?;
+        }
+        if let Some(responder) = mapping.responder() {
+            validate_responder(responder)?;
+        }
+        validate_context(mapping.target().context())?;
+        if let Some(address) = mapping.target().address() {
+            validate_text("target namespace", address.namespace())?;
+            validate_text("target value", address.value())?;
+        }
+        validate_provenance(mapping.provenance())?;
+    }
+    Ok(())
+}
+
+fn validate_role(role: &RoleAssignment) -> Result<(), String> {
+    if let EcuRole::VendorSpecific(value) = role.role() {
+        validate_text("ECU role", value)?;
+    }
+    validate_provenance(role.provenance())
+}
+
+fn validate_context(context: &ProtocolContext) -> Result<(), String> {
+    if let Protocol::VendorSpecific(value) = context.protocol() {
+        validate_text("protocol", value)?;
+    }
+    if let AddressingContext::VendorSpecific(value) = context.addressing() {
+        validate_text("addressing", value)?;
+    }
+    Ok(())
+}
+
+fn validate_responder(responder: &ResponderIdentity) -> Result<(), String> {
+    validate_context(responder.context())?;
+    if let Some(value) = responder.value() {
+        validate_text("responder", value)?;
+    }
+    Ok(())
+}
+
+fn validate_provenance(provenance: &Provenance) -> Result<(), String> {
+    validate_text("provenance", provenance.source())
 }
 
 fn validate_text(field: &str, value: &str) -> Result<(), String> {
@@ -477,7 +1471,7 @@ mod tests {
         let path = root.join("6c6f63616c2d6b6579.tsv");
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            "OBDENTIC-VEHICLE-CACHE\t1\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t2\nevidence\tevidence\n"
+            "OBDENTIC-VEHICLE-CACHE\t3\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t2\nhistory\tevidence\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -517,10 +1511,165 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("6c6f63616c2d6b6579.tsv"),
-            "OBDENTIC-VEHICLE-CACHE\t2\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
+            "OBDENTIC-VEHICLE-CACHE\t4\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
         )
         .unwrap();
         assert!(store.load("local-key").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn round_trips_typed_snapshot_and_keeps_history_separate() {
+        let root = root("typed-roundtrip");
+        let store = CacheStore::new(&root);
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Functional);
+        let provenance = Provenance::new("functional discovery", Confidence::High).unwrap();
+        let topology = TopologyObservation::new(
+            context.clone(),
+            ResponderIdentity::opaque(context.clone(), "7E8"),
+            Some(vec![0x41, 0x00, 0, 0, 0, 1]),
+            Some(ObservationWindow::new(10, 20).unwrap()),
+            provenance.clone(),
+        );
+        let snapshot = VehicleCacheSnapshot::new(
+            [topology],
+            [EcuCapabilitySnapshot::new(
+                ResponderIdentity::opaque(context.clone(), "7E8"),
+                [CapabilityPageSnapshot::new(
+                    [0x01, 0x00],
+                    vec![0x41, 0x00, 0, 0, 0, 1],
+                    provenance.clone(),
+                )],
+            )],
+            [TargetMappingSnapshot::new(
+                None,
+                Some(ResponderIdentity::opaque(context.clone(), "7E8")),
+                RequestTarget::functional(context),
+                provenance,
+            )],
+        );
+        let cache = VehicleCache::with_snapshot(
+            "local-key",
+            10,
+            20,
+            snapshot.clone(),
+            vec!["historical evidence".into()],
+        );
+        store.save(&cache).unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert_eq!(loaded.snapshot(), &snapshot);
+        assert_eq!(loaded.history(), ["historical evidence"]);
+        assert_eq!(
+            loaded.snapshot().validation_signature(),
+            snapshot.validation_signature()
+        );
+        assert!(loaded
+            .snapshot()
+            .validation_signature()
+            .target_mappings()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validation_signature_keeps_only_mode_01_page_00_evidence() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Functional);
+        let responder = ResponderIdentity::opaque(context.clone(), "7E8");
+        let provenance = Provenance::new("functional discovery", Confidence::High).unwrap();
+        let snapshot = VehicleCacheSnapshot::new(
+            [
+                TopologyObservation::new(
+                    context.clone(),
+                    responder.clone(),
+                    Some(vec![0x41, 0x00, 0, 0, 0, 1]),
+                    None,
+                    provenance.clone(),
+                ),
+                TopologyObservation::new(
+                    context.clone(),
+                    responder.clone(),
+                    Some(vec![0x41, 0x20, 0, 0, 0, 1]),
+                    None,
+                    provenance.clone(),
+                ),
+                TopologyObservation::new(
+                    context,
+                    responder.clone(),
+                    None,
+                    None,
+                    provenance.clone(),
+                ),
+            ],
+            [EcuCapabilitySnapshot::new(
+                responder,
+                [
+                    CapabilityPageSnapshot::new(
+                        [0x01, 0x00],
+                        vec![0x41, 0x00, 0, 0, 0, 1],
+                        provenance.clone(),
+                    ),
+                    CapabilityPageSnapshot::new(
+                        [0x01, 0x20],
+                        vec![0x41, 0x20, 0, 0, 0, 1],
+                        provenance,
+                    ),
+                ],
+            )],
+            [],
+        );
+
+        let signature = snapshot.validation_signature();
+        assert_eq!(signature.topology().len(), 1);
+        assert_eq!(signature.ecu_capabilities().len(), 1);
+        assert_eq!(signature.ecu_capabilities()[0].pages().len(), 1);
+        assert_eq!(
+            signature.ecu_capabilities()[0].pages()[0].request(),
+            [0x01, 0x00]
+        );
+        assert!(signature.target_mappings().is_empty());
+    }
+
+    #[test]
+    fn only_roleful_mapping_can_be_reconstructed_for_routing() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let provenance = Provenance::new("validated topology", Confidence::High).unwrap();
+        let mapping = TargetMappingSnapshot::new(
+            Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
+            Some(ResponderIdentity::address(context.clone(), "7E8")),
+            RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E0")),
+            provenance,
+        );
+        assert_eq!(
+            mapping
+                .to_vehicle_knowledge_mapping()
+                .unwrap()
+                .role()
+                .role(),
+            &EcuRole::Engine
+        );
+        assert!(TargetMappingSnapshot::new(
+            None,
+            mapping.responder().cloned(),
+            mapping.target().clone(),
+            mapping.provenance().clone(),
+        )
+        .to_vehicle_knowledge_mapping()
+        .is_none());
+    }
+
+    #[test]
+    fn loads_legacy_textual_evidence_as_history_only() {
+        let root = root("legacy");
+        let store = CacheStore::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("6c6f63616c2d6b6579.tsv"),
+            "OBDENTIC-VEHICLE-CACHE\t1\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\nevidence\told\n",
+        )
+        .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert!(loaded.snapshot().topology().is_empty());
+        assert_eq!(loaded.history(), ["old"]);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,10 +1,13 @@
 use obdentic::vehicle_cache::VehicleCache;
+use obdentic::vehicle_knowledge::{
+    EcuTargetMapping, FallbackPolicy, ReadRouting, VehicleKnowledge,
+};
 use obdentic::{
     audit::AuditState,
     ble, capture,
     capture_events::{CaptureEvent, CaptureSubscription, SubscriptionFilterOutcome},
     capture_report, hex, jsonl_capture, prepare_read, record, replay,
-    scheduler::{Subscription, TelemetryScheduler},
+    scheduler::{ObservationPlan, Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
     tui, ReadRequest, Transaction,
@@ -96,8 +99,8 @@ async fn run() -> Result<(), String> {
             let identity = ble::identify(&adapter_id).await?;
             println!("VIN       {}", identity.vin());
         }
-        Command::VehicleDiscover { adapter_id } => run_vehicle_discover(&adapter_id).await?,
-        Command::VehicleRefresh { adapter_id } => run_vehicle_discover(&adapter_id).await?,
+        Command::VehicleDiscover { adapter_id } => run_vehicle_discover(&adapter_id, false).await?,
+        Command::VehicleRefresh { adapter_id } => run_vehicle_discover(&adapter_id, true).await?,
         Command::VehicleShow => run_vehicle_show()?,
         Command::Capture {
             adapter_id,
@@ -118,7 +121,14 @@ async fn run() -> Result<(), String> {
             adapter_id,
             recording,
         } => {
-            let transaction = ble::read(&adapter_id, request).await?;
+            let (mappings, cache_valid) = cached_routing_mappings(&adapter_id).await;
+            let transaction =
+                match route_request(request.metadata().semantic, &mappings, cache_valid)? {
+                    ReadRouting::Functional(request) => ble::read(&adapter_id, request).await?,
+                    ReadRouting::Targeted(request) => {
+                        ble::read_targeted(&adapter_id, request).await?
+                    }
+                };
             if let Some(path) = recording.as_deref() {
                 record(Path::new(path), &transaction)?;
             }
@@ -158,7 +168,7 @@ async fn run() -> Result<(), String> {
             };
             let scheduler = match TelemetryScheduler::start(
                 &adapter_id,
-                live_subscriptions()?,
+                routed_observation_plans(&adapter_id, live_subscriptions()?).await?,
                 telemetry.clone(),
                 audit.clone(),
                 recorder.clone(),
@@ -184,7 +194,7 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
-async fn run_vehicle_discover(adapter_id: &str) -> Result<(), String> {
+async fn run_vehicle_discover(adapter_id: &str, refresh: bool) -> Result<(), String> {
     let identity = ble::identify(adapter_id).await?;
     let root = vehicle_cache_root()?;
     let store = obdentic::vehicle_cache::CacheStore::new(&root);
@@ -195,6 +205,29 @@ async fn run_vehicle_discover(adapter_id: &str) -> Result<(), String> {
         .map(|key| store.load(key))
         .transpose()?
         .flatten();
+
+    if !refresh {
+        if let Some(cache) = existing.as_ref() {
+            let validation = ble::validate_functional_support(adapter_id)
+                .await
+                .and_then(snapshot_from_support_validation);
+            match obdentic::cache_validation::validate_snapshot(cache, validation) {
+                obdentic::cache_validation::CacheValidation::Validated => {
+                    print_cached_vehicle_discovery(cache);
+                    return Ok(());
+                }
+                obdentic::cache_validation::CacheValidation::StaleMissingExpected(_) => {
+                    println!("cache\tstale-missing; running full discovery");
+                }
+                obdentic::cache_validation::CacheValidation::StaleUnexpected(_) => {
+                    println!("cache\tstale-unexpected; running full discovery");
+                }
+                obdentic::cache_validation::CacheValidation::TransportError(error) => {
+                    println!("cache\tvalidation-error ({error}); running full discovery");
+                }
+            }
+        }
+    }
 
     let session = ble::start_session(adapter_id).await?;
     let discovery = obdentic::functional_discovery::discover_functional_responders(&session).await;
@@ -208,37 +241,33 @@ async fn run_vehicle_discover(adapter_id: &str) -> Result<(), String> {
         .as_ref()
         .map(VehicleCache::first_seen_ms)
         .unwrap_or(now);
-    let observed_evidence = discovery_evidence(&discovery);
-    let cache_state =
-        existing.as_ref().map(|cache| {
-            match obdentic::cache_validation::validate_cache(cache, Ok(observed_evidence.clone())) {
-                obdentic::cache_validation::CacheValidation::Validated => "validated",
-                obdentic::cache_validation::CacheValidation::StaleMissingExpected(_) => {
-                    "stale-missing"
-                }
-                obdentic::cache_validation::CacheValidation::StaleUnexpected(_) => {
-                    "stale-unexpected"
-                }
-                obdentic::cache_validation::CacheValidation::TransportError(_) => {
-                    "validation-error"
-                }
-            }
-        });
-    let mut evidence = existing
+    let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
+        &discovery.topology(),
+        &discovery.capabilities(),
+    );
+    let mut history = existing
         .as_ref()
-        .map(|cache| cache.evidence().to_vec())
+        .map(|cache| cache.history().to_vec())
         .unwrap_or_default();
-    evidence.extend(observed_evidence);
-    store.save(&VehicleCache::new(
+    history.extend(discovery_evidence(&discovery));
+    store.save(&VehicleCache::with_snapshot(
         local_key.clone(),
         first_seen,
         now,
-        evidence,
+        snapshot,
+        history,
     ))?;
 
     println!("vehicle discovery");
     println!("local_id\t{local_key}");
-    println!("cache\t{}", cache_state.unwrap_or("miss"));
+    println!(
+        "cache\t{}",
+        if refresh {
+            "refreshed"
+        } else {
+            "miss-or-stale"
+        }
+    );
     println!("responders\t{}", discovery.responders().len());
     for responder in discovery.responders() {
         println!(
@@ -248,6 +277,41 @@ async fn run_vehicle_discover(adapter_id: &str) -> Result<(), String> {
     }
     println!("evidence\t{}", discovery.observations().len());
     Ok(())
+}
+
+fn snapshot_from_support_validation(
+    pages: Vec<ble::SupportDiscovery>,
+) -> Result<obdentic::vehicle_cache::VehicleCacheSnapshot, String> {
+    let discovery =
+        obdentic::functional_discovery::FunctionalResponderDiscovery::from_support_discovery(
+            &pages,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(
+        obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
+            &discovery.topology(),
+            &discovery.capabilities(),
+        ),
+    )
+}
+
+fn print_cached_vehicle_discovery(cache: &VehicleCache) {
+    let signature = cache.snapshot().validation_signature();
+    println!("vehicle discovery");
+    println!("local_id\t{}", cache.local_key());
+    println!("cache\tvalidated-reused");
+    println!("responders\t{}", signature.topology().len());
+    for observation in signature.topology() {
+        println!(
+            "responder\t{}",
+            observation
+                .responder()
+                .value()
+                .unwrap_or("unknown")
+                .escape_default()
+        );
+    }
+    println!("evidence\t{}", signature.topology().len());
 }
 
 fn run_vehicle_show() -> Result<(), String> {
@@ -322,8 +386,16 @@ fn render_vehicle_summaries(caches: &[obdentic::vehicle_cache::VehicleCache]) ->
         output.push_str(&format!("local_id\t{}\n", cache.local_key()));
         output.push_str(&format!("first_seen_ms\t{}\n", cache.first_seen_ms()));
         output.push_str(&format!("last_seen_ms\t{}\n", cache.last_seen_ms()));
-        output.push_str(&format!("evidence\t{}\n", cache.evidence().len()));
-        for evidence in cache.evidence() {
+        output.push_str(&format!(
+            "topology\t{}\n",
+            cache.snapshot().topology().len()
+        ));
+        output.push_str(&format!(
+            "capabilities\t{}\n",
+            cache.snapshot().capabilities().len()
+        ));
+        output.push_str(&format!("history\t{}\n", cache.history().len()));
+        for evidence in cache.history() {
             output.push_str(&format!("  {}\n", evidence.escape_default()));
         }
     }
@@ -367,7 +439,7 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
 
     let scheduler = match TelemetryScheduler::start(
         adapter_id,
-        subscriptions,
+        routed_observation_plans(adapter_id, subscriptions).await?,
         Arc::new(Mutex::new(TelemetryState::new(600)?)),
         Arc::new(Mutex::new(AuditState::new(600)?)),
         Some(sender.clone()),
@@ -481,6 +553,83 @@ fn live_subscriptions() -> Result<Vec<Subscription>, String> {
     .into_iter()
     .map(|(signal, milliseconds)| Subscription::new(signal, Duration::from_millis(milliseconds)))
     .collect()
+}
+
+async fn routed_observation_plans(
+    adapter_id: &str,
+    subscriptions: Vec<Subscription>,
+) -> Result<Vec<ObservationPlan>, String> {
+    let (mappings, cache_valid) = cached_routing_mappings(adapter_id).await;
+    subscriptions
+        .into_iter()
+        .map(|subscription| {
+            ObservationPlan::new(
+                route_request(subscription.semantic(), &mappings, cache_valid)?,
+                subscription.interval(),
+            )
+        })
+        .collect()
+}
+
+fn route_request(
+    semantic: &str,
+    mappings: &[EcuTargetMapping],
+    cache_valid: bool,
+) -> Result<ReadRouting, String> {
+    let knowledge = VehicleKnowledge::generic_obd2();
+    let mapping = knowledge.rule(semantic).and_then(|rule| {
+        mappings
+            .iter()
+            .find(|mapping| mapping.role().role() == rule.role())
+    });
+    ReadRouting::from_decision(
+        knowledge
+            .route(semantic, mapping, cache_valid, FallbackPolicy::Functional)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+async fn cached_routing_mappings(adapter_id: &str) -> (Vec<EcuTargetMapping>, bool) {
+    let result: Result<Option<Vec<EcuTargetMapping>>, String> = async {
+        let identity = ble::identify(adapter_id).await?;
+        let root = vehicle_cache_root()?;
+        let store = obdentic::vehicle_cache::CacheStore::new(&root);
+        let index = obdentic::vehicle_cache::VehicleIndex::new(&root);
+        let Some(key) = index.key_for(identity.vin())? else {
+            return Ok(None);
+        };
+        let Some(cache) = store.load(&key)? else {
+            return Ok(None);
+        };
+        let validation = ble::validate_functional_support(adapter_id)
+            .await
+            .and_then(snapshot_from_support_validation);
+        if !matches!(
+            obdentic::cache_validation::validate_snapshot(&cache, validation),
+            obdentic::cache_validation::CacheValidation::Validated
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(
+            cache
+                .snapshot()
+                .target_mappings()
+                .iter()
+                .filter_map(|mapping| mapping.to_vehicle_knowledge_mapping())
+                .collect::<Vec<_>>(),
+        ))
+    }
+    .await;
+
+    match result {
+        Ok(Some(mappings)) => (mappings, true),
+        Ok(None) => (Vec::new(), false),
+        Err(error) => {
+            eprintln!("routing cache unavailable; using functional requests: {error}");
+            (Vec::new(), false)
+        }
+    }
 }
 
 fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
@@ -968,6 +1117,14 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn missing_or_unvalidated_mapping_stays_functional() {
+        assert!(matches!(
+            route_request("engine.rpm", &[], false),
+            Ok(ReadRouting::Functional(_))
+        ));
     }
 
     #[test]

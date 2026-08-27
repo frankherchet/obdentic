@@ -153,12 +153,15 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
         }
         CaptureEvent::SupportDiscovery {
             request_payload,
+            responder,
             response_payload,
         } => {
             object.push_str("\"support_discovery\",\"sequence\":");
             object.push_str(&sequence.to_string());
             object.push_str(",\"request_payload\":");
             push_string(&mut object, &hex(request_payload));
+            object.push_str(",\"responder\":");
+            push_option_string(&mut object, responder.as_deref());
             object.push_str(",\"response_payload\":");
             push_string(&mut object, &hex(response_payload));
         }
@@ -518,23 +521,42 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
             })
         }
         "support_discovery" => {
-            fields_exact(
-                object,
-                &[
-                    "schema",
-                    "version",
-                    "type",
-                    "sequence",
-                    "request_payload",
-                    "response_payload",
-                ],
-                line_number,
-            )?;
+            let responder = if object.contains_key("responder") {
+                fields_exact(
+                    object,
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "request_payload",
+                        "responder",
+                        "response_payload",
+                    ],
+                    line_number,
+                )?;
+                optional_string_field(object, "responder", line_number)?
+            } else {
+                fields_exact(
+                    object,
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "request_payload",
+                        "response_payload",
+                    ],
+                    line_number,
+                )?;
+                None
+            };
             Ok(CaptureEvent::SupportDiscovery {
                 request_payload: parse_hex(
                     &string_field(object, "request_payload", line_number)?,
                     line_number,
                 )?,
+                responder,
                 response_payload: parse_hex(
                     &string_field(object, "response_payload", line_number)?,
                     line_number,
@@ -1228,8 +1250,9 @@ mod tests {
                 250_000,
                 SubscriptionFilterOutcome::Scheduled,
             ),
-            CaptureEvent::support_discovery(
+            CaptureEvent::support_discovery_with_responder(
                 vec![0x01, 0x00],
+                Some("7E8".into()),
                 vec![0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
             ),
             CaptureEvent::responses_observed(
@@ -1348,6 +1371,7 @@ mod tests {
         sender
             .send(CaptureEvent::SupportDiscovery {
                 request_payload: vec![0x01, 0xab],
+                responder: None,
                 response_payload: vec![0x41, 0x00, 0x00, 0xff],
             })
             .await
@@ -1355,7 +1379,27 @@ mod tests {
         finish(sender, writer).await;
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"support_discovery\",\"sequence\":0,\"request_payload\":\"01 AB\",\"response_payload\":\"41 00 00 FF\"}\n"
+            "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"support_discovery\",\"sequence\":0,\"request_payload\":\"01 AB\",\"responder\":null,\"response_payload\":\"41 00 00 FF\"}\n"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accepts_legacy_support_discovery_without_responder() {
+        let path = temp_path("legacy-support-discovery");
+        fs::write(
+            &path,
+            "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"support_discovery\",\"sequence\":0,\"request_payload\":\"01 00\",\"response_payload\":\"41 00 80 00 00 01\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_events(&path).unwrap(),
+            vec![CaptureEvent::SupportDiscovery {
+                request_payload: vec![0x01, 0x00],
+                responder: None,
+                response_payload: vec![0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
+            }]
         );
         fs::remove_file(path).unwrap();
     }

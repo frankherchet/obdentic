@@ -129,6 +129,7 @@ pub enum CaptureEvent {
     },
     SupportDiscovery {
         request_payload: Vec<u8>,
+        responder: Option<String>,
         response_payload: Vec<u8>,
     },
     /// Preserves every normalized response before semantic selection. This
@@ -198,8 +199,17 @@ impl CaptureEvent {
     }
 
     pub fn support_discovery(request_payload: Vec<u8>, response_payload: Vec<u8>) -> Self {
+        Self::support_discovery_with_responder(request_payload, None, response_payload)
+    }
+
+    pub fn support_discovery_with_responder(
+        request_payload: Vec<u8>,
+        responder: Option<String>,
+        response_payload: Vec<u8>,
+    ) -> Self {
         Self::SupportDiscovery {
             request_payload,
+            responder,
             response_payload,
         }
     }
@@ -400,6 +410,30 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn support_discovery_preserves_optional_responder() {
+        assert_eq!(
+            CaptureEvent::support_discovery_with_responder(
+                vec![0x01, 0x00],
+                Some("7E8".into()),
+                vec![0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
+            ),
+            CaptureEvent::SupportDiscovery {
+                request_payload: vec![0x01, 0x00],
+                responder: Some("7E8".into()),
+                response_payload: vec![0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
+            }
+        );
+        assert_eq!(
+            CaptureEvent::support_discovery(vec![0x01, 0x00], vec![0x41, 0x00]),
+            CaptureEvent::SupportDiscovery {
+                request_payload: vec![0x01, 0x00],
+                responder: None,
+                response_payload: vec![0x41, 0x00],
+            }
+        );
     }
 
     #[test]

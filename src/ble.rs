@@ -367,13 +367,33 @@ pub async fn read_targeted(
 }
 
 pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
-    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
+    let mut session =
+        DiagnosticSession::connect_without_support_discovery(adapter_id, true).await?;
     let result = tokio::select! {
         identity = session.identify() => identity,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
     match (result, session.disconnect().await) {
         (Ok(identity), Ok(())) => Ok(identity),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
+/// Connect, initialize the adapter, and validate functional support with one
+/// bounded `0100` request. The returned observations retain each responder's
+/// adapter-level identity.
+pub async fn validate_functional_support(
+    adapter_id: &str,
+) -> Result<Vec<SupportDiscovery>, String> {
+    let mut session =
+        DiagnosticSession::connect_without_support_discovery(adapter_id, false).await?;
+    let result = tokio::select! {
+        support = session.validate_functional_support() => support,
+        _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
+    };
+    match (result, session.disconnect().await) {
+        (Ok(support), Ok(())) => Ok(support),
         (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
     }
@@ -641,9 +661,24 @@ impl DiagnosticSession {
         Self::connect_with_adapter_io(adapter_id, false).await
     }
 
+    async fn connect_without_support_discovery(
+        adapter_id: &str,
+        show_adapter_io: bool,
+    ) -> Result<Self, String> {
+        Self::connect_with_adapter_io_mode(adapter_id, show_adapter_io, false).await
+    }
+
     async fn connect_with_adapter_io(
         adapter_id: &str,
         show_adapter_io: bool,
+    ) -> Result<Self, String> {
+        Self::connect_with_adapter_io_mode(adapter_id, show_adapter_io, true).await
+    }
+
+    async fn connect_with_adapter_io_mode(
+        adapter_id: &str,
+        show_adapter_io: bool,
+        discover_support: bool,
     ) -> Result<Self, String> {
         let (manager, adapter) = central().await?;
         let peripheral = find_peripheral(&adapter, adapter_id).await?;
@@ -675,6 +710,9 @@ impl DiagnosticSession {
                 show_adapter_io,
             };
             session.initialize().await?;
+            if discover_support {
+                session.discover_support().await?;
+            }
             Ok(session)
         }
         .await;
@@ -707,6 +745,16 @@ impl DiagnosticSession {
         let response = exchange.exchange("0902\r", COMMAND_TIMEOUT).await?;
         let segments = normalize_mode09_segments(&response)?;
         crate::identity::decode_mode09_pid02(&segments).map_err(|error| error.to_string())
+    }
+
+    async fn validate_functional_support(&mut self) -> Result<Vec<SupportDiscovery>, String> {
+        let mut exchange = LiveExchange {
+            peripheral: &self.peripheral,
+            channel: &self.channel,
+            notifications: &mut self.notifications,
+            show_adapter_io: self.show_adapter_io,
+        };
+        validate_functional_support_exchange(&mut exchange).await
     }
 
     async fn read_with_evidence(&mut self, request: ReadRequest) -> ReadOutcome {
@@ -786,16 +834,23 @@ impl DiagnosticSession {
     }
 
     async fn initialize(&mut self) -> Result<(), String> {
-        let supported = {
-            let mut exchange = LiveExchange {
-                peripheral: &self.peripheral,
-                channel: &self.channel,
-                notifications: &mut self.notifications,
-                show_adapter_io: self.show_adapter_io,
-            };
-            initialize_elm(&mut exchange).await?
+        let mut exchange = LiveExchange {
+            peripheral: &self.peripheral,
+            channel: &self.channel,
+            notifications: &mut self.notifications,
+            show_adapter_io: self.show_adapter_io,
         };
-        self.supported = supported;
+        initialize_elm(&mut exchange).await
+    }
+
+    async fn discover_support(&mut self) -> Result<(), String> {
+        let mut exchange = LiveExchange {
+            peripheral: &self.peripheral,
+            channel: &self.channel,
+            notifications: &mut self.notifications,
+            show_adapter_io: self.show_adapter_io,
+        };
+        self.supported = discover_pid_support(&mut exchange).await?;
         Ok(())
     }
 
@@ -914,7 +969,7 @@ where
     }
 }
 
-async fn initialize_elm<E>(exchange: &mut E) -> Result<PidSupport, String>
+async fn initialize_elm<E>(exchange: &mut E) -> Result<(), String>
 where
     E: ElmExchange,
 {
@@ -945,7 +1000,7 @@ where
         let response = exchange.exchange(command, Duration::from_secs(3)).await?;
         require_response(&response, "OK", true, &format!("{} failed", command.trim()))?;
     }
-    discover_pid_support(exchange).await
+    Ok(())
 }
 
 async fn discover_pid_support<E>(exchange: &mut E) -> Result<PidSupport, String>
@@ -976,6 +1031,16 @@ where
         page = next_page;
     }
     Ok(PidSupport { pages, discovery })
+}
+
+async fn validate_functional_support_exchange<E>(
+    exchange: &mut E,
+) -> Result<Vec<SupportDiscovery>, String>
+where
+    E: ElmExchange,
+{
+    let response = exchange.exchange("0100\r", COMMAND_TIMEOUT).await?;
+    normalize_pid_support_page_with_evidence(&response, 0x00).map(|(_, observations)| observations)
 }
 
 #[cfg(test)]
@@ -1014,7 +1079,7 @@ where
             return Err(ReadEvidenceError {
                 error,
                 observations: Vec::new(),
-            })
+            });
         }
     };
     match first.unambiguous_payload(request.pid()) {
@@ -1035,7 +1100,7 @@ where
                             first.raw_response().escape_default()
                         ),
                         observations,
-                    })
+                    });
                 }
             };
             match retry.unambiguous_payload(request.pid()) {
@@ -1587,6 +1652,14 @@ mod tests {
         }
     }
 
+    async fn initialize_with_support<E>(exchange: &mut E) -> Result<PidSupport, String>
+    where
+        E: ElmExchange,
+    {
+        initialize_elm(exchange).await?;
+        discover_pid_support(exchange).await
+    }
+
     fn captured_responses() -> Vec<String> {
         [
             "ELM327 v1.4 v100\r>",
@@ -1962,6 +2035,49 @@ mod tests {
         assert_eq!(support.status(0x01), SignalSupportStatus::Supported);
     }
 
+    #[tokio::test]
+    async fn elm_initialization_does_not_probe_pid_support() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "ELM327 v1.4 v100\r>".into(),
+            "carly-universal v200\r>".into(),
+            "ELM327 v1.4 v100\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+            "OK\r>".into(),
+        ]);
+
+        initialize_elm(&mut exchange).await.unwrap();
+
+        assert_eq!(
+            exchange.commands,
+            ["ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r",]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_functional_validation_queries_once_and_preserves_responders() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>".into(),
+        ]);
+
+        let validation = validate_functional_support_exchange(&mut exchange)
+            .await
+            .unwrap();
+
+        assert_eq!(exchange.commands, ["0100\r"]);
+        assert_eq!(validation.len(), 2);
+        assert_eq!(
+            validation[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+        assert_eq!(
+            validation[1].responder,
+            Some(ResponderIdentity::ElmHeader("7E9".into()))
+        );
+    }
+
     #[test]
     fn assembles_fragmented_notifications_through_prompt_with_a_size_bound() {
         let mut response = Vec::new();
@@ -2007,7 +2123,7 @@ mod tests {
     async fn replays_captured_zero_rpm_session_in_exact_command_order() {
         let mut exchange = ScriptedExchange::captured(captured_responses());
         let request = crate::prepare_read("engine.rpm").unwrap();
-        let supported = initialize_elm(&mut exchange).await.unwrap();
+        let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
         let transaction = request
             .complete("user", read_elm(&mut exchange, request).await.unwrap())
@@ -2037,7 +2153,7 @@ mod tests {
         responses.push("410C0000\r>".into());
         let mut exchange = ScriptedExchange::captured(responses);
         let request = crate::prepare_read("engine.rpm").unwrap();
-        let supported = initialize_elm(&mut exchange).await.unwrap();
+        let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
 
         assert_eq!(
@@ -2185,7 +2301,7 @@ mod tests {
         responses.push(conflict.into());
         let mut exchange = ScriptedExchange::captured(responses);
         let request = crate::prepare_read("engine.rpm").unwrap();
-        let supported = initialize_elm(&mut exchange).await.unwrap();
+        let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
 
         let error = read_elm(&mut exchange, request).await.unwrap_err();
@@ -2200,7 +2316,7 @@ mod tests {
         responses[9] = "NO DATA\r>".into();
         let mut exchange = ScriptedExchange::captured(responses);
         let request = crate::prepare_read("engine.rpm").unwrap();
-        let supported = initialize_elm(&mut exchange).await.unwrap();
+        let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
 
         assert!(read_elm(&mut exchange, request).await.is_err());
@@ -2225,7 +2341,7 @@ mod tests {
             responses[9] = response.into();
             let mut exchange = ScriptedExchange::captured(responses);
             let request = crate::prepare_read(semantic).unwrap();
-            let supported = initialize_elm(&mut exchange).await.unwrap();
+            let supported = initialize_with_support(&mut exchange).await.unwrap();
             assert!(supports_pid(&supported, request.pid()));
             let transaction = request
                 .complete("user", read_elm(&mut exchange, request).await.unwrap())
@@ -2246,7 +2362,7 @@ mod tests {
         let rpm = crate::prepare_read("engine.rpm").unwrap();
         let coolant = crate::prepare_read("engine.coolant_temperature").unwrap();
 
-        let supported = initialize_elm(&mut exchange).await.unwrap();
+        let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, rpm.pid()));
         assert!(supports_pid(&supported, coolant.pid()));
         let rpm = rpm
@@ -2287,9 +2403,9 @@ mod tests {
 
             let request = crate::prepare_read("engine.rpm").unwrap();
             let failed = if index < INIT_COMMANDS.len() {
-                initialize_elm(&mut exchange).await.is_err()
+                initialize_with_support(&mut exchange).await.is_err()
             } else {
-                initialize_elm(&mut exchange).await.unwrap();
+                initialize_with_support(&mut exchange).await.unwrap();
                 read_elm(&mut exchange, request).await.is_err()
             };
             assert!(failed);

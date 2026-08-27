@@ -6,6 +6,7 @@ use crate::{
     },
     prepare_read,
     telemetry::TelemetryState,
+    vehicle_knowledge::{ReadRouting, RoutingDecision},
     ReadRequest,
 };
 use std::{
@@ -50,15 +51,74 @@ impl Subscription {
     }
 }
 
+/// A scheduler-ready observation carrying its closed functional/targeted route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservationPlan {
+    routing: ReadRouting,
+    interval: Duration,
+    interval_us: CaptureTimeUs,
+}
+
+impl ObservationPlan {
+    pub fn new(routing: ReadRouting, interval: Duration) -> Result<Self, String> {
+        if interval.is_zero() {
+            return Err("subscription interval must be greater than zero".into());
+        }
+        Ok(Self {
+            interval_us: duration_us(interval)?,
+            routing,
+            interval,
+        })
+    }
+
+    pub fn from_routing_decision(
+        decision: RoutingDecision,
+        interval: Duration,
+    ) -> Result<Self, String> {
+        let routing = ReadRouting::from_decision(decision).map_err(|error| error.to_string())?;
+        Self::new(routing, interval)
+    }
+
+    pub fn semantic(&self) -> &'static str {
+        self.routing.request().metadata().semantic
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub const fn interval_us(&self) -> CaptureTimeUs {
+        self.interval_us
+    }
+
+    pub fn routing(&self) -> &ReadRouting {
+        &self.routing
+    }
+
+    fn request(&self) -> ReadRequest {
+        self.routing.request()
+    }
+}
+
+impl From<Subscription> for ObservationPlan {
+    fn from(subscription: Subscription) -> Self {
+        Self {
+            routing: ReadRouting::Functional(subscription.request),
+            interval: subscription.interval,
+            interval_us: subscription.interval_us,
+        }
+    }
+}
+
 pub struct TelemetryScheduler {
     cancel: oneshot::Sender<()>,
     task: JoinHandle<Result<(), String>>,
 }
 
 impl TelemetryScheduler {
-    pub async fn start(
+    pub async fn start<Plan: Into<ObservationPlan>>(
         adapter_id: &str,
-        subscriptions: Vec<Subscription>,
+        subscriptions: Vec<Plan>,
         telemetry: Arc<Mutex<TelemetryState>>,
         audit: Arc<Mutex<AuditState>>,
         recorder: Option<mpsc::Sender<CaptureEvent>>,
@@ -68,6 +128,10 @@ impl TelemetryScheduler {
         if subscriptions.is_empty() {
             return Err("telemetry scheduler needs at least one subscription".into());
         }
+        let subscriptions = subscriptions
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
         let session = start_session(adapter_id).await?;
         let session_start = Instant::now();
         let started = CaptureEvent::capture_started(
@@ -107,7 +171,12 @@ impl TelemetryScheduler {
             .chain(std::iter::once(CaptureEvent::SessionInitialized))
             .chain(configured.into_iter().map(CaptureSubscription::into_event))
             .chain(discovery.into_iter().map(|page| {
-                CaptureEvent::support_discovery(page.request.into(), page.response.into())
+                CaptureEvent::support_discovery_with_responder(
+                    page.request.into(),
+                    page.responder
+                        .map(|responder| responder.as_str().to_owned()),
+                    page.response.into(),
+                )
             }));
         if let Err(error) = events.try_for_each(|event| emit(&recorder, event)) {
             let cleanup = session.shutdown().await;
@@ -143,7 +212,7 @@ impl TelemetryScheduler {
 
 async fn run(
     session: SessionClient,
-    subscriptions: Vec<Subscription>,
+    subscriptions: Vec<ObservationPlan>,
     telemetry: Arc<Mutex<TelemetryState>>,
     audit: Arc<Mutex<AuditState>>,
     recorder: Option<mpsc::Sender<CaptureEvent>>,
@@ -172,7 +241,7 @@ async fn run(
                     let due_us = offset_us(session_start, *due);
                     let read_started = Instant::now();
                     let started_us = offset_us(session_start, read_started);
-                    let outcome = session.read_with_evidence(subscription.request).await;
+                    let outcome = read_routed(&session, subscription.routing()).await;
                     let read_finished = Instant::now();
                     let finished_us = offset_us(session_start, read_finished);
                     let timing = ReadTiming::new(due_us, started_us, finished_us);
@@ -184,7 +253,7 @@ async fn run(
                             if let Err(error) = emit_response_observations(
                                 &recorder,
                                 subscription.semantic(),
-                                subscription.request,
+                                subscription.request(),
                                 observations,
                             ) {
                                 break 'scheduler Err(error);
@@ -207,7 +276,7 @@ async fn run(
                             if let Err(record_error) = emit_response_observations(
                                 &recorder,
                                 subscription.semantic(),
-                                subscription.request,
+                                subscription.request(),
                                 observations,
                             ) {
                                 break 'scheduler Err(record_error);
@@ -220,7 +289,7 @@ async fn run(
                                     subscription.semantic(),
                                     subscription.interval_us(),
                                     timing,
-                                    subscription.request.bytes().into(),
+                                    subscription.request().bytes().into(),
                                     &error,
                                 ) {
                                     break 'scheduler Err(record_error);
@@ -233,7 +302,7 @@ async fn run(
                                 subscription.semantic(),
                                 subscription.interval_us,
                                 timing,
-                                subscription.request.bytes().into(),
+                                subscription.request().bytes().into(),
                                 &error,
                             ) {
                                 break 'scheduler Err(error);
@@ -248,7 +317,7 @@ async fn run(
                                     subscription.semantic(),
                                     subscription.interval_us(),
                                     timing,
-                                    subscription.request.bytes().into(),
+                                    subscription.request().bytes().into(),
                                     &error,
                                 ) {
                                     break 'scheduler Err(record_error);
@@ -261,7 +330,7 @@ async fn run(
                                 subscription.semantic(),
                                 subscription.interval_us,
                                 timing,
-                                subscription.request.bytes().into(),
+                                subscription.request().bytes().into(),
                                 &error,
                             ) {
                                 break 'scheduler Err(error);
@@ -310,6 +379,24 @@ async fn run(
             .record_error(error);
     }
     result
+}
+
+async fn read_routed(
+    session: &SessionClient,
+    routing: &ReadRouting,
+) -> Result<ReadOutcome, String> {
+    match routing {
+        ReadRouting::Functional(request) => session.read_with_evidence(*request).await,
+        ReadRouting::Targeted(request) => {
+            session
+                .read_targeted(request.clone())
+                .await
+                .map(|transaction| ReadOutcome::Succeeded {
+                    transaction,
+                    observations: Vec::new(),
+                })
+        }
+    }
 }
 
 fn duration_us(duration: Duration) -> Result<CaptureTimeUs, String> {
@@ -422,6 +509,34 @@ fn emit(recorder: &Option<mpsc::Sender<CaptureEvent>>, event: CaptureEvent) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topology::{
+        AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
+        RequestAddress, RequestTarget, RequestTargetEvidence, ResponderIdentity, RoleAssignment,
+    };
+
+    fn targeted_decision() -> RoutingDecision {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let provenance = Provenance::new("scheduler test evidence", Confidence::High).unwrap();
+        RoutingDecision::Targeted {
+            request: crate::ble::TargetedReadRequest::new(
+                crate::prepare_read("engine.rpm").unwrap(),
+                RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0")),
+                crate::ble::ResponderIdentity::ElmHeader("7E8".into()),
+            )
+            .unwrap(),
+            mapping: crate::vehicle_knowledge::EcuTargetMapping::new(
+                RoleAssignment::new(EcuRole::Engine, provenance.clone()),
+                RequestTargetEvidence::new(
+                    RequestTarget::concrete(
+                        context.clone(),
+                        RequestAddress::new("elm-header", "7E0"),
+                    ),
+                    provenance.clone(),
+                ),
+                ResponderIdentity::address(context, "7E8"),
+            ),
+        }
+    }
 
     #[test]
     fn subscriptions_only_accept_known_read_only_signals_and_positive_intervals() {
@@ -433,6 +548,26 @@ mod tests {
         );
         assert!(Subscription::new("dtc.clear", Duration::from_secs(1)).is_err());
         assert!(Subscription::new("engine.rpm", Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn observation_plan_keeps_targeted_routes_and_explicit_functional_fallbacks() {
+        let targeted =
+            ObservationPlan::from_routing_decision(targeted_decision(), Duration::from_millis(200))
+                .unwrap();
+        assert!(matches!(targeted.routing(), ReadRouting::Targeted(_)));
+
+        let fallback = ObservationPlan::from_routing_decision(
+            RoutingDecision::FunctionalFallback {
+                request: crate::prepare_read("engine.rpm").unwrap(),
+                mapping: None,
+                reason: crate::vehicle_knowledge::RoutingReason::NoTargetMapping,
+            },
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(matches!(fallback.routing(), ReadRouting::Functional(_)));
+        assert_eq!(fallback.semantic(), "engine.rpm");
     }
 
     #[test]
