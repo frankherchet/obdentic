@@ -199,7 +199,7 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
         );
     }
     println!("capture record   {}", path.display());
-    println!("capture running  press Ctrl-C to stop");
+    println!("capture connecting...  wait for session initialization");
 
     let scheduler = match TelemetryScheduler::start(
         adapter_id,
@@ -219,6 +219,7 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
             return Err(error);
         }
     };
+    println!("capture running  press Ctrl-C to stop");
 
     let wait_result = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
