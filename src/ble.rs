@@ -1,4 +1,4 @@
-use crate::{read_transaction, DiagnosticTransport, ReadRequest, Transaction};
+use crate::{ReadRequest, Transaction};
 use btleplug::{
     api::{
         bleuuid::uuid_from_u16, Central, CharPropFlags, Characteristic, Manager as _,
@@ -7,7 +7,7 @@ use btleplug::{
     platform::{Adapter, Manager, Peripheral},
 };
 use futures_util::{Stream, StreamExt};
-use std::time::Duration;
+use std::{pin::Pin, time::Duration};
 use tokio::time::{sleep, timeout};
 
 const CARLY_SERVICE: u16 = 0xFFE0;
@@ -59,45 +59,110 @@ pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
 }
 
 pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction, String> {
-    let (_manager, adapter) = central().await?;
-    let peripheral = find_peripheral(&adapter, adapter_id).await?;
+    let mut session = DiagnosticSession::connect(adapter_id).await?;
     let result = tokio::select! {
-        transaction = connect_and_read(&peripheral, request) => transaction,
+        transaction = session.read(request) => transaction,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    finish_disconnect(&peripheral, result).await
-}
-
-async fn connect_and_read(
-    peripheral: &Peripheral,
-    request: ReadRequest,
-) -> Result<Transaction, String> {
-    timeout(CONNECT_TIMEOUT, peripheral.connect())
-        .await
-        .map_err(|_| "Bluetooth connection timed out".to_string())?
-        .map_err(|error| format!("Bluetooth connection failed: {error}"))?;
-    timeout(SETUP_TIMEOUT, peripheral.discover_services())
-        .await
-        .map_err(|_| "BLE service discovery timed out".to_string())?
-        .map_err(|error| format!("BLE service discovery failed: {error}"))?;
-    let channel = carly_channel(peripheral)?;
-    run_session(peripheral, &channel, request).await
-}
-
-async fn finish_disconnect(
-    peripheral: &Peripheral,
-    result: Result<Transaction, String>,
-) -> Result<Transaction, String> {
-    let disconnected = timeout(CONNECT_TIMEOUT, peripheral.disconnect())
-        .await
-        .map_err(|_| "Bluetooth disconnect timed out".to_string())
-        .and_then(|result| result.map_err(|error| format!("Bluetooth disconnect failed: {error}")));
-
-    match (result, disconnected) {
+    match (result, session.disconnect().await) {
         (Ok(transaction), Ok(())) => Ok(transaction),
         (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
     }
+}
+
+type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
+
+/// One connected, initialized, read-only Carly diagnostic path.
+pub struct DiagnosticSession {
+    _manager: Manager,
+    peripheral: Peripheral,
+    channel: Characteristic,
+    notifications: Notifications,
+    supported: Vec<u8>,
+}
+
+impl DiagnosticSession {
+    pub async fn connect(adapter_id: &str) -> Result<Self, String> {
+        let (manager, adapter) = central().await?;
+        let peripheral = find_peripheral(&adapter, adapter_id).await?;
+        let cleanup_peripheral = peripheral.clone();
+        let result = async {
+            timeout(CONNECT_TIMEOUT, peripheral.connect())
+                .await
+                .map_err(|_| "Bluetooth connection timed out".to_string())?
+                .map_err(|error| format!("Bluetooth connection failed: {error}"))?;
+            timeout(SETUP_TIMEOUT, peripheral.discover_services())
+                .await
+                .map_err(|_| "BLE service discovery timed out".to_string())?
+                .map_err(|error| format!("BLE service discovery failed: {error}"))?;
+            let channel = carly_channel(&peripheral)?;
+            timeout(SETUP_TIMEOUT, peripheral.subscribe(&channel))
+                .await
+                .map_err(|_| "Carly notification activation timed out".to_string())?
+                .map_err(|error| format!("Carly notifications unavailable: {error}"))?;
+            let notifications = timeout(SETUP_TIMEOUT, peripheral.notifications())
+                .await
+                .map_err(|_| "Carly notification stream timed out".to_string())?
+                .map_err(|error| format!("Carly notification stream unavailable: {error}"))?;
+            let mut session = Self {
+                _manager: manager,
+                peripheral,
+                channel,
+                notifications,
+                supported: Vec::new(),
+            };
+            session.initialize().await?;
+            Ok(session)
+        }
+        .await;
+        if result.is_err() {
+            best_effort_disconnect(&cleanup_peripheral).await;
+        }
+        result
+    }
+
+    pub async fn read(&mut self, request: ReadRequest) -> Result<Transaction, String> {
+        if !supports_pid(&self.supported, request.pid()) {
+            return Err(format!(
+                "vehicle does not advertise support for {}",
+                crate::hex(&request.bytes())
+            ));
+        }
+        let response = {
+            let mut exchange = LiveExchange {
+                peripheral: &self.peripheral,
+                channel: &self.channel,
+                notifications: &mut self.notifications,
+            };
+            read_elm(&mut exchange, request).await?
+        };
+        request.complete("user", response)
+    }
+
+    pub async fn disconnect(&mut self) -> Result<(), String> {
+        timeout(CONNECT_TIMEOUT, self.peripheral.disconnect())
+            .await
+            .map_err(|_| "Bluetooth disconnect timed out".to_string())?
+            .map_err(|error| format!("Bluetooth disconnect failed: {error}"))
+    }
+
+    async fn initialize(&mut self) -> Result<(), String> {
+        let supported = {
+            let mut exchange = LiveExchange {
+                peripheral: &self.peripheral,
+                channel: &self.channel,
+                notifications: &mut self.notifications,
+            };
+            initialize_elm(&mut exchange).await?
+        };
+        self.supported = supported;
+        Ok(())
+    }
+}
+
+async fn best_effort_disconnect(peripheral: &Peripheral) {
+    let _ = timeout(CONNECT_TIMEOUT, peripheral.disconnect()).await;
 }
 
 async fn central() -> Result<(Manager, Adapter), String> {
@@ -164,30 +229,6 @@ fn carly_channel(peripheral: &Peripheral) -> Result<Characteristic, String> {
     Ok(channel)
 }
 
-async fn run_session(
-    peripheral: &Peripheral,
-    channel: &Characteristic,
-    request: ReadRequest,
-) -> Result<Transaction, String> {
-    timeout(SETUP_TIMEOUT, peripheral.subscribe(channel))
-        .await
-        .map_err(|_| "Carly notification activation timed out".to_string())?
-        .map_err(|error| format!("Carly notifications unavailable: {error}"))?;
-    let mut notifications = timeout(SETUP_TIMEOUT, peripheral.notifications())
-        .await
-        .map_err(|_| "Carly notification stream timed out".to_string())?
-        .map_err(|error| format!("Carly notification stream unavailable: {error}"))?;
-    let mut exchange = LiveExchange {
-        peripheral,
-        channel,
-        notifications: &mut notifications,
-    };
-    let mut transport = ElmTransport {
-        exchange: &mut exchange,
-    };
-    read_transaction(&mut transport, request).await
-}
-
 trait ElmExchange {
     async fn exchange(
         &mut self,
@@ -222,20 +263,7 @@ where
     }
 }
 
-struct ElmTransport<'a, E> {
-    exchange: &'a mut E,
-}
-
-impl<E> DiagnosticTransport for ElmTransport<'_, E>
-where
-    E: ElmExchange,
-{
-    async fn read(&mut self, request: ReadRequest) -> Result<Vec<u8>, String> {
-        run_elm_session(self.exchange, request).await
-    }
-}
-
-async fn run_elm_session<E>(exchange: &mut E, request: ReadRequest) -> Result<Vec<u8>, String>
+async fn initialize_elm<E>(exchange: &mut E) -> Result<Vec<u8>, String>
 where
     E: ElmExchange,
 {
@@ -265,14 +293,13 @@ where
         require_response(&response, "OK", true, &format!("{} failed", command.trim()))?;
     }
     let protocols = exchange.exchange("0100\r", Duration::from_secs(10)).await?;
-    let supported = normalize_pid_support(&protocols)?;
-    if !supports_pid(&supported, request.pid()) {
-        return Err(format!(
-            "vehicle does not advertise support for {}",
-            crate::hex(&request.bytes())
-        ));
-    }
+    normalize_pid_support(&protocols)
+}
 
+async fn read_elm<E>(exchange: &mut E, request: ReadRequest) -> Result<Vec<u8>, String>
+where
+    E: ElmExchange,
+{
     let command = obd_command(request);
     let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
     normalize_mode01(&response, request.pid(), request.data_len())
@@ -481,9 +508,8 @@ mod tests {
     use super::*;
     use std::collections::{BTreeSet, VecDeque};
 
-    const SESSION_COMMANDS: [&str; 10] = [
+    const INIT_COMMANDS: [&str; 9] = [
         "ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS0\r", "ATH0\r", "ATSP0\r", "0100\r",
-        "010C\r",
     ];
 
     struct ScriptedExchange {
@@ -640,16 +666,15 @@ mod tests {
     #[tokio::test]
     async fn replays_captured_zero_rpm_session_in_exact_command_order() {
         let mut exchange = ScriptedExchange::captured(captured_responses());
-        let transaction = {
-            let mut transport = ElmTransport {
-                exchange: &mut exchange,
-            };
-            read_transaction(&mut transport, crate::prepare_read("engine.rpm").unwrap())
-                .await
-                .unwrap()
-        };
+        let request = crate::prepare_read("engine.rpm").unwrap();
+        let supported = initialize_elm(&mut exchange).await.unwrap();
+        assert!(supports_pid(&supported, request.pid()));
+        let transaction = request
+            .complete("user", read_elm(&mut exchange, request).await.unwrap())
+            .unwrap();
 
-        assert_eq!(exchange.commands, SESSION_COMMANDS);
+        assert_eq!(exchange.commands[..9], INIT_COMMANDS);
+        assert_eq!(exchange.commands[9], "010C\r");
         assert_eq!(transaction.response(), [0x41, 0x0c, 0x00, 0x00]);
         assert_eq!(transaction.value(), 0.0);
 
@@ -682,21 +707,52 @@ mod tests {
             responses[8] = "410008190000\r>".into();
             responses[9] = response.into();
             let mut exchange = ScriptedExchange::captured(responses);
+            let request = crate::prepare_read(semantic).unwrap();
+            let supported = initialize_elm(&mut exchange).await.unwrap();
+            assert!(supports_pid(&supported, request.pid()));
+            let transaction = request
+                .complete("user", read_elm(&mut exchange, request).await.unwrap())
+                .unwrap();
 
-            let transaction = {
-                let mut transport = ElmTransport {
-                    exchange: &mut exchange,
-                };
-                read_transaction(&mut transport, crate::prepare_read(semantic).unwrap())
-                    .await
-                    .unwrap()
-            };
-
-            assert_eq!(exchange.commands[..9], SESSION_COMMANDS[..9]);
+            assert_eq!(exchange.commands[..9], INIT_COMMANDS);
             assert_eq!(exchange.commands[9], command);
             assert_eq!(transaction.value(), value);
             assert_eq!(transaction.unit(), unit);
         }
+    }
+
+    #[tokio::test]
+    async fn initialization_and_pid_support_are_cached_across_sequential_reads() {
+        let mut responses = captured_responses();
+        responses.push("41055A\r>".into());
+        let mut exchange = ScriptedExchange::captured(responses);
+        let rpm = crate::prepare_read("engine.rpm").unwrap();
+        let coolant = crate::prepare_read("engine.coolant_temperature").unwrap();
+
+        let supported = initialize_elm(&mut exchange).await.unwrap();
+        assert!(supports_pid(&supported, rpm.pid()));
+        assert!(supports_pid(&supported, coolant.pid()));
+        let rpm = rpm
+            .complete("user", read_elm(&mut exchange, rpm).await.unwrap())
+            .unwrap();
+        let coolant = coolant
+            .complete("user", read_elm(&mut exchange, coolant).await.unwrap())
+            .unwrap();
+
+        assert_eq!(rpm.value(), 0.0);
+        assert_eq!(coolant.value(), 50.0);
+        assert_eq!(
+            exchange.commands,
+            [INIT_COMMANDS.as_slice(), &["010C\r", "0105\r"],].concat()
+        );
+        assert_eq!(
+            exchange
+                .commands
+                .iter()
+                .filter(|command| *command == "0100\r")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -712,16 +768,18 @@ mod tests {
             responses[index] = response.into();
             let mut exchange = ScriptedExchange::captured(responses);
 
-            let failed = {
-                let mut transport = ElmTransport {
-                    exchange: &mut exchange,
-                };
-                read_transaction(&mut transport, crate::prepare_read("engine.rpm").unwrap())
-                    .await
-                    .is_err()
+            let request = crate::prepare_read("engine.rpm").unwrap();
+            let failed = if index < INIT_COMMANDS.len() {
+                initialize_elm(&mut exchange).await.is_err()
+            } else {
+                initialize_elm(&mut exchange).await.unwrap();
+                read_elm(&mut exchange, request).await.is_err()
             };
             assert!(failed);
-            assert_eq!(exchange.commands, SESSION_COMMANDS[..=index]);
+            assert_eq!(
+                exchange.commands,
+                [INIT_COMMANDS.as_slice(), &["010C\r"]][..].concat()[..=index]
+            );
         }
     }
 }
