@@ -25,6 +25,7 @@ pub mod telemetry;
 pub mod topology;
 pub mod tui;
 pub mod vehicle;
+pub mod vehicle_cache;
 pub mod vehicle_knowledge;
 
 pub use identity::{
