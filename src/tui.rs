@@ -500,7 +500,7 @@ fn sparkline_values(history: Option<&VecDeque<Sample>>) -> Vec<u64> {
         .iter()
         .map(|sample| {
             if span == 0.0 {
-                100
+                1
             } else {
                 ((sample.value - minimum) * 100.0 / span) as u64
             }
@@ -707,6 +707,14 @@ mod tests {
             },
         ]);
         assert_eq!(sparkline_values(Some(&history)), [0, 100, 50]);
+        assert_eq!(
+            sparkline_values(Some(&VecDeque::from([Sample {
+                timestamp_ms: 1_000,
+                value: 0.0,
+                unit: "rpm",
+            }]))),
+            [1]
+        );
         assert_eq!(
             time_points_from(&history, 1_000),
             [(0.0, 1.0), (1.5, 3.0), (5.0, 2.0)]

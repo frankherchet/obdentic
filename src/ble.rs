@@ -60,7 +60,7 @@ pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
 }
 
 pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction, String> {
-    let mut session = DiagnosticSession::connect(adapter_id).await?;
+    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
     let result = tokio::select! {
         transaction = session.read(request) => transaction,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
@@ -145,10 +145,18 @@ pub struct DiagnosticSession {
     channel: Characteristic,
     notifications: Notifications,
     supported: Vec<u8>,
+    show_adapter_io: bool,
 }
 
 impl DiagnosticSession {
     pub async fn connect(adapter_id: &str) -> Result<Self, String> {
+        Self::connect_with_adapter_io(adapter_id, false).await
+    }
+
+    async fn connect_with_adapter_io(
+        adapter_id: &str,
+        show_adapter_io: bool,
+    ) -> Result<Self, String> {
         let (manager, adapter) = central().await?;
         let peripheral = find_peripheral(&adapter, adapter_id).await?;
         let cleanup_peripheral = peripheral.clone();
@@ -176,6 +184,7 @@ impl DiagnosticSession {
                 channel,
                 notifications,
                 supported: Vec::new(),
+                show_adapter_io,
             };
             session.initialize().await?;
             Ok(session)
@@ -199,6 +208,7 @@ impl DiagnosticSession {
                 peripheral: &self.peripheral,
                 channel: &self.channel,
                 notifications: &mut self.notifications,
+                show_adapter_io: self.show_adapter_io,
             };
             read_elm(&mut exchange, request).await?
         };
@@ -218,6 +228,7 @@ impl DiagnosticSession {
                 peripheral: &self.peripheral,
                 channel: &self.channel,
                 notifications: &mut self.notifications,
+                show_adapter_io: self.show_adapter_io,
             };
             initialize_elm(&mut exchange).await?
         };
@@ -306,6 +317,7 @@ struct LiveExchange<'a, S> {
     peripheral: &'a Peripheral,
     channel: &'a Characteristic,
     notifications: &'a mut S,
+    show_adapter_io: bool,
 }
 
 impl<S> ElmExchange for LiveExchange<'_, S>
@@ -323,6 +335,7 @@ where
             self.notifications,
             command,
             command_timeout,
+            self.show_adapter_io,
         )
         .await
     }
@@ -384,6 +397,7 @@ async fn elm_exchange<S>(
     notifications: &mut S,
     command: &str,
     command_timeout: Duration,
+    show_adapter_io: bool,
 ) -> Result<String, String>
 where
     S: Stream<Item = ValueNotification> + Unpin,
@@ -403,13 +417,25 @@ where
     .await
     .map_err(|_| format!("Carly write timed out: {}", command.trim()))?
     .map_err(|error| format!("Carly write failed: {error}"))?;
-    println!("adapter tx  {}", command.trim());
+    if let Some(line) = adapter_io_line(show_adapter_io, "tx", command.trim()) {
+        println!("{line}");
+    }
 
     let response = timeout(command_timeout, wait_for_prompt(notifications, channel))
         .await
         .map_err(|_| format!("Carly command timed out: {}", command.trim()))??;
-    println!("adapter rx  {}", response.escape_default());
+    if let Some(line) = adapter_io_line(show_adapter_io, "rx", response.escape_default()) {
+        println!("{line}");
+    }
     Ok(response)
+}
+
+fn adapter_io_line(
+    show_adapter_io: bool,
+    direction: &str,
+    value: impl std::fmt::Display,
+) -> Option<String> {
+    show_adapter_io.then(|| format!("adapter {direction}  {value}"))
 }
 
 async fn wait_for_prompt<S>(
@@ -728,6 +754,19 @@ mod tests {
         assert!(normalize_mode01("41 0C ZZ 00\r>", 0x0c, 2).is_err());
         assert!(require_response("OK\rERROR\r>", "OK", true, "command failed").is_err());
         assert!(require_response("NOTCARLY\r>", "CARLY-UNIVERSAL", false, "identity").is_err());
+    }
+
+    #[test]
+    fn suppresses_adapter_io_for_live_sessions_but_keeps_one_shot_format() {
+        assert_eq!(adapter_io_line(false, "tx", "010C"), None);
+        assert_eq!(
+            adapter_io_line(true, "tx", "010C"),
+            Some("adapter tx  010C".into())
+        );
+        assert_eq!(
+            adapter_io_line(true, "rx", "410C0000\\r>"),
+            Some("adapter rx  410C0000\\r>".into())
+        );
     }
 
     #[test]
