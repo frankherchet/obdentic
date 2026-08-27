@@ -564,23 +564,17 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => return Err(format!("line {line_number}: responses must be an array")),
             };
-            if responses.is_empty() {
-                return Err(format!("line {line_number}: responses must not be empty"));
-            }
-            Ok(CaptureEvent::ResponsesObserved {
-                semantic: string_field(object, "semantic", line_number)?,
-                request_payload: parse_hex(
+            CaptureEvent::responses_observed(
+                string_field(object, "semantic", line_number)?,
+                parse_hex(
                     &string_field(object, "request_payload", line_number)?,
                     line_number,
                 )?,
                 responses,
-                selected_responder: optional_string_field(
-                    object,
-                    "selected_responder",
-                    line_number,
-                )?,
-                selection_error: optional_string_field(object, "selection_error", line_number)?,
-            })
+                optional_string_field(object, "selected_responder", line_number)?,
+                optional_string_field(object, "selection_error", line_number)?,
+            )
+            .map_err(|error| format!("line {line_number}: {error}"))
         }
         "read_succeeded" => {
             fields_exact(
@@ -1408,6 +1402,14 @@ mod tests {
         assert!(read(&path)
             .unwrap_err()
             .contains("unknown subscription filter outcome"));
+        fs::write(
+            &path,
+            "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"responses_observed\",\"sequence\":0,\"semantic\":\"engine.rpm\",\"request_payload\":\"01 0C\",\"responses\":[],\"selected_responder\":null,\"selection_error\":null}\n",
+        )
+        .unwrap();
+        assert!(read(&path)
+            .unwrap_err()
+            .contains("observed response list must not be empty"));
         fs::remove_file(path).unwrap();
     }
 

@@ -104,6 +104,34 @@ pub struct DiagnosticResponses {
     raw_response: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResponseObservation {
+    pub(crate) responses: Vec<crate::capture_events::ResponderEvidence>,
+    pub(crate) selected_responder: Option<String>,
+    pub(crate) selection_error: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReadOutcome {
+    Succeeded {
+        transaction: Transaction,
+        observations: Vec<ResponseObservation>,
+    },
+    Failed {
+        error: String,
+        observations: Vec<ResponseObservation>,
+    },
+}
+
+impl ReadOutcome {
+    fn into_transaction(self) -> Result<Transaction, String> {
+        match self {
+            Self::Succeeded { transaction, .. } => Ok(transaction),
+            Self::Failed { error, .. } => Err(error),
+        }
+    }
+}
+
 impl DiagnosticResponses {
     fn new(responses: Vec<DiagnosticResponse>, raw_response: &str) -> Self {
         Self {
@@ -135,6 +163,24 @@ impl DiagnosticResponses {
                 payload: response.payload.clone(),
             })
             .collect()
+    }
+
+    fn observation(&self, selection_error: Option<String>) -> ResponseObservation {
+        let selected_responder = self
+            .responses
+            .first()
+            .and_then(|response| response.responder.as_ref())
+            .filter(|first| {
+                self.responses
+                    .iter()
+                    .all(|response| response.responder.as_ref() == Some(*first))
+            })
+            .map(|responder| responder.as_str().to_owned());
+        ResponseObservation {
+            responses: self.capture_evidence(),
+            selected_responder,
+            selection_error,
+        }
     }
 
     /// Select only a known responder. No value-based fallback is permitted.
@@ -222,7 +268,7 @@ pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
 pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction, String> {
     let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
     let result = tokio::select! {
-        transaction = session.read(request) => transaction,
+        outcome = session.read_with_evidence(request) => outcome.into_transaction(),
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
     match (result, session.disconnect().await) {
@@ -257,6 +303,13 @@ pub struct SessionClient {
 
 impl SessionClient {
     pub async fn read(&self, request: ReadRequest) -> Result<Transaction, String> {
+        self.read_with_evidence(request).await?.into_transaction()
+    }
+
+    pub(crate) async fn read_with_evidence(
+        &self,
+        request: ReadRequest,
+    ) -> Result<ReadOutcome, String> {
         let (reply, result) = oneshot::channel();
         self.sender
             .send(SessionCommand::Read { request, reply })
@@ -293,7 +346,7 @@ impl SessionClient {
 enum SessionCommand {
     Read {
         request: ReadRequest,
-        reply: oneshot::Sender<Result<Transaction, String>>,
+        reply: oneshot::Sender<Result<ReadOutcome, String>>,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), String>>,
@@ -316,19 +369,29 @@ async fn session_actor(
                     let _ = reply.send(Err(error.to_owned()));
                     continue;
                 }
-                match session.read(request).await {
-                    Ok(transaction) => {
+                let outcome = session.read_with_evidence(request).await;
+                match outcome {
+                    ReadOutcome::Succeeded { .. } => {
                         health.success();
-                        let _ = reply.send(Ok(transaction));
+                        let _ = reply.send(Ok(outcome));
                     }
-                    Err(error) => {
+                    ReadOutcome::Failed {
+                        error,
+                        observations,
+                    } => {
                         if health.observe(&error) {
                             let fatal = health.unhealthy().unwrap().to_owned();
                             session.disconnect_best_effort().await;
                             disconnect_done = true;
-                            let _ = reply.send(Err(fatal));
+                            let _ = reply.send(Ok(ReadOutcome::Failed {
+                                error: fatal,
+                                observations,
+                            }));
                         } else {
-                            let _ = reply.send(Err(error));
+                            let _ = reply.send(Ok(ReadOutcome::Failed {
+                                error,
+                                observations,
+                            }));
                         }
                     }
                 }
@@ -461,22 +524,44 @@ impl DiagnosticSession {
     }
 
     pub async fn read(&mut self, request: ReadRequest) -> Result<Transaction, String> {
+        self.read_with_evidence(request).await.into_transaction()
+    }
+
+    async fn read_with_evidence(&mut self, request: ReadRequest) -> ReadOutcome {
         if !supports_pid(&self.supported, request.pid()) {
-            return Err(format!(
-                "vehicle does not advertise support for {}",
-                crate::hex(&request.bytes())
-            ));
+            return ReadOutcome::Failed {
+                error: format!(
+                    "vehicle does not advertise support for {}",
+                    crate::hex(&request.bytes())
+                ),
+                observations: Vec::new(),
+            };
         }
-        let response = {
+        let read = {
             let mut exchange = LiveExchange {
                 peripheral: &self.peripheral,
                 channel: &self.channel,
                 notifications: &mut self.notifications,
                 show_adapter_io: self.show_adapter_io,
             };
-            read_elm(&mut exchange, request).await?
+            read_elm_with_evidence(&mut exchange, request).await
         };
-        request.complete("user", response)
+        match read {
+            Ok(read) => match request.complete("user", read.payload) {
+                Ok(transaction) => ReadOutcome::Succeeded {
+                    transaction,
+                    observations: read.observations,
+                },
+                Err(error) => ReadOutcome::Failed {
+                    error,
+                    observations: read.observations,
+                },
+            },
+            Err(error) => ReadOutcome::Failed {
+                error: error.error,
+                observations: error.observations,
+            },
+        }
     }
 
     pub async fn disconnect(&mut self) -> Result<(), String> {
@@ -687,35 +772,91 @@ where
     Ok(PidSupport { pages, discovery })
 }
 
+#[cfg(test)]
 async fn read_elm<E>(exchange: &mut E, request: ReadRequest) -> Result<Vec<u8>, String>
 where
     E: ElmExchange,
 {
-    let first = read_elm_responses(exchange, request).await?;
+    read_elm_with_evidence(exchange, request)
+        .await
+        .map(|read| read.payload)
+        .map_err(|error| error.error)
+}
+
+#[derive(Debug)]
+struct ReadEvidence {
+    payload: Vec<u8>,
+    observations: Vec<ResponseObservation>,
+}
+
+#[derive(Debug)]
+struct ReadEvidenceError {
+    error: String,
+    observations: Vec<ResponseObservation>,
+}
+
+async fn read_elm_with_evidence<E>(
+    exchange: &mut E,
+    request: ReadRequest,
+) -> Result<ReadEvidence, ReadEvidenceError>
+where
+    E: ElmExchange,
+{
+    let first = match read_elm_responses(exchange, request).await {
+        Ok(first) => first,
+        Err(error) => {
+            return Err(ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })
+        }
+    };
     match first.unambiguous_payload(request.pid()) {
-        Ok(payload) => Ok(payload),
+        Ok(payload) => Ok(ReadEvidence {
+            payload,
+            observations: vec![first.observation(None)],
+        }),
         Err(error)
             if error.starts_with(&format!("conflicting 01{:02X} responses", request.pid())) =>
         {
-            let retry = read_elm_responses(exchange, request)
-                .await
-                .map_err(|retry_error| {
-                    format!(
-                        "{error}; first ELM response={}; retry failed: {retry_error}",
-                        first.raw_response().escape_default()
-                    )
-                })?;
-            retry
-                .unambiguous_payload(request.pid())
-                .map_err(|retry_error| {
-                    format!(
-                        "{retry_error}; first ELM response={}; retry ELM response={}",
-                        first.raw_response().escape_default(),
-                        retry.raw_response().escape_default()
-                    )
-                })
+            let mut observations = vec![first.observation(Some(error.clone()))];
+            let retry = match read_elm_responses(exchange, request).await {
+                Ok(retry) => retry,
+                Err(retry_error) => {
+                    return Err(ReadEvidenceError {
+                        error: format!(
+                            "{error}; first ELM response={}; retry failed: {retry_error}",
+                            first.raw_response().escape_default()
+                        ),
+                        observations,
+                    })
+                }
+            };
+            match retry.unambiguous_payload(request.pid()) {
+                Ok(payload) => {
+                    observations.push(retry.observation(None));
+                    Ok(ReadEvidence {
+                        payload,
+                        observations,
+                    })
+                }
+                Err(retry_error) => {
+                    observations.push(retry.observation(Some(retry_error.clone())));
+                    Err(ReadEvidenceError {
+                        error: format!(
+                            "{retry_error}; first ELM response={}; retry ELM response={}",
+                            first.raw_response().escape_default(),
+                            retry.raw_response().escape_default()
+                        ),
+                        observations,
+                    })
+                }
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(ReadEvidenceError {
+            error: error.clone(),
+            observations: vec![first.observation(Some(error))],
+        }),
     }
 }
 
@@ -1096,7 +1237,10 @@ mod tests {
                             [0x01, 0x05] => vec![0x41, 0x05, 0x5a],
                             _ => unreachable!("closed test request vocabulary"),
                         };
-                        let _ = reply.send(request.complete("user", response));
+                        let _ = reply.send(Ok(ReadOutcome::Succeeded {
+                            transaction: request.complete("user", response).unwrap(),
+                            observations: Vec::new(),
+                        }));
                     }
                     SessionCommand::Shutdown { reply } => {
                         let _ = reply.send(Ok(()));
@@ -1453,6 +1597,48 @@ mod tests {
             vec![0x41, 0x0c, 0x00, 0x00]
         );
         assert_eq!(&exchange.commands[9..], ["010C\r", "010C\r"]);
+    }
+
+    #[tokio::test]
+    async fn read_evidence_preserves_responder_and_payload_before_decode() {
+        let mut exchange = ScriptedExchange::captured(vec!["7e8 04 41 0C 00 00 00 00\r>".into()]);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+
+        let read = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap();
+
+        assert_eq!(read.observations.len(), 1);
+        assert_eq!(
+            read.observations[0].responses,
+            vec![crate::capture_events::ResponderEvidence {
+                responder: Some("7E8".into()),
+                payload: vec![0x41, 0x0c, 0x00, 0x00],
+            }]
+        );
+        assert_eq!(
+            read.observations[0].selected_responder.as_deref(),
+            Some("7E8")
+        );
+        assert_eq!(read.payload, vec![0x41, 0x0c, 0x00, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn read_evidence_keeps_both_attempts_when_conflict_remains() {
+        let conflict = "7E8 04 41 0C 00 00 00 00\r7E9 04 41 0C 00 04 00 00\r>";
+        let mut exchange = ScriptedExchange::captured(vec![conflict.into(), conflict.into()]);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+
+        let failure = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.observations.len(), 2);
+        assert_eq!(failure.observations[0].responses.len(), 2);
+        assert_eq!(failure.observations[1].responses.len(), 2);
+        assert_eq!(failure.observations[0].selected_responder, None);
+        assert!(failure.observations[0].selection_error.is_some());
+        assert!(failure.error.contains("conflicting 010C responses"));
     }
 
     #[tokio::test]

@@ -15,14 +15,20 @@ pub mod capture;
 pub mod capture_events;
 pub mod capture_report;
 pub mod evidence;
+pub mod identity;
 pub mod jsonl_capture;
 pub mod protocol;
 pub mod scheduler;
 pub mod subscription_policy;
 pub mod telemetry;
+pub mod topology;
 pub mod tui;
 pub mod vehicle;
 
+pub use identity::{
+    decode_mode09_pid02, IdentityDecodeError, IdentitySource, Provenance, VehicleIdentity, Vin,
+    VinError, MODE09_PID02_REQUEST,
+};
 pub use vehicle::{supported_profiles, ProfileMetadata, SignalMetadata};
 
 /// The complete, read-only request vocabulary exposed by the diagnostic core.

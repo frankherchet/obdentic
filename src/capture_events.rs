@@ -217,6 +217,9 @@ impl CaptureEvent {
         if responses.is_empty() {
             return Err("observed response list must not be empty".into());
         }
+        if responses.iter().any(|response| response.payload.is_empty()) {
+            return Err("observed response payload must not be empty".into());
+        }
         Ok(Self::ResponsesObserved {
             semantic: semantic.into(),
             request_payload,
@@ -397,5 +400,38 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn responses_observed_rejects_empty_request_or_evidence() {
+        let response = ResponderEvidence::new(Some("7E8".into()), vec![0x41, 0x0c]).unwrap();
+        assert!(CaptureEvent::responses_observed(
+            "engine.rpm",
+            Vec::new(),
+            vec![response.clone()],
+            None,
+            None,
+        )
+        .is_err());
+        assert!(CaptureEvent::responses_observed(
+            "engine.rpm",
+            vec![0x01, 0x0c],
+            Vec::new(),
+            None,
+            None,
+        )
+        .is_err());
+        assert!(CaptureEvent::responses_observed(
+            "engine.rpm",
+            vec![0x01, 0x0c],
+            vec![ResponderEvidence {
+                responder: Some("7E8".into()),
+                payload: Vec::new(),
+            }],
+            None,
+            None,
+        )
+        .is_err());
+        assert!(ResponderEvidence::new(Some("7E8".into()), Vec::new()).is_err());
     }
 }

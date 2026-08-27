@@ -1,6 +1,6 @@
 use crate::{
     audit::AuditState,
-    ble::{is_session_unhealthy, start_session, SessionClient},
+    ble::{is_session_unhealthy, start_session, ReadOutcome, ResponseObservation, SessionClient},
     capture_events::{
         CaptureEvent, CaptureSubscription, CaptureTimeUs, ReadTiming, SubscriptionFilterOutcome,
     },
@@ -172,12 +172,23 @@ async fn run(
                     let due_us = offset_us(session_start, *due);
                     let read_started = Instant::now();
                     let started_us = offset_us(session_start, read_started);
-                    let outcome = session.read(subscription.request).await;
+                    let outcome = session.read_with_evidence(subscription.request).await;
                     let read_finished = Instant::now();
                     let finished_us = offset_us(session_start, read_finished);
                     let timing = ReadTiming::new(due_us, started_us, finished_us);
                     match outcome {
-                        Ok(transaction) => {
+                        Ok(ReadOutcome::Succeeded {
+                            transaction,
+                            observations,
+                        }) => {
+                            if let Err(error) = emit_response_observations(
+                                &recorder,
+                                subscription.semantic(),
+                                subscription.request,
+                                observations,
+                            ) {
+                                break 'scheduler Err(error);
+                            }
                             telemetry.lock().map_err(|_| "telemetry state lock poisoned")?.ingest(&transaction);
                             audit.lock().map_err(|_| "audit state lock poisoned")?.ingest(&transaction);
                             let event = CaptureEvent::read_succeeded_from_transaction(
@@ -186,6 +197,45 @@ async fn run(
                                 timing,
                             )?;
                             if let Err(error) = emit(&recorder, event) {
+                                break 'scheduler Err(error);
+                            }
+                        }
+                        Ok(ReadOutcome::Failed {
+                            error,
+                            observations,
+                        }) => {
+                            if let Err(record_error) = emit_response_observations(
+                                &recorder,
+                                subscription.semantic(),
+                                subscription.request,
+                                observations,
+                            ) {
+                                break 'scheduler Err(record_error);
+                            }
+                            if is_session_unhealthy(&error) {
+                                let fatal = error.clone();
+                                if let Err(record_error) = record_fatal_read_failure(
+                                    &audit,
+                                    &recorder,
+                                    subscription.semantic(),
+                                    subscription.interval_us(),
+                                    timing,
+                                    subscription.request.bytes().into(),
+                                    &error,
+                                ) {
+                                    break 'scheduler Err(record_error);
+                                }
+                                break 'scheduler Err(fatal);
+                            }
+                            if let Err(error) = record_read_failure(
+                                &audit,
+                                &recorder,
+                                subscription.semantic(),
+                                subscription.interval_us,
+                                timing,
+                                subscription.request.bytes().into(),
+                                &error,
+                            ) {
                                 break 'scheduler Err(error);
                             }
                         }
@@ -317,6 +367,27 @@ fn record_read_failure(
     Ok(())
 }
 
+fn emit_response_observations(
+    recorder: &Option<mpsc::Sender<CaptureEvent>>,
+    semantic: &'static str,
+    request: ReadRequest,
+    observations: Vec<ResponseObservation>,
+) -> Result<(), String> {
+    for observation in observations {
+        emit(
+            recorder,
+            CaptureEvent::responses_observed(
+                semantic,
+                request.bytes().into(),
+                observation.responses,
+                observation.selected_responder,
+                observation.selection_error,
+            )?,
+        )?;
+    }
+    Ok(())
+}
+
 fn record_fatal_read_failure(
     audit: &Arc<Mutex<AuditState>>,
     recorder: &Option<mpsc::Sender<CaptureEvent>>,
@@ -431,6 +502,48 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].semantic, "scheduler.error");
         assert!(entries[0].source.contains("conflicting 010C responses"));
+    }
+
+    #[test]
+    fn response_observations_are_emitted_before_the_read_outcome() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+        let observation = ResponseObservation {
+            responses: vec![crate::capture_events::ResponderEvidence {
+                responder: Some("7E8".into()),
+                payload: vec![0x41, 0x0c, 0x00, 0x00],
+            }],
+            selected_responder: Some("7E8".into()),
+            selection_error: None,
+        };
+
+        emit_response_observations(
+            &Some(sender.clone()),
+            request.metadata().semantic,
+            request,
+            vec![observation],
+        )
+        .unwrap();
+        emit(
+            &Some(sender),
+            CaptureEvent::read_failed(
+                request.metadata().semantic,
+                250_000,
+                Some(ReadTiming::new(1, 2, 3)),
+                Some(request.bytes().into()),
+                "ambiguous responders",
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CaptureEvent::ResponsesObserved { .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CaptureEvent::ReadFailed { .. }
+        ));
     }
 
     #[test]
