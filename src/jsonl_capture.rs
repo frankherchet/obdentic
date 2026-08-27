@@ -30,10 +30,10 @@ pub struct ParsedCapture {
     pub status: CaptureStatus,
 }
 
-/// Starts an append-only recorder on a newly created private file.
+/// Starts a private recorder, replacing an earlier capture at the same path.
 pub fn start(path: &Path) -> Result<(Sender, Writer), String> {
     let mut options = OpenOptions::new();
-    options.append(true).create_new(true);
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path).map_err(|error| error.to_string())?;
@@ -1412,11 +1412,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_overwrite_and_uses_private_permissions() {
+    async fn overwrites_prior_capture_and_uses_private_permissions() {
         let path = temp_path("private");
         let (sender, writer) = start(&path).unwrap();
+        sender
+            .send(CaptureEvent::SessionStopped { offset_us: 1 })
+            .await
+            .unwrap();
         finish(sender, writer).await;
-        assert!(start(&path).is_err());
+        let (sender, writer) = start(&path).unwrap();
+        sender
+            .send(CaptureEvent::SessionStopped { offset_us: 2 })
+            .await
+            .unwrap();
+        finish(sender, writer).await;
+        assert_eq!(
+            read(&path).unwrap().events,
+            vec![CaptureEvent::SessionStopped { offset_us: 2 }]
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
