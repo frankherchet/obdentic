@@ -3,3 +3,4 @@
 /evidence/
 *.btsnoop
 *.tmp
+.DS_Store
