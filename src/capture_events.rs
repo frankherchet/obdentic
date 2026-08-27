@@ -32,6 +32,57 @@ impl ReadTiming {
     }
 }
 
+/// The deterministic result of applying session support knowledge to a
+/// requested capture subscription.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionFilterOutcome {
+    Scheduled,
+    Unsupported,
+    Unknown,
+}
+
+/// One requested subscription and its deterministic support-filter result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureSubscription {
+    semantic: String,
+    requested_interval_us: CaptureTimeUs,
+    filter: SubscriptionFilterOutcome,
+}
+
+impl CaptureSubscription {
+    pub fn new(
+        semantic: impl Into<String>,
+        requested_interval_us: CaptureTimeUs,
+        filter: SubscriptionFilterOutcome,
+    ) -> Self {
+        Self {
+            semantic: semantic.into(),
+            requested_interval_us,
+            filter,
+        }
+    }
+
+    pub fn semantic(&self) -> &str {
+        &self.semantic
+    }
+
+    pub const fn requested_interval_us(&self) -> CaptureTimeUs {
+        self.requested_interval_us
+    }
+
+    pub const fn filter(&self) -> SubscriptionFilterOutcome {
+        self.filter
+    }
+
+    pub fn into_event(self) -> CaptureEvent {
+        CaptureEvent::subscription_configured(
+            self.semantic,
+            self.requested_interval_us,
+            self.filter,
+        )
+    }
+}
+
 /// Values are extensible beyond the numeric values currently exposed by the
 /// vehicle catalog.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +108,7 @@ pub enum CaptureEvent {
     SubscriptionConfigured {
         semantic: String,
         requested_interval_us: CaptureTimeUs,
+        filter: SubscriptionFilterOutcome,
     },
     SupportDiscovery {
         request_payload: Vec<u8>,
@@ -110,10 +162,12 @@ impl CaptureEvent {
     pub fn subscription_configured(
         semantic: impl Into<String>,
         requested_interval_us: CaptureTimeUs,
+        filter: SubscriptionFilterOutcome,
     ) -> Self {
         Self::SubscriptionConfigured {
             semantic: semantic.into(),
             requested_interval_us,
+            filter,
         }
     }
 
@@ -277,5 +331,23 @@ mod tests {
         let read = prepare_read("engine.rpm").unwrap();
         assert_eq!(read.bytes(), [0x01, 0x0c]);
         assert!(prepare_read("dtc.clear").is_err());
+    }
+
+    #[test]
+    fn subscription_configuration_keeps_support_filter_outcome() {
+        for outcome in [
+            SubscriptionFilterOutcome::Scheduled,
+            SubscriptionFilterOutcome::Unsupported,
+            SubscriptionFilterOutcome::Unknown,
+        ] {
+            assert_eq!(
+                CaptureEvent::subscription_configured("engine.rpm", 250_000, outcome),
+                CaptureEvent::SubscriptionConfigured {
+                    semantic: "engine.rpm".into(),
+                    requested_interval_us: 250_000,
+                    filter: outcome,
+                }
+            );
+        }
     }
 }

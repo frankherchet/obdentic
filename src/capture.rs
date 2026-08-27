@@ -53,6 +53,7 @@ pub fn profile(name: &str) -> Result<CaptureProfile, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn exposes_engine_baseline_name_and_semantics() {
@@ -99,6 +100,23 @@ mod tests {
         assert!(subscriptions[10..]
             .iter()
             .all(|subscription| subscription.interval() == Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn engine_baseline_has_unique_catalogued_semantics_and_positive_intervals() {
+        let subscriptions = profile("engine-baseline").unwrap().subscriptions().unwrap();
+        let semantics = subscriptions
+            .iter()
+            .map(|subscription| subscription.semantic())
+            .collect::<Vec<_>>();
+        let unique = semantics.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(unique.len(), semantics.len());
+        assert!(!semantics.is_empty());
+        for subscription in subscriptions {
+            assert!(subscription.interval() > Duration::ZERO);
+            assert!(crate::vehicle::signal(subscription.semantic()).is_some());
+        }
     }
 
     #[test]

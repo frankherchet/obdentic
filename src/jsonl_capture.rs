@@ -1,4 +1,4 @@
-use crate::capture_events::{CaptureEvent, CaptureValue, ReadTiming};
+use crate::capture_events::{CaptureEvent, CaptureValue, ReadTiming, SubscriptionFilterOutcome};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -140,6 +140,7 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
         CaptureEvent::SubscriptionConfigured {
             semantic,
             requested_interval_us,
+            filter,
         } => {
             object.push_str("\"subscription_configured\",\"sequence\":");
             object.push_str(&sequence.to_string());
@@ -147,6 +148,8 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             push_string(&mut object, semantic);
             object.push_str(",\"requested_interval_us\":");
             object.push_str(&requested_interval_us.to_string());
+            object.push_str(",\"filter_outcome\":");
+            push_string(&mut object, filter_outcome_name(*filter));
         }
         CaptureEvent::SupportDiscovery {
             request_payload,
@@ -475,12 +478,14 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                     "sequence",
                     "semantic",
                     "requested_interval_us",
+                    "filter_outcome",
                 ],
                 line_number,
             )?;
             Ok(CaptureEvent::SubscriptionConfigured {
                 semantic: string_field(object, "semantic", line_number)?,
                 requested_interval_us: u64_field(object, "requested_interval_us", line_number)?,
+                filter: parse_filter_outcome(object, line_number)?,
             })
         }
         "support_discovery" => {
@@ -798,6 +803,28 @@ fn optional_u64_field(
     }
 }
 
+fn filter_outcome_name(outcome: SubscriptionFilterOutcome) -> &'static str {
+    match outcome {
+        SubscriptionFilterOutcome::Scheduled => "scheduled",
+        SubscriptionFilterOutcome::Unsupported => "unsupported",
+        SubscriptionFilterOutcome::Unknown => "unknown",
+    }
+}
+
+fn parse_filter_outcome(
+    object: &Object,
+    line_number: usize,
+) -> Result<SubscriptionFilterOutcome, String> {
+    match string_field(object, "filter_outcome", line_number)?.as_str() {
+        "scheduled" => Ok(SubscriptionFilterOutcome::Scheduled),
+        "unsupported" => Ok(SubscriptionFilterOutcome::Unsupported),
+        "unknown" => Ok(SubscriptionFilterOutcome::Unknown),
+        outcome => Err(format!(
+            "line {line_number}: unknown subscription filter outcome {outcome:?}"
+        )),
+    }
+}
+
 fn parse_hex(value: &str, line_number: usize) -> Result<Vec<u8>, String> {
     if value.is_empty() {
         return Ok(Vec::new());
@@ -1069,7 +1096,7 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture_events::CaptureEvent;
+    use crate::capture_events::{CaptureEvent, SubscriptionFilterOutcome};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -1094,7 +1121,11 @@ mod tests {
         vec![
             CaptureEvent::capture_started(Some(1_700_000_000_000), Some("engine-baseline".into())),
             CaptureEvent::SessionInitialized,
-            CaptureEvent::subscription_configured("engine.rpm", 250_000),
+            CaptureEvent::subscription_configured(
+                "engine.rpm",
+                250_000,
+                SubscriptionFilterOutcome::Scheduled,
+            ),
             CaptureEvent::support_discovery(
                 vec![0x01, 0x00],
                 vec![0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
@@ -1156,6 +1187,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_each_subscription_filter_outcome() {
+        let path = temp_path("subscription-outcomes");
+        let (sender, writer) = start(&path).unwrap();
+        let expected = vec![
+            CaptureEvent::subscription_configured(
+                "engine.rpm",
+                250_000,
+                SubscriptionFilterOutcome::Scheduled,
+            ),
+            CaptureEvent::subscription_configured(
+                "engine.maf",
+                500_000,
+                SubscriptionFilterOutcome::Unsupported,
+            ),
+            CaptureEvent::subscription_configured(
+                "engine.load",
+                500_000,
+                SubscriptionFilterOutcome::Unknown,
+            ),
+        ];
+        for event in expected.iter().cloned() {
+            sender.send(event).await.unwrap();
+        }
+        finish(sender, writer).await;
+
+        assert_eq!(read_events(&path).unwrap(), expected);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"filter_outcome\":\"scheduled\""));
+        assert!(contents.contains("\"filter_outcome\":\"unsupported\""));
+        assert!(contents.contains("\"filter_outcome\":\"unknown\""));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn emits_deterministic_header_hex_and_sequence_bytes() {
         let path = temp_path("bytes");
         let (sender, writer) = start(&path).unwrap();
@@ -1208,6 +1273,14 @@ mod tests {
         )
         .unwrap();
         assert!(read(&path).unwrap_err().contains("line 2"));
+        fs::write(
+            &path,
+            "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"subscription_configured\",\"sequence\":0,\"semantic\":\"engine.rpm\",\"requested_interval_us\":250000,\"filter_outcome\":\"invalid\"}\n",
+        )
+        .unwrap();
+        assert!(read(&path)
+            .unwrap_err()
+            .contains("unknown subscription filter outcome"));
         fs::remove_file(path).unwrap();
     }
 

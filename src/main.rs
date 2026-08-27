@@ -1,6 +1,8 @@
 use obdentic::{
     audit::AuditState,
-    ble, capture, hex, jsonl_capture, prepare_read, record, replay,
+    ble, capture,
+    capture_events::{CaptureSubscription, SubscriptionFilterOutcome},
+    hex, jsonl_capture, prepare_read, record, replay,
     scheduler::{Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
@@ -133,6 +135,7 @@ async fn run() -> Result<(), String> {
                 audit.clone(),
                 recorder.clone(),
                 None,
+                None,
             )
             .await
             {
@@ -158,15 +161,8 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
     let configured = profile.subscriptions()?;
     let advertised = ble::supported_signals(adapter_id).await?;
     let total = configured.len();
-    let subscriptions = configured
-        .into_iter()
-        .filter(|subscription| {
-            advertised.iter().any(|signal| {
-                signal.semantic == subscription.semantic()
-                    && signal.status == ble::SignalSupportStatus::Supported
-            })
-        })
-        .collect::<Vec<_>>();
+    let (subscriptions, capture_subscriptions) =
+        filter_capture_subscriptions(configured, &advertised);
     if subscriptions.is_empty() {
         return Err(format!(
             "capture profile {profile_name} has no signals supported by the adapter"
@@ -180,6 +176,18 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
         subscriptions.len(),
         total
     );
+    for subscription in &capture_subscriptions {
+        println!(
+            "capture signal   {}  {} ms  {}",
+            subscription.semantic(),
+            subscription.requested_interval_us() / 1_000,
+            match subscription.filter() {
+                SubscriptionFilterOutcome::Scheduled => "scheduled",
+                SubscriptionFilterOutcome::Unsupported => "unsupported (omitted)",
+                SubscriptionFilterOutcome::Unknown => "unknown (omitted)",
+            },
+        );
+    }
     println!("capture record   {}", path.display());
     println!("capture running  press Ctrl-C to stop");
 
@@ -190,6 +198,7 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
         Arc::new(Mutex::new(AuditState::new(600)?)),
         Some(sender.clone()),
         Some(profile.name().into()),
+        Some(capture_subscriptions),
     )
     .await
     {
@@ -212,6 +221,35 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
     recorded?;
     println!("capture stopped");
     Ok(())
+}
+
+fn filter_capture_subscriptions(
+    configured: Vec<Subscription>,
+    advertised: &[ble::SignalSupport],
+) -> (Vec<Subscription>, Vec<CaptureSubscription>) {
+    let mut scheduled = Vec::new();
+    let mut decisions = Vec::new();
+    for subscription in configured {
+        let filter = match advertised
+            .iter()
+            .find(|signal| signal.semantic == subscription.semantic())
+            .map(|signal| signal.status)
+            .unwrap_or(ble::SignalSupportStatus::Unknown)
+        {
+            ble::SignalSupportStatus::Supported => SubscriptionFilterOutcome::Scheduled,
+            ble::SignalSupportStatus::Unsupported => SubscriptionFilterOutcome::Unsupported,
+            ble::SignalSupportStatus::Unknown => SubscriptionFilterOutcome::Unknown,
+        };
+        decisions.push(CaptureSubscription::new(
+            subscription.semantic(),
+            subscription.interval_us(),
+            filter,
+        ));
+        if filter == SubscriptionFilterOutcome::Scheduled {
+            scheduled.push(subscription);
+        }
+    }
+    (scheduled, decisions)
 }
 
 async fn wait_for_scheduler(scheduler: &TelemetryScheduler) {
@@ -756,6 +794,38 @@ mod tests {
             .lines()
             .any(|line| line.starts_with("engine.load\tunknown\t")));
         assert_eq!(output.lines().count(), supported_signals().len() + 1);
+    }
+
+    #[test]
+    fn capture_filter_schedules_only_advertised_signals_and_records_all_decisions() {
+        let configured = capture::profile("engine-baseline")
+            .unwrap()
+            .subscriptions()
+            .unwrap();
+        let (scheduled, decisions) = filter_capture_subscriptions(
+            configured,
+            &[
+                ble::SignalSupport {
+                    semantic: "engine.rpm",
+                    status: ble::SignalSupportStatus::Supported,
+                },
+                ble::SignalSupport {
+                    semantic: "engine.maf",
+                    status: ble::SignalSupportStatus::Unsupported,
+                },
+            ],
+        );
+
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].semantic(), "engine.rpm");
+        assert_eq!(scheduled[0].interval(), Duration::from_millis(250));
+        assert_eq!(decisions.len(), 15);
+        assert_eq!(decisions[0].filter(), SubscriptionFilterOutcome::Scheduled);
+        assert_eq!(
+            decisions[1].filter(),
+            SubscriptionFilterOutcome::Unsupported
+        );
+        assert_eq!(decisions[2].filter(), SubscriptionFilterOutcome::Unknown);
     }
 
     #[test]

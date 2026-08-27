@@ -1,7 +1,9 @@
 use crate::{
     audit::AuditState,
     ble::{start_session, SessionClient},
-    capture_events::{CaptureEvent, CaptureTimeUs, ReadTiming},
+    capture_events::{
+        CaptureEvent, CaptureSubscription, CaptureTimeUs, ReadTiming, SubscriptionFilterOutcome,
+    },
     prepare_read,
     telemetry::TelemetryState,
     ReadRequest,
@@ -42,6 +44,10 @@ impl Subscription {
     pub fn interval(self) -> Duration {
         self.interval
     }
+
+    pub const fn interval_us(self) -> CaptureTimeUs {
+        self.interval_us
+    }
 }
 
 pub struct TelemetryScheduler {
@@ -57,6 +63,7 @@ impl TelemetryScheduler {
         audit: Arc<Mutex<AuditState>>,
         recorder: Option<mpsc::Sender<CaptureEvent>>,
         capture_profile: Option<String>,
+        capture_subscriptions: Option<Vec<CaptureSubscription>>,
     ) -> Result<Self, String> {
         if subscriptions.is_empty() {
             return Err("telemetry scheduler needs at least one subscription".into());
@@ -74,8 +81,17 @@ impl TelemetryScheduler {
             ),
             capture_profile,
         );
-        let configured = subscriptions.iter().map(|subscription| {
-            CaptureEvent::subscription_configured(subscription.semantic(), subscription.interval_us)
+        let configured = capture_subscriptions.unwrap_or_else(|| {
+            subscriptions
+                .iter()
+                .map(|subscription| {
+                    CaptureSubscription::new(
+                        subscription.semantic(),
+                        subscription.interval_us,
+                        SubscriptionFilterOutcome::Scheduled,
+                    )
+                })
+                .collect()
         });
         let discovery = match session.support_discovery().await {
             Ok(discovery) => discovery,
@@ -89,7 +105,7 @@ impl TelemetryScheduler {
         };
         let mut events = std::iter::once(started)
             .chain(std::iter::once(CaptureEvent::SessionInitialized))
-            .chain(configured)
+            .chain(configured.into_iter().map(CaptureSubscription::into_event))
             .chain(discovery.into_iter().map(|page| {
                 CaptureEvent::support_discovery(page.request.into(), page.response.into())
             }));
