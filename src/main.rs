@@ -1227,6 +1227,8 @@ async fn run_capture(
     runtime_state: &mut RuntimeState,
 ) -> Result<(), String> {
     let profile = capture::profile(profile_name)?;
+    let capability = obdentic::capability::HardwareCapability::conservative_default();
+    profile.admit(capability)?;
     let configured = profile.subscriptions()?;
     let advertised = ble::supported_signals(adapter_id).await?;
     let total = configured.len();
@@ -1252,6 +1254,10 @@ async fn run_capture(
         "capture signals  {}/{} supported",
         subscriptions.len(),
         total
+    );
+    println!(
+        "capture budget   {} reads/s conservative",
+        capability.request_budget_per_second()
     );
     for subscription in &capture_subscriptions {
         println!(
@@ -2239,8 +2245,8 @@ mod tests {
 
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].semantic(), "engine.rpm");
-        assert_eq!(scheduled[0].interval(), Duration::from_millis(250));
-        assert_eq!(decisions.len(), 15);
+        assert_eq!(scheduled[0].interval(), Duration::from_secs(1));
+        assert_eq!(decisions.len(), 13);
         assert_eq!(decisions[0].filter(), SubscriptionFilterOutcome::Scheduled);
         assert_eq!(
             decisions[1].filter(),

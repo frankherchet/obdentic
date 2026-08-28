@@ -1,4 +1,8 @@
-use crate::scheduler::Subscription;
+use crate::{
+    capability::HardwareCapability,
+    scheduler::Subscription,
+    subscription_policy::{ObservationRequest, PlanStatus, SubscriptionPolicy},
+};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,26 +24,53 @@ impl CaptureProfile {
             })
             .collect()
     }
+
+    /// Reject a profile before connecting when its offered load exceeds the
+    /// session's conservative sequential-command budget.
+    pub fn admit(self, capability: HardwareCapability) -> Result<(), String> {
+        let requests = self
+            .subscriptions
+            .iter()
+            .map(|(semantic, interval_ms)| {
+                ObservationRequest::new("capture", *semantic, Duration::from_millis(*interval_ms))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let plan = SubscriptionPolicy::new(capability).plan(
+            &requests,
+            self.subscriptions.iter().map(|(semantic, _)| *semantic),
+        );
+        if plan
+            .entries()
+            .iter()
+            .any(|entry| entry.status() == PlanStatus::RateReduced)
+        {
+            return Err(format!(
+                "capture profile {} exceeds the {} reads/s session budget",
+                self.name,
+                capability.request_budget_per_second()
+            ));
+        }
+        Ok(())
+    }
 }
 
 const ENGINE_BASELINE: CaptureProfile = CaptureProfile {
     name: "engine-baseline",
     subscriptions: &[
-        ("engine.rpm", 250),
-        ("engine.maf", 500),
-        ("engine.load", 500),
-        ("engine.intake_manifold_pressure", 500),
-        ("vehicle.speed", 1_000),
-        ("engine.egr.commanded", 1_000),
-        ("engine.egr.error", 1_000),
-        ("vehicle.accelerator_pedal_d", 1_000),
-        ("vehicle.accelerator_pedal_e", 1_000),
-        ("engine.relative_throttle", 1_000),
-        ("engine.coolant_temperature", 2_000),
-        ("engine.intake_air_temperature", 2_000),
-        ("engine.control_module_voltage", 2_000),
-        ("engine.runtime", 2_000),
-        ("engine.barometric_pressure", 2_000),
+        ("engine.rpm", 1_000),
+        ("engine.maf", 2_000),
+        ("engine.load", 2_000),
+        ("engine.intake_manifold_pressure", 2_000),
+        ("vehicle.speed", 8_000),
+        ("engine.egr.commanded", 8_000),
+        ("engine.egr.error", 8_000),
+        ("vehicle.accelerator_pedal_e", 8_000),
+        ("engine.relative_throttle", 8_000),
+        ("engine.coolant_temperature", 8_000),
+        ("engine.intake_air_temperature", 8_000),
+        ("engine.runtime", 8_000),
+        ("engine.barometric_pressure", 8_000),
     ],
 };
 
@@ -101,12 +132,10 @@ mod tests {
                 "vehicle.speed",
                 "engine.egr.commanded",
                 "engine.egr.error",
-                "vehicle.accelerator_pedal_d",
                 "vehicle.accelerator_pedal_e",
                 "engine.relative_throttle",
                 "engine.coolant_temperature",
                 "engine.intake_air_temperature",
-                "engine.control_module_voltage",
                 "engine.runtime",
                 "engine.barometric_pressure",
             ]
@@ -116,16 +145,13 @@ mod tests {
     #[test]
     fn engine_baseline_keeps_its_declared_sampling_intervals() {
         let subscriptions = profile("engine-baseline").unwrap().subscriptions().unwrap();
-        assert_eq!(subscriptions[0].interval(), Duration::from_millis(250));
+        assert_eq!(subscriptions[0].interval(), Duration::from_secs(1));
         assert!(subscriptions[1..4]
             .iter()
-            .all(|subscription| subscription.interval() == Duration::from_millis(500)));
-        assert!(subscriptions[4..10]
-            .iter()
-            .all(|subscription| subscription.interval() == Duration::from_secs(1)));
-        assert!(subscriptions[10..]
-            .iter()
             .all(|subscription| subscription.interval() == Duration::from_secs(2)));
+        assert!(subscriptions[4..]
+            .iter()
+            .all(|subscription| subscription.interval() == Duration::from_secs(8)));
     }
 
     #[test]
@@ -194,5 +220,24 @@ mod tests {
             profile("not-a-profile"),
             Err("unknown capture profile: not-a-profile".into())
         );
+    }
+
+    #[test]
+    fn engine_baseline_is_admitted_by_the_conservative_session_budget() {
+        let profile = profile("engine-baseline").unwrap();
+        assert_eq!(
+            profile.admit(HardwareCapability::conservative_default()),
+            Ok(())
+        );
+        assert!(profile
+            .admit(
+                HardwareCapability::new(
+                    3,
+                    Duration::from_millis(250),
+                    crate::capability::CapabilityProvenance::MeasuredFromCapture,
+                )
+                .unwrap(),
+            )
+            .is_err());
     }
 }
