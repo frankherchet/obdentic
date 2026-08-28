@@ -189,6 +189,13 @@ pub enum CaptureEvent {
         responder: Option<String>,
         response_payload: Vec<u8>,
     },
+    /// Evidence from the fixed read-only `01 00` probe used only to make an
+    /// ELM327 `ATSP0` protocol choice explicit before a diagnostic job.
+    ProtocolNegotiationObserved {
+        request_payload: Vec<u8>,
+        responder: Option<String>,
+        response_payload: Vec<u8>,
+    },
     /// Preserves every normalized response before semantic selection. This
     /// event may accompany either a successful read or an explicit ambiguity.
     ResponsesObserved {
@@ -317,6 +324,26 @@ impl CaptureEvent {
             responder,
             response_payload,
         }
+    }
+
+    pub fn protocol_negotiation_observed(
+        request_payload: Vec<u8>,
+        responder: Option<String>,
+        response_payload: Vec<u8>,
+    ) -> Result<Self, String> {
+        if request_payload.as_slice() != [0x01, 0x00] {
+            return Err("protocol negotiation request must be OBD-II 01 00".into());
+        }
+        if response_payload.len() != 6 || response_payload[0] != 0x41 || response_payload[1] != 0x00
+        {
+            return Err("protocol negotiation evidence must be a normalized 41 00 response".into());
+        }
+        validate_diagnostic_source(responder.as_deref())?;
+        Ok(Self::ProtocolNegotiationObserved {
+            request_payload,
+            responder,
+            response_payload,
+        })
     }
 
     pub fn responses_observed(
