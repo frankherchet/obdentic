@@ -1,140 +1,237 @@
 # OBDentic
 
-Transparent, local-first and read-only vehicle diagnostics.
+**Transparent, local-first and strictly read-only vehicle diagnostics for humans and agents.**
 
-The first vertical slice reads standard OBD-II engine RPM through one diagnostic-core seam, shows the semantic request and raw bytes, records the transaction, and replays it deterministically. The Rust BLE path is implemented; its final targeted hardware acceptance is still pending.
+OBDentic is building a deterministic diagnostic layer between a vehicle and higher-level diagnostic tooling. It owns the physical adapter connection, turns protocol traffic into typed vehicle facts, preserves the underlying evidence, and keeps unsafe operations outside the executable vocabulary.
 
-The current split is intentionally narrow: `protocol` contains Mode-01 framing and
-response validation; `vehicle` contains signal/profile metadata and deterministic
-decoders; `ble` contains the Carly transport. EA189 is a metadata-only profile
-skeleton until a read-only request and response have been evidenced.
+The long-term goal is not a single EA189/EGR tool. The VW EA189 is the first real vehicle profile and a useful proving ground for deeper diagnostics such as DPF, EGR and intake analysis. The project itself is intended to become a **generic agentic OBD vehicle-diagnostics platform**: an AI agent should be able to reason about a vehicle, request bounded semantic reads, inspect provenance and raw evidence, and explain a diagnosis without ever receiving an unrestricted CAN/UDS command path.
 
-This Mac also has an obsolete MacPorts Cargo earlier in `PATH`. Activate rustup
-before running the project; `rust-toolchain.toml` then selects Rust 1.98.0:
+## Design principles
+
+### Strictly read-only
+
+Safety is enforced below the CLI, TUI and future agent interface. The executable vocabulary is a closed set of known read-only semantic operations.
+
+No raw CAN/UDS command API is exposed to consumers. Coding, adaptation, actuator tests, DTC clearing, SecurityAccess and other state-changing operations are outside the current safety boundary.
+
+```text
+semantic request
+    -> read-only safety policy
+    -> vehicle/protocol knowledge
+    -> bounded transport request
+```
+
+### Capture first, interpret later
+
+Live access produces evidence first. Interpretation can then be repeated offline without touching the vehicle again.
+
+```text
+vehicle
+  -> raw responder evidence
+  -> deterministic normalization
+  -> persisted capture
+
+persisted capture
+  -> deterministic re-decode
+  -> correlation
+  -> diagnosis / agent reasoning
+```
+
+Responder identity and non-selected evidence are preserved. OBDentic must never choose a value merely because it looks more plausible.
+
+### Separate protocol, vehicle and diagnostic knowledge
+
+OBDentic keeps three concerns deliberately separate:
+
+1. **Protocol knowledge** — BLE, ELM327-style adapters, CAN, ISO-TP, OBD-II, UDS and later manufacturer-specific transports.
+2. **Vehicle knowledge** — ECU identity, addressing, supported PIDs/DIDs, typed layouts, scaling, units and provenance.
+3. **Diagnostic knowledge** — correlation of facts into explanations, hypotheses and recommended next reads. This is where local agentic reasoning belongs.
+
+The vehicle profile translates bytes into facts. The diagnostic layer translates facts into understanding.
+
+## Current architecture
+
+The first production path is Rust on macOS with a BLE ELM327-style adapter. One session actor owns the physical adapter and serializes all commands; schedulers, the TUI and future MCP consumers share semantic state rather than opening competing connections.
+
+The runtime model is explicit and deterministic. Lifecycle phase and current activity are separate so observation, bounded reads and diagnostic jobs do not create accidental state combinations.
+
+```text
+OBDentic runtime
+├── phase
+│   ├── init
+│   ├── discover
+│   ├── ready
+│   ├── stopping
+│   ├── stopped
+│   └── fault
+└── activity
+    ├── idle
+    ├── observe
+    ├── read
+    ├── diagnose
+    └── write        # representable, not executable today
+```
+
+A pure reducer applies typed events, while effects such as BLE I/O and persistence happen outside the reducer. This makes runtime history replayable and auditable.
+
+## What works today
+
+The repository already contains the main building blocks of the generic read-only path:
+
+- CoreBluetooth discovery and BLE communication with the current Carly/ELM-compatible adapter
+- bounded ELM initialization and protocol negotiation
+- generic OBD-II Mode 01 support discovery and a typed scalar signal catalog
+- vehicle identity, topology evidence, cache validation and targeted routing
+- deterministic multi-responder handling without plausibility-based selection
+- read-only stored-DTC scanning through a typed diagnostic job
+- JSONL capture with raw responder evidence, timings and runtime-state transitions
+- offline capture inspection and transport-capability reporting
+- deterministic transaction replay
+- a terminal TUI and declarative layouts
+- explicit runtime state, audit state and read-only safety policy
+
+Manufacturer-specific vehicle knowledge is intentionally added only when a read-only request and response have been evidenced.
+
+## Quick start
+
+`rust-toolchain.toml` selects Rust 1.98.0. If another Cargo installation appears earlier in `PATH`, activate rustup first:
 
 ```sh
 source "$HOME/.cargo/env"
 cargo --version
 ```
 
+Run the offline checks:
+
 ```sh
-cargo run -- demo
-cargo run -- replay session.tsv
-cargo run -- signals
-cargo run -- scan
-cargo run -- tui demo
-cargo run -- tui replay session.tsv
 cargo test --locked
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Example transaction:
+Discover the adapter and establish vehicle identity/topology:
+
+```sh
+cargo run -- scan
+export ADAPTER_UUID='PASTE_COREBLUETOOTH_UUID'
+
+cargo run -- vehicle identify --adapter "$ADAPTER_UUID"
+cargo run -- vehicle discover --adapter "$ADAPTER_UUID"
+cargo run -- vehicle show
+```
+
+Inspect the semantic signal vocabulary and the subset advertised by the current vehicle:
+
+```sh
+cargo run -- signals
+cargo run -- signals --adapter "$ADAPTER_UUID" --supported
+```
+
+Perform a bounded semantic read:
+
+```sh
+cargo run -- read engine.rpm --adapter "$ADAPTER_UUID"
+```
+
+Record an observation session and inspect it offline:
+
+```sh
+cargo run -- capture \
+  --adapter "$ADAPTER_UUID" \
+  --profile engine-drive \
+  --record evidence/drive.jsonl
+
+cargo run -- capture inspect evidence/drive.jsonl
+cargo run -- capture capability evidence/drive.jsonl
+```
+
+Run the currently supported generic diagnostic job:
+
+```sh
+cargo run -- diagnose dtc.scan \
+  --adapter "$ADAPTER_UUID" \
+  --record evidence/dtc-scan.jsonl
+```
+
+`dtc.scan` is currently a strictly read-only generic stored-DTC workflow. DTC clearing is deliberately not part of the executable API.
+
+## Evidence and privacy
+
+Captures are intended to remain local. They preserve enough transport and responder evidence for deterministic offline analysis without making identity data part of ordinary telemetry.
+
+VIN is used as a local vehicle-identity anchor where necessary, but it is not intended as a normal capture/log field. Raw Bluetooth captures, authentication material and other sensitive vehicle-specific evidence should remain local and untracked.
+
+Adapter-specific findings for the current Carly CUA-V200 are documented in [`docs/carly-cua-v200.md`](docs/carly-cua-v200.md). Research notes live under [`docs/research/`](docs/research/).
+
+## Roadmap
+
+The roadmap is intentionally broader than the first EA189 use cases. GitHub issues and milestones track the executable work; the stages below describe the architectural direction.
+
+### 1. Finish the generic OBD/ELM foundation
+
+Make identity, topology, targeted routing, capture/replay, transport-capability calibration and deterministic scheduling boring and reliable. A vehicle session should be reproducible, auditable and free of hidden state changes.
+
+### 2. Expand the generic diagnostic vocabulary
+
+Build standards-based read-only workflows beyond scalar Mode 01 values: readiness and monitor status, pending/permanent DTCs, freeze-frame data, Mode 06 monitor results and compound facts. These remain semantic operations rather than arbitrary protocol commands.
+
+### 3. Add evidence-backed vehicle profiles
+
+Use manufacturer-specific knowledge only where public documentation or owned evidence supports it. VW/EA189 is the first deep profile, with ECU-specific DTC access and DPF/EGR/intake diagnostics as concrete proving cases — not as the boundary of the project.
+
+### 4. Build semantic diagnostic snapshots
+
+Combine responder-scoped facts, ECU identity, timing, provenance and confidence into deterministic snapshots that can be compared across idle, load, drive and fault conditions. The same capture should always produce the same decoded facts.
+
+### 5. Expose a local agent interface
+
+Add a local MCP-facing semantic API so Codex or another local agent can inspect current state, request approved read-only measurements and diagnostic jobs, and reason over persisted captures.
+
+The agent should see:
 
 ```text
-semantic  engine.rpm
-tx        01 0C
-rx        41 0C 1A F8
-decoded   1726 rpm
+intent / hypothesis
+    -> approved semantic read or DiagnosticJob
+    -> exact TX + complete RX evidence
+    -> deterministic facts
+    -> diagnostic reasoning
 ```
 
-The core only accepts known read-only semantic signals. Unsupported or mutating requests are rejected before a transport can be called.
+It should **not** receive a raw CAN console.
 
-`cargo run -- signals` is the canonical full read-only signal catalog. It lists
-generic OBD-II Mode 01 signals and their request, decoder, unit, range,
-provenance and validation metadata. The catalog contains no VW/EA189-specific
-interpretation; such vehicle knowledge requires separately evidenced requests.
+### 6. Generalize across vehicles and adapters
 
-The current hardware milestone is capture-first: collect bounded, privacy-safe
-read-only evidence from the Carly transport before making claims about vehicle
-capability or adding manufacturer-specific signals. Offline decoder and replay
-tests remain the primary validation seam until targeted hardware acceptance is
-complete.
+Grow the protocol and vehicle-knowledge layers independently: more ELM-compatible adapters, additional manufacturer profiles, more ECU roles and eventually other safe transport backends. Vehicle-specific knowledge remains versioned and provenance-aware so support can grow without weakening the generic safety model.
 
-`tui demo` provides an irregularly-timestamped `demo` history and `tui replay`
-renders a decoded recording. `tui live` opens one read-only Carly session and
-uses the fixed benchmark subscriptions: RPM at 200 ms, MAF at 500 ms, coolant
-and speed at 1000 ms. Press `q` or `Esc` to close it cleanly.
+## Why EA189 still matters
 
-Use the rustup Cargo explicitly on this Mac, then record a live benchmark:
+The EA189 remains an excellent first deep-diagnostics target because it gives OBDentic real, non-trivial questions to solve: DPF loading/regeneration, EGR behavior, intake plausibility, ECU topology and manufacturer-specific diagnostic data.
+
+Those use cases now serve a larger purpose: proving that a generic diagnostic agent can move from protocol evidence to vehicle facts to an explainable diagnosis while the software remains local, deterministic and read-only.
+
+## TUI
+
+The TUI can render decoded telemetry from demo, replay and live sources. Layouts remain semantic: panels refer to signal names, not raw PIDs or addresses.
 
 ```sh
-mkdir -p evidence
-/Users/frankherchet/.cargo/bin/cargo +1.98.0 run -- tui live \
-  --adapter "$ADAPTER_UUID" \
-  --record evidence/02-idle.tsv
-```
+cargo run -- tui demo
+cargo run -- tui live --adapter "$ADAPTER_UUID"
 
-Evidence files are new private (`0600`) append-only files, never overwrite an
-existing path, and are ignored by Git. They contain the session subscriptions
-and monotonic per-read scheduling/latency timings, canonical read-only TX/RX,
-decoder result and orderly session stop; they contain no adapter UUID, device
-name, initialization transcript, VIN or authentication data. Keep raw Bluetooth
-captures under `captures/` local and untracked; never publish them.
-
-The built-in `engine-overview` is a declarative layout: panels name only a
-view (`Value`, `Sparkline`, `TimeSeries` or `Compare`) and semantic signals.
-Save it to a new local file and load it for an offline TUI run with:
-
-```sh
 cargo run -- layout save engine-overview engine-overview.tsv
 cargo run -- tui demo --layout engine-overview.tsv
 ```
 
-Layout files are private (`0600` on macOS), atomically created without
-overwriting an existing file, and contain only names, views and semantic
-signals. Sampling control remains a future slice.
+This keeps presentation independent from transport and vehicle addressing, which is also the model intended for the future agent interface.
 
-For MIUI Android 10 bugreports, extract the embedded Bluetooth capture with:
+## Development rule of thumb
 
-```sh
-mkdir -p captures
-python3 tools/extract_miui_btsnooz.py bugreport.txt captures/capture.btsnoop
+When adding functionality, keep this dependency direction:
+
+```text
+transport evidence
+    -> protocol normalization
+    -> vehicle facts
+    -> diagnostic interpretation
+    -> presentation / agent reasoning
 ```
 
-Confirmed Carly CUA-V200 BLE handles and protocol findings are documented in [`docs/carly-cua-v200.md`](docs/carly-cua-v200.md).
-
-With ignition on, use `scan` to obtain the current CoreBluetooth UUID, then pass
-that exact UUID to `read`. On macOS, grant Bluetooth access to Terminal/iTerm in
-System Settings → Privacy & Security → Bluetooth. A bundled app additionally
-needs `NSBluetoothAlwaysUsageDescription` in its `Info.plist`.
-
-The existing Swift probe remains available for hardware parity checks:
-
-```sh
-swift tools/carly_probe.swift
-```
-
-## Targeted hardware acceptance (pending)
-
-Run this checklist with the Carly adapter plugged in, ignition on and engine
-off. Do not connect the Carly app at the same time. On macOS, grant Bluetooth
-access to Terminal/iTerm before starting. This exercises read-only RPM only;
-do not add VIN, UDS session-control, coding or DTC-clear commands.
-
-```sh
-# Build and offline checks first.
-cargo test --locked
-cargo clippy --all-targets -- -D warnings
-
-# Copy the exact current CoreBluetooth UUID printed by scan; do not reuse a stale UUID.
-cargo run -- scan
-export ADAPTER_UUID='PASTE_EXACT_UUID_FROM_SCAN'
-
-# Three independent processes mean three fresh BLE connections.
-for attempt in 1 2 3; do
-  cargo run -- read engine.rpm --adapter "$ADAPTER_UUID" --record "session-$attempt.tsv" || exit 1
-done
-
-# Every run must show 01 0C, 41 0C 00 00 and 0 rpm, then replay identically.
-for attempt in 1 2 3; do
-  cargo run -- replay "session-$attempt.tsv" || exit 1
-done
-```
-
-Acceptance also requires starting the same `read` command, pressing
-`Ctrl-C` during scan/connect/response wait, and confirming it exits cleanly;
-repeat the command afterward to prove reconnectability. Repeat once with the
-adapter unavailable long enough to hit the command timeout, then restore the
-adapter and confirm a fresh read succeeds. Keep the Swift probe until these
-three Rust reads, record/replays, interruption, timeout and reconnect checks
-match; remove it only after that parity is demonstrated.
+Never invert it by letting a diagnosis, UI or agent guess an ECU address, select a responder by plausibility, or bypass the read-only vocabulary.
