@@ -28,6 +28,7 @@ pub mod runtime_reducer;
 pub mod runtime_state;
 pub mod safety;
 pub mod scheduler;
+pub mod semantic_snapshot;
 pub mod subscription_policy;
 pub mod telemetry;
 pub mod topology;
