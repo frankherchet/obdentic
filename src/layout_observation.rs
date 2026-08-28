@@ -27,7 +27,7 @@ impl LayoutFreshnessPolicy {
     ) -> Result<Self, String> {
         if [value, sparkline, time_series, compare]
             .into_iter()
-            .any(Duration::is_zero)
+            .any(|interval| interval.is_zero())
         {
             return Err("layout freshness intervals must be greater than zero".into());
         }
