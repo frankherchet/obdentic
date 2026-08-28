@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Sparkline},
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph},
     Frame, Terminal,
 };
 use std::{collections::BTreeMap, env, io, path::Path};
@@ -24,6 +24,7 @@ use ratatui::backend::TestBackend;
 
 const DEFAULT_WINDOW_US: u64 = 60_000_000;
 const MIN_WINDOW_US: u64 = 1_000_000;
+const STALE_AFTER_INTERVALS: u64 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 struct Sample {
@@ -59,6 +60,7 @@ struct Timeline {
     duration_us: u64,
     samples: BTreeMap<String, Vec<Sample>>,
     subscriptions: BTreeMap<String, SubscriptionFilterOutcome>,
+    requested_intervals_us: BTreeMap<String, u64>,
     evidence: Vec<Evidence>,
 }
 
@@ -70,6 +72,7 @@ impl Timeline {
             duration_us: 0,
             samples: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
+            requested_intervals_us: BTreeMap::new(),
             evidence: Vec::new(),
         };
         let mut clock_us = 0_u64;
@@ -79,11 +82,25 @@ impl Timeline {
             match event {
                 CaptureEvent::CaptureStarted { profile, .. } => {
                     timeline.profile = profile.clone();
-                    timeline.push(0, "capture", None, format!("started profile={}", profile.as_deref().unwrap_or("unknown")));
+                    timeline.push(
+                        0,
+                        "capture",
+                        None,
+                        format!("started profile={}", profile.as_deref().unwrap_or("unknown")),
+                    );
                 }
-                CaptureEvent::SessionInitialized => timeline.push(clock_us, "session", None, "initialized".into()),
-                CaptureEvent::SubscriptionConfigured { semantic, requested_interval_us, filter } => {
+                CaptureEvent::SessionInitialized => {
+                    timeline.push(clock_us, "session", None, "initialized".into());
+                }
+                CaptureEvent::SubscriptionConfigured {
+                    semantic,
+                    requested_interval_us,
+                    filter,
+                } => {
                     timeline.subscriptions.insert(semantic.clone(), *filter);
+                    timeline
+                        .requested_intervals_us
+                        .insert(semantic.clone(), *requested_interval_us);
                     timeline.push(
                         clock_us,
                         "subscription",
@@ -91,22 +108,52 @@ impl Timeline {
                         format!("{}ms {}", requested_interval_us / 1_000, filter_text(*filter)),
                     );
                 }
-                CaptureEvent::SupportDiscovery { request_payload, responder, response_payload } => timeline.push(
+                CaptureEvent::SupportDiscovery {
+                    request_payload,
+                    responder,
+                    response_payload,
+                } => timeline.push(
                     clock_us,
                     "support",
                     None,
-                    format!("{} TX {} RX {}", responder.as_deref().unwrap_or("unknown"), hex(request_payload), hex(response_payload)),
+                    format!(
+                        "{} TX {} RX {}",
+                        responder.as_deref().unwrap_or("unknown"),
+                        hex(request_payload),
+                        hex(response_payload)
+                    ),
                 ),
-                CaptureEvent::ProtocolNegotiationObserved { request_payload, responder, response_payload } => timeline.push(
+                CaptureEvent::ProtocolNegotiationObserved {
+                    request_payload,
+                    responder,
+                    response_payload,
+                } => timeline.push(
                     clock_us,
                     "protocol",
                     None,
-                    format!("{} TX {} RX {}", responder.as_deref().unwrap_or("unknown"), hex(request_payload), hex(response_payload)),
+                    format!(
+                        "{} TX {} RX {}",
+                        responder.as_deref().unwrap_or("unknown"),
+                        hex(request_payload),
+                        hex(response_payload)
+                    ),
                 ),
-                CaptureEvent::ResponsesObserved { semantic, request_payload, responses, selected_responder, selection_error } => {
+                CaptureEvent::ResponsesObserved {
+                    semantic,
+                    request_payload,
+                    responses,
+                    selected_responder,
+                    selection_error,
+                } => {
                     let responders = responses
                         .iter()
-                        .map(|response| format!("{}:{}", response.responder.as_deref().unwrap_or("unknown"), hex(&response.payload)))
+                        .map(|response| {
+                            format!(
+                                "{}:{}",
+                                response.responder.as_deref().unwrap_or("unknown"),
+                                hex(&response.payload)
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(" | ");
                     timeline.push(
@@ -118,7 +165,10 @@ impl Timeline {
                             hex(request_payload),
                             responders,
                             selected_responder.as_deref().unwrap_or("none"),
-                            selection_error.as_ref().map(|error| format!(" error={error}")).unwrap_or_default()
+                            selection_error
+                                .as_ref()
+                                .map(|error| format!(" error={error}"))
+                                .unwrap_or_default()
                         ),
                     );
                     pending_responses.push(timeline.evidence.len() - 1);
@@ -141,23 +191,39 @@ impl Timeline {
                     for index in pending_responses.drain(..) {
                         timeline.evidence[index].at_us = *finished_us;
                     }
-                    timeline.samples.entry(semantic.clone()).or_default().push(Sample {
-                        at_us: *finished_us,
-                        value: value.clone(),
-                        unit: unit.clone(),
-                        source: source.clone(),
-                        profile: profile.clone(),
-                        decoder: decoder.clone(),
-                        provenance: provenance.clone(),
-                    });
+                    timeline
+                        .samples
+                        .entry(semantic.clone())
+                        .or_default()
+                        .push(Sample {
+                            at_us: *finished_us,
+                            value: value.clone(),
+                            unit: unit.clone(),
+                            source: source.clone(),
+                            profile: profile.clone(),
+                            decoder: decoder.clone(),
+                            provenance: provenance.clone(),
+                        });
                     timeline.push(
                         *finished_us,
                         "read_ok",
                         Some(semantic.clone()),
-                        format!("TX {} RX {} -> {} {}", hex(request_payload), hex(response_payload), value_text(value), unit),
+                        format!(
+                            "TX {} RX {} -> {} {}",
+                            hex(request_payload),
+                            hex(response_payload),
+                            value_text(value),
+                            unit
+                        ),
                     );
                 }
-                CaptureEvent::ReadFailed { semantic, timing, request_payload, error, .. } => {
+                CaptureEvent::ReadFailed {
+                    semantic,
+                    timing,
+                    request_payload,
+                    error,
+                    ..
+                } => {
                     let at_us = timing.map(|timing| timing.finished_us).unwrap_or(clock_us);
                     clock_us = clock_us.max(at_us);
                     timeline.duration_us = timeline.duration_us.max(at_us);
@@ -168,47 +234,106 @@ impl Timeline {
                         at_us,
                         "read_error",
                         Some(semantic.clone()),
-                        format!("TX {} error={error}", request_payload.as_deref().map(hex).unwrap_or_else(|| "none".into())),
+                        format!(
+                            "TX {} error={error}",
+                            request_payload
+                                .as_deref()
+                                .map(hex)
+                                .unwrap_or_else(|| "none".into())
+                        ),
                     );
                 }
-                CaptureEvent::SlotsSkipped { semantic, count, last_due_us, .. } => {
+                CaptureEvent::SlotsSkipped {
+                    semantic,
+                    count,
+                    last_due_us,
+                    ..
+                } => {
                     clock_us = clock_us.max(*last_due_us);
                     timeline.duration_us = timeline.duration_us.max(*last_due_us);
-                    timeline.push(*last_due_us, "skipped", Some(semantic.clone()), format!("slots={count}"));
+                    timeline.push(
+                        *last_due_us,
+                        "skipped",
+                        Some(semantic.clone()),
+                        format!("slots={count}"),
+                    );
                 }
-                CaptureEvent::SessionError { error } => timeline.push(clock_us, "session_error", None, error.clone()),
-                CaptureEvent::RuntimeStateChanged { from, to, event, .. } => timeline.push(
+                CaptureEvent::SessionError { error } => {
+                    timeline.push(clock_us, "session_error", None, error.clone());
+                }
+                CaptureEvent::RuntimeStateChanged {
+                    from, to, event, ..
+                } => timeline.push(
                     clock_us,
                     "runtime",
                     None,
                     format!("{} -> {} ({event:?})", from.serialize(), to.serialize()),
                 ),
-                CaptureEvent::ShutdownRequested => timeline.push(clock_us, "shutdown", None, "requested".into()),
+                CaptureEvent::ShutdownRequested => {
+                    timeline.push(clock_us, "shutdown", None, "requested".into());
+                }
                 CaptureEvent::SessionStopped { offset_us } => {
                     timeline.duration_us = timeline.duration_us.max(*offset_us);
                     timeline.push(*offset_us, "session", None, "stopped".into());
                 }
-                CaptureEvent::DiagnosticJobStarted { job_id, .. } => timeline.push(clock_us, "job", None, format!("{job_id} started")),
-                CaptureEvent::DiagnosticJobStep { job_id, step_sequence, status, error, .. } => timeline.push(
+                CaptureEvent::DiagnosticJobStarted { job_id, .. } => {
+                    timeline.push(clock_us, "job", None, format!("{job_id} started"));
+                }
+                CaptureEvent::DiagnosticJobStep {
+                    job_id,
+                    step_sequence,
+                    status,
+                    error,
+                    ..
+                } => timeline.push(
                     clock_us,
                     "job_step",
                     None,
-                    format!("{job_id} step={step_sequence} {}{}", status.as_str(), error.as_ref().map(|error| format!(" error={error}")).unwrap_or_default()),
+                    format!(
+                        "{job_id} step={step_sequence} {}{}",
+                        status.as_str(),
+                        error
+                            .as_ref()
+                            .map(|error| format!(" error={error}"))
+                            .unwrap_or_default()
+                    ),
                 ),
-                CaptureEvent::DiagnosticJobCompleted { job_id, status } => timeline.push(clock_us, "job", None, format!("{job_id} {status:?}")),
-                CaptureEvent::DiagnosticJobFailed { job_id, error } => timeline.push(clock_us, "job_error", None, format!("{job_id} {error}")),
-                CaptureEvent::DiagnosticJobCancelled { job_id } => timeline.push(clock_us, "job", None, format!("{job_id} cancelled")),
-                CaptureEvent::DtcTransportObserved { job_id, responder, outcome, .. } => timeline.push(
+                CaptureEvent::DiagnosticJobCompleted { job_id, status } => {
+                    timeline.push(clock_us, "job", None, format!("{job_id} {status:?}"));
+                }
+                CaptureEvent::DiagnosticJobFailed { job_id, error } => {
+                    timeline.push(clock_us, "job_error", None, format!("{job_id} {error}"));
+                }
+                CaptureEvent::DiagnosticJobCancelled { job_id } => {
+                    timeline.push(clock_us, "job", None, format!("{job_id} cancelled"));
+                }
+                CaptureEvent::DtcTransportObserved {
+                    job_id,
+                    responder,
+                    outcome,
+                    ..
+                } => timeline.push(
                     clock_us,
                     "dtc_transport",
                     None,
-                    format!("{job_id} {} {outcome:?}", responder.as_deref().unwrap_or("unknown")),
+                    format!(
+                        "{job_id} {} {outcome:?}",
+                        responder.as_deref().unwrap_or("unknown")
+                    ),
                 ),
-                CaptureEvent::DtcObservation { job_id, responder, fact, .. } => timeline.push(
+                CaptureEvent::DtcObservation {
+                    job_id,
+                    responder,
+                    fact,
+                    ..
+                } => timeline.push(
                     clock_us,
                     "dtc_fact",
                     None,
-                    format!("{job_id} {} {fact:?}", responder.as_deref().unwrap_or("unknown")),
+                    format!(
+                        "{job_id} {} {fact:?}",
+                        responder.as_deref().unwrap_or("unknown")
+                    ),
                 ),
             }
         }
@@ -220,16 +345,27 @@ impl Timeline {
     }
 
     fn push(&mut self, at_us: u64, kind: &'static str, semantic: Option<String>, text: String) {
-        self.evidence.push(Evidence { at_us, kind, semantic, text });
+        self.evidence.push(Evidence {
+            at_us,
+            kind,
+            semantic,
+            text,
+        });
     }
 
     fn availability(&self, semantic: &str) -> Availability {
-        if self.samples.get(semantic).is_some_and(|samples| !samples.is_empty()) {
+        if self
+            .samples
+            .get(semantic)
+            .is_some_and(|samples| !samples.is_empty())
+        {
             return Availability::Captured;
         }
         match self.subscriptions.get(semantic) {
             Some(SubscriptionFilterOutcome::Scheduled) => Availability::RequestedNoSample,
-            Some(SubscriptionFilterOutcome::Unsupported | SubscriptionFilterOutcome::Unknown) => Availability::Unsupported,
+            Some(SubscriptionFilterOutcome::Unsupported | SubscriptionFilterOutcome::Unknown) => {
+                Availability::Unsupported
+            }
             None => Availability::NotCaptured,
         }
     }
@@ -241,7 +377,9 @@ impl Timeline {
     }
 
     fn samples_in(&self, semantic: &str, start_us: u64, end_us: u64) -> &[Sample] {
-        let Some(samples) = self.samples.get(semantic) else { return &[]; };
+        let Some(samples) = self.samples.get(semantic) else {
+            return &[];
+        };
         let start = samples.partition_point(|sample| sample.at_us < start_us);
         let end = samples.partition_point(|sample| sample.at_us <= end_us);
         &samples[start..end]
@@ -251,6 +389,13 @@ impl Timeline {
         let start = self.evidence.partition_point(|event| event.at_us < start_us);
         let end = self.evidence.partition_point(|event| event.at_us <= end_us);
         &self.evidence[start..end]
+    }
+
+    fn stale_after_us(&self, semantic: &str) -> Option<u64> {
+        self.requested_intervals_us
+            .get(semantic)
+            .copied()
+            .map(|interval| interval.saturating_mul(STALE_AFTER_INTERVALS))
     }
 }
 
@@ -286,13 +431,26 @@ impl Nav {
         let step = (self.window_us / 10).max(100_000);
         match key {
             KeyCode::Left => self.cursor_us = self.cursor_us.saturating_sub(step),
-            KeyCode::Right => self.cursor_us = self.cursor_us.saturating_add(step).min(duration_us),
+            KeyCode::Right => {
+                self.cursor_us = self.cursor_us.saturating_add(step).min(duration_us);
+            }
             KeyCode::PageUp => self.cursor_us = self.cursor_us.saturating_sub(self.window_us),
-            KeyCode::PageDown => self.cursor_us = self.cursor_us.saturating_add(self.window_us).min(duration_us),
+            KeyCode::PageDown => {
+                self.cursor_us = self.cursor_us.saturating_add(self.window_us).min(duration_us);
+            }
             KeyCode::Home | KeyCode::Char('g') => self.cursor_us = 0,
             KeyCode::End | KeyCode::Char('G') => self.cursor_us = duration_us,
-            KeyCode::Char('+') | KeyCode::Char('=') => self.window_us = (self.window_us / 2).max(MIN_WINDOW_US).min(duration_us.max(MIN_WINDOW_US)),
-            KeyCode::Char('-') => self.window_us = self.window_us.saturating_mul(2).min(duration_us.max(MIN_WINDOW_US)),
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.window_us = (self.window_us / 2)
+                    .max(MIN_WINDOW_US)
+                    .min(duration_us.max(MIN_WINDOW_US));
+            }
+            KeyCode::Char('-') => {
+                self.window_us = self
+                    .window_us
+                    .saturating_mul(2)
+                    .min(duration_us.max(MIN_WINDOW_US));
+            }
             _ => {}
         }
     }
@@ -325,28 +483,51 @@ fn numeric(samples: &[Sample]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn spark(samples: &[Sample]) -> Vec<u64> {
-    let values = samples
-        .iter()
-        .filter_map(|sample| match &sample.value { CaptureValue::Number(value) => Some(*value), _ => None })
-        .collect::<Vec<_>>();
-    if values.is_empty() { return Vec::new(); }
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let span = max - min;
-    values.into_iter().map(|value| if span == 0.0 { 1 } else { ((value - min) * 100.0 / span) as u64 }).collect()
+fn numeric_segments(samples: &[Sample], max_gap_us: Option<u64>) -> Vec<Vec<(f64, f64)>> {
+    let mut segments = Vec::<Vec<(f64, f64)>>::new();
+    let mut previous_at_us = None;
+    for sample in samples {
+        let CaptureValue::Number(value) = &sample.value else {
+            continue;
+        };
+        let split = previous_at_us
+            .zip(max_gap_us)
+            .is_some_and(|(previous, max_gap)| sample.at_us.saturating_sub(previous) > max_gap);
+        if segments.is_empty() || split {
+            segments.push(Vec::new());
+        }
+        segments
+            .last_mut()
+            .expect("a segment exists")
+            .push((sample.at_us as f64 / 1_000_000.0, *value));
+        previous_at_us = Some(sample.at_us);
+    }
+    segments
 }
 
 fn bounds(left: &[(f64, f64)], right: &[(f64, f64)]) -> (f64, f64) {
     let mut values = left.iter().chain(right.iter()).map(|(_, y)| *y);
-    let Some(first) = values.next() else { return (0.0, 1.0); };
+    let Some(first) = values.next() else {
+        return (0.0, 1.0);
+    };
     let (mut min, mut max) = (first, first);
-    for value in values { min = min.min(value); max = max.max(value); }
-    if min == max { max += 1.0; }
+    for value in values {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    if min == max {
+        max += 1.0;
+    }
     (min, max)
 }
 
-fn unavailable(frame: &mut Frame, area: Rect, panel: &Panel, timeline: &Timeline, semantic: &str) {
+fn unavailable(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &Panel,
+    timeline: &Timeline,
+    semantic: &str,
+) {
     let status = match timeline.availability(semantic) {
         Availability::Captured => "no sample in window",
         Availability::Unsupported => "unsupported / unavailable",
@@ -360,15 +541,54 @@ fn unavailable(frame: &mut Frame, area: Rect, panel: &Panel, timeline: &Timeline
     );
 }
 
-fn panel(frame: &mut Frame, area: Rect, panel: &Panel, timeline: &Timeline, nav: Nav, start_us: u64, end_us: u64) {
+fn panel(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &Panel,
+    timeline: &Timeline,
+    nav: Nav,
+    start_us: u64,
+    end_us: u64,
+) {
     match panel.view {
         View::Value => {
-            let [semantic] = panel.signals.as_slice() else { return unavailable(frame, area, panel, timeline, "invalid value panel"); };
-            let Some(sample) = timeline.current_at(semantic, nav.cursor_us) else { return unavailable(frame, area, panel, timeline, semantic); };
+            let [semantic] = panel.signals.as_slice() else {
+                return unavailable(frame, area, panel, timeline, "invalid value panel");
+            };
+            let Some(sample) = timeline.current_at(semantic, nav.cursor_us) else {
+                return unavailable(frame, area, panel, timeline, semantic);
+            };
+            let age_us = nav.cursor_us.saturating_sub(sample.at_us);
+            let freshness = timeline.stale_after_us(semantic).map(|stale_after_us| {
+                if age_us > stale_after_us {
+                    (
+                        format!(
+                            "STALE age={}ms threshold={}ms source={}",
+                            age_us / 1_000,
+                            stale_after_us / 1_000,
+                            sample.source
+                        ),
+                        Color::Yellow,
+                    )
+                } else {
+                    (
+                        format!("fresh age={}ms source={}", age_us / 1_000, sample.source),
+                        Color::Green,
+                    )
+                }
+            });
+            let freshness = freshness.unwrap_or_else(|| {
+                (
+                    format!("age={}ms source={}", age_us / 1_000, sample.source),
+                    Color::Reset,
+                )
+            });
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(format!("{} {}", value_text(&sample.value), sample.unit)).style(Style::default().fg(Color::Cyan)),
-                    Line::from(format!("{semantic} age={}ms source={}", nav.cursor_us.saturating_sub(sample.at_us) / 1_000, sample.source)),
+                    Line::from(format!("{} {}", value_text(&sample.value), sample.unit))
+                        .style(Style::default().fg(Color::Cyan)),
+                    Line::from(format!("{semantic} {}", freshness.0))
+                        .style(Style::default().fg(freshness.1)),
                     Line::from(format!("profile={} decoder={}", sample.profile, sample.decoder)),
                     Line::from(format!("provenance={}", sample.provenance)),
                 ])
@@ -377,58 +597,179 @@ fn panel(frame: &mut Frame, area: Rect, panel: &Panel, timeline: &Timeline, nav:
             );
         }
         View::Sparkline => {
-            let [semantic] = panel.signals.as_slice() else { return unavailable(frame, area, panel, timeline, "invalid sparkline panel"); };
-            let values = spark(timeline.samples_in(semantic, start_us, end_us));
-            if values.is_empty() { return unavailable(frame, area, panel, timeline, semantic); }
-            frame.render_widget(Sparkline::default().data(&values).block(Block::default().borders(Borders::ALL).title(panel.title.as_str())), area);
-        }
-        View::TimeSeries => {
-            let [semantic] = panel.signals.as_slice() else { return unavailable(frame, area, panel, timeline, "invalid timeseries panel"); };
+            let [semantic] = panel.signals.as_slice() else {
+                return unavailable(frame, area, panel, timeline, "invalid sparkline panel");
+            };
             let samples = timeline.samples_in(semantic, start_us, end_us);
             let points = numeric(samples);
-            if points.is_empty() { return unavailable(frame, area, panel, timeline, semantic); }
-            let unit = samples.iter().find_map(|sample| matches!(&sample.value, CaptureValue::Number(_)).then_some(sample.unit.as_str())).unwrap_or("");
+            if points.is_empty() {
+                return unavailable(frame, area, panel, timeline, semantic);
+            }
+            let max_gap_us = timeline
+                .requested_intervals_us
+                .get(semantic)
+                .copied()
+                .map(|interval| interval.saturating_mul(STALE_AFTER_INTERVALS));
+            let segments = numeric_segments(samples, max_gap_us);
             let (y_min, y_max) = bounds(&points, &[]);
-            let chart = Chart::new(vec![Dataset::default().name(semantic.as_str()).graph_type(GraphType::Line).data(&points)])
-                .block(Block::default().borders(Borders::ALL).title(panel.title.as_str()))
-                .x_axis(Axis::default().title("capture seconds").bounds([start_us as f64 / 1_000_000.0, end_us as f64 / 1_000_000.0]))
-                .y_axis(Axis::default().title(unit).bounds([y_min, y_max]));
+            let mut datasets = vec![Dataset::default()
+                .graph_type(GraphType::Scatter)
+                .data(&points)];
+            datasets.extend(
+                segments
+                    .iter()
+                    .filter(|segment| segment.len() > 1)
+                    .map(|segment| Dataset::default().graph_type(GraphType::Line).data(segment)),
+            );
+            frame.render_widget(
+                Chart::new(datasets)
+                    .block(Block::default().borders(Borders::ALL).title(panel.title.as_str()))
+                    .x_axis(Axis::default().bounds([
+                        start_us as f64 / 1_000_000.0,
+                        end_us as f64 / 1_000_000.0,
+                    ]))
+                    .y_axis(Axis::default().bounds([y_min, y_max])),
+                area,
+            );
+        }
+        View::TimeSeries => {
+            let [semantic] = panel.signals.as_slice() else {
+                return unavailable(frame, area, panel, timeline, "invalid timeseries panel");
+            };
+            let samples = timeline.samples_in(semantic, start_us, end_us);
+            let points = numeric(samples);
+            if points.is_empty() {
+                return unavailable(frame, area, panel, timeline, semantic);
+            }
+            let unit = samples
+                .iter()
+                .find_map(|sample| {
+                    matches!(&sample.value, CaptureValue::Number(_)).then_some(sample.unit.as_str())
+                })
+                .unwrap_or("");
+            let (y_min, y_max) = bounds(&points, &[]);
+            let chart = Chart::new(vec![Dataset::default()
+                .name(semantic.as_str())
+                .graph_type(GraphType::Line)
+                .data(&points)])
+            .block(Block::default().borders(Borders::ALL).title(panel.title.as_str()))
+            .x_axis(
+                Axis::default()
+                    .title("capture seconds")
+                    .bounds([
+                        start_us as f64 / 1_000_000.0,
+                        end_us as f64 / 1_000_000.0,
+                    ]),
+            )
+            .y_axis(Axis::default().title(unit).bounds([y_min, y_max]));
             frame.render_widget(chart, area);
         }
         View::Compare => {
-            let [left, right] = panel.signals.as_slice() else { return unavailable(frame, area, panel, timeline, "invalid compare panel"); };
+            let [left, right] = panel.signals.as_slice() else {
+                return unavailable(frame, area, panel, timeline, "invalid compare panel");
+            };
             let left_samples = timeline.samples_in(left, start_us, end_us);
             let right_samples = timeline.samples_in(right, start_us, end_us);
             let left_points = numeric(left_samples);
             let right_points = numeric(right_samples);
-            if left_points.is_empty() || right_points.is_empty() { return unavailable(frame, area, panel, timeline, &format!("{left}/{right}")); }
-            let left_unit = left_samples.iter().find_map(|sample| matches!(&sample.value, CaptureValue::Number(_)).then_some(sample.unit.as_str())).unwrap_or("");
-            let right_unit = right_samples.iter().find_map(|sample| matches!(&sample.value, CaptureValue::Number(_)).then_some(sample.unit.as_str())).unwrap_or("");
+            if left_points.is_empty() || right_points.is_empty() {
+                return unavailable(
+                    frame,
+                    area,
+                    panel,
+                    timeline,
+                    &format!("{left}/{right}"),
+                );
+            }
+            let left_unit = left_samples
+                .iter()
+                .find_map(|sample| {
+                    matches!(&sample.value, CaptureValue::Number(_)).then_some(sample.unit.as_str())
+                })
+                .unwrap_or("");
+            let right_unit = right_samples
+                .iter()
+                .find_map(|sample| {
+                    matches!(&sample.value, CaptureValue::Number(_)).then_some(sample.unit.as_str())
+                })
+                .unwrap_or("");
             if left_unit != right_unit {
-                frame.render_widget(Paragraph::new(format!("incompatible units: {left_unit} vs {right_unit}")).block(Block::default().borders(Borders::ALL).title(panel.title.as_str())), area);
+                frame.render_widget(
+                    Paragraph::new(format!("incompatible units: {left_unit} vs {right_unit}"))
+                        .block(Block::default().borders(Borders::ALL).title(panel.title.as_str())),
+                    area,
+                );
                 return;
             }
             let (y_min, y_max) = bounds(&left_points, &right_points);
             let chart = Chart::new(vec![
-                Dataset::default().name(left.as_str()).graph_type(GraphType::Line).data(&left_points),
-                Dataset::default().name(right.as_str()).graph_type(GraphType::Line).data(&right_points),
+                Dataset::default()
+                    .name(left.as_str())
+                    .graph_type(GraphType::Line)
+                    .data(&left_points),
+                Dataset::default()
+                    .name(right.as_str())
+                    .graph_type(GraphType::Line)
+                    .data(&right_points),
             ])
             .block(Block::default().borders(Borders::ALL).title(panel.title.as_str()))
-            .x_axis(Axis::default().title("capture seconds").bounds([start_us as f64 / 1_000_000.0, end_us as f64 / 1_000_000.0]))
+            .x_axis(
+                Axis::default()
+                    .title("capture seconds")
+                    .bounds([
+                        start_us as f64 / 1_000_000.0,
+                        end_us as f64 / 1_000_000.0,
+                    ]),
+            )
             .y_axis(Axis::default().title(left_unit).bounds([y_min, y_max]));
             frame.render_widget(chart, area);
         }
     }
 }
 
+fn offline_engine_overview() -> DashboardLayout {
+    let mut layout = tui::engine_overview();
+    if let Some(compare) = layout
+        .panels
+        .iter_mut()
+        .find(|panel| panel.view == View::Compare)
+    {
+        compare.title = "MAP / barometric pressure".into();
+        compare.signals = vec![
+            "engine.intake_manifold_pressure".into(),
+            "engine.barometric_pressure".into(),
+        ];
+    }
+    layout
+}
+
 fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav: Nav, path: &str) {
-    let areas = Layout::vertical([Constraint::Length(4), Constraint::Min(12), Constraint::Length(9)]).split(frame.area());
+    let areas = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(12),
+        Constraint::Length(9),
+    ])
+    .split(frame.area());
     let (start_us, end_us) = nav.bounds(timeline.duration_us);
-    let status = if timeline.status == CaptureStatus::Complete { "COMPLETE" } else { "PARTIAL" };
+    let evidence_end_us = nav.cursor_us.min(end_us);
+    let status = if timeline.status == CaptureStatus::Complete {
+        "COMPLETE"
+    } else {
+        "PARTIAL"
+    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!("OBDentic | {path} | {status} | profile={}", timeline.profile.as_deref().unwrap_or("unknown"))),
-            Line::from(format!("cursor {:.3}s/{:.3}s window {:.3}s..{:.3}s | arrows PgUp/PgDn Home/End +/- q/Esc", nav.cursor_us as f64 / 1_000_000.0, timeline.duration_us as f64 / 1_000_000.0, start_us as f64 / 1_000_000.0, end_us as f64 / 1_000_000.0)),
+            Line::from(format!(
+                "OBDentic | {path} | {status} | profile={}",
+                timeline.profile.as_deref().unwrap_or("unknown")
+            )),
+            Line::from(format!(
+                "cursor {:.3}s/{:.3}s window {:.3}s..{:.3}s | arrows PgUp/PgDn Home/End +/- q/Esc",
+                nav.cursor_us as f64 / 1_000_000.0,
+                timeline.duration_us as f64 / 1_000_000.0,
+                start_us as f64 / 1_000_000.0,
+                end_us as f64 / 1_000_000.0
+            )),
         ])
         .block(Block::default().borders(Borders::ALL).title("Offline capture")),
         areas[0],
@@ -436,36 +777,73 @@ fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav:
 
     let rows = layout.panels.len().div_ceil(2);
     if rows > 0 {
-        let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(areas[1]);
+        let row_areas =
+            Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(areas[1]);
         for (panel_def, area) in layout.panels.iter().zip(row_areas.iter().flat_map(|row| {
-            let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(*row);
+            let columns = Layout::horizontal([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(*row);
             [columns[0], columns[1]]
         })) {
             panel(frame, area, panel_def, timeline, nav, start_us, end_us);
         }
     }
 
-    let bottom = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).split(areas[2]);
+    let bottom = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(areas[2]);
     let relevant = timeline
-        .evidence_in(start_us, end_us)
+        .evidence_in(start_us, evidence_end_us)
         .iter()
-        .filter(|event| matches!(event.kind, "read_ok" | "read_error" | "responses" | "support" | "protocol" | "dtc_fact" | "dtc_transport"))
+        .filter(|event| {
+            matches!(
+                event.kind,
+                "read_ok"
+                    | "read_error"
+                    | "responses"
+                    | "support"
+                    | "protocol"
+                    | "dtc_fact"
+                    | "dtc_transport"
+            )
+        })
         .collect::<Vec<_>>();
     let evidence = relevant.iter().rev().take(6).collect::<Vec<_>>();
     frame.render_widget(
-        List::new(evidence.into_iter().rev().map(|event| ListItem::new(format!("{:>7.3}s {} {} {}", event.at_us as f64 / 1_000_000.0, event.kind, event.semantic.as_deref().unwrap_or(""), event.text))))
-            .block(Block::default().borders(Borders::ALL).title("Evidence / TX / RX")),
+        List::new(evidence.into_iter().rev().map(|event| {
+            ListItem::new(format!(
+                "{:>7.3}s {} {} {}",
+                event.at_us as f64 / 1_000_000.0,
+                event.kind,
+                event.semantic.as_deref().unwrap_or(""),
+                event.text
+            ))
+        }))
+        .block(Block::default().borders(Borders::ALL).title("Evidence / TX / RX")),
         bottom[0],
     );
     let problems = timeline
-        .evidence_in(start_us, end_us)
+        .evidence_in(start_us, evidence_end_us)
         .iter()
-        .filter(|event| matches!(event.kind, "read_error" | "skipped" | "session_error" | "job_error" | "runtime"))
+        .filter(|event| {
+            matches!(
+                event.kind,
+                "read_error" | "skipped" | "session_error" | "job_error" | "runtime"
+            )
+        })
         .collect::<Vec<_>>();
     let problems = problems.iter().rev().take(6).collect::<Vec<_>>();
     frame.render_widget(
-        List::new(problems.into_iter().rev().map(|event| ListItem::new(format!("{:>7.2}s {} {}", event.at_us as f64 / 1_000_000.0, event.kind, event.text))))
-            .block(Block::default().borders(Borders::ALL).title("Errors / lifecycle")),
+        List::new(problems.into_iter().rev().map(|event| {
+            ListItem::new(format!(
+                "{:>7.2}s {} {}",
+                event.at_us as f64 / 1_000_000.0,
+                event.kind,
+                event.text
+            ))
+        }))
+        .block(Block::default().borders(Borders::ALL).title("Errors / lifecycle")),
         bottom[1],
     );
 }
@@ -479,10 +857,13 @@ fn run_tui(path: &Path, layout: &DashboardLayout) -> Result<(), String> {
         let _ = disable_raw_mode();
         return Err(error.to_string());
     }
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| error.to_string())?;
+    let mut terminal =
+        Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| error.to_string())?;
     let mut nav = Nav::new(timeline.duration_us);
     let result = loop {
-        terminal.draw(|frame| render(frame, layout, &timeline, nav, &path.display().to_string())).map_err(|error| error.to_string())?;
+        terminal
+            .draw(|frame| render(frame, layout, &timeline, nav, &path.display().to_string()))
+            .map_err(|error| error.to_string())?;
         match event::read().map_err(|error| error.to_string())? {
             Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => break Ok(()),
             Event::Key(key) => nav.key(key.code, timeline.duration_us),
@@ -500,10 +881,19 @@ fn main() {
     let result = (|| {
         let (capture, layout) = match args.as_slice() {
             [capture] => (capture.as_str(), None),
-            [capture, flag, layout] if flag == "--layout" => (capture.as_str(), Some(layout.as_str())),
-            _ => return Err("usage: obdentic-capture-tui <capture.jsonl> [--layout <layout.tsv>]".into()),
+            [capture, flag, layout] if flag == "--layout" => {
+                (capture.as_str(), Some(layout.as_str()))
+            }
+            _ => {
+                return Err(
+                    "usage: obdentic-capture-tui <capture.jsonl> [--layout <layout.tsv>]".into(),
+                );
+            }
         };
-        let layout = layout.map_or_else(|| Ok(tui::engine_overview()), |path| tui::load_layout(Path::new(path)))?;
+        let layout = layout.map_or_else(
+            || Ok(offline_engine_overview()),
+            |path| tui::load_layout(Path::new(path)),
+        )?;
         run_tui(Path::new(capture), &layout)
     })();
     if let Err(error) = result {
@@ -538,15 +928,28 @@ mod tests {
     fn fixture(status: CaptureStatus) -> ParsedCapture {
         let mut events = vec![
             CaptureEvent::capture_started(None, Some("engine-drive".into())),
-            CaptureEvent::subscription_configured("engine.rpm", 1_000_000, SubscriptionFilterOutcome::Scheduled),
-            CaptureEvent::subscription_configured("future.signal", 1_000_000, SubscriptionFilterOutcome::Unsupported),
+            CaptureEvent::subscription_configured(
+                "engine.rpm",
+                1_000_000,
+                SubscriptionFilterOutcome::Scheduled,
+            ),
+            CaptureEvent::subscription_configured(
+                "future.signal",
+                1_000_000,
+                SubscriptionFilterOutcome::Unsupported,
+            ),
             CaptureEvent::responses_observed(
                 "engine.rpm",
                 vec![0x01, 0x0c],
-                vec![ResponderEvidence::new(Some("7E8".into()), vec![0x41, 0x0c, 0x0c, 0x80]).unwrap()],
+                vec![ResponderEvidence::new(
+                    Some("7E8".into()),
+                    vec![0x41, 0x0c, 0x0c, 0x80],
+                )
+                .unwrap()],
                 Some("7E8".into()),
                 None,
-            ).unwrap(),
+            )
+            .unwrap(),
             read("engine.rpm", 1_000_000, 800.0, "rpm"),
             read("engine.rpm", 2_500_000, 1_200.0, "rpm"),
             CaptureEvent::ReadFailed {
@@ -563,21 +966,44 @@ mod tests {
                 last_due_us: 4_000_000,
             },
         ];
-        if status == CaptureStatus::Complete { events.push(CaptureEvent::SessionStopped { offset_us: 5_000_000 }); }
+        if status == CaptureStatus::Complete {
+            events.push(CaptureEvent::SessionStopped {
+                offset_us: 5_000_000,
+            });
+        }
         ParsedCapture { events, status }
     }
 
     fn text(terminal: &Terminal<TestBackend>) -> String {
-        terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect()
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     #[test]
     fn indexes_irregular_timestamps_and_prior_sample() {
         let timeline = Timeline::from_capture(&fixture(CaptureStatus::Complete));
-        assert_eq!(timeline.current_at("engine.rpm", 2_000_000).unwrap().at_us, 1_000_000);
-        assert_eq!(timeline.current_at("engine.rpm", 3_000_000).unwrap().at_us, 2_500_000);
-        assert_eq!(numeric(timeline.samples_in("engine.rpm", 0, 5_000_000)), [(1.0, 800.0), (2.5, 1_200.0)]);
-        assert_eq!(timeline.availability("future.signal"), Availability::Unsupported);
+        assert_eq!(
+            timeline.current_at("engine.rpm", 2_000_000).unwrap().at_us,
+            1_000_000
+        );
+        assert_eq!(
+            timeline.current_at("engine.rpm", 3_000_000).unwrap().at_us,
+            2_500_000
+        );
+        assert_eq!(
+            numeric(timeline.samples_in("engine.rpm", 0, 5_000_000)),
+            [(1.0, 800.0), (2.5, 1_200.0)]
+        );
+        assert_eq!(
+            timeline.availability("future.signal"),
+            Availability::Unsupported
+        );
+        assert_eq!(timeline.stale_after_us("engine.rpm"), Some(2_000_000));
     }
 
     #[test]
@@ -587,10 +1013,104 @@ mod tests {
         assert_eq!(nav.cursor_us, 0);
         nav.key(KeyCode::Right, 120_000_000);
         assert!(nav.cursor_us > 0);
-        for _ in 0..20 { nav.key(KeyCode::Char('+'), 120_000_000); }
+        for _ in 0..20 {
+            nav.key(KeyCode::Char('+'), 120_000_000);
+        }
         assert_eq!(nav.window_us, MIN_WINDOW_US);
         nav.key(KeyCode::End, 120_000_000);
         assert_eq!(nav.cursor_us, 120_000_000);
+    }
+
+    #[test]
+    fn evidence_and_errors_never_look_ahead_of_cursor() {
+        let timeline = Timeline::from_capture(&fixture(CaptureStatus::Complete));
+        let layout = DashboardLayout {
+            name: "cursor".into(),
+            panels: vec![Panel {
+                title: "RPM".into(),
+                view: View::Value,
+                signals: vec!["engine.rpm".into()],
+            }],
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &layout,
+                    &timeline,
+                    Nav {
+                        cursor_us: 2_600_000,
+                        window_us: 5_000_000,
+                    },
+                    "fixture.jsonl",
+                )
+            })
+            .unwrap();
+        let output = text(&terminal);
+        assert!(output.contains("TX 01 0C"));
+        assert!(!output.contains("conflicting responders"));
+        assert!(!output.contains("skipped"));
+    }
+
+    #[test]
+    fn stale_value_is_explicit_at_cursor() {
+        let timeline = Timeline::from_capture(&fixture(CaptureStatus::Complete));
+        let layout = DashboardLayout {
+            name: "stale".into(),
+            panels: vec![Panel {
+                title: "RPM".into(),
+                view: View::Value,
+                signals: vec!["engine.rpm".into()],
+            }],
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &layout,
+                    &timeline,
+                    Nav {
+                        cursor_us: 5_000_000,
+                        window_us: 5_000_000,
+                    },
+                    "fixture.jsonl",
+                )
+            })
+            .unwrap();
+        assert!(text(&terminal).contains("STALE"));
+    }
+
+    #[test]
+    fn sparkline_segments_preserve_large_capture_time_gaps() {
+        let mut parsed = fixture(CaptureStatus::Complete);
+        parsed
+            .events
+            .push(read("engine.rpm", 8_000_000, 1_500.0, "rpm"));
+        let timeline = Timeline::from_capture(&parsed);
+        let samples = timeline.samples_in("engine.rpm", 0, 10_000_000);
+        let segments = numeric_segments(samples, timeline.stale_after_us("engine.rpm"));
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], [(1.0, 800.0), (2.5, 1_200.0)]);
+        assert_eq!(segments[1], [(8.0, 1_500.0)]);
+    }
+
+    #[test]
+    fn default_offline_compare_uses_compatible_pressure_signals() {
+        let layout = offline_engine_overview();
+        let compare = layout
+            .panels
+            .iter()
+            .find(|panel| panel.view == View::Compare)
+            .unwrap();
+        assert_eq!(
+            compare.signals,
+            [
+                "engine.intake_manifold_pressure",
+                "engine.barometric_pressure"
+            ]
+        );
     }
 
     #[test]
@@ -599,12 +1119,30 @@ mod tests {
         let layout = DashboardLayout {
             name: "offline".into(),
             panels: vec![
-                Panel { title: "RPM".into(), view: View::TimeSeries, signals: vec!["engine.rpm".into()] },
-                Panel { title: "Missing".into(), view: View::Value, signals: vec!["future.signal".into()] },
+                Panel {
+                    title: "RPM".into(),
+                    view: View::TimeSeries,
+                    signals: vec!["engine.rpm".into()],
+                },
+                Panel {
+                    title: "Missing".into(),
+                    view: View::Value,
+                    signals: vec!["future.signal".into()],
+                },
             ],
         };
         let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
-        terminal.draw(|frame| render(frame, &layout, &timeline, Nav::new(timeline.duration_us), "fixture.jsonl")).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &layout,
+                    &timeline,
+                    Nav::new(timeline.duration_us),
+                    "fixture.jsonl",
+                )
+            })
+            .unwrap();
         let output = text(&terminal);
         assert!(output.contains("PARTIAL"));
         assert!(output.contains("unsupported / unavailable"));
@@ -616,14 +1154,30 @@ mod tests {
     #[test]
     fn compare_rejects_incompatible_units() {
         let mut parsed = fixture(CaptureStatus::Complete);
-        parsed.events.push(read("vehicle.speed", 2_000_000, 50.0, "km/h"));
+        parsed
+            .events
+            .push(read("vehicle.speed", 2_000_000, 50.0, "km/h"));
         let timeline = Timeline::from_capture(&parsed);
         let layout = DashboardLayout {
             name: "compare".into(),
-            panels: vec![Panel { title: "Compare".into(), view: View::Compare, signals: vec!["engine.rpm".into(), "vehicle.speed".into()] }],
+            panels: vec![Panel {
+                title: "Compare".into(),
+                view: View::Compare,
+                signals: vec!["engine.rpm".into(), "vehicle.speed".into()],
+            }],
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        terminal.draw(|frame| render(frame, &layout, &timeline, Nav::new(timeline.duration_us), "fixture.jsonl")).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &layout,
+                    &timeline,
+                    Nav::new(timeline.duration_us),
+                    "fixture.jsonl",
+                )
+            })
+            .unwrap();
         assert!(text(&terminal).contains("incompatible units: rpm vs km/h"));
     }
 }
