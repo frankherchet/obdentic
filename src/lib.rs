@@ -17,6 +17,7 @@ pub mod capture_events;
 pub mod capture_report;
 pub mod diagnostic_job;
 pub mod dtc;
+pub mod ea189;
 pub mod evidence;
 pub mod functional_discovery;
 pub mod identity;
