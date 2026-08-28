@@ -748,10 +748,7 @@ mod tests {
             unit: "rpm",
         }]);
         assert_eq!(
-            time_points_from(
-                [1_000_000_u128].into_iter().zip(compatible.iter()),
-                0,
-            ),
+            time_points_from([1_000_000_u128].into_iter().zip(compatible.iter()), 0,),
             [(1.0, 1.0)]
         );
 
