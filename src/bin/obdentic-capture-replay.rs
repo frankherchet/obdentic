@@ -48,8 +48,9 @@ fn run() -> Result<(), String> {
 
     tui::run(&layout, &telemetry, replay.transactions())?;
     println!(
-        "capture replay  reads={} issues={} duration={:.3}s",
+        "capture replay  reads={} timed_reads={} issues={} duration={:.3}s",
         replay.transactions().len(),
+        replay.offsets_us().len(),
         replay.issues().len(),
         replay.duration_us() as f64 / 1_000_000.0
     );
