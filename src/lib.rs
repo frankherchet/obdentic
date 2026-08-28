@@ -417,7 +417,14 @@ mod tests {
     #[test]
     fn supported_signal_metadata_matches_the_closed_request_vocabulary() {
         let expected = [
-            ("engine.rpm", [0x01, 0x0c], "rpm", 0.0, 16383.75, "powertrain"),
+            (
+                "engine.rpm",
+                [0x01, 0x0c],
+                "rpm",
+                0.0,
+                16383.75,
+                "powertrain",
+            ),
             (
                 "engine.coolant_temperature",
                 [0x01, 0x05],
@@ -426,7 +433,14 @@ mod tests {
                 215.0,
                 "powertrain",
             ),
-            ("vehicle.speed", [0x01, 0x0d], "km/h", 0.0, 255.0, "powertrain"),
+            (
+                "vehicle.speed",
+                [0x01, 0x0d],
+                "km/h",
+                0.0,
+                255.0,
+                "powertrain",
+            ),
             ("engine.maf", [0x01, 0x10], "g/s", 0.0, 655.35, "powertrain"),
             ("engine.load", [0x01, 0x04], "%", 0.0, 100.0, "powertrain"),
             (
@@ -461,7 +475,14 @@ mod tests {
                 99.21875,
                 "powertrain",
             ),
-            ("engine.runtime", [0x01, 0x1f], "s", 0.0, 65535.0, "powertrain"),
+            (
+                "engine.runtime",
+                [0x01, 0x1f],
+                "s",
+                0.0,
+                65535.0,
+                "powertrain",
+            ),
             (
                 "vehicle.accelerator_pedal_d",
                 [0x01, 0x49],
