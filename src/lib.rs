@@ -21,6 +21,7 @@ pub mod functional_discovery;
 pub mod identity;
 pub mod jsonl_capture;
 pub mod protocol;
+pub mod runtime_reducer;
 pub mod runtime_state;
 pub mod safety;
 pub mod scheduler;
