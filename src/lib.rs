@@ -417,23 +417,39 @@ mod tests {
     #[test]
     fn supported_signal_metadata_matches_the_closed_request_vocabulary() {
         let expected = [
-            ("engine.rpm", [0x01, 0x0c], "rpm", 0.0, 16383.75),
+            (
+                "engine.rpm",
+                [0x01, 0x0c],
+                "rpm",
+                0.0,
+                16383.75,
+                "powertrain",
+            ),
             (
                 "engine.coolant_temperature",
                 [0x01, 0x05],
                 "°C",
                 -40.0,
                 215.0,
+                "powertrain",
             ),
-            ("vehicle.speed", [0x01, 0x0d], "km/h", 0.0, 255.0),
-            ("engine.maf", [0x01, 0x10], "g/s", 0.0, 655.35),
-            ("engine.load", [0x01, 0x04], "%", 0.0, 100.0),
+            (
+                "vehicle.speed",
+                [0x01, 0x0d],
+                "km/h",
+                0.0,
+                255.0,
+                "powertrain",
+            ),
+            ("engine.maf", [0x01, 0x10], "g/s", 0.0, 655.35, "powertrain"),
+            ("engine.load", [0x01, 0x04], "%", 0.0, 100.0, "powertrain"),
             (
                 "engine.intake_manifold_pressure",
                 [0x01, 0x0b],
                 "kPa",
                 0.0,
                 255.0,
+                "powertrain",
             ),
             (
                 "engine.intake_air_temperature",
@@ -441,19 +457,63 @@ mod tests {
                 "°C",
                 -40.0,
                 215.0,
+                "powertrain",
             ),
-            ("engine.egr.commanded", [0x01, 0x2c], "%", 0.0, 100.0),
-            ("engine.egr.error", [0x01, 0x2d], "%", -100.0, 99.21875),
-            ("engine.runtime", [0x01, 0x1f], "s", 0.0, 65535.0),
-            ("vehicle.accelerator_pedal_d", [0x01, 0x49], "%", 0.0, 100.0),
-            ("vehicle.accelerator_pedal_e", [0x01, 0x4a], "%", 0.0, 100.0),
-            ("engine.relative_throttle", [0x01, 0x45], "%", 0.0, 100.0),
+            (
+                "engine.egr.commanded",
+                [0x01, 0x2c],
+                "%",
+                0.0,
+                100.0,
+                "powertrain",
+            ),
+            (
+                "engine.egr.error",
+                [0x01, 0x2d],
+                "%",
+                -100.0,
+                99.21875,
+                "powertrain",
+            ),
+            (
+                "engine.runtime",
+                [0x01, 0x1f],
+                "s",
+                0.0,
+                65535.0,
+                "powertrain",
+            ),
+            (
+                "vehicle.accelerator_pedal_d",
+                [0x01, 0x49],
+                "%",
+                0.0,
+                100.0,
+                "powertrain",
+            ),
+            (
+                "vehicle.accelerator_pedal_e",
+                [0x01, 0x4a],
+                "%",
+                0.0,
+                100.0,
+                "powertrain",
+            ),
+            (
+                "engine.relative_throttle",
+                [0x01, 0x45],
+                "%",
+                0.0,
+                100.0,
+                "powertrain",
+            ),
             (
                 "engine.barometric_pressure",
                 [0x01, 0x33],
                 "kPa",
                 0.0,
                 255.0,
+                "powertrain",
             ),
             (
                 "engine.control_module_voltage",
@@ -461,11 +521,68 @@ mod tests {
                 "V",
                 0.0,
                 65.535,
+                "powertrain",
+            ),
+            (
+                "engine.throttle_position",
+                [0x01, 0x11],
+                "%",
+                0.0,
+                100.0,
+                "powertrain",
+            ),
+            (
+                "vehicle.distance_with_mil_on",
+                [0x01, 0x21],
+                "km",
+                0.0,
+                65535.0,
+                "diagnostics",
+            ),
+            (
+                "engine.fuel_rail_gauge_pressure",
+                [0x01, 0x23],
+                "kPa",
+                0.0,
+                655350.0,
+                "powertrain",
+            ),
+            (
+                "vehicle.warmups_since_dtc_clear",
+                [0x01, 0x30],
+                "count",
+                0.0,
+                255.0,
+                "diagnostics",
+            ),
+            (
+                "vehicle.distance_since_dtc_clear",
+                [0x01, 0x31],
+                "km",
+                0.0,
+                65535.0,
+                "diagnostics",
+            ),
+            (
+                "vehicle.ambient_air_temperature",
+                [0x01, 0x46],
+                "°C",
+                -40.0,
+                215.0,
+                "environment",
+            ),
+            (
+                "engine.throttle_actuator.commanded",
+                [0x01, 0x4c],
+                "%",
+                0.0,
+                100.0,
+                "powertrain",
             ),
         ];
         assert_eq!(supported_signals().len(), expected.len());
 
-        for (definition, (semantic, bytes, unit, minimum, maximum)) in
+        for (definition, (semantic, bytes, unit, minimum, maximum, subsystem)) in
             supported_signals().iter().zip(expected)
         {
             let metadata = definition.metadata();
@@ -477,7 +594,7 @@ mod tests {
             assert_eq!(metadata.protocol, "OBD-II Mode 01");
             assert_eq!(metadata.unit, unit);
             assert_eq!((metadata.minimum, metadata.maximum), (minimum, maximum));
-            assert_eq!(metadata.subsystem, "powertrain");
+            assert_eq!(metadata.subsystem, subsystem);
             assert!(!metadata.decoder.is_empty());
             assert!(metadata.description.ends_with('.'));
             assert!(metadata.provenance.starts_with("SAE J1979"));
