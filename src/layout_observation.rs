@@ -170,10 +170,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].semantic(), "engine.rpm");
         assert_eq!(requests[1].semantic(), "engine.maf");
-        assert_eq!(
-            requests[0].desired_interval(),
-            Duration::from_millis(500)
-        );
+        assert_eq!(requests[0].desired_interval(), Duration::from_millis(500));
     }
 
     #[test]
@@ -250,13 +247,8 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap();
-        let plan = polling_plan(
-            &layout,
-            freshness,
-            policy(4),
-            ["engine.rpm", "engine.maf"],
-        )
-        .unwrap();
+        let plan =
+            polling_plan(&layout, freshness, policy(4), ["engine.rpm", "engine.maf"]).unwrap();
         assert!(plan.entries().iter().all(|entry| {
             entry.status() == PlanStatus::RateReduced
                 && entry.reason() == PlanReason::SessionRequestBudget
