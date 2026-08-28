@@ -144,6 +144,16 @@ cargo run -- capture inspect evidence/drive.jsonl
 cargo run -- capture capability evidence/drive.jsonl
 ```
 
+To validate the seven already advertised, standards-derived Mode 01 additions
+without overbooking the conservative session budget, use the dedicated profile:
+
+```sh
+cargo run -- capture \
+  --adapter "$ADAPTER_UUID" \
+  --profile obd2-expansion-validation \
+  --record evidence/obd2-expansion-validation.jsonl
+```
+
 Run the currently supported generic diagnostic job:
 
 ```sh

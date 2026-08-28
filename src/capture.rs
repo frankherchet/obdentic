@@ -99,10 +99,24 @@ const ENGINE_DRIVE: CaptureProfile = CaptureProfile {
     ],
 };
 
+const OBD2_EXPANSION_VALIDATION: CaptureProfile = CaptureProfile {
+    name: "obd2-expansion-validation",
+    subscriptions: &[
+        ("engine.throttle_position", 2_000),
+        ("vehicle.distance_with_mil_on", 2_000),
+        ("engine.fuel_rail_gauge_pressure", 2_000),
+        ("vehicle.warmups_since_dtc_clear", 2_000),
+        ("vehicle.distance_since_dtc_clear", 2_000),
+        ("vehicle.ambient_air_temperature", 2_000),
+        ("engine.throttle_actuator.commanded", 2_000),
+    ],
+};
+
 pub fn profile(name: &str) -> Result<CaptureProfile, String> {
     match name {
         "engine-baseline" => Ok(ENGINE_BASELINE),
         "engine-drive" => Ok(ENGINE_DRIVE),
+        "obd2-expansion-validation" => Ok(OBD2_EXPANSION_VALIDATION),
         _ => Err(format!("unknown capture profile: {name}")),
     }
 }
@@ -202,8 +216,46 @@ mod tests {
     }
 
     #[test]
+    fn obd2_expansion_validation_has_exact_catalogued_semantics_and_intervals() {
+        let profile = profile("obd2-expansion-validation").unwrap();
+        assert_eq!(profile.name(), "obd2-expansion-validation");
+        let subscriptions = profile.subscriptions().unwrap();
+        assert_eq!(
+            subscriptions
+                .iter()
+                .map(|subscription| subscription.semantic())
+                .collect::<Vec<_>>(),
+            [
+                "engine.throttle_position",
+                "vehicle.distance_with_mil_on",
+                "engine.fuel_rail_gauge_pressure",
+                "vehicle.warmups_since_dtc_clear",
+                "vehicle.distance_since_dtc_clear",
+                "vehicle.ambient_air_temperature",
+                "engine.throttle_actuator.commanded",
+            ]
+        );
+        assert!(subscriptions
+            .iter()
+            .all(|subscription| subscription.interval() == Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn obd2_expansion_validation_is_admitted_by_default_budget() {
+        let profile = profile("obd2-expansion-validation").unwrap();
+        assert_eq!(
+            profile.admit(HardwareCapability::conservative_default()),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn profiles_have_unique_catalogued_semantics_and_positive_intervals() {
-        for name in ["engine-baseline", "engine-drive"] {
+        for name in [
+            "engine-baseline",
+            "engine-drive",
+            "obd2-expansion-validation",
+        ] {
             let subscriptions = profile(name).unwrap().subscriptions().unwrap();
             let semantics = subscriptions
                 .iter()
