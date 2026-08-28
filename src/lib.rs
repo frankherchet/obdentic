@@ -57,15 +57,30 @@ impl Eq for ReadRequest {}
 
 impl ReadRequest {
     pub fn bytes(self) -> [u8; 2] {
-        self.signal.request().bytes()
+        match self.operation() {
+            protocol::ReadOperation::Mode01(mode) => mode.bytes(),
+            protocol::ReadOperation::UdsReadDataByIdentifier { .. } => {
+                unreachable!("semantic ReadRequest must use Mode01")
+            }
+        }
     }
 
     pub(crate) fn pid(self) -> u8 {
-        self.signal.request().pid()
+        match self.operation() {
+            protocol::ReadOperation::Mode01(mode) => mode.pid(),
+            protocol::ReadOperation::UdsReadDataByIdentifier { .. } => {
+                unreachable!("semantic ReadRequest must use Mode01")
+            }
+        }
     }
 
     pub(crate) fn data_len(self) -> usize {
-        self.signal.request().data_len()
+        match self.operation() {
+            protocol::ReadOperation::Mode01(mode) => mode.data_len(),
+            protocol::ReadOperation::UdsReadDataByIdentifier { .. } => {
+                unreachable!("semantic ReadRequest must use Mode01")
+            }
+        }
     }
 
     pub fn metadata(self) -> &'static SignalMetadata {
@@ -85,7 +100,14 @@ impl ReadRequest {
     }
 
     fn value(self, response: &[u8]) -> Result<f64, String> {
+        self.operation()
+            .validate_response(response, self.semantic())
+            .map_err(|error| error.to_string())?;
         self.signal.decode(response)
+    }
+
+    pub(crate) fn operation(self) -> protocol::ReadOperation {
+        protocol::ReadOperation::Mode01(self.signal.request())
     }
 
     pub fn complete(self, source: &str, response: Vec<u8>) -> Result<Transaction, String> {
