@@ -9,7 +9,7 @@ use obdentic::{
         CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, DtcObservationFact,
         DtcTransportOutcome, SubscriptionFilterOutcome,
     },
-    capture_report,
+    capture_report, capture_tui,
     diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus},
     dtc, hex, jsonl_capture, prepare_read, record, replay,
     runtime_actor::RuntimeClient,
@@ -35,7 +35,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -76,6 +76,10 @@ enum Command {
     TuiDemo(Option<String>),
     TuiReplay {
         recording: String,
+        layout: Option<String>,
+    },
+    TuiCapture {
+        capture: String,
         layout: Option<String>,
     },
     TuiLive {
@@ -216,6 +220,9 @@ async fn run() -> Result<(), String> {
                 let layout = load_layout(layout.as_deref())?;
                 tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
                 Ok(())
+            }
+            Command::TuiCapture { capture, layout } => {
+                capture_tui::run_capture_tui(Path::new(&capture), layout.as_deref().map(Path::new))
             }
             Command::TuiLive {
                 adapter_id,
@@ -1754,6 +1761,20 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 layout: Some(path.clone()),
             })
         }
+        [command, source, capture] if command == "tui" && source == "capture" => {
+            Ok(Command::TuiCapture {
+                capture: capture.clone(),
+                layout: None,
+            })
+        }
+        [command, source, capture, layout_flag, path]
+            if command == "tui" && source == "capture" && layout_flag == "--layout" =>
+        {
+            Ok(Command::TuiCapture {
+                capture: capture.clone(),
+                layout: Some(path.clone()),
+            })
+        }
         [command, source, adapter_flag, adapter_id]
             if command == "tui" && source == "live" && adapter_flag == "--adapter" =>
         {
@@ -2131,6 +2152,26 @@ mod tests {
             ])),
             Ok(Command::TuiReplay {
                 recording: "session.tsv".into(),
+                layout: Some("custom.tsv".into()),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["tui", "capture", "drive.jsonl"])),
+            Ok(Command::TuiCapture {
+                capture: "drive.jsonl".into(),
+                layout: None,
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "tui",
+                "capture",
+                "drive.jsonl",
+                "--layout",
+                "custom.tsv",
+            ])),
+            Ok(Command::TuiCapture {
+                capture: "drive.jsonl".into(),
                 layout: Some("custom.tsv".into()),
             })
         );

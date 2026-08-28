@@ -216,6 +216,9 @@ The TUI can render decoded telemetry from demo, replay and live sources. Layouts
 cargo run -- tui demo
 cargo run -- tui live --adapter "$ADAPTER_UUID"
 
+# Explore a recorded JSONL session without an adapter.
+cargo run -- tui capture evidence/12-drive.jsonl
+
 cargo run -- layout save engine-overview engine-overview.tsv
 cargo run -- tui demo --layout engine-overview.tsv
 ```
