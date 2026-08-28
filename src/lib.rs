@@ -14,6 +14,7 @@ pub mod cache_validation;
 pub mod capability;
 pub mod capture;
 pub mod capture_events;
+pub mod capture_replay;
 pub mod capture_report;
 pub mod diagnostic_job;
 pub mod dtc;

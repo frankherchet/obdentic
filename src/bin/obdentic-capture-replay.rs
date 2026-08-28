@@ -1,10 +1,4 @@
-pub use obdentic::{capture_events, jsonl_capture, prepare_read, telemetry, Transaction};
-
-#[path = "../capture_replay.rs"]
-mod capture_replay;
-
-use capture_replay::CaptureReplay;
-use obdentic::tui;
+use obdentic::{capture_replay::CaptureReplay, jsonl_capture, tui};
 use std::{env, path::Path};
 
 fn main() {
@@ -48,15 +42,16 @@ fn run() -> Result<(), String> {
 
     tui::run(&layout, &telemetry, replay.transactions())?;
     println!(
-        "capture replay  reads={} timed_reads={} issues={} duration={:.3}s",
+        "capture replay  reads={} issues={} duration={:.6}s first_us={} last_us={}",
         replay.transactions().len(),
-        replay.offsets_us().len(),
         replay.issues().len(),
-        replay.duration_us() as f64 / 1_000_000.0
+        replay.duration_us() as f64 / 1_000_000.0,
+        replay.offsets_us().first().copied().unwrap_or(0),
+        replay.offsets_us().last().copied().unwrap_or(0),
     );
     for issue in replay.issues().iter().take(10) {
         println!(
-            "replay issue  {:.3}s {:?} {} {}",
+            "replay issue  {:.6}s {:?} {} {}",
             issue.at_us() as f64 / 1_000_000.0,
             issue.kind(),
             issue.semantic(),

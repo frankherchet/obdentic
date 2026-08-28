@@ -165,6 +165,7 @@ impl CaptureReplay {
         self.duration_us
     }
 
+    /// Exact monotonic JSONL timestamps aligned one-to-one with [`Self::transactions`].
     pub fn offsets_us(&self) -> &[u64] {
         &self.offsets_us
     }
@@ -180,8 +181,12 @@ impl CaptureReplay {
     pub fn telemetry_at(&self, cursor_us: u64, capacity: usize) -> Result<TelemetryState, String> {
         let mut state = TelemetryState::new(capacity)?;
         let end = self.offsets_us.partition_point(|at_us| *at_us <= cursor_us);
-        for transaction in &self.transactions[..end] {
-            state.ingest(transaction);
+        for (timestamp_us, transaction) in self.offsets_us[..end]
+            .iter()
+            .copied()
+            .zip(&self.transactions[..end])
+        {
+            state.ingest_at_us(transaction, u128::from(timestamp_us));
         }
         Ok(state)
     }
@@ -298,6 +303,45 @@ mod tests {
         assert_eq!(before.current("engine.rpm").unwrap().value, 800.0);
         let after = replay.telemetry_at(3_000_000, 8).unwrap();
         assert_eq!(after.current("engine.rpm").unwrap().value, 1_200.0);
+    }
+
+    #[test]
+    fn replay_preserves_distinct_submillisecond_capture_offsets_in_telemetry() {
+        let replay = CaptureReplay::from_capture(&capture(vec![
+            successful_read(
+                "engine.rpm",
+                1_000_001,
+                vec![0x01, 0x0c],
+                vec![0x41, 0x0c, 0x00, 0x04],
+                1.0,
+                "rpm",
+            ),
+            successful_read(
+                "engine.rpm",
+                1_000_999,
+                vec![0x01, 0x0c],
+                vec![0x41, 0x0c, 0x00, 0x08],
+                2.0,
+                "rpm",
+            ),
+        ]));
+
+        let state = replay.telemetry_full(8).unwrap();
+        let exact = state
+            .timed_history("engine.rpm")
+            .unwrap()
+            .map(|(timestamp_us, sample)| (timestamp_us, sample.value))
+            .collect::<Vec<_>>();
+        assert_eq!(exact, [(1_000_001, 1.0), (1_000_999, 2.0)]);
+        assert_eq!(
+            state
+                .history("engine.rpm")
+                .unwrap()
+                .iter()
+                .map(|sample| sample.timestamp_ms)
+                .collect::<Vec<_>>(),
+            [1_000, 1_000]
+        );
     }
 
     #[test]

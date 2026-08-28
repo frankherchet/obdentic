@@ -12,6 +12,7 @@ pub struct Sample {
 pub struct TelemetryState {
     capacity: usize,
     samples: BTreeMap<&'static str, VecDeque<Sample>>,
+    timestamps_us: BTreeMap<&'static str, VecDeque<u128>>,
 }
 
 impl TelemetryState {
@@ -20,26 +21,45 @@ impl TelemetryState {
             .then_some(Self {
                 capacity,
                 samples: BTreeMap::new(),
+                timestamps_us: BTreeMap::new(),
             })
             .ok_or_else(|| "telemetry capacity must be greater than zero".into())
     }
 
     pub fn ingest(&mut self, transaction: &Transaction) {
-        let samples = self.samples.entry(transaction.semantic()).or_default();
+        self.ingest_at_us(
+            transaction,
+            transaction.timestamp_ms().saturating_mul(1_000),
+        );
+    }
+
+    /// Ingest a decoded transaction while preserving an exact monotonic timestamp.
+    ///
+    /// Live callers normally use [`Self::ingest`]. Offline capture replay uses this
+    /// method so JSONL microsecond offsets remain canonical even though the legacy
+    /// [`Sample::timestamp_ms`] compatibility field is only millisecond precision.
+    pub fn ingest_at_us(&mut self, transaction: &Transaction, timestamp_us: u128) {
+        let semantic = transaction.semantic();
+        let samples = self.samples.entry(semantic).or_default();
+        let timestamps = self.timestamps_us.entry(semantic).or_default();
+        debug_assert_eq!(samples.len(), timestamps.len());
+
         let sample = Sample {
-            timestamp_ms: transaction.timestamp_ms(),
+            timestamp_ms: timestamp_us / 1_000,
             value: transaction.value(),
             unit: transaction.unit(),
         };
-        // ponytail: histories cap at 600 samples; use a time-indexed store if much larger out-of-order streams arrive.
-        let position = samples
+        let position = timestamps
             .iter()
-            .position(|current| current.timestamp_ms > sample.timestamp_ms)
-            .unwrap_or(samples.len());
+            .position(|current| *current > timestamp_us)
+            .unwrap_or(timestamps.len());
+        timestamps.insert(position, timestamp_us);
         samples.insert(position, sample);
         if samples.len() > self.capacity {
             samples.pop_front();
+            timestamps.pop_front();
         }
+        debug_assert_eq!(samples.len(), timestamps.len());
     }
 
     pub fn current(&self, semantic: &str) -> Option<&Sample> {
@@ -48,6 +68,21 @@ impl TelemetryState {
 
     pub fn history(&self, semantic: &str) -> Option<&VecDeque<Sample>> {
         self.samples.get(semantic)
+    }
+
+    /// Iterate a signal history with its exact timestamp in microseconds.
+    ///
+    /// The timestamps are kept in lock-step with [`Self::history`]. This is the
+    /// canonical time axis for offline JSONL replay and avoids collapsing distinct
+    /// samples that happen within the same millisecond.
+    pub fn timed_history(
+        &self,
+        semantic: &str,
+    ) -> Option<impl Iterator<Item = (u128, &Sample)> + '_> {
+        let samples = self.samples.get(semantic)?;
+        let timestamps = self.timestamps_us.get(semantic)?;
+        debug_assert_eq!(samples.len(), timestamps.len());
+        Some(timestamps.iter().copied().zip(samples.iter()))
     }
 
     pub fn signals(&self) -> impl Iterator<Item = &'static str> + '_ {
@@ -86,6 +121,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2, 3]
         );
+        assert_eq!(
+            state
+                .timed_history("engine.rpm")
+                .unwrap()
+                .map(|(timestamp_us, _)| timestamp_us)
+                .collect::<Vec<_>>(),
+            [2_000, 3_000]
+        );
         assert_eq!(state.signals().collect::<Vec<_>>(), ["engine.rpm"]);
     }
 
@@ -102,6 +145,7 @@ mod tests {
         assert_eq!(state.current("vehicle.speed").unwrap().value, 50.0);
         assert!(state.current("dpf.diff_pressure").is_none());
         assert!(state.history("dpf.diff_pressure").is_none());
+        assert!(state.timed_history("dpf.diff_pressure").is_none());
         assert!(TelemetryState::new(0).is_err());
     }
 
@@ -122,5 +166,31 @@ mod tests {
             [2, 3]
         );
         assert_eq!(state.current("engine.rpm").unwrap().value, 3.0);
+    }
+
+    #[test]
+    fn exact_microsecond_timeline_distinguishes_samples_within_one_millisecond() {
+        let mut state = TelemetryState::new(4).unwrap();
+        let first = transaction(0, vec![0x41, 0x0c, 0x00, 0x04]);
+        let second = transaction(0, vec![0x41, 0x0c, 0x00, 0x08]);
+        state.ingest_at_us(&second, 1_000_999);
+        state.ingest_at_us(&first, 1_000_001);
+
+        assert_eq!(
+            state
+                .history("engine.rpm")
+                .unwrap()
+                .iter()
+                .map(|sample| sample.timestamp_ms)
+                .collect::<Vec<_>>(),
+            [1_000, 1_000]
+        );
+        let exact = state
+            .timed_history("engine.rpm")
+            .unwrap()
+            .map(|(timestamp_us, sample)| (timestamp_us, sample.value))
+            .collect::<Vec<_>>();
+        assert_eq!(exact, [(1_000_001, 1.0), (1_000_999, 2.0)]);
+        assert_eq!(state.current("engine.rpm").unwrap().value, 2.0);
     }
 }
