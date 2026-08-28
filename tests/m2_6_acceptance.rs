@@ -197,6 +197,12 @@ async fn jsonl_round_trip_keeps_runtime_and_diagnostic_events_ordered() {
             initialized.to(),
             initialized.event(),
         ),
+        CaptureEvent::protocol_negotiation_observed(
+            vec![0x01, 0x00],
+            Some("7E8".into()),
+            vec![0x41, 0x00, 0x98, 0x3b, 0xa0, 0x13],
+        )
+        .unwrap(),
         CaptureEvent::runtime_transition(
             diagnosing.sequence(),
             diagnosing.from(),
@@ -269,6 +275,8 @@ async fn jsonl_round_trip_keeps_runtime_and_diagnostic_events_ordered() {
     }
     assert_eq!(replayed.identity(), (Phase::Ready, Activity::Idle));
     let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("protocol_negotiation_observed"));
+    assert!(contents.contains("01 00"));
     assert!(!contents.contains("VIN"));
     assert!(!contents.contains("device_id"));
     assert!(!contents.contains("raw_command"));

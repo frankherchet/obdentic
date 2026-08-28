@@ -178,6 +178,20 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             object.push_str(",\"response_payload\":");
             push_string(&mut object, &hex(response_payload));
         }
+        CaptureEvent::ProtocolNegotiationObserved {
+            request_payload,
+            responder,
+            response_payload,
+        } => {
+            object.push_str("\"protocol_negotiation_observed\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"request_payload\":");
+            push_string(&mut object, &hex(request_payload));
+            object.push_str(",\"responder\":");
+            push_option_string(&mut object, responder.as_deref());
+            object.push_str(",\"response_payload\":");
+            push_string(&mut object, &hex(response_payload));
+        }
         CaptureEvent::ResponsesObserved {
             semantic,
             request_payload,
@@ -755,6 +769,33 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                     line_number,
                 )?,
             })
+        }
+        "protocol_negotiation_observed" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "request_payload",
+                    "responder",
+                    "response_payload",
+                ],
+                line_number,
+            )?;
+            CaptureEvent::protocol_negotiation_observed(
+                parse_hex(
+                    &string_field(object, "request_payload", line_number)?,
+                    line_number,
+                )?,
+                optional_string_field(object, "responder", line_number)?,
+                parse_hex(
+                    &string_field(object, "response_payload", line_number)?,
+                    line_number,
+                )?,
+            )
+            .map_err(|error| format!("line {line_number}: {error}"))
         }
         "responses_observed" => {
             fields_exact(
@@ -2112,6 +2153,37 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"support_discovery\",\"sequence\":0,\"request_payload\":\"01 AB\",\"responder\":null,\"response_payload\":\"41 00 00 FF\"}\n"
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn round_trips_protocol_negotiation_as_separate_responder_evidence() {
+        let path = temp_path("protocol-negotiation");
+        let (sender, writer) = start(&path).unwrap();
+        let expected = vec![
+            CaptureEvent::protocol_negotiation_observed(
+                vec![0x01, 0x00],
+                Some("7E8".into()),
+                vec![0x41, 0x00, 0x98, 0x3b, 0xa0, 0x13],
+            )
+            .unwrap(),
+            CaptureEvent::protocol_negotiation_observed(
+                vec![0x01, 0x00],
+                Some("7E9".into()),
+                vec![0x41, 0x00, 0x98, 0x18, 0x00, 0x01],
+            )
+            .unwrap(),
+        ];
+        for event in expected.iter().cloned() {
+            sender.send(event).await.unwrap();
+        }
+        finish(sender, writer).await;
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"type\":\"protocol_negotiation_observed\""));
+        assert!(contents.contains("\"request_payload\":\"01 00\""));
+        assert!(!contents.contains("dtc_observation"));
+        assert_eq!(read_events(&path).unwrap(), expected);
         fs::remove_file(path).unwrap();
     }
 

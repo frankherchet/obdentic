@@ -67,6 +67,7 @@ fn summary(capture: &ParsedCapture) -> Summary {
             }
             CaptureEvent::SessionInitialized
             | CaptureEvent::SupportDiscovery { .. }
+            | CaptureEvent::ProtocolNegotiationObserved { .. }
             | CaptureEvent::RuntimeStateChanged { .. }
             | CaptureEvent::ShutdownRequested => summary.lifecycle += 1,
             CaptureEvent::ResponsesObserved { .. } => {

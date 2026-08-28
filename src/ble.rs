@@ -81,6 +81,49 @@ pub struct SupportDiscovery {
     pub response: [u8; 6],
 }
 
+/// Bounded read-only evidence produced while an ELM327 using `ATSP0`
+/// establishes the vehicle protocol. This is transport preparation, not a
+/// semantic diagnostic-job step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtocolNegotiation {
+    observations: Vec<SupportDiscovery>,
+}
+
+impl ProtocolNegotiation {
+    pub fn observations(&self) -> &[SupportDiscovery] {
+        &self.observations
+    }
+}
+
+/// One initialized session whose ELM auto protocol is already established.
+/// The only vehicle request performed before construction is the closed,
+/// read-only `01 00` negotiation probe.
+pub struct PreparedDiagnosticSession {
+    session: SessionClient,
+    negotiation: ProtocolNegotiation,
+}
+
+impl PreparedDiagnosticSession {
+    pub fn negotiation(&self) -> &ProtocolNegotiation {
+        &self.negotiation
+    }
+
+    /// Execute the one bounded stored-DTC request and deterministically close
+    /// the physical session afterwards.
+    pub async fn read_stored_dtcs(self) -> Result<DiagnosticResponses, String> {
+        let result = self.session.read_stored_dtcs().await;
+        match (result, self.session.shutdown().await) {
+            (Ok(responses), Ok(())) => Ok(responses),
+            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+        }
+    }
+
+    pub async fn shutdown(self) -> Result<(), String> {
+        self.session.shutdown().await
+    }
+}
+
 /// Identity exposed by ELM header output. This is deliberately not called a
 /// CAN identifier: ELM may be speaking a non-CAN protocol and the text alone
 /// does not prove a wire-level CAN frame.
@@ -394,16 +437,36 @@ pub async fn read_targeted(
     }
 }
 
-/// Read stored emission-related DTCs through one initialized functional ELM
-/// session.  The command and addressing are fixed by this API.
+/// Connect and initialize an ELM327 session, then establish the automatic
+/// vehicle protocol with exactly one bounded, standards-based `01 00` probe.
+/// The returned session has not yet executed a diagnostic job request.
+pub async fn prepare_diagnostic_session(
+    adapter_id: &str,
+) -> Result<PreparedDiagnosticSession, String> {
+    let mut session =
+        DiagnosticSession::connect_with_adapter_io_mode(adapter_id, false, false).await?;
+    let negotiation = match session.establish_protocol().await {
+        Ok(negotiation) => negotiation,
+        Err(error) => {
+            return match session.disconnect().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
+            };
+        }
+    };
+    Ok(PreparedDiagnosticSession {
+        session: start_session_actor(session),
+        negotiation,
+    })
+}
+
+/// Compatibility helper for callers that do not need the explicit protocol
+/// evidence. The semantic DTC request remains exactly one Mode 03 command.
 pub async fn read_stored_dtcs(adapter_id: &str) -> Result<DiagnosticResponses, String> {
-    let session = start_session_mode(adapter_id, false).await?;
-    let result = session.read_stored_dtcs().await;
-    match (result, session.shutdown().await) {
-        (Ok(responses), Ok(())) => Ok(responses),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    prepare_diagnostic_session(adapter_id)
+        .await?
+        .read_stored_dtcs()
+        .await
 }
 
 pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
@@ -461,9 +524,13 @@ async fn start_session_mode(
     let session =
         DiagnosticSession::connect_with_adapter_io_mode(adapter_id, false, discover_support)
             .await?;
+    Ok(start_session_actor(session))
+}
+
+fn start_session_actor(session: DiagnosticSession) -> SessionClient {
     let (sender, receiver) = mpsc::channel(16);
     tokio::spawn(session_actor(session, receiver));
-    Ok(SessionClient { sender })
+    SessionClient { sender }
 }
 
 #[derive(Clone)]
@@ -852,6 +919,16 @@ impl DiagnosticSession {
         validate_functional_support_exchange(&mut exchange).await
     }
 
+    async fn establish_protocol(&mut self) -> Result<ProtocolNegotiation, String> {
+        let mut exchange = LiveExchange {
+            peripheral: &self.peripheral,
+            channel: &self.channel,
+            notifications: &mut self.notifications,
+            show_adapter_io: self.show_adapter_io,
+        };
+        establish_elm_protocol(&mut exchange).await
+    }
+
     async fn read_with_evidence(&mut self, request: ReadRequest) -> ReadOutcome {
         if !supports_pid(&self.supported, request.pid()) {
             return ReadOutcome::Failed {
@@ -1136,6 +1213,17 @@ where
 {
     let response = exchange.exchange("0100\r", COMMAND_TIMEOUT).await?;
     normalize_pid_support_page_with_evidence(&response, 0x00).map(|(_, observations)| observations)
+}
+
+/// Force `ATSP0` auto-selection to finish before a semantic diagnostic job.
+/// `01 00` is a fixed standards-based read-only probe already used elsewhere
+/// for functional support validation; no caller-supplied payload is accepted.
+async fn establish_elm_protocol<E>(exchange: &mut E) -> Result<ProtocolNegotiation, String>
+where
+    E: ElmExchange,
+{
+    let observations = validate_functional_support_exchange(exchange).await?;
+    Ok(ProtocolNegotiation { observations })
 }
 
 #[cfg(test)]
@@ -2466,6 +2554,49 @@ mod tests {
 
         assert_eq!(exchange.commands, ["03\r"]);
         assert_eq!(responses.as_slice()[0].payload, [0x43, 0x01, 0x0c]);
+    }
+
+    #[tokio::test]
+    async fn protocol_negotiation_keeps_hardware_0100_evidence_out_of_mode03() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "SEARCHING...\r7E8 06 41 00 98 3B A0 13 00\r7E9 06 41 00 98 18 00 01 AA\r>".into(),
+            "7E8 03 43 00 00\r7E9 03 43 01 0C\r>".into(),
+        ]);
+
+        let negotiation = establish_elm_protocol(&mut exchange).await.unwrap();
+        let responses = read_elm_mode03_responses(&mut exchange).await.unwrap();
+
+        assert_eq!(exchange.commands, ["0100\r", "03\r"]);
+        assert_eq!(negotiation.observations().len(), 2);
+        assert_eq!(
+            negotiation.observations()[0],
+            SupportDiscovery {
+                request: [0x01, 0x00],
+                responder: Some(ResponderIdentity::ElmHeader("7E8".into())),
+                response: [0x41, 0x00, 0x98, 0x3b, 0xa0, 0x13],
+            }
+        );
+        assert_eq!(
+            negotiation.observations()[1],
+            SupportDiscovery {
+                request: [0x01, 0x00],
+                responder: Some(ResponderIdentity::ElmHeader("7E9".into())),
+                response: [0x41, 0x00, 0x98, 0x18, 0x00, 0x01],
+            }
+        );
+        assert_eq!(responses.errors(), &[]);
+        assert!(responses
+            .as_slice()
+            .iter()
+            .all(|response| response.payload.first() == Some(&0x43)));
+    }
+
+    #[tokio::test]
+    async fn failed_protocol_negotiation_never_dispatches_mode03() {
+        let mut exchange = ScriptedExchange::captured(vec!["NO DATA\r>".into()]);
+
+        assert!(establish_elm_protocol(&mut exchange).await.is_err());
+        assert_eq!(exchange.commands, ["0100\r"]);
     }
 
     #[test]

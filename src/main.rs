@@ -730,10 +730,42 @@ async fn run_diagnose_dtc_scan_inner(
         RuntimeEvent::transport(TransportState::Connecting),
     )
     .await?;
+    let prepared = match ble::prepare_diagnostic_session(adapter_id).await {
+        Ok(prepared) => prepared,
+        Err(error) if obdentic::scheduler::is_fatal_runtime_error(&error) => {
+            apply_runtime_event(
+                runtime,
+                state,
+                recorder,
+                RuntimeEvent::transport(TransportState::Unhealthy),
+            )
+            .await?;
+            apply_runtime_event(runtime, state, recorder, RuntimeEvent::FatalRuntimeError).await?;
+            return Err(error);
+        }
+        Err(error) => {
+            apply_runtime_event(
+                runtime,
+                state,
+                recorder,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    record_protocol_negotiation(recorder, prepared.negotiation()).await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::transport(TransportState::Connected),
+    )
+    .await?;
     apply_runtime_event(runtime, state, recorder, RuntimeEvent::DiagnosticJobStarted).await?;
     emit_capture_event(recorder, CaptureEvent::diagnostic_job_started(&job)).await?;
 
-    match ble::read_stored_dtcs(adapter_id).await {
+    match prepared.read_stored_dtcs().await {
         Ok(responses) => {
             record_dtc_transport_evidence(recorder, &job, &responses).await?;
             if !responses.is_empty() {
@@ -922,6 +954,27 @@ fn dtc_evidence(
             ))
         })
         .collect()
+}
+
+async fn record_protocol_negotiation(
+    recorder: Option<&jsonl_capture::Sender>,
+    negotiation: &ble::ProtocolNegotiation,
+) -> Result<(), String> {
+    for observation in negotiation.observations() {
+        emit_capture_event(
+            recorder,
+            CaptureEvent::protocol_negotiation_observed(
+                observation.request.into(),
+                observation
+                    .responder
+                    .as_ref()
+                    .map(|responder| responder.as_str().into()),
+                observation.response.into(),
+            )?,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn record_dtc_transport_evidence(
