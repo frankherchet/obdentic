@@ -268,6 +268,10 @@ pub fn decode_mode03_payload(payload: &[u8]) -> Result<DtcResponse, DtcDecodeErr
         });
     }
 
+    if payload == [MODE03_POSITIVE_RESPONSE, 0x00] {
+        return Ok(DtcResponse::NoDtcs);
+    }
+
     let bytes = &payload[1..];
     if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return Err(DtcDecodeError::MalformedResponse);
@@ -320,6 +324,9 @@ mod tests {
         let result = decode_mode03(&[response(None, &[0x43, 0x00, 0x00])]);
         assert_eq!(result.observations().len(), 1);
         assert_eq!(result.observations()[0].response(), &DtcResponse::NoDtcs);
+
+        let compact = decode_mode03(&[response(None, &[0x43, 0x00])]);
+        assert_eq!(compact.observations()[0].response(), &DtcResponse::NoDtcs);
     }
 
     #[test]

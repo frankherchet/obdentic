@@ -1632,7 +1632,7 @@ fn push_mode03_payload(
         return;
     };
     let payload = bytes[start..].to_vec();
-    if payload.len() < 3 || !(payload.len() - 1).is_multiple_of(2) {
+    if payload != [0x43, 0x00] && (payload.len() < 3 || !(payload.len() - 1).is_multiple_of(2)) {
         errors.push(DiagnosticResponseError {
             responder: responder.clone(),
             error: format!("malformed normalized Mode 03 payload: {line:?}"),
@@ -2457,6 +2457,33 @@ mod tests {
                 responder: Some(ResponderIdentity::ElmHeader("7E9".into())),
                 payload: vec![0x43, 0x00, 0x00, 0x00, 0x00],
             }
+        );
+    }
+
+    #[test]
+    fn normalizes_compact_hardware_no_dtc_responses_per_responder() {
+        let responses = normalize_mode03_responses(
+            "7E8 02 43 00 00 00 00 00 00\r7E9 02 43 00 AA AA AA AA AA\r>",
+        )
+        .unwrap();
+
+        assert!(responses.errors().is_empty());
+        assert_eq!(
+            responses
+                .as_slice()
+                .iter()
+                .map(|response| (response.responder.clone(), response.payload.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some(ResponderIdentity::ElmHeader("7E8".into())),
+                    vec![0x43, 0x00]
+                ),
+                (
+                    Some(ResponderIdentity::ElmHeader("7E9".into())),
+                    vec![0x43, 0x00]
+                ),
+            ]
         );
     }
 
