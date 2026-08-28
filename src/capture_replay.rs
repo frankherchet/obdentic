@@ -133,11 +133,13 @@ impl CaptureReplay {
                     }
                     decoded.push((*finished_us, transaction));
                 }
-                CaptureEvent::ReadFailed { timing, .. } => {
-                    if let Some(timing) = timing {
-                        duration_us = duration_us.max(timing.finished_us);
-                    }
+                CaptureEvent::ReadFailed {
+                    timing: Some(timing),
+                    ..
+                } => {
+                    duration_us = duration_us.max(timing.finished_us);
                 }
+                CaptureEvent::ReadFailed { timing: None, .. } => {}
                 CaptureEvent::SlotsSkipped { last_due_us, .. } => {
                     duration_us = duration_us.max(*last_due_us);
                 }
