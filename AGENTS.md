@@ -10,7 +10,7 @@ Choose the lowest-cost worker that can reliably handle the task. Give every work
 
 ## Issue workflow
 
-When work is tracked by a GitHub issue, completing that work includes committing its intended changes and pushing the commit to `main`. Immediately after that successful push, close the implemented issue. Keep the milestone open when a separately recorded hardware acceptance remains; close it after all its issues and required acceptance work are complete.
+When work is tracked by a GitHub issue, completing that work includes committing its intended changes on a feature branch, opening a pull request, and merging it into `main` only after CI succeeds. Enable auto-merge for a ready pull request so GitHub merges it once its required CI checks pass. Immediately after that successful merge, close the implemented issue. Keep the milestone open when a separately recorded hardware acceptance remains; close it after all its issues and required acceptance work are complete.
 
 ## Project constraints
 
@@ -23,4 +23,4 @@ When work is tracked by a GitHub issue, completing that work includes committing
   obsolete Cargo 1.61; run Rust commands with
   `rtk env PATH=/Users/frankherchet/.cargo/bin:/opt/local/bin:/usr/bin:/bin cargo +1.98.0 ...`.
 - Before handoff, run the smallest relevant checks; for the current codebase this includes `cargo test`, `cargo clippy --all-targets -- -D warnings`, and Swift compilation when the BLE probe changes.
-- A meaningful feature or bug-fix task is complete only after its relevant checks pass, its intended changes are committed, and that commit is pushed to `main`.
+- A meaningful feature or bug-fix task is complete only after its relevant checks pass, its intended changes are committed to a feature branch, its pull request is merged into `main`, and the merge is visible on `origin/main`.
