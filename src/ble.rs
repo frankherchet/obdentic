@@ -1971,6 +1971,7 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
 
 fn normalize_mode09_segments(response: &str) -> Result<Vec<Vec<u8>>, String> {
     let mut segments = Vec::new();
+    let mut isotp: Option<(Option<String>, usize, Vec<u8>, u8)> = None;
     for raw_line in response.split(['\r', '\n']) {
         let line = raw_line.trim().trim_end_matches('>').trim();
         if line.is_empty()
@@ -1989,11 +1990,11 @@ fn normalize_mode09_segments(response: &str) -> Result<Vec<Vec<u8>>, String> {
             return Err(format!("ELM327 rejected 0902: {line}"));
         }
         let mut tokens = line.split_ascii_whitespace();
-        let has_header = tokens
+        let header = tokens
             .next()
             .filter(|token| token.len() == 3 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .is_some();
-        if !has_header {
+            .map(str::to_ascii_uppercase);
+        if header.is_none() {
             tokens = line.split_ascii_whitespace();
         }
         let mut bytes = Vec::new();
@@ -2009,9 +2010,49 @@ fn normalize_mode09_segments(response: &str) -> Result<Vec<Vec<u8>>, String> {
                 bytes.push(u8::from_str_radix(pair, 16).map_err(|error| error.to_string())?);
             }
         }
-        if !bytes.is_empty() {
-            segments.push(bytes);
+        match bytes.first().map(|byte| byte >> 4) {
+            Some(1) => {
+                if bytes.len() < 3 || isotp.is_some() {
+                    return Err("malformed ISO-TP Mode 09 first frame".into());
+                }
+                let declared_len = ((bytes[0] as usize & 0x0f) << 8) | bytes[1] as usize;
+                let payload = bytes[2..].to_vec();
+                if declared_len < 3 || payload.len() >= declared_len {
+                    return Err("malformed ISO-TP Mode 09 first frame".into());
+                }
+                isotp = Some((header, declared_len, payload, 1));
+            }
+            Some(2) => {
+                let Some((expected_header, declared_len, payload, expected_sequence)) =
+                    isotp.as_mut()
+                else {
+                    return Err("Mode 09 consecutive frame without first frame".into());
+                };
+                if *expected_header != header || bytes[0] & 0x0f != *expected_sequence {
+                    return Err("malformed ISO-TP Mode 09 consecutive frame".into());
+                }
+                let remaining = *declared_len - payload.len();
+                let frame_payload = &bytes[1..];
+                if frame_payload.len() > remaining
+                    && frame_payload[remaining..]
+                        .iter()
+                        .any(|byte| !matches!(byte, 0x00 | 0xaa))
+                {
+                    return Err("unexpected bytes after ISO-TP Mode 09 response".into());
+                }
+                payload.extend_from_slice(&frame_payload[..frame_payload.len().min(remaining)]);
+                *expected_sequence = (*expected_sequence + 1) & 0x0f;
+                if payload.len() == *declared_len {
+                    segments.push(std::mem::take(payload));
+                    isotp = None;
+                }
+            }
+            _ if !bytes.is_empty() => segments.push(bytes),
+            _ => {}
         }
+    }
+    if isotp.is_some() {
+        return Err("truncated ISO-TP Mode 09 response".into());
     }
     (!segments.is_empty())
         .then_some(segments)
@@ -2630,13 +2671,27 @@ mod tests {
     async fn identity_negotiates_protocol_before_mode09_pid02() {
         let mut exchange = ScriptedExchange::captured(vec![
             "7E8 06 41 00 98 3B A0 13 00\r>".into(),
-            "49 02 01 57 56 57 5A 5A 5A 31 4A 5A 58 57 30 30 30 30 30 31\r>".into(),
+            "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4A 5A 58\r7E8 22 57 30 30 30 30 30 31\r>".into(),
         ]);
 
         let identity = read_elm_identity(&mut exchange).await.unwrap();
 
         assert_eq!(identity.vin().as_str(), "WVWZZZ1JZXW000001");
         assert_eq!(exchange.commands, ["0100\r", "0902\r"]);
+    }
+
+    #[test]
+    fn mode09_isotp_rejects_truncated_or_out_of_sequence_frames() {
+        assert_eq!(
+            normalize_mode09_segments("7E8 10 14 49 02 01 57 56 57\r>"),
+            Err("truncated ISO-TP Mode 09 response".into())
+        );
+        assert_eq!(
+            normalize_mode09_segments(
+                "7E8 10 14 49 02 01 57 56 57\r7E8 22 5A 5A 5A 31 4A 5A 58\r>",
+            ),
+            Err("malformed ISO-TP Mode 09 consecutive frame".into())
+        );
     }
 
     #[tokio::test]
