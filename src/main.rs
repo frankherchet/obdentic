@@ -5,13 +5,19 @@ use obdentic::vehicle_knowledge::{
 use obdentic::{
     audit::AuditState,
     ble, capture,
-    capture_events::{CaptureEvent, CaptureSubscription, SubscriptionFilterOutcome},
-    capture_report, hex, jsonl_capture, prepare_read, record, replay,
+    capture_events::{
+        CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, SubscriptionFilterOutcome,
+    },
+    capture_report,
+    diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus},
+    dtc, hex, jsonl_capture, prepare_read, record, replay,
     runtime_actor::RuntimeClient,
     runtime_reducer::RuntimeEvent,
     runtime_state::{
-        RecordingState, RuntimeState, SourceState, TopologyState, TransportState, VehicleState,
+        Activity, RecordingState, RuntimeState, SourceState, TopologyState, TransportState,
+        VehicleState,
     },
+    safety::{DtcReadKind, Operation, OperationRequest, SafetyPolicy},
     scheduler::{apply_runtime_event, ObservationPlan, Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
@@ -24,7 +30,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -33,6 +39,10 @@ enum Command {
         adapter_id: String,
     },
     Scan,
+    DiagnoseDtcScan {
+        adapter_id: String,
+        recording: Option<String>,
+    },
     VehicleIdentify {
         adapter_id: String,
     },
@@ -115,6 +125,18 @@ async fn run() -> Result<(), String> {
                     );
                 }
                 Ok(())
+            }
+            Command::DiagnoseDtcScan {
+                adapter_id,
+                recording,
+            } => {
+                run_diagnose_dtc_scan(
+                    &adapter_id,
+                    recording.as_deref().map(Path::new),
+                    &runtime,
+                    &mut runtime_state,
+                )
+                .await
             }
             Command::VehicleIdentify { adapter_id } => {
                 run_vehicle_identify(&adapter_id, &runtime, &mut runtime_state).await
@@ -603,6 +625,360 @@ async fn run_read(
     }
 }
 
+async fn run_diagnose_dtc_scan(
+    adapter_id: &str,
+    recording: Option<&Path>,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    let recorder = recording
+        .map(jsonl_capture::JsonlRecorder::start)
+        .transpose()?;
+    let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
+    let result = async {
+        if sender.is_some() {
+            emit_capture_event(
+                sender,
+                CaptureEvent::capture_started(Some(wallclock_ms()?), Some("dtc.scan".into())),
+            )
+            .await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                sender,
+                RuntimeEvent::recording(RecordingState::Active),
+            )
+            .await?;
+        }
+
+        run_diagnose_dtc_scan_inner(adapter_id, runtime, state, sender).await
+    }
+    .await;
+    let inactive = if sender.is_some() {
+        apply_runtime_event(
+            runtime,
+            state,
+            sender,
+            RuntimeEvent::recording(RecordingState::Inactive),
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    let shutdown = finish_runtime(runtime, state, sender).await;
+    let stopped = emit_capture_event(sender, CaptureEvent::SessionStopped { offset_us: 0 }).await;
+    let result = result.and(inactive).and(shutdown).and(stopped);
+    let recorded = match recorder {
+        Some(recorder) => recorder.close().await,
+        None => Ok(()),
+    };
+    result.and(recorded)
+}
+
+async fn run_diagnose_dtc_scan_inner(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+    recorder: Option<&jsonl_capture::Sender>,
+) -> Result<(), String> {
+    let job = DiagnosticJob::dtc_scan(DiagnosticScope::VehicleWide);
+    let plan = job.plan();
+    match SafetyPolicy::read_only().authorize_activity(
+        Activity::Diagnose,
+        OperationRequest::read_dtcs(DtcReadKind::Stored),
+    ) {
+        Ok(Operation::ReadDtcs(DtcReadKind::Stored)) => {}
+        Ok(_) => return Err("read-only safety policy returned the wrong DTC operation".into()),
+        Err(error) => return Err(error.to_string()),
+    }
+
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, recorder, RuntimeEvent::DiagnosticJobStarted).await?;
+    emit_capture_event(recorder, CaptureEvent::diagnostic_job_started(&job)).await?;
+
+    match ble::read_stored_dtcs(adapter_id).await {
+        Ok(responses) => {
+            if !responses.is_empty() {
+                emit_capture_event(
+                    recorder,
+                    CaptureEvent::responses_observed(
+                        job.id().to_string(),
+                        [0x03].into(),
+                        responses.capture_evidence(),
+                        None,
+                        None,
+                    )?,
+                )
+                .await?;
+            }
+            let evidence = match dtc_evidence(&responses) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    emit_capture_event(
+                        recorder,
+                        CaptureEvent::diagnostic_job_step(
+                            job.id().to_string(),
+                            0,
+                            0x03,
+                            None,
+                            DiagnosticJobStepStatus::Recoverable,
+                            Some("malformed_evidence".into()),
+                        )?,
+                    )
+                    .await?;
+                    emit_capture_event(
+                        recorder,
+                        CaptureEvent::DiagnosticJobCompleted {
+                            job_id: job.id().to_string(),
+                            status: JobStatus::CompletedWithErrors,
+                        },
+                    )
+                    .await?;
+                    finish_diagnostic(runtime, state, recorder).await?;
+                    println!(
+                        "{}",
+                        render_dtc_scan_error(&job, &plan, &error, "completed_with_errors")
+                    );
+                    return Err(error);
+                }
+            };
+            let decoded = dtc::decode_mode03(&evidence);
+            let rendered = render_dtc_scan(&job, &plan, &decoded, responses.errors());
+            let recoverable = !responses.errors().is_empty()
+                || decoded.observations().iter().any(|observation| {
+                    matches!(observation.response(), dtc::DtcResponse::Error(_))
+                });
+            emit_capture_event(
+                recorder,
+                CaptureEvent::diagnostic_job_step(
+                    job.id().to_string(),
+                    0,
+                    0x03,
+                    None,
+                    if recoverable {
+                        DiagnosticJobStepStatus::Recoverable
+                    } else {
+                        DiagnosticJobStepStatus::Success
+                    },
+                    recoverable.then_some("malformed_evidence".into()),
+                )?,
+            )
+            .await?;
+            emit_capture_event(
+                recorder,
+                CaptureEvent::DiagnosticJobCompleted {
+                    job_id: job.id().to_string(),
+                    status: if recoverable {
+                        JobStatus::CompletedWithErrors
+                    } else {
+                        JobStatus::Completed
+                    },
+                },
+            )
+            .await?;
+            finish_diagnostic(runtime, state, recorder).await?;
+            print!("{rendered}");
+            Ok(())
+        }
+        Err(error) if obdentic::scheduler::is_fatal_runtime_error(&error) => {
+            apply_runtime_event(
+                runtime,
+                state,
+                recorder,
+                RuntimeEvent::transport(TransportState::Unhealthy),
+            )
+            .await?;
+            apply_runtime_event(runtime, state, recorder, RuntimeEvent::FatalRuntimeError).await?;
+            emit_capture_event(
+                recorder,
+                CaptureEvent::diagnostic_job_step(
+                    job.id().to_string(),
+                    0,
+                    0x03,
+                    None,
+                    DiagnosticJobStepStatus::Fatal,
+                    Some("session_failed".into()),
+                )?,
+            )
+            .await?;
+            emit_capture_event(
+                recorder,
+                CaptureEvent::DiagnosticJobFailed {
+                    job_id: job.id().to_string(),
+                    error: "session_failed".into(),
+                },
+            )
+            .await?;
+            println!("{}", render_dtc_scan_error(&job, &plan, &error, "failed"));
+            Err(error)
+        }
+        Err(error) => {
+            emit_capture_event(
+                recorder,
+                CaptureEvent::diagnostic_job_step(
+                    job.id().to_string(),
+                    0,
+                    0x03,
+                    None,
+                    DiagnosticJobStepStatus::Recoverable,
+                    Some("read_failed".into()),
+                )?,
+            )
+            .await?;
+            emit_capture_event(
+                recorder,
+                CaptureEvent::DiagnosticJobCompleted {
+                    job_id: job.id().to_string(),
+                    status: JobStatus::CompletedWithErrors,
+                },
+            )
+            .await?;
+            finish_diagnostic(runtime, state, recorder).await?;
+            println!(
+                "{}",
+                render_dtc_scan_error(&job, &plan, &error, "completed_with_errors")
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn finish_diagnostic(
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+    recorder: Option<&jsonl_capture::Sender>,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::DiagnosticJobCompleted,
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::transport(TransportState::Disconnected),
+    )
+    .await
+}
+
+fn dtc_evidence(
+    responses: &ble::DiagnosticResponses,
+) -> Result<Vec<dtc::ResponseEvidence>, String> {
+    responses
+        .as_slice()
+        .iter()
+        .map(|response| {
+            let responder = response
+                .responder
+                .as_ref()
+                .map(|responder| dtc::ResponderIdentity::new(responder.as_str()))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            Ok(dtc::ResponseEvidence::new(
+                responder,
+                response.payload.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn render_dtc_scan(
+    job: &DiagnosticJob,
+    plan: &obdentic::diagnostic_job::JobPlan,
+    result: &dtc::DtcScanResult,
+    errors: &[ble::DiagnosticResponseError],
+) -> String {
+    let has_decode_errors = result
+        .observations()
+        .iter()
+        .any(|observation| matches!(observation.response(), dtc::DtcResponse::Error(_)));
+    let status = if errors.is_empty() && !has_decode_errors {
+        "completed"
+    } else {
+        "completed_with_errors"
+    };
+    let mut output = render_dtc_header(job, plan, status);
+    for observation in result.observations() {
+        let responder = observation
+            .source()
+            .responder()
+            .map_or("unknown", dtc::ResponderIdentity::as_str);
+        match observation.response() {
+            dtc::DtcResponse::NoDtcs => output.push_str(&format!(
+                "responder\t{}\tno_dtcs\n",
+                escape_field(responder)
+            )),
+            dtc::DtcResponse::Stored(dtcs) => {
+                for dtc in dtcs {
+                    output.push_str(&format!(
+                        "responder\t{}\tdtc\t{}\n",
+                        escape_field(responder),
+                        dtc
+                    ));
+                }
+            }
+            dtc::DtcResponse::Error(error) => output.push_str(&format!(
+                "responder\t{}\terror\t{}\n",
+                escape_field(responder),
+                escape_field(&error.to_string())
+            )),
+        }
+    }
+    for error in errors {
+        let responder = error
+            .responder
+            .as_ref()
+            .map_or("unknown", ble::ResponderIdentity::as_str);
+        output.push_str(&format!(
+            "responder\t{}\terror\t{}\n",
+            escape_field(responder),
+            escape_field(&error.error)
+        ));
+    }
+    output
+}
+
+fn render_dtc_scan_error(
+    job: &DiagnosticJob,
+    plan: &obdentic::diagnostic_job::JobPlan,
+    error: &str,
+    status: &str,
+) -> String {
+    format!(
+        "{}error\t{}\n",
+        render_dtc_header(job, plan, status),
+        escape_field(error)
+    )
+}
+
+fn render_dtc_header(
+    job: &DiagnosticJob,
+    plan: &obdentic::diagnostic_job::JobPlan,
+    status: &str,
+) -> String {
+    let mut output = format!("job\t{}\nstatus\t{}\n", job.id(), status);
+    for step in plan.steps() {
+        output.push_str(&format!("step\t{}\tread_dtc\tvehicle\n", step.sequence()));
+    }
+    output
+}
+
 async fn finish_runtime(
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
@@ -894,6 +1270,19 @@ async fn finish_capture(
     }
 }
 
+async fn emit_capture_event(
+    recorder: Option<&jsonl_capture::Sender>,
+    event: CaptureEvent,
+) -> Result<(), String> {
+    if let Some(recorder) = recorder {
+        recorder
+            .send(event)
+            .await
+            .map_err(|_| "capture recorder is closed".to_string())?;
+    }
+    Ok(())
+}
+
 async fn record_capture_start_failure(
     sender: &jsonl_capture::Sender,
     profile: &str,
@@ -1028,6 +1417,27 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             })
         }
         [command] if command == "scan" => Ok(Command::Scan),
+        [command, job, adapter_flag, adapter_id]
+            if command == "diagnose" && job == "dtc.scan" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::DiagnoseDtcScan {
+                adapter_id: adapter_id.clone(),
+                recording: None,
+            })
+        }
+        [command, job, adapter_flag, adapter_id, record_flag, path]
+            if command == "diagnose"
+                && job == "dtc.scan"
+                && adapter_flag == "--adapter"
+                && record_flag == "--record" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::DiagnoseDtcScan {
+                adapter_id: adapter_id.clone(),
+                recording: Some(path.clone()),
+            })
+        }
         [command, action, adapter_flag, adapter_id]
             if command == "vehicle" && action == "identify" && adapter_flag == "--adapter" =>
         {
@@ -1377,6 +1787,27 @@ mod tests {
         );
         assert_eq!(parse_command(&args(&["scan"])), Ok(Command::Scan));
         assert_eq!(
+            parse_command(&args(&["diagnose", "dtc.scan", "--adapter", uuid,])),
+            Ok(Command::DiagnoseDtcScan {
+                adapter_id: uuid.into(),
+                recording: None,
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "diagnose",
+                "dtc.scan",
+                "--adapter",
+                uuid,
+                "--record",
+                "dtc.jsonl",
+            ])),
+            Ok(Command::DiagnoseDtcScan {
+                adapter_id: uuid.into(),
+                recording: Some("dtc.jsonl".into()),
+            })
+        );
+        assert_eq!(
             parse_command(&args(&["vehicle", "identify", "--adapter", uuid,])),
             Ok(Command::VehicleIdentify {
                 adapter_id: uuid.into(),
@@ -1556,6 +1987,26 @@ mod tests {
         );
         assert_eq!(parse_command(&args(&["scan", "extra"])), Err(USAGE.into()));
         assert_eq!(
+            parse_command(&args(&[
+                "diagnose",
+                "dtc.read",
+                "--adapter",
+                "00000000-0000-4000-8000-000000000000",
+            ])),
+            Err(USAGE.into())
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "diagnose",
+                "dtc.scan",
+                "--adapter",
+                "00000000-0000-4000-8000-000000000000",
+                "--service",
+                "03",
+            ])),
+            Err(USAGE.into())
+        );
+        assert_eq!(
             parse_command(&args(&["vehicle", "identify", "--adapter", "UUID"])),
             Err("adapter must be a CoreBluetooth UUID".into())
         );
@@ -1706,5 +2157,22 @@ mod tests {
         assert!(samples
             .windows(2)
             .any(|pair| pair[0].timestamp_ms() != pair[1].timestamp_ms()));
+    }
+
+    #[test]
+    fn renders_responder_scoped_dtc_facts_without_vehicle_diagnosis() {
+        let evidence = [dtc::ResponseEvidence::new(
+            Some(dtc::ResponderIdentity::new("7E8").unwrap()),
+            [0x43, 0x01, 0x0c],
+        )];
+        let result = dtc::decode_mode03(&evidence);
+        let job = DiagnosticJob::dtc_scan(DiagnosticScope::VehicleWide);
+        let output = render_dtc_scan(&job, &job.plan(), &result, &[]);
+
+        assert!(output.contains("job\tdtc.scan"));
+        assert!(output.contains("status\tcompleted"));
+        assert!(output.contains("responder\t7E8\tdtc\tP010C"));
+        assert!(!output.contains("VIN"));
+        assert!(!output.contains("diagnosis"));
     }
 }

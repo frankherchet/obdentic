@@ -1,4 +1,12 @@
-use crate::{runtime_reducer::RuntimeEvent, runtime_state::RuntimeState, Transaction};
+use crate::{
+    diagnostic_job::{
+        DiagnosticJob, JobPlan, JobResult, JobStatus, JobStep, SessionError, SkipReason, StepError,
+        StepOutcome,
+    },
+    runtime_reducer::RuntimeEvent,
+    runtime_state::RuntimeState,
+    Transaction,
+};
 
 /// Relative capture time in integer microseconds.
 pub type CaptureTimeUs = u64;
@@ -111,6 +119,35 @@ pub enum CaptureValue {
     Unavailable { reason: String },
 }
 
+/// Per-step status retained in diagnostic-job audit records.
+///
+/// `Skipped` is used for the deterministic suffix that follows cancellation;
+/// a fatal session stops the remaining steps and records them as skipped only
+/// when the executor emits their planned outcomes.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DiagnosticJobStepStatus {
+    Success,
+    Recoverable,
+    Fatal,
+    Skipped,
+}
+
+impl DiagnosticJobStepStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Recoverable => "recoverable",
+            Self::Fatal => "fatal",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+pub const MAX_DIAGNOSTIC_JOB_ID_LEN: usize = 64;
+pub const MAX_DIAGNOSTIC_SOURCE_LEN: usize = 64;
+pub const MAX_DIAGNOSTIC_ERROR_LEN: usize = 256;
+pub const MAX_DIAGNOSTIC_MODE: u8 = 0x7f;
+
 /// A closed vocabulary of passive observations from one capture session.
 ///
 /// These values contain no transport handles and no operation that can issue
@@ -182,6 +219,30 @@ pub enum CaptureEvent {
     ShutdownRequested,
     SessionStopped {
         offset_us: CaptureTimeUs,
+    },
+    DiagnosticJobStarted {
+        job_id: String,
+        model_version: u16,
+        step_count: u64,
+    },
+    DiagnosticJobStep {
+        job_id: String,
+        step_sequence: u64,
+        mode: u8,
+        source: Option<String>,
+        status: DiagnosticJobStepStatus,
+        error: Option<String>,
+    },
+    DiagnosticJobCompleted {
+        job_id: String,
+        status: JobStatus,
+    },
+    DiagnosticJobFailed {
+        job_id: String,
+        error: String,
+    },
+    DiagnosticJobCancelled {
+        job_id: String,
     },
 }
 
@@ -333,11 +394,193 @@ impl CaptureEvent {
     ) -> Self {
         Self::runtime_state_changed(from, to, event)
     }
+
+    /// Record the immutable plan shape without retaining scope, transport, or
+    /// any request payload.
+    pub fn diagnostic_job_started(job: &DiagnosticJob) -> Self {
+        Self::diagnostic_job_started_from_plan(&job.plan())
+    }
+
+    pub fn diagnostic_job_started_from_plan(plan: &JobPlan) -> Self {
+        Self::DiagnosticJobStarted {
+            job_id: plan.id().to_string(),
+            model_version: plan.model_version(),
+            step_count: plan.steps().len() as u64,
+        }
+    }
+
+    /// Record one bounded semantic step outcome. No opaque evidence reference
+    /// or raw request is copied into the capture event.
+    pub fn diagnostic_job_step(
+        job_id: impl Into<String>,
+        step_sequence: u64,
+        mode: u8,
+        source: Option<String>,
+        status: DiagnosticJobStepStatus,
+        error: Option<String>,
+    ) -> Result<Self, String> {
+        let job_id = job_id.into();
+        validate_diagnostic_job_id(&job_id)?;
+        validate_diagnostic_mode(mode)?;
+        validate_diagnostic_source(source.as_deref())?;
+        validate_diagnostic_error(error.as_deref())?;
+        Ok(Self::DiagnosticJobStep {
+            job_id,
+            step_sequence,
+            mode,
+            source,
+            status,
+            error,
+        })
+    }
+
+    /// Convert a closed job-model outcome into privacy-safe capture metadata.
+    /// Evidence references stay in the executor/audit layer and are not
+    /// serialized here.
+    pub fn diagnostic_job_step_outcome(
+        job: &DiagnosticJob,
+        step: &JobStep,
+        mode: u8,
+        source: Option<String>,
+        outcome: &StepOutcome,
+    ) -> Result<Self, String> {
+        let (status, error) = match outcome {
+            StepOutcome::Succeeded { .. } => (DiagnosticJobStepStatus::Success, None),
+            StepOutcome::RecoverableError { error, .. } => (
+                DiagnosticJobStepStatus::Recoverable,
+                Some(step_error_name(error).into()),
+            ),
+            StepOutcome::NotRun {
+                reason: SkipReason::SessionFailed,
+            } => (
+                DiagnosticJobStepStatus::Fatal,
+                Some("session_failed".into()),
+            ),
+            StepOutcome::NotRun {
+                reason: SkipReason::Cancelled,
+            } => (DiagnosticJobStepStatus::Skipped, Some("cancelled".into())),
+        };
+        Self::diagnostic_job_step(
+            job.id().to_string(),
+            step.sequence() as u64,
+            mode,
+            source,
+            status,
+            error,
+        )
+    }
+
+    pub fn diagnostic_job_completed(result: &JobResult) -> Result<Self, String> {
+        match result.status() {
+            JobStatus::Completed | JobStatus::CompletedWithErrors => {
+                Ok(Self::DiagnosticJobCompleted {
+                    job_id: result.id().to_string(),
+                    status: result.status(),
+                })
+            }
+            status => Err(format!("diagnostic job result is not completed: {status}")),
+        }
+    }
+
+    pub fn diagnostic_job_terminal(result: &JobResult) -> Result<Self, String> {
+        match result.status() {
+            JobStatus::Completed | JobStatus::CompletedWithErrors => {
+                Self::diagnostic_job_completed(result)
+            }
+            JobStatus::Failed => Ok(Self::DiagnosticJobFailed {
+                job_id: result.id().to_string(),
+                error: result
+                    .session_error()
+                    .map(session_error_name)
+                    .unwrap_or("session_failed")
+                    .into(),
+            }),
+            JobStatus::Cancelled => Ok(Self::DiagnosticJobCancelled {
+                job_id: result.id().to_string(),
+            }),
+            status => Err(format!("diagnostic job result is not terminal: {status}")),
+        }
+    }
+
+    pub fn diagnostic_job_failed(job_id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self::DiagnosticJobFailed {
+            job_id: job_id.into(),
+            error: error.into(),
+        }
+    }
+
+    pub fn diagnostic_job_cancelled(job_id: impl Into<String>) -> Self {
+        Self::DiagnosticJobCancelled {
+            job_id: job_id.into(),
+        }
+    }
+}
+
+pub(crate) fn validate_diagnostic_job_id(value: &str) -> Result<(), String> {
+    validate_diagnostic_text("job id", value, MAX_DIAGNOSTIC_JOB_ID_LEN)
+}
+
+pub(crate) fn validate_diagnostic_source(value: Option<&str>) -> Result<(), String> {
+    value.map_or(Ok(()), |value| {
+        validate_diagnostic_text("source", value, MAX_DIAGNOSTIC_SOURCE_LEN)
+    })
+}
+
+pub(crate) fn validate_diagnostic_error(value: Option<&str>) -> Result<(), String> {
+    value.map_or(Ok(()), |value| {
+        validate_diagnostic_text("error", value, MAX_DIAGNOSTIC_ERROR_LEN)
+    })
+}
+
+fn validate_diagnostic_text(label: &str, value: &str, max_len: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("diagnostic {label} must not be empty"));
+    }
+    if value.len() > max_len {
+        return Err(format!("diagnostic {label} exceeds {max_len} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "diagnostic {label} must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_diagnostic_mode(mode: u8) -> Result<(), String> {
+    (1..=MAX_DIAGNOSTIC_MODE)
+        .contains(&mode)
+        .then_some(())
+        .ok_or_else(|| {
+            format!("diagnostic mode must be between 0x01 and 0x{MAX_DIAGNOSTIC_MODE:02X}")
+        })
+}
+
+fn step_error_name(error: &StepError) -> &'static str {
+    match error {
+        StepError::Unsupported => "unsupported",
+        StepError::NegativeResponse => "negative_response",
+        StepError::Timeout => "timeout",
+        StepError::MalformedEvidence => "malformed_evidence",
+        StepError::Other(_) => "other",
+    }
+}
+
+fn session_error_name(error: &SessionError) -> &'static str {
+    match error {
+        SessionError::Disconnected => "disconnected",
+        SessionError::Transport => "transport",
+        SessionError::Fault => "fault",
+        SessionError::Other(_) => "other",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic_job::{
+        DiagnosticScope, EvidenceRef, JobResult, KnownResponder, StepEvidence, Termination,
+    };
     use crate::prepare_read;
 
     #[test]
@@ -516,5 +759,91 @@ mod tests {
         );
         assert!(!from.serialize().contains("VIN"));
         assert!(!to.serialize().contains("VIN"));
+    }
+
+    #[test]
+    fn diagnostic_job_events_are_privacy_safe_and_map_closed_outcomes() {
+        let scope =
+            DiagnosticScope::known_obd_responders([KnownResponder::new("7E8").unwrap()]).unwrap();
+        let job = DiagnosticJob::dtc_scan(scope);
+        assert_eq!(
+            CaptureEvent::diagnostic_job_started(&job),
+            CaptureEvent::DiagnosticJobStarted {
+                job_id: "dtc.scan".into(),
+                model_version: 1,
+                step_count: 1,
+            }
+        );
+        let plan = job.plan();
+        let step = &plan.steps()[0];
+        let evidence = StepEvidence::new(EvidenceRef::new("opaque-ref").unwrap(), None);
+        let event = CaptureEvent::diagnostic_job_step_outcome(
+            &job,
+            step,
+            0x03,
+            Some("7E8".into()),
+            &StepOutcome::succeeded([evidence]),
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            CaptureEvent::DiagnosticJobStep {
+                job_id: "dtc.scan".into(),
+                step_sequence: 0,
+                mode: 0x03,
+                source: Some("7E8".into()),
+                status: DiagnosticJobStepStatus::Success,
+                error: None,
+            }
+        );
+        assert!(!format!("{event:?}").contains("opaque-ref"));
+    }
+
+    #[test]
+    fn diagnostic_job_step_validation_keeps_identifiers_bounded() {
+        assert!(CaptureEvent::diagnostic_job_step(
+            "dtc.scan",
+            0,
+            0,
+            None,
+            DiagnosticJobStepStatus::Success,
+            None,
+        )
+        .is_err());
+        assert!(CaptureEvent::diagnostic_job_step(
+            "dtc.scan",
+            0,
+            3,
+            Some("source\nleak".into()),
+            DiagnosticJobStepStatus::Success,
+            None,
+        )
+        .is_err());
+        assert!(CaptureEvent::diagnostic_job_step(
+            "dtc.scan",
+            0,
+            3,
+            Some("x".repeat(MAX_DIAGNOSTIC_SOURCE_LEN + 1)),
+            DiagnosticJobStepStatus::Success,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn diagnostic_job_terminal_event_follows_immutable_result_status() {
+        let job = DiagnosticJob::dtc_scan(DiagnosticScope::vehicle_wide());
+        let result = JobResult::from_outcomes(
+            &job.plan(),
+            [StepOutcome::not_run(SkipReason::Cancelled)],
+            Termination::Cancelled,
+        )
+        .unwrap();
+        assert_eq!(
+            CaptureEvent::diagnostic_job_terminal(&result).unwrap(),
+            CaptureEvent::DiagnosticJobCancelled {
+                job_id: "dtc.scan".into(),
+            }
+        );
     }
 }

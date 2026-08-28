@@ -23,6 +23,7 @@ const SHUTDOWN_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE: usize = 8 * 1024;
+const MODE03_COMMAND: &str = "03\r";
 // Two consecutive transport failures stop a live session; data failures reset the count.
 const TRANSPORT_FAILURE_THRESHOLD: u8 = 2;
 const SESSION_UNHEALTHY_PREFIX: &str =
@@ -170,10 +171,20 @@ pub struct DiagnosticResponse {
     pub payload: Vec<u8>,
 }
 
+/// A recoverable issue attached to one Mode 03 response line.  The raw line
+/// remains available through [`DiagnosticResponses::raw_response`], while a
+/// partial payload (when one can be normalized) remains in `responses`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticResponseError {
+    pub responder: Option<ResponderIdentity>,
+    pub error: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiagnosticResponses {
     responses: Vec<DiagnosticResponse>,
     raw_response: String,
+    errors: Vec<DiagnosticResponseError>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +220,19 @@ impl DiagnosticResponses {
         Self {
             responses,
             raw_response: raw_response.into(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn with_errors(
+        responses: Vec<DiagnosticResponse>,
+        raw_response: &str,
+        errors: Vec<DiagnosticResponseError>,
+    ) -> Self {
+        Self {
+            responses,
+            raw_response: raw_response.into(),
+            errors,
         }
     }
 
@@ -222,6 +246,10 @@ impl DiagnosticResponses {
 
     pub fn raw_response(&self) -> &str {
         &self.raw_response
+    }
+
+    pub fn errors(&self) -> &[DiagnosticResponseError] {
+        &self.errors
     }
 
     pub fn capture_evidence(&self) -> Vec<crate::capture_events::ResponderEvidence> {
@@ -366,6 +394,18 @@ pub async fn read_targeted(
     }
 }
 
+/// Read stored emission-related DTCs through one initialized functional ELM
+/// session.  The command and addressing are fixed by this API.
+pub async fn read_stored_dtcs(adapter_id: &str) -> Result<DiagnosticResponses, String> {
+    let session = start_session(adapter_id).await?;
+    let result = session.read_stored_dtcs().await;
+    match (result, session.shutdown().await) {
+        (Ok(responses), Ok(())) => Ok(responses),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
 pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
     let mut session =
         DiagnosticSession::connect_without_support_discovery(adapter_id, true).await?;
@@ -447,6 +487,17 @@ impl SessionClient {
             .into_transaction()
     }
 
+    pub async fn read_stored_dtcs(&self) -> Result<DiagnosticResponses, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::ReadStoredDtcs { reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
     async fn read_targeted_with_evidence(
         &self,
         request: TargetedReadRequest,
@@ -493,6 +544,9 @@ enum SessionCommand {
         request: TargetedReadRequest,
         reply: oneshot::Sender<Result<ReadOutcome, String>>,
     },
+    ReadStoredDtcs {
+        reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -538,6 +592,28 @@ async fn session_actor(
                     reply,
                 )
                 .await;
+            }
+            SessionCommand::ReadStoredDtcs { reply } => {
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
+                }
+                match session.read_stored_dtcs().await {
+                    Ok(responses) => {
+                        health.success();
+                        let _ = reply.send(Ok(responses));
+                    }
+                    Err(error) => {
+                        if health.observe(&error) {
+                            let fatal = health.unhealthy().unwrap().to_owned();
+                            session.disconnect_best_effort().await;
+                            disconnect_done = true;
+                            let _ = reply.send(Err(fatal));
+                        } else {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
             }
             SessionCommand::Shutdown { reply } => {
                 if !disconnect_done {
@@ -733,6 +809,16 @@ impl DiagnosticSession {
         self.read_targeted_with_evidence(request)
             .await
             .into_transaction()
+    }
+
+    async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
+        let mut exchange = LiveExchange {
+            peripheral: &self.peripheral,
+            channel: &self.channel,
+            notifications: &mut self.notifications,
+            show_adapter_io: self.show_adapter_io,
+        };
+        read_elm_mode03_responses(&mut exchange).await
     }
 
     pub async fn identify(&mut self) -> Result<crate::identity::VehicleIdentity, String> {
@@ -1263,6 +1349,16 @@ where
     normalize_mode01_responses(&response, request.pid(), request.data_len())
 }
 
+pub(crate) async fn read_elm_mode03_responses<E>(
+    exchange: &mut E,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let response = exchange.exchange(MODE03_COMMAND, COMMAND_TIMEOUT).await?;
+    normalize_mode03_responses(&response)
+}
+
 fn supports_pid(support: &PidSupport, pid: u8) -> bool {
     support.supports_pid(pid)
 }
@@ -1403,6 +1499,126 @@ pub(crate) fn normalize_mode01_responses(
         mode01_responses(response, pid, data_len)?,
         response,
     ))
+}
+
+pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticResponses, String> {
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+
+    for raw_line in response.split(['\r', '\n']) {
+        let line = raw_line.trim().trim_end_matches('>').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        let compact = upper.split_ascii_whitespace().collect::<String>();
+        if compact == "03"
+            || upper.starts_with("SEARCHING")
+            || (upper.starts_with("BUS INIT") && !upper.contains("ERROR"))
+        {
+            continue;
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let header = tokens.first().filter(|token| token.len() == 3).copied();
+        let responder =
+            header.map(|value| ResponderIdentity::ElmHeader(value.to_ascii_uppercase()));
+        let data = if header.is_some() {
+            &tokens[1..]
+        } else {
+            tokens.as_slice()
+        };
+
+        if ["?", "NO DATA", "STOPPED", "UNABLE TO CONNECT", "ERROR"]
+            .iter()
+            .any(|status| upper == *status || upper.contains(status))
+        {
+            errors.push(DiagnosticResponseError {
+                responder,
+                error: format!("ELM327 rejected Mode 03 response: {line}"),
+            });
+            continue;
+        }
+
+        if let Some(header) = header {
+            if !header.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                errors.push(DiagnosticResponseError {
+                    responder,
+                    error: format!("malformed ELM327 responder header: {line:?}"),
+                });
+                continue;
+            }
+        }
+
+        let mut bytes = Vec::new();
+        let mut malformed = None;
+        for token in data {
+            if token.len() % 2 != 0 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                malformed = Some(format!("malformed ELM327 Mode 03 response line: {line:?}"));
+                break;
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let pair = match std::str::from_utf8(pair) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        malformed = Some(error.to_string());
+                        break;
+                    }
+                };
+                match u8::from_str_radix(pair, 16) {
+                    Ok(byte) => bytes.push(byte),
+                    Err(error) => {
+                        malformed = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            if malformed.is_some() {
+                break;
+            }
+        }
+
+        if let Some(error) = malformed {
+            if let Some(start) = bytes.iter().position(|byte| *byte == 0x43) {
+                matches.push(DiagnosticResponse {
+                    responder: responder.clone(),
+                    payload: bytes[start..].to_vec(),
+                });
+            }
+            errors.push(DiagnosticResponseError { responder, error });
+            continue;
+        }
+
+        let Some(start) = bytes.iter().position(|byte| *byte == 0x43) else {
+            if !bytes.is_empty() {
+                matches.push(DiagnosticResponse {
+                    responder: responder.clone(),
+                    payload: bytes,
+                });
+            }
+            errors.push(DiagnosticResponseError {
+                responder,
+                error: format!("Mode 03 positive response not found: {line:?}"),
+            });
+            continue;
+        };
+        let payload = bytes[start..].to_vec();
+        if payload.len() < 3 || (payload.len() - 1) % 2 != 0 {
+            errors.push(DiagnosticResponseError {
+                responder: responder.clone(),
+                error: format!("malformed normalized Mode 03 payload: {line:?}"),
+            });
+        }
+        matches.push(DiagnosticResponse { responder, payload });
+    }
+
+    if matches.is_empty() && errors.is_empty() {
+        errors.push(DiagnosticResponseError {
+            responder: None,
+            error: "Mode 03 response not found".into(),
+        });
+    }
+    Ok(DiagnosticResponses::with_errors(matches, response, errors))
 }
 
 fn normalize_mode09_segments(response: &str) -> Result<Vec<Vec<u8>>, String> {
@@ -1733,6 +1949,9 @@ mod tests {
                     SessionCommand::ReadTargeted { reply, .. } => {
                         let _ = reply.send(Err("targeted test request not scripted".into()));
                     }
+                    SessionCommand::ReadStoredDtcs { reply } => {
+                        let _ = reply.send(Err("stored DTC test request not scripted".into()));
+                    }
                     SessionCommand::Shutdown { reply } => {
                         let _ = reply.send(Ok(()));
                         return seen;
@@ -1764,6 +1983,22 @@ mod tests {
         );
         client.shutdown().await.unwrap();
         assert_eq!(actor.await.unwrap(), vec![[0x01, 0x0c], [0x01, 0x05]]);
+    }
+
+    #[tokio::test]
+    async fn session_client_requests_stored_dtcs_without_a_protocol_argument() {
+        let (sender, mut commands) = mpsc::channel(1);
+        let actor = tokio::spawn(async move {
+            if let Some(SessionCommand::ReadStoredDtcs { reply }) = commands.recv().await {
+                let _ = reply.send(normalize_mode03_responses("7E8 03 43 01 0C\r>"));
+            }
+        });
+        let client = SessionClient { sender };
+
+        let responses = client.read_stored_dtcs().await.unwrap();
+
+        assert_eq!(responses.as_slice()[0].payload, [0x43, 0x01, 0x0c]);
+        actor.await.unwrap();
     }
 
     #[tokio::test]
@@ -1860,6 +2095,75 @@ mod tests {
             normalize_mode01("SEARCHING...\r064100BE3EB813\r>", 0x00, 4),
             Ok(vec![0x41, 0x00, 0xbe, 0x3e, 0xb8, 0x13])
         );
+    }
+
+    #[test]
+    fn normalizes_stored_dtc_responses_and_accepts_no_dtcs() {
+        let responses =
+            normalize_mode03_responses("03\r7E8 03 43 01 0C\r7E9 05 43 00 00 00 00\r>").unwrap();
+
+        assert_eq!(responses.errors(), &[]);
+        assert_eq!(responses.as_slice().len(), 2);
+        assert_eq!(
+            responses.as_slice()[0],
+            DiagnosticResponse {
+                responder: Some(ResponderIdentity::ElmHeader("7E8".into())),
+                payload: vec![0x43, 0x01, 0x0c],
+            }
+        );
+        assert_eq!(
+            responses.as_slice()[1],
+            DiagnosticResponse {
+                responder: Some(ResponderIdentity::ElmHeader("7E9".into())),
+                payload: vec![0x43, 0x00, 0x00, 0x00, 0x00],
+            }
+        );
+    }
+
+    #[test]
+    fn retains_valid_responder_payloads_when_another_line_is_malformed() {
+        let responses =
+            normalize_mode03_responses("7E8 03 43 01 0C\r7E9 03 43 01\r7EA ERROR\r>").unwrap();
+
+        assert_eq!(responses.as_slice().len(), 2);
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+        assert_eq!(responses.as_slice()[0].payload, [0x43, 0x01, 0x0c]);
+        assert_eq!(
+            responses.as_slice()[1].responder,
+            Some(ResponderIdentity::ElmHeader("7E9".into()))
+        );
+        assert_eq!(responses.as_slice()[1].payload, [0x43, 0x01]);
+        assert_eq!(responses.errors().len(), 2);
+        assert_eq!(
+            responses.errors()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E9".into()))
+        );
+        assert_eq!(
+            responses.errors()[1].responder,
+            Some(ResponderIdentity::ElmHeader("7EA".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_dtc_transport_uses_only_the_bounded_mode03_command() {
+        let mut exchange = ScriptedExchange::captured(vec!["43 01 0C\r>".into()]);
+
+        let responses = read_elm_mode03_responses(&mut exchange).await.unwrap();
+
+        assert_eq!(exchange.commands, ["03\r"]);
+        assert_eq!(responses.as_slice()[0].payload, [0x43, 0x01, 0x0c]);
+    }
+
+    #[test]
+    fn exposes_an_empty_mode03_response_as_recoverable_error() {
+        let responses = normalize_mode03_responses("03\r>").unwrap();
+
+        assert!(responses.is_empty());
+        assert_eq!(responses.errors().len(), 1);
+        assert_eq!(responses.errors()[0].responder, None);
     }
 
     #[test]

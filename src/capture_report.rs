@@ -1,7 +1,10 @@
 //! Deterministic, read-only summaries of recorded capture events.
 
 use crate::{
-    capture_events::{CaptureEvent, CaptureTimeUs, CaptureValue, SubscriptionFilterOutcome},
+    capture_events::{
+        CaptureEvent, CaptureTimeUs, CaptureValue, DiagnosticJobStepStatus,
+        SubscriptionFilterOutcome,
+    },
     jsonl_capture::{CaptureStatus, ParsedCapture},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +39,15 @@ struct Summary {
     session_errors: Vec<String>,
     error_messages: BTreeMap<String, u64>,
     all_reads: Vec<(CaptureTimeUs, CaptureTimeUs, CaptureTimeUs)>,
+    diagnostic_jobs_started: u64,
+    diagnostic_jobs_completed: u64,
+    diagnostic_jobs_failed: u64,
+    diagnostic_jobs_cancelled: u64,
+    diagnostic_steps: u64,
+    diagnostic_successes: u64,
+    diagnostic_recoverable: u64,
+    diagnostic_fatal: u64,
+    diagnostic_skipped: u64,
 }
 
 fn summary(capture: &ParsedCapture) -> Summary {
@@ -66,6 +78,32 @@ fn summary(capture: &ParsedCapture) -> Summary {
             CaptureEvent::SessionError { error } => {
                 summary.lifecycle += 1;
                 summary.session_errors.push(error.clone());
+            }
+            CaptureEvent::DiagnosticJobStarted { .. } => {
+                summary.lifecycle += 1;
+                summary.diagnostic_jobs_started += 1;
+            }
+            CaptureEvent::DiagnosticJobStep { status, .. } => {
+                summary.lifecycle += 1;
+                summary.diagnostic_steps += 1;
+                match status {
+                    DiagnosticJobStepStatus::Success => summary.diagnostic_successes += 1,
+                    DiagnosticJobStepStatus::Recoverable => summary.diagnostic_recoverable += 1,
+                    DiagnosticJobStepStatus::Fatal => summary.diagnostic_fatal += 1,
+                    DiagnosticJobStepStatus::Skipped => summary.diagnostic_skipped += 1,
+                }
+            }
+            CaptureEvent::DiagnosticJobCompleted { .. } => {
+                summary.lifecycle += 1;
+                summary.diagnostic_jobs_completed += 1;
+            }
+            CaptureEvent::DiagnosticJobFailed { .. } => {
+                summary.lifecycle += 1;
+                summary.diagnostic_jobs_failed += 1;
+            }
+            CaptureEvent::DiagnosticJobCancelled { .. } => {
+                summary.lifecycle += 1;
+                summary.diagnostic_jobs_cancelled += 1;
             }
             CaptureEvent::SubscriptionConfigured {
                 semantic,
@@ -161,7 +199,7 @@ fn observe_offset(summary: &mut Summary, offset: CaptureTimeUs) {
 pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
     let summary = summary(capture);
     let mut output = format!(
-        "Capture: {path}\nFormat: JSONL {}\nStatus: {}\nProfile: {}\nStarted: {}\nDuration: {}\nEvents: {}\nReads: {} succeeded, {} failed\nSkipped: {} events, {} slots\nLifecycle events: {}\n\nSignals\n",
+        "Capture: {path}\nFormat: JSONL {}\nStatus: {}\nProfile: {}\nStarted: {}\nDuration: {}\nEvents: {}\nReads: {} succeeded, {} failed\nSkipped: {} events, {} slots\nDiagnostic jobs: {} started, {} completed, {} failed, {} cancelled\nDiagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\nLifecycle events: {}\n\nSignals\n",
         crate::jsonl_capture::VERSION,
         status(capture.status),
         summary.profile.as_deref().unwrap_or("unavailable"),
@@ -172,6 +210,14 @@ pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
         summary.failures,
         summary.skipped_events,
         summary.skipped_slots,
+        summary.diagnostic_jobs_started,
+        summary.diagnostic_jobs_completed,
+        summary.diagnostic_jobs_failed,
+        summary.diagnostic_jobs_cancelled,
+        summary.diagnostic_successes,
+        summary.diagnostic_recoverable,
+        summary.diagnostic_fatal,
+        summary.diagnostic_skipped,
         summary.lifecycle,
     );
     for (semantic, signal) in &summary.signals {
@@ -227,7 +273,7 @@ pub fn render_capability(path: &str, capture: &ParsedCapture) -> String {
         .map(|(due, start, _)| start - due)
         .collect::<Vec<_>>();
     let mut output = format!(
-        "Capture: {path}\nStatus: {}\nDuration: {}\n\nOverall\n  successful reads: {}\n  failed reads: {} ({})\n  observed successful throughput: {} reads/s\n  observed attempted throughput: {} reads/s\n  read latency p50/p95/max: {}\n  scheduler lateness p50/p95/max: {}\n  skipped slots: {} across {} events\n  session errors: {}\n\nSignals\n",
+        "Capture: {path}\nStatus: {}\nDuration: {}\n\nOverall\n  successful reads: {}\n  failed reads: {} ({})\n  observed successful throughput: {} reads/s\n  observed attempted throughput: {} reads/s\n  read latency p50/p95/max: {}\n  scheduler lateness p50/p95/max: {}\n  skipped slots: {} across {} events\n  diagnostic jobs: {} started, {} completed, {} failed, {} cancelled\n  diagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\n  session errors: {}\n\nSignals\n",
         status(capture.status),
         duration(summary.first_offset_us, summary.last_offset_us),
         summary.successes,
@@ -239,6 +285,14 @@ pub fn render_capability(path: &str, capture: &ParsedCapture) -> String {
         metrics(&lateness),
         summary.skipped_slots,
         summary.skipped_events,
+        summary.diagnostic_jobs_started,
+        summary.diagnostic_jobs_completed,
+        summary.diagnostic_jobs_failed,
+        summary.diagnostic_jobs_cancelled,
+        summary.diagnostic_successes,
+        summary.diagnostic_recoverable,
+        summary.diagnostic_fatal,
+        summary.diagnostic_skipped,
         summary.session_errors.len(),
     );
     for (semantic, signal) in &summary.signals {
@@ -379,7 +433,8 @@ fn percentage(part: u64, total: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture_events::{CaptureEvent, CaptureValue};
+    use crate::capture_events::{CaptureEvent, CaptureValue, DiagnosticJobStepStatus};
+    use crate::diagnostic_job::JobStatus;
 
     fn capture(events: Vec<CaptureEvent>) -> ParsedCapture {
         ParsedCapture {
@@ -473,5 +528,41 @@ mod tests {
             ]),
         );
         assert!(rendered.contains("incompatible units"));
+    }
+
+    #[test]
+    fn inspection_reports_diagnostic_job_lifecycle_and_step_statuses() {
+        let rendered = render_inspection(
+            "job.jsonl",
+            &capture(vec![
+                CaptureEvent::DiagnosticJobStarted {
+                    job_id: "dtc.scan".into(),
+                    model_version: 1,
+                    step_count: 2,
+                },
+                CaptureEvent::DiagnosticJobStep {
+                    job_id: "dtc.scan".into(),
+                    step_sequence: 0,
+                    mode: 3,
+                    source: Some("7E8".into()),
+                    status: DiagnosticJobStepStatus::Success,
+                    error: None,
+                },
+                CaptureEvent::DiagnosticJobStep {
+                    job_id: "dtc.scan".into(),
+                    step_sequence: 1,
+                    mode: 3,
+                    source: Some("7E9".into()),
+                    status: DiagnosticJobStepStatus::Fatal,
+                    error: Some("transport".into()),
+                },
+                CaptureEvent::DiagnosticJobCompleted {
+                    job_id: "dtc.scan".into(),
+                    status: JobStatus::CompletedWithErrors,
+                },
+            ]),
+        );
+        assert!(rendered.contains("Diagnostic jobs: 1 started, 1 completed, 0 failed, 0 cancelled"));
+        assert!(rendered.contains("Diagnostic steps: 1 success, 0 recoverable, 1 fatal, 0 skipped"));
     }
 }

@@ -1,5 +1,10 @@
 use crate::{
-    capture_events::{CaptureEvent, CaptureValue, ReadTiming, SubscriptionFilterOutcome},
+    capture_events::{
+        validate_diagnostic_error, validate_diagnostic_job_id, validate_diagnostic_mode,
+        validate_diagnostic_source, CaptureEvent, CaptureValue, DiagnosticJobStepStatus,
+        ReadTiming, SubscriptionFilterOutcome,
+    },
+    diagnostic_job::JobStatus,
     runtime_reducer::{ContextUpdate, RuntimeEvent},
     runtime_state::{
         RecordingState, RuntimeState, SafetyCapability, SourceState, TopologyState, TransportState,
@@ -313,6 +318,82 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             object.push_str(&sequence.to_string());
             object.push_str(",\"offset_us\":");
             object.push_str(&offset_us.to_string());
+        }
+        CaptureEvent::DiagnosticJobStarted {
+            job_id,
+            model_version,
+            step_count,
+        } => {
+            validate_diagnostic_job_id(job_id)?;
+            object.push_str("\"diagnostic_job_started\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"job_id\":");
+            push_string(&mut object, job_id);
+            object.push_str(",\"model_version\":");
+            object.push_str(&model_version.to_string());
+            object.push_str(",\"step_count\":");
+            object.push_str(&step_count.to_string());
+        }
+        CaptureEvent::DiagnosticJobStep {
+            job_id,
+            step_sequence,
+            mode,
+            source,
+            status,
+            error,
+        } => {
+            validate_diagnostic_job_id(job_id)?;
+            validate_diagnostic_mode(*mode)?;
+            validate_diagnostic_source(source.as_deref())?;
+            validate_diagnostic_error(error.as_deref())?;
+            object.push_str("\"diagnostic_job_step\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"job_id\":");
+            push_string(&mut object, job_id);
+            object.push_str(",\"step_sequence\":");
+            object.push_str(&step_sequence.to_string());
+            object.push_str(",\"mode\":");
+            object.push_str(&mode.to_string());
+            object.push_str(",\"source\":");
+            push_option_string(&mut object, source.as_deref());
+            object.push_str(",\"status\":");
+            push_string(&mut object, status.as_str());
+            object.push_str(",\"error\":");
+            push_option_string(&mut object, error.as_deref());
+        }
+        CaptureEvent::DiagnosticJobCompleted { job_id, status } => {
+            validate_diagnostic_job_id(job_id)?;
+            if !matches!(
+                status,
+                JobStatus::Completed | JobStatus::CompletedWithErrors
+            ) {
+                return Err(format!(
+                    "diagnostic job completion has non-completed status: {status}"
+                ));
+            }
+            object.push_str("\"diagnostic_job_completed\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"job_id\":");
+            push_string(&mut object, job_id);
+            object.push_str(",\"status\":");
+            push_string(&mut object, status.as_str());
+        }
+        CaptureEvent::DiagnosticJobFailed { job_id, error } => {
+            validate_diagnostic_job_id(job_id)?;
+            validate_diagnostic_error(Some(error))?;
+            object.push_str("\"diagnostic_job_failed\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"job_id\":");
+            push_string(&mut object, job_id);
+            object.push_str(",\"error\":");
+            push_string(&mut object, error);
+        }
+        CaptureEvent::DiagnosticJobCancelled { job_id } => {
+            validate_diagnostic_job_id(job_id)?;
+            object.push_str("\"diagnostic_job_cancelled\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"job_id\":");
+            push_string(&mut object, job_id);
         }
     }
     object.push_str("}\n");
@@ -810,6 +891,114 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 offset_us: u64_field(object, "offset_us", line_number)?,
             })
         }
+        "diagnostic_job_started" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "job_id",
+                    "model_version",
+                    "step_count",
+                ],
+                line_number,
+            )?;
+            let job_id = string_field(object, "job_id", line_number)?;
+            validate_diagnostic_job_id(&job_id)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            Ok(CaptureEvent::DiagnosticJobStarted {
+                job_id,
+                model_version: u16::try_from(u64_field(object, "model_version", line_number)?)
+                    .map_err(|_| format!("line {line_number}: model_version is out of range"))?,
+                step_count: u64_field(object, "step_count", line_number)?,
+            })
+        }
+        "diagnostic_job_step" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "job_id",
+                    "step_sequence",
+                    "mode",
+                    "source",
+                    "status",
+                    "error",
+                ],
+                line_number,
+            )?;
+            let job_id = string_field(object, "job_id", line_number)?;
+            validate_diagnostic_job_id(&job_id)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let mode = u8::try_from(u64_field(object, "mode", line_number)?)
+                .map_err(|_| format!("line {line_number}: mode is out of range"))?;
+            validate_diagnostic_mode(mode)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let source = optional_string_field(object, "source", line_number)?;
+            validate_diagnostic_source(source.as_deref())
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let error = optional_string_field(object, "error", line_number)?;
+            validate_diagnostic_error(error.as_deref())
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            Ok(CaptureEvent::DiagnosticJobStep {
+                job_id,
+                step_sequence: u64_field(object, "step_sequence", line_number)?,
+                mode,
+                source,
+                status: parse_diagnostic_job_step_status(object, line_number)?,
+                error,
+            })
+        }
+        "diagnostic_job_completed" => {
+            fields_exact(
+                object,
+                &["schema", "version", "type", "sequence", "job_id", "status"],
+                line_number,
+            )?;
+            let job_id = string_field(object, "job_id", line_number)?;
+            validate_diagnostic_job_id(&job_id)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let status = parse_job_status(object, line_number)?;
+            if !matches!(
+                status,
+                JobStatus::Completed | JobStatus::CompletedWithErrors
+            ) {
+                return Err(format!(
+                    "line {line_number}: diagnostic job completion has non-completed status"
+                ));
+            }
+            Ok(CaptureEvent::DiagnosticJobCompleted { job_id, status })
+        }
+        "diagnostic_job_failed" => {
+            fields_exact(
+                object,
+                &["schema", "version", "type", "sequence", "job_id", "error"],
+                line_number,
+            )?;
+            let job_id = string_field(object, "job_id", line_number)?;
+            validate_diagnostic_job_id(&job_id)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let error = string_field(object, "error", line_number)?;
+            validate_diagnostic_error(Some(&error))
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            Ok(CaptureEvent::DiagnosticJobFailed { job_id, error })
+        }
+        "diagnostic_job_cancelled" => {
+            fields_exact(
+                object,
+                &["schema", "version", "type", "sequence", "job_id"],
+                line_number,
+            )?;
+            let job_id = string_field(object, "job_id", line_number)?;
+            validate_diagnostic_job_id(&job_id)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            Ok(CaptureEvent::DiagnosticJobCancelled { job_id })
+        }
         _ => Err(format!(
             "line {line_number}: unknown capture event type {event_type:?}"
         )),
@@ -1147,6 +1336,35 @@ fn parse_filter_outcome(
     }
 }
 
+fn parse_diagnostic_job_step_status(
+    object: &Object,
+    line_number: usize,
+) -> Result<DiagnosticJobStepStatus, String> {
+    match string_field(object, "status", line_number)?.as_str() {
+        "success" => Ok(DiagnosticJobStepStatus::Success),
+        "recoverable" => Ok(DiagnosticJobStepStatus::Recoverable),
+        "fatal" => Ok(DiagnosticJobStepStatus::Fatal),
+        "skipped" => Ok(DiagnosticJobStepStatus::Skipped),
+        status => Err(format!(
+            "line {line_number}: unknown diagnostic job step status {status:?}"
+        )),
+    }
+}
+
+fn parse_job_status(object: &Object, line_number: usize) -> Result<JobStatus, String> {
+    match string_field(object, "status", line_number)?.as_str() {
+        "planned" => Ok(JobStatus::Planned),
+        "running" => Ok(JobStatus::Running),
+        "completed" => Ok(JobStatus::Completed),
+        "completed_with_errors" => Ok(JobStatus::CompletedWithErrors),
+        "failed" => Ok(JobStatus::Failed),
+        "cancelled" => Ok(JobStatus::Cancelled),
+        status => Err(format!(
+            "line {line_number}: unknown diagnostic job status {status:?}"
+        )),
+    }
+}
+
 fn parse_hex(value: &str, line_number: usize) -> Result<Vec<u8>, String> {
     if value.is_empty() {
         return Ok(Vec::new());
@@ -1437,7 +1655,7 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture_events::{CaptureEvent, SubscriptionFilterOutcome};
+    use crate::capture_events::{CaptureEvent, DiagnosticJobStepStatus, SubscriptionFilterOutcome};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -1551,6 +1769,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..expected.len() as u64).collect::<Vec<_>>()
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn round_trips_diagnostic_job_lifecycle_without_raw_or_private_identifiers() {
+        let path = temp_path("diagnostic-job");
+        let (sender, writer) = start(&path).unwrap();
+        let expected = vec![
+            CaptureEvent::DiagnosticJobStarted {
+                job_id: "dtc.scan".into(),
+                model_version: 1,
+                step_count: 2,
+            },
+            CaptureEvent::DiagnosticJobStep {
+                job_id: "dtc.scan".into(),
+                step_sequence: 0,
+                mode: 0x03,
+                source: Some("7E8".into()),
+                status: DiagnosticJobStepStatus::Success,
+                error: None,
+            },
+            CaptureEvent::DiagnosticJobStep {
+                job_id: "dtc.scan".into(),
+                step_sequence: 1,
+                mode: 0x03,
+                source: Some("7E9".into()),
+                status: DiagnosticJobStepStatus::Recoverable,
+                error: Some("malformed_evidence".into()),
+            },
+            CaptureEvent::DiagnosticJobCompleted {
+                job_id: "dtc.scan".into(),
+                status: JobStatus::CompletedWithErrors,
+            },
+            CaptureEvent::DiagnosticJobFailed {
+                job_id: "dtc.scan".into(),
+                error: "transport".into(),
+            },
+            CaptureEvent::DiagnosticJobCancelled {
+                job_id: "dtc.scan".into(),
+            },
+        ];
+        for event in expected.iter().cloned() {
+            sender.send(event).await.unwrap();
+        }
+        finish(sender, writer).await;
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"mode\":3"));
+        assert!(contents.contains("\"source\":\"7E8\""));
+        assert!(!contents.contains("VIN"));
+        assert!(!contents.contains("raw_command"));
+        assert_eq!(read_events(&path).unwrap(), expected);
         fs::remove_file(path).unwrap();
     }
 
