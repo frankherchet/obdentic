@@ -65,6 +65,62 @@ impl RuntimeSnapshot {
     }
 }
 
+/// The actor-authoritative result of one accepted runtime event.
+///
+/// `from` and `to` are captured by the state owner together with the monotone
+/// sequence, so consumers never infer a prior state from local shadow state.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuntimeTransition {
+    transition_sequence: TransitionSequence,
+    event: RuntimeEvent,
+    from: RuntimeState,
+    to: RuntimeState,
+}
+
+impl RuntimeTransition {
+    const fn new(
+        transition_sequence: TransitionSequence,
+        event: RuntimeEvent,
+        from: RuntimeState,
+        to: RuntimeState,
+    ) -> Self {
+        Self {
+            transition_sequence,
+            event,
+            from,
+            to,
+        }
+    }
+
+    pub const fn sequence(self) -> TransitionSequence {
+        self.transition_sequence
+    }
+
+    pub const fn transition_sequence(self) -> TransitionSequence {
+        self.transition_sequence
+    }
+
+    pub const fn event(self) -> RuntimeEvent {
+        self.event
+    }
+
+    pub const fn from(self) -> RuntimeState {
+        self.from
+    }
+
+    pub const fn to(self) -> RuntimeState {
+        self.to
+    }
+
+    pub const fn state(self) -> RuntimeState {
+        self.to
+    }
+
+    pub const fn activity(self) -> Activity {
+        self.to.activity()
+    }
+}
+
 /// Errors from command delivery or the pure reducer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeActorError {
@@ -110,8 +166,8 @@ pub struct RuntimeClient {
 }
 
 impl RuntimeClient {
-    /// Submit one event and await its serialized result.
-    pub async fn send(&self, event: RuntimeEvent) -> Result<RuntimeSnapshot, RuntimeActorError> {
+    /// Submit one event and await its actor-authoritative transition.
+    pub async fn send(&self, event: RuntimeEvent) -> Result<RuntimeTransition, RuntimeActorError> {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(Command::Event { event, reply })
@@ -124,7 +180,7 @@ impl RuntimeClient {
     pub fn try_send(
         &self,
         event: RuntimeEvent,
-    ) -> Result<oneshot::Receiver<Result<RuntimeSnapshot, RuntimeActorError>>, RuntimeActorError>
+    ) -> Result<oneshot::Receiver<Result<RuntimeTransition, RuntimeActorError>>, RuntimeActorError>
     {
         let (reply, result) = oneshot::channel();
         self.commands
@@ -163,7 +219,7 @@ pub type Client = RuntimeClient;
 enum Command {
     Event {
         event: RuntimeEvent,
-        reply: oneshot::Sender<Result<RuntimeSnapshot, RuntimeActorError>>,
+        reply: oneshot::Sender<Result<RuntimeTransition, RuntimeActorError>>,
     },
     Snapshot {
         reply: oneshot::Sender<RuntimeSnapshot>,
@@ -210,17 +266,18 @@ fn apply(
     state: &mut RuntimeState,
     transition_sequence: &mut TransitionSequence,
     event: RuntimeEvent,
-) -> Result<RuntimeSnapshot, RuntimeActorError> {
+) -> Result<RuntimeTransition, RuntimeActorError> {
     if state.phase() == Phase::Stopped {
         return Err(RuntimeActorError::Stopped);
     }
+    let from = *state;
     let next = runtime_reducer::transition(state, event).map_err(RuntimeActorError::Transition)?;
     let next_sequence = transition_sequence
         .checked_add(1)
         .ok_or(RuntimeActorError::SequenceOverflow)?;
     *state = next;
     *transition_sequence = next_sequence;
-    Ok(RuntimeSnapshot::new(next, next_sequence))
+    Ok(RuntimeTransition::new(next_sequence, event, from, next))
 }
 
 fn shutdown(
@@ -267,7 +324,7 @@ mod tests {
         assert_eq!(reading.state().identity(), (Phase::Ready, Activity::Read));
         assert_eq!(idle.state().identity(), (Phase::Ready, Activity::Idle));
         assert_eq!(
-            [ready, reading, idle].map(RuntimeSnapshot::transition_sequence),
+            [ready, reading, idle].map(RuntimeTransition::transition_sequence),
             [1, 2, 3]
         );
         drop(client);
@@ -312,7 +369,7 @@ mod tests {
         let sequences = [left, right]
             .into_iter()
             .filter_map(Result::ok)
-            .map(RuntimeSnapshot::transition_sequence)
+            .map(RuntimeTransition::transition_sequence)
             .collect::<Vec<_>>();
         assert!(matches!(sequences.as_slice(), [2] | [2, 3]));
 

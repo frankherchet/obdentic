@@ -6,7 +6,8 @@ use obdentic::{
     audit::AuditState,
     ble, capture,
     capture_events::{
-        CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, SubscriptionFilterOutcome,
+        CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, DtcObservationFact,
+        DtcTransportOutcome, SubscriptionFilterOutcome,
     },
     capture_report,
     diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus},
@@ -27,7 +28,7 @@ use std::{
     env,
     path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile engine-baseline --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
@@ -99,7 +100,8 @@ async fn run() -> Result<(), String> {
         None,
         RuntimeEvent::InitializationCompleted,
     )
-    .await;
+    .await
+    .map(|_| ());
     if result.is_ok() {
         result = match command {
             Command::Signals => {
@@ -357,15 +359,7 @@ async fn run_vehicle_identify(
             Ok(())
         }
         Err(error) => {
-            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryFailed).await?;
-            apply_runtime_event(
-                runtime,
-                state,
-                None,
-                RuntimeEvent::transport(TransportState::Unhealthy),
-            )
-            .await?;
-            apply_runtime_event(runtime, state, None, RuntimeEvent::FatalRuntimeError).await?;
+            finish_discovery_failure(&error, runtime, state).await?;
             Err(error)
         }
     }
@@ -419,18 +413,37 @@ async fn run_vehicle_discover(
             .await
         }
         Err(error) => {
-            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryFailed).await?;
-            apply_runtime_event(
-                runtime,
-                state,
-                None,
-                RuntimeEvent::transport(TransportState::Unhealthy),
-            )
-            .await?;
-            apply_runtime_event(runtime, state, None, RuntimeEvent::FatalRuntimeError).await?;
+            finish_discovery_failure(&error, runtime, state).await?;
             Err(error)
         }
     }
+}
+
+async fn finish_discovery_failure(
+    error: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryFailed).await?;
+    if obdentic::scheduler::is_fatal_runtime_error(error) {
+        apply_runtime_event(
+            runtime,
+            state,
+            None,
+            RuntimeEvent::transport(TransportState::Unhealthy),
+        )
+        .await?;
+        apply_runtime_event(runtime, state, None, RuntimeEvent::FatalRuntimeError).await?;
+    } else {
+        apply_runtime_event(
+            runtime,
+            state,
+            None,
+            RuntimeEvent::transport(TransportState::Disconnected),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(), String> {
@@ -631,6 +644,7 @@ async fn run_diagnose_dtc_scan(
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
 ) -> Result<(), String> {
+    let started = Instant::now();
     let recorder = recording
         .map(jsonl_capture::JsonlRecorder::start)
         .transpose()?;
@@ -666,7 +680,17 @@ async fn run_diagnose_dtc_scan(
         Ok(())
     };
     let shutdown = finish_runtime(runtime, state, sender).await;
-    let stopped = emit_capture_event(sender, CaptureEvent::SessionStopped { offset_us: 0 }).await;
+    let stopped = emit_capture_event(
+        sender,
+        CaptureEvent::SessionStopped {
+            offset_us: started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .map_err(|_| "DTC capture duration exceeds supported range")?,
+        },
+    )
+    .await;
     let result = result.and(inactive).and(shutdown).and(stopped);
     let recorded = match recorder {
         Some(recorder) => recorder.close().await,
@@ -711,6 +735,7 @@ async fn run_diagnose_dtc_scan_inner(
 
     match ble::read_stored_dtcs(adapter_id).await {
         Ok(responses) => {
+            record_dtc_transport_evidence(recorder, &job, &responses).await?;
             if !responses.is_empty() {
                 emit_capture_event(
                     recorder,
@@ -756,6 +781,7 @@ async fn run_diagnose_dtc_scan_inner(
                 }
             };
             let decoded = dtc::decode_mode03(&evidence);
+            record_dtc_facts(recorder, &job, &decoded).await?;
             let rendered = render_dtc_scan(&job, &plan, &decoded, responses.errors());
             let recoverable = !responses.errors().is_empty()
                 || decoded.observations().iter().any(|observation| {
@@ -896,6 +922,82 @@ fn dtc_evidence(
             ))
         })
         .collect()
+}
+
+async fn record_dtc_transport_evidence(
+    recorder: Option<&jsonl_capture::Sender>,
+    job: &DiagnosticJob,
+    responses: &ble::DiagnosticResponses,
+) -> Result<(), String> {
+    for response in responses.as_slice() {
+        emit_capture_event(
+            recorder,
+            CaptureEvent::dtc_transport_observed(
+                job.id().to_string(),
+                0,
+                response
+                    .responder
+                    .as_ref()
+                    .map(|responder| responder.as_str().into()),
+                DtcTransportOutcome::Response,
+            )?,
+        )
+        .await?;
+    }
+    for error in responses.errors() {
+        emit_capture_event(
+            recorder,
+            CaptureEvent::dtc_transport_observed(
+                job.id().to_string(),
+                0,
+                error
+                    .responder
+                    .as_ref()
+                    .map(|responder| responder.as_str().into()),
+                DtcTransportOutcome::Error(error.error.clone()),
+            )?,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn record_dtc_facts(
+    recorder: Option<&jsonl_capture::Sender>,
+    job: &DiagnosticJob,
+    result: &dtc::DtcScanResult,
+) -> Result<(), String> {
+    for observation in result.observations() {
+        let responder = observation
+            .source()
+            .responder()
+            .map(|responder| responder.as_str().into());
+        let facts = match observation.response() {
+            dtc::DtcResponse::NoDtcs => vec![DtcObservationFact::NoDtcs],
+            dtc::DtcResponse::Stored(codes) => codes
+                .iter()
+                .map(|code| DtcObservationFact::DtcCode(code.to_string()))
+                .collect(),
+            dtc::DtcResponse::Error(error) => {
+                vec![DtcObservationFact::DecodeError(error.to_string())]
+            }
+        };
+        for fact in facts {
+            emit_capture_event(
+                recorder,
+                CaptureEvent::dtc_observation(
+                    job.id().to_string(),
+                    0,
+                    responder.clone(),
+                    fact,
+                    "obdii.mode03",
+                    "SAE J1979 Mode 03",
+                )?,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 fn render_dtc_scan(
@@ -2174,5 +2276,37 @@ mod tests {
         assert!(output.contains("responder\t7E8\tdtc\tP010C"));
         assert!(!output.contains("VIN"));
         assert!(!output.contains("diagnosis"));
+    }
+
+    #[tokio::test]
+    async fn discovery_data_failures_return_to_ready_without_faulting_transport() {
+        let (runtime, task) = obdentic::runtime_actor::start();
+        let mut state = RuntimeState::default();
+        apply_runtime_event(
+            &runtime,
+            &mut state,
+            None,
+            RuntimeEvent::InitializationCompleted,
+        )
+        .await
+        .unwrap();
+        apply_runtime_event(&runtime, &mut state, None, RuntimeEvent::DiscoveryStarted)
+            .await
+            .unwrap();
+
+        finish_discovery_failure("invalid identity payload", &runtime, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.identity(),
+            (
+                obdentic::runtime_state::Phase::Ready,
+                obdentic::runtime_state::Activity::Idle
+            )
+        );
+        assert_eq!(state.context().transport(), TransportState::Disconnected);
+        drop(runtime);
+        task.await.unwrap();
     }
 }

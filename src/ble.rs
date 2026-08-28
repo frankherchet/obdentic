@@ -397,7 +397,7 @@ pub async fn read_targeted(
 /// Read stored emission-related DTCs through one initialized functional ELM
 /// session.  The command and addressing are fixed by this API.
 pub async fn read_stored_dtcs(adapter_id: &str) -> Result<DiagnosticResponses, String> {
-    let session = start_session(adapter_id).await?;
+    let session = start_session_mode(adapter_id, false).await?;
     let result = session.read_stored_dtcs().await;
     match (result, session.shutdown().await) {
         (Ok(responses), Ok(())) => Ok(responses),
@@ -451,7 +451,16 @@ pub async fn supported_signals(adapter_id: &str) -> Result<Vec<SignalSupport>, S
 }
 
 pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
-    let session = DiagnosticSession::connect(adapter_id).await?;
+    start_session_mode(adapter_id, true).await
+}
+
+async fn start_session_mode(
+    adapter_id: &str,
+    discover_support: bool,
+) -> Result<SessionClient, String> {
+    let session =
+        DiagnosticSession::connect_with_adapter_io_mode(adapter_id, false, discover_support)
+            .await?;
     let (sender, receiver) = mpsc::channel(16);
     tokio::spawn(session_actor(session, receiver));
     Ok(SessionClient { sender })
@@ -1501,9 +1510,56 @@ pub(crate) fn normalize_mode01_responses(
     ))
 }
 
+#[derive(Debug)]
+struct Mode03IsoTpAssembly {
+    declared_len: usize,
+    payload: Vec<u8>,
+    next_sequence: u8,
+}
+
+fn push_mode03_payload(
+    matches: &mut Vec<DiagnosticResponse>,
+    errors: &mut Vec<DiagnosticResponseError>,
+    responder: Option<ResponderIdentity>,
+    bytes: &[u8],
+    line: &str,
+    strict: bool,
+) {
+    let start = if strict {
+        (bytes.first() == Some(&0x43)).then_some(0)
+    } else {
+        bytes.iter().position(|byte| *byte == 0x43)
+    };
+    let Some(start) = start else {
+        if !strict && !bytes.is_empty() {
+            matches.push(DiagnosticResponse {
+                responder: responder.clone(),
+                payload: bytes.to_vec(),
+            });
+        }
+        errors.push(DiagnosticResponseError {
+            responder,
+            error: format!("Mode 03 positive response not found: {line:?}"),
+        });
+        return;
+    };
+    let payload = bytes[start..].to_vec();
+    if payload.len() < 3 || !(payload.len() - 1).is_multiple_of(2) {
+        errors.push(DiagnosticResponseError {
+            responder: responder.clone(),
+            error: format!("malformed normalized Mode 03 payload: {line:?}"),
+        });
+        if strict {
+            return;
+        }
+    }
+    matches.push(DiagnosticResponse { responder, payload });
+}
+
 pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticResponses, String> {
     let mut matches = Vec::new();
     let mut errors = Vec::new();
+    let mut assemblies: Vec<(Option<ResponderIdentity>, Mode03IsoTpAssembly)> = Vec::new();
 
     for raw_line in response.split(['\r', '\n']) {
         let line = raw_line.trim().trim_end_matches('>').trim();
@@ -1579,7 +1635,23 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
         }
 
         if let Some(error) = malformed {
-            if let Some(start) = bytes.iter().position(|byte| *byte == 0x43) {
+            if matches!(bytes.first().map(|byte| byte >> 4), Some(1 | 2)) {
+                if let Some(index) = assemblies
+                    .iter()
+                    .position(|(identity, _)| *identity == responder)
+                {
+                    assemblies.remove(index);
+                }
+            } else if bytes.first().map(|byte| byte >> 4) == Some(0) {
+                let declared_len = (bytes[0] & 0x0f) as usize;
+                let payload = &bytes[1..];
+                if let Some(start) = payload.iter().position(|byte| *byte == 0x43) {
+                    matches.push(DiagnosticResponse {
+                        responder: responder.clone(),
+                        payload: payload[start..payload.len().min(start + declared_len)].to_vec(),
+                    });
+                }
+            } else if let Some(start) = bytes.iter().position(|byte| *byte == 0x43) {
                 matches.push(DiagnosticResponse {
                     responder: responder.clone(),
                     payload: bytes[start..].to_vec(),
@@ -1589,27 +1661,207 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
             continue;
         }
 
-        let Some(start) = bytes.iter().position(|byte| *byte == 0x43) else {
-            if !bytes.is_empty() {
-                matches.push(DiagnosticResponse {
-                    responder: responder.clone(),
-                    payload: bytes,
+        match bytes.first().map(|byte| byte >> 4) {
+            Some(0) => {
+                let declared_len = (bytes[0] & 0x0f) as usize;
+                let payload = &bytes[1..];
+                if declared_len == 0 {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 03 single frame: {line:?}"),
+                    });
+                    continue;
+                }
+                if payload.len() < declared_len {
+                    if let Some(start) = payload.iter().position(|byte| *byte == 0x43) {
+                        matches.push(DiagnosticResponse {
+                            responder: responder.clone(),
+                            payload: payload[start..].to_vec(),
+                        });
+                    }
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!(
+                            "truncated Mode 03 single frame: declared {declared_len} bytes, received {}",
+                            payload.len()
+                        ),
+                    });
+                    continue;
+                }
+                if payload[declared_len..]
+                    .iter()
+                    .any(|byte| !matches!(byte, 0x00 | 0xaa))
+                {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("unexpected bytes after Mode 03 single frame: {line:?}"),
+                    });
+                    continue;
+                }
+                push_mode03_payload(
+                    &mut matches,
+                    &mut errors,
+                    responder,
+                    &payload[..declared_len],
+                    line,
+                    false,
+                );
+            }
+            Some(1) => {
+                if bytes.len() < 3 {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 03 first frame: {line:?}"),
+                    });
+                    continue;
+                }
+                let declared_len = (((bytes[0] & 0x0f) as usize) << 8) | bytes[1] as usize;
+                let payload = &bytes[2..];
+                if declared_len < 3 || payload.len() >= declared_len {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!(
+                            "malformed Mode 03 first frame: declared {declared_len} bytes, received {}",
+                            payload.len()
+                        ),
+                    });
+                    continue;
+                }
+                if assemblies
+                    .iter()
+                    .any(|(identity, _)| *identity == responder)
+                {
+                    assemblies.retain(|(identity, _)| *identity != responder);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("duplicate Mode 03 first frame: {line:?}"),
+                    });
+                    continue;
+                }
+                assemblies.push((
+                    responder,
+                    Mode03IsoTpAssembly {
+                        declared_len,
+                        payload: payload.to_vec(),
+                        next_sequence: 1,
+                    },
+                ));
+            }
+            Some(2) => {
+                let Some(index) = assemblies
+                    .iter()
+                    .position(|(identity, _)| *identity == responder)
+                else {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("Mode 03 consecutive frame without first frame: {line:?}"),
+                    });
+                    continue;
+                };
+                if bytes.len() < 2 {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 03 consecutive frame: {line:?}"),
+                    });
+                    continue;
+                }
+                let sequence = bytes[0] & 0x0f;
+                let expected = assemblies[index].1.next_sequence;
+                if sequence != expected {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!(
+                            "Mode 03 sequence mismatch: expected {expected}, got {sequence}"
+                        ),
+                    });
+                    continue;
+                }
+                let data = &bytes[1..];
+                let (declared_len, received_len) = {
+                    let assembly = &assemblies[index].1;
+                    (assembly.declared_len, assembly.payload.len())
+                };
+                if received_len >= declared_len {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("Mode 03 ISO-TP payload exceeded declared length: {line:?}"),
+                    });
+                    continue;
+                }
+                let remaining = declared_len - received_len;
+                if data.len() > remaining
+                    && data[remaining..]
+                        .iter()
+                        .any(|byte| !matches!(byte, 0x00 | 0xaa))
+                {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("Mode 03 ISO-TP payload exceeded declared length: {line:?}"),
+                    });
+                    continue;
+                }
+                let complete = {
+                    let assembly = &mut assemblies[index].1;
+                    assembly
+                        .payload
+                        .extend_from_slice(&data[..data.len().min(remaining)]);
+                    assembly.next_sequence = (sequence + 1) & 0x0f;
+                    assembly.payload.len() == declared_len
+                };
+                if complete {
+                    let (_, assembly) = assemblies.remove(index);
+                    push_mode03_payload(
+                        &mut matches,
+                        &mut errors,
+                        responder,
+                        &assembly.payload,
+                        line,
+                        true,
+                    );
+                }
+            }
+            Some(3) => {
+                if let Some(index) = assemblies
+                    .iter()
+                    .position(|(identity, _)| *identity == responder)
+                {
+                    assemblies.remove(index);
+                }
+                errors.push(DiagnosticResponseError {
+                    responder,
+                    error: format!("unexpected Mode 03 flow-control frame: {line:?}"),
                 });
             }
-            errors.push(DiagnosticResponseError {
-                responder,
-                error: format!("Mode 03 positive response not found: {line:?}"),
-            });
-            continue;
-        };
-        let payload = bytes[start..].to_vec();
-        if payload.len() < 3 || (payload.len() - 1) % 2 != 0 {
-            errors.push(DiagnosticResponseError {
-                responder: responder.clone(),
-                error: format!("malformed normalized Mode 03 payload: {line:?}"),
-            });
+            _ => {
+                if assemblies
+                    .iter()
+                    .any(|(identity, _)| *identity == responder)
+                {
+                    assemblies.retain(|(identity, _)| *identity != responder);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("interleaved Mode 03 response frame: {line:?}"),
+                    });
+                    continue;
+                }
+                push_mode03_payload(&mut matches, &mut errors, responder, &bytes, line, false);
+            }
         }
-        matches.push(DiagnosticResponse { responder, payload });
+    }
+
+    for (responder, assembly) in assemblies {
+        errors.push(DiagnosticResponseError {
+            responder,
+            error: format!(
+                "truncated Mode 03 ISO-TP response: declared {} bytes, received {}",
+                assembly.declared_len,
+                assembly.payload.len()
+            ),
+        });
     }
 
     if matches.is_empty() && errors.is_empty() {
@@ -2118,6 +2370,65 @@ mod tests {
                 payload: vec![0x43, 0x00, 0x00, 0x00, 0x00],
             }
         );
+    }
+
+    #[test]
+    fn reassembles_mode03_iso_tp_frames_per_responder() {
+        let responses = normalize_mode03_responses(
+            "7E8 10 0B 43 01 0C 02 0D 00\r7E9 10 0B 43 00 00 00 00 00\r7E8 21 00 00 00 00 00 00 00\r7E9 21 00 00 00 00 00 00 00\r>",
+        )
+        .unwrap();
+
+        assert_eq!(responses.errors(), &[]);
+        assert_eq!(responses.as_slice().len(), 2);
+        assert_eq!(
+            responses.as_slice()[0],
+            DiagnosticResponse {
+                responder: Some(ResponderIdentity::ElmHeader("7E8".into())),
+                payload: vec![0x43, 0x01, 0x0c, 0x02, 0x0d, 0, 0, 0, 0, 0, 0],
+            }
+        );
+        assert_eq!(
+            responses.as_slice()[1],
+            DiagnosticResponse {
+                responder: Some(ResponderIdentity::ElmHeader("7E9".into())),
+                payload: vec![0x43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_mode03_iso_tp_sequence_and_truncation_errors() {
+        let sequence =
+            normalize_mode03_responses("7E8 10 0B 43 01 0C 02 0D 00\r7E8 22 00 00\r>").unwrap();
+        assert!(sequence.is_empty());
+        assert_eq!(sequence.errors().len(), 1);
+        assert!(sequence.errors()[0].error.contains("sequence mismatch"));
+
+        let truncated = normalize_mode03_responses("7E8 10 0B 43 01 0C 02 0D 00\r>").unwrap();
+        assert!(truncated.is_empty());
+        assert_eq!(truncated.errors().len(), 1);
+        assert!(truncated.errors()[0].error.contains("truncated"));
+    }
+
+    #[test]
+    fn does_not_mix_interleaved_mode03_responders() {
+        let responses = normalize_mode03_responses(
+            "7E8 10 0B 43 01 0C 02 0D 00\r7E9 21 00 00 00 00 00 00 00\r7E8 21 00 00 00 00 00 00 00\r>",
+        )
+        .unwrap();
+
+        assert_eq!(responses.as_slice().len(), 1);
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+        assert_eq!(responses.errors().len(), 1);
+        assert_eq!(
+            responses.errors()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E9".into()))
+        );
+        assert!(responses.errors()[0].error.contains("without first frame"));
     }
 
     #[test]

@@ -143,9 +143,29 @@ impl DiagnosticJobStepStatus {
     }
 }
 
+/// The responder-scoped transport result for one DTC step. Raw response
+/// bytes, when present, remain in [`CaptureEvent::ResponsesObserved`].
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DtcTransportOutcome {
+    Response,
+    NoResponse,
+    Malformed,
+    Error(String),
+}
+
+/// One privacy-safe fact produced while decoding a responder's DTC response.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DtcObservationFact {
+    DtcCode(String),
+    NoDtcs,
+    DecodeError(String),
+}
+
 pub const MAX_DIAGNOSTIC_JOB_ID_LEN: usize = 64;
 pub const MAX_DIAGNOSTIC_SOURCE_LEN: usize = 64;
 pub const MAX_DIAGNOSTIC_ERROR_LEN: usize = 256;
+pub const MAX_DTC_DECODER_LEN: usize = 128;
+pub const MAX_DTC_PROVENANCE_LEN: usize = 256;
 pub const MAX_DIAGNOSTIC_MODE: u8 = 0x7f;
 
 /// A closed vocabulary of passive observations from one capture session.
@@ -212,6 +232,9 @@ pub enum CaptureEvent {
     /// An observational snapshot of one reducer transition. The recorder
     /// persists this value; it never applies `event` or derives `to` itself.
     RuntimeStateChanged {
+        /// Actor-local sequence. Zero denotes a legacy capture that predates
+        /// actor-authoritative transition evidence.
+        transition_sequence: u64,
         from: RuntimeState,
         to: RuntimeState,
         event: RuntimeEvent,
@@ -243,6 +266,20 @@ pub enum CaptureEvent {
     },
     DiagnosticJobCancelled {
         job_id: String,
+    },
+    DtcTransportObserved {
+        job_id: String,
+        step_sequence: u64,
+        responder: Option<String>,
+        outcome: DtcTransportOutcome,
+    },
+    DtcObservation {
+        job_id: String,
+        step_sequence: u64,
+        responder: Option<String>,
+        fact: DtcObservationFact,
+        decoder: String,
+        provenance: String,
     },
 }
 
@@ -382,17 +419,33 @@ impl CaptureEvent {
         to: RuntimeState,
         event: RuntimeEvent,
     ) -> Self {
-        Self::RuntimeStateChanged { from, to, event }
+        Self::runtime_transition(0, from, to, event)
+    }
+
+    /// Build actor-authoritative transition evidence with its local sequence.
+    pub const fn runtime_transition(
+        transition_sequence: u64,
+        from: RuntimeState,
+        to: RuntimeState,
+        event: RuntimeEvent,
+    ) -> Self {
+        Self::RuntimeStateChanged {
+            transition_sequence,
+            from,
+            to,
+            event,
+        }
     }
 
     /// Compatibility spelling for callers that call the observation a
     /// transition rather than a state change.
     pub const fn runtime_state_transition(
+        transition_sequence: u64,
         from: RuntimeState,
         to: RuntimeState,
         event: RuntimeEvent,
     ) -> Self {
-        Self::runtime_state_changed(from, to, event)
+        Self::runtime_transition(transition_sequence, from, to, event)
     }
 
     /// Record the immutable plan shape without retaining scope, transport, or
@@ -514,6 +567,56 @@ impl CaptureEvent {
             job_id: job_id.into(),
         }
     }
+
+    /// Record responder-scoped transport semantics without copying a command
+    /// or payload into the structured event.
+    pub fn dtc_transport_observed(
+        job_id: impl Into<String>,
+        step_sequence: u64,
+        responder: Option<String>,
+        outcome: DtcTransportOutcome,
+    ) -> Result<Self, String> {
+        let job_id = job_id.into();
+        validate_diagnostic_job_id(&job_id)?;
+        validate_diagnostic_source(responder.as_deref())?;
+        if let DtcTransportOutcome::Error(reason) = &outcome {
+            validate_diagnostic_error(Some(reason))?;
+        }
+        Ok(Self::DtcTransportObserved {
+            job_id,
+            step_sequence,
+            responder,
+            outcome,
+        })
+    }
+
+    /// Record one decoded DTC fact. Raw bytes stay in the separate response
+    /// evidence event, while decoder and provenance identify the interpretation.
+    pub fn dtc_observation(
+        job_id: impl Into<String>,
+        step_sequence: u64,
+        responder: Option<String>,
+        fact: DtcObservationFact,
+        decoder: impl Into<String>,
+        provenance: impl Into<String>,
+    ) -> Result<Self, String> {
+        let job_id = job_id.into();
+        let decoder = decoder.into();
+        let provenance = provenance.into();
+        validate_diagnostic_job_id(&job_id)?;
+        validate_diagnostic_source(responder.as_deref())?;
+        validate_dtc_fact(&fact)?;
+        validate_diagnostic_text("decoder", &decoder, MAX_DTC_DECODER_LEN)?;
+        validate_diagnostic_text("provenance", &provenance, MAX_DTC_PROVENANCE_LEN)?;
+        Ok(Self::DtcObservation {
+            job_id,
+            step_sequence,
+            responder,
+            fact,
+            decoder,
+            provenance,
+        })
+    }
 }
 
 pub(crate) fn validate_diagnostic_job_id(value: &str) -> Result<(), String> {
@@ -532,7 +635,11 @@ pub(crate) fn validate_diagnostic_error(value: Option<&str>) -> Result<(), Strin
     })
 }
 
-fn validate_diagnostic_text(label: &str, value: &str, max_len: usize) -> Result<(), String> {
+pub(crate) fn validate_diagnostic_text(
+    label: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("diagnostic {label} must not be empty"));
     }
@@ -554,6 +661,27 @@ pub(crate) fn validate_diagnostic_mode(mode: u8) -> Result<(), String> {
         .ok_or_else(|| {
             format!("diagnostic mode must be between 0x01 and 0x{MAX_DIAGNOSTIC_MODE:02X}")
         })
+}
+
+pub(crate) fn validate_dtc_fact(fact: &DtcObservationFact) -> Result<(), String> {
+    match fact {
+        DtcObservationFact::DtcCode(code) => validate_dtc_code(code),
+        DtcObservationFact::NoDtcs => Ok(()),
+        DtcObservationFact::DecodeError(error) => validate_diagnostic_error(Some(error)),
+    }
+}
+
+fn validate_dtc_code(value: &str) -> Result<(), String> {
+    let valid_prefix = matches!(value.as_bytes().first(), Some(b'P' | b'C' | b'B' | b'U'));
+    if value.len() != 5
+        || !valid_prefix
+        || !value.as_bytes()[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
+    {
+        return Err("DTC code must be an uppercase five-character OBD-II code".into());
+    }
+    Ok(())
 }
 
 fn step_error_name(error: &StepError) -> &'static str {
@@ -752,6 +880,7 @@ mod tests {
         assert_eq!(
             event,
             CaptureEvent::RuntimeStateChanged {
+                transition_sequence: 0,
                 from,
                 to,
                 event: RuntimeEvent::InitializationCompleted,
@@ -826,6 +955,60 @@ mod tests {
             Some("x".repeat(MAX_DIAGNOSTIC_SOURCE_LEN + 1)),
             DiagnosticJobStepStatus::Success,
             None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn dtc_capture_events_keep_transport_and_decode_facts_bounded() {
+        assert!(CaptureEvent::dtc_transport_observed(
+            "dtc.scan",
+            0,
+            Some("7E8".into()),
+            DtcTransportOutcome::NoResponse,
+        )
+        .is_ok());
+        assert!(CaptureEvent::dtc_transport_observed(
+            "dtc.scan",
+            0,
+            Some("7E8\nleak".into()),
+            DtcTransportOutcome::Malformed,
+        )
+        .is_err());
+
+        let event = CaptureEvent::dtc_observation(
+            "dtc.scan",
+            0,
+            Some("7E8".into()),
+            DtcObservationFact::DtcCode("P010C".into()),
+            "SAE J1979 Mode 03",
+            "OBD-II Mode 03 decoder v1",
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            CaptureEvent::DtcObservation {
+                responder: Some(ref responder),
+                fact: DtcObservationFact::DtcCode(ref code),
+                ..
+            } if responder == "7E8" && code == "P010C"
+        ));
+        assert!(CaptureEvent::dtc_observation(
+            "dtc.scan",
+            0,
+            None,
+            DtcObservationFact::DtcCode("p010c".into()),
+            "decoder",
+            "provenance",
+        )
+        .is_err());
+        assert!(CaptureEvent::dtc_observation(
+            "dtc.scan",
+            0,
+            None,
+            DtcObservationFact::NoDtcs,
+            "decoder\nleak",
+            "provenance",
         )
         .is_err());
     }

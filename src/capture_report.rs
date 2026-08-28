@@ -2,8 +2,8 @@
 
 use crate::{
     capture_events::{
-        CaptureEvent, CaptureTimeUs, CaptureValue, DiagnosticJobStepStatus,
-        SubscriptionFilterOutcome,
+        CaptureEvent, CaptureTimeUs, CaptureValue, DiagnosticJobStepStatus, DtcObservationFact,
+        DtcTransportOutcome, SubscriptionFilterOutcome,
     },
     jsonl_capture::{CaptureStatus, ParsedCapture},
 };
@@ -48,6 +48,8 @@ struct Summary {
     diagnostic_recoverable: u64,
     diagnostic_fatal: u64,
     diagnostic_skipped: u64,
+    dtc_transport: BTreeMap<(String, u64, String, String), u64>,
+    dtc_observations: BTreeMap<(String, u64, String, String), u64>,
 }
 
 fn summary(capture: &ParsedCapture) -> Summary {
@@ -70,6 +72,35 @@ fn summary(capture: &ParsedCapture) -> Summary {
             CaptureEvent::ResponsesObserved { .. } => {
                 // Raw responder evidence remains in ParsedCapture for an
                 // explicit offline re-decoder; summaries do not reinterpret it.
+            }
+            CaptureEvent::DtcTransportObserved {
+                job_id,
+                step_sequence,
+                responder,
+                outcome,
+            } => {
+                let key = (
+                    job_id.clone(),
+                    *step_sequence,
+                    responder.as_deref().unwrap_or("unknown").into(),
+                    dtc_transport_name(outcome),
+                );
+                *summary.dtc_transport.entry(key).or_default() += 1;
+            }
+            CaptureEvent::DtcObservation {
+                job_id,
+                step_sequence,
+                responder,
+                fact,
+                ..
+            } => {
+                let key = (
+                    job_id.clone(),
+                    *step_sequence,
+                    responder.as_deref().unwrap_or("unknown").into(),
+                    dtc_fact_name(fact),
+                );
+                *summary.dtc_observations.entry(key).or_default() += 1;
             }
             CaptureEvent::SessionStopped { offset_us } => {
                 summary.lifecycle += 1;
@@ -199,7 +230,7 @@ fn observe_offset(summary: &mut Summary, offset: CaptureTimeUs) {
 pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
     let summary = summary(capture);
     let mut output = format!(
-        "Capture: {path}\nFormat: JSONL {}\nStatus: {}\nProfile: {}\nStarted: {}\nDuration: {}\nEvents: {}\nReads: {} succeeded, {} failed\nSkipped: {} events, {} slots\nDiagnostic jobs: {} started, {} completed, {} failed, {} cancelled\nDiagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\nLifecycle events: {}\n\nSignals\n",
+        "Capture: {path}\nFormat: JSONL {}\nStatus: {}\nProfile: {}\nStarted: {}\nDuration: {}\nEvents: {}\nReads: {} succeeded, {} failed\nSkipped: {} events, {} slots\nDiagnostic jobs: {} started, {} completed, {} failed, {} cancelled\nDiagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\nDTC transport observations: {}\nDTC decoded observations: {}\nLifecycle events: {}\n\nSignals\n",
         crate::jsonl_capture::VERSION,
         status(capture.status),
         summary.profile.as_deref().unwrap_or("unavailable"),
@@ -218,6 +249,8 @@ pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
         summary.diagnostic_recoverable,
         summary.diagnostic_fatal,
         summary.diagnostic_skipped,
+        count_entries(&summary.dtc_transport),
+        count_entries(&summary.dtc_observations),
         summary.lifecycle,
     );
     for (semantic, signal) in &summary.signals {
@@ -237,6 +270,22 @@ pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
             offset(signal.first_sample_us),
             offset(signal.last_sample_us),
         ));
+    }
+    if !summary.dtc_transport.is_empty() {
+        output.push_str("\nDTC transport observations\n");
+        for ((job_id, step_sequence, responder, outcome), count) in &summary.dtc_transport {
+            output.push_str(&format!(
+                "  {job_id} step {step_sequence} responder {responder}: {outcome} ({count})\n"
+            ));
+        }
+    }
+    if !summary.dtc_observations.is_empty() {
+        output.push_str("\nDTC decoded observations\n");
+        for ((job_id, step_sequence, responder, fact), count) in &summary.dtc_observations {
+            output.push_str(&format!(
+                "  {job_id} step {step_sequence} responder {responder}: {fact} ({count})\n"
+            ));
+        }
     }
     if !summary.session_errors.is_empty() {
         output.push_str("\nSession errors\n");
@@ -363,6 +412,27 @@ fn filter_name(value: Option<SubscriptionFilterOutcome>) -> &'static str {
         Some(SubscriptionFilterOutcome::Unsupported) => "unsupported",
         Some(SubscriptionFilterOutcome::Unknown) => "unknown",
         None => "unavailable",
+    }
+}
+
+fn count_entries(entries: &BTreeMap<(String, u64, String, String), u64>) -> u64 {
+    entries.values().sum()
+}
+
+fn dtc_transport_name(outcome: &DtcTransportOutcome) -> String {
+    match outcome {
+        DtcTransportOutcome::Response => "response".into(),
+        DtcTransportOutcome::NoResponse => "no_response".into(),
+        DtcTransportOutcome::Malformed => "malformed".into(),
+        DtcTransportOutcome::Error(reason) => format!("error: {reason}"),
+    }
+}
+
+fn dtc_fact_name(fact: &DtcObservationFact) -> String {
+    match fact {
+        DtcObservationFact::DtcCode(code) => code.clone(),
+        DtcObservationFact::NoDtcs => "no_dtcs".into(),
+        DtcObservationFact::DecodeError(error) => format!("decode_error: {error}"),
     }
 }
 
@@ -564,5 +634,58 @@ mod tests {
         );
         assert!(rendered.contains("Diagnostic jobs: 1 started, 1 completed, 0 failed, 0 cancelled"));
         assert!(rendered.contains("Diagnostic steps: 1 success, 0 recoverable, 1 fatal, 0 skipped"));
+    }
+
+    #[test]
+    fn inspection_reports_responder_scoped_dtc_facts_without_payloads() {
+        let rendered = render_inspection(
+            "dtc.jsonl",
+            &capture(vec![
+                CaptureEvent::DtcTransportObserved {
+                    job_id: "dtc.scan".into(),
+                    step_sequence: 0,
+                    responder: Some("7E8".into()),
+                    outcome: DtcTransportOutcome::NoResponse,
+                },
+                CaptureEvent::DtcTransportObserved {
+                    job_id: "dtc.scan".into(),
+                    step_sequence: 0,
+                    responder: Some("7E9".into()),
+                    outcome: DtcTransportOutcome::Malformed,
+                },
+                CaptureEvent::DtcObservation {
+                    job_id: "dtc.scan".into(),
+                    step_sequence: 0,
+                    responder: Some("7E8".into()),
+                    fact: DtcObservationFact::DtcCode("P010C".into()),
+                    decoder: "decoder".into(),
+                    provenance: "provenance".into(),
+                },
+                CaptureEvent::DtcObservation {
+                    job_id: "dtc.scan".into(),
+                    step_sequence: 0,
+                    responder: Some("7E9".into()),
+                    fact: DtcObservationFact::NoDtcs,
+                    decoder: "decoder".into(),
+                    provenance: "provenance".into(),
+                },
+                CaptureEvent::DtcObservation {
+                    job_id: "dtc.scan".into(),
+                    step_sequence: 0,
+                    responder: None,
+                    fact: DtcObservationFact::DecodeError("unknown_response".into()),
+                    decoder: "decoder".into(),
+                    provenance: "provenance".into(),
+                },
+            ]),
+        );
+        assert!(rendered.contains("DTC transport observations: 2"));
+        assert!(rendered.contains("DTC decoded observations: 3"));
+        assert!(rendered.contains("responder 7E8: no_response (1)"));
+        assert!(rendered.contains("responder 7E9: malformed (1)"));
+        assert!(rendered.contains("responder 7E8: P010C (1)"));
+        assert!(rendered.contains("responder 7E9: no_dtcs (1)"));
+        assert!(rendered.contains("responder unknown: decode_error: unknown_response (1)"));
+        assert!(!rendered.contains("raw_command"));
     }
 }

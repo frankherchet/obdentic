@@ -1,5 +1,7 @@
 use obdentic::{
-    capture_events::{CaptureEvent, DiagnosticJobStepStatus},
+    capture_events::{
+        CaptureEvent, DiagnosticJobStepStatus, DtcObservationFact, ResponderEvidence,
+    },
     diagnostic_job::{DiagnosticJob, DiagnosticScope},
     dtc::{decode_mode03, DtcResponse, ResponderIdentity, ResponseEvidence},
     jsonl_capture::{self, CaptureStatus, JsonlRecorder},
@@ -8,6 +10,18 @@ use obdentic::{
     runtime_state::{Activity, Phase, RuntimeState},
     safety::{OperationKind, OperationRequest, SafetyError, SafetyPolicy},
 };
+
+struct ScriptedMode03Transport {
+    commands: Vec<[u8; 1]>,
+    responses: Vec<ResponseEvidence>,
+}
+
+impl ScriptedMode03Transport {
+    fn read_stored(&mut self) -> Vec<ResponseEvidence> {
+        self.commands.push([0x03]);
+        self.responses.clone()
+    }
+}
 
 #[test]
 fn reducer_covers_read_observe_diagnose_shutdown_and_fault_lifecycles() {
@@ -148,12 +162,56 @@ async fn jsonl_round_trip_keeps_runtime_and_diagnostic_events_ordered() {
         std::process::id()
     ));
     let recorder = JsonlRecorder::start(&path).unwrap();
-    let from = RuntimeState::default();
-    let to = runtime_reducer::transition(&from, RuntimeEvent::InitializationCompleted).unwrap();
+    let (client, actor) = runtime_actor::start();
+    let initialized = client
+        .send(RuntimeEvent::InitializationCompleted)
+        .await
+        .unwrap();
     let job = DiagnosticJob::dtc_scan(DiagnosticScope::vehicle_wide());
-    let events = [
-        CaptureEvent::runtime_state_changed(from, to, RuntimeEvent::InitializationCompleted),
+    let diagnosing = client
+        .send(RuntimeEvent::DiagnosticJobStarted)
+        .await
+        .unwrap();
+    let mut transport = ScriptedMode03Transport {
+        commands: Vec::new(),
+        responses: vec![ResponseEvidence::new(
+            Some(ResponderIdentity::new("7E8").unwrap()),
+            [0x43, 0x01, 0x0c],
+        )],
+    };
+    let evidence = transport.read_stored();
+    assert_eq!(transport.commands, [[0x03]]);
+    let decoded = decode_mode03(&evidence);
+    assert_eq!(
+        decoded.observations()[0].response().dtcs()[0].to_string(),
+        "P010C"
+    );
+    let completed = client
+        .send(RuntimeEvent::DiagnosticJobCompleted)
+        .await
+        .unwrap();
+    let events = vec![
+        CaptureEvent::runtime_transition(
+            initialized.sequence(),
+            initialized.from(),
+            initialized.to(),
+            initialized.event(),
+        ),
+        CaptureEvent::runtime_transition(
+            diagnosing.sequence(),
+            diagnosing.from(),
+            diagnosing.to(),
+            diagnosing.event(),
+        ),
         CaptureEvent::diagnostic_job_started(&job),
+        CaptureEvent::responses_observed(
+            "dtc.scan",
+            vec![0x03],
+            vec![ResponderEvidence::new(Some("7E8".into()), vec![0x43, 0x01, 0x0c]).unwrap()],
+            None,
+            None,
+        )
+        .unwrap(),
         CaptureEvent::diagnostic_job_step(
             "dtc.scan",
             0,
@@ -163,6 +221,21 @@ async fn jsonl_round_trip_keeps_runtime_and_diagnostic_events_ordered() {
             None,
         )
         .unwrap(),
+        CaptureEvent::dtc_observation(
+            "dtc.scan",
+            0,
+            Some("7E8".into()),
+            DtcObservationFact::DtcCode("P010C".into()),
+            "obdii.mode03",
+            "SAE J1979 Mode 03",
+        )
+        .unwrap(),
+        CaptureEvent::runtime_transition(
+            completed.sequence(),
+            completed.from(),
+            completed.to(),
+            completed.event(),
+        ),
         CaptureEvent::DiagnosticJobCompleted {
             job_id: "dtc.scan".into(),
             status: obdentic::diagnostic_job::JobStatus::Completed,
@@ -176,9 +249,30 @@ async fn jsonl_round_trip_keeps_runtime_and_diagnostic_events_ordered() {
     let parsed = jsonl_capture::read(&path).unwrap();
     assert_eq!(parsed.status, CaptureStatus::Partial);
     assert_eq!(parsed.events, events);
+    assert!(matches!(
+        parsed.events.first(),
+        Some(CaptureEvent::RuntimeStateChanged {
+            transition_sequence: 1,
+            ..
+        })
+    ));
+    let mut replayed = RuntimeState::default();
+    for event in &parsed.events {
+        if let CaptureEvent::RuntimeStateChanged {
+            from, to, event, ..
+        } = event
+        {
+            assert_eq!(*from, replayed);
+            replayed = runtime_reducer::transition(&replayed, *event).unwrap();
+            assert_eq!(*to, replayed);
+        }
+    }
+    assert_eq!(replayed.identity(), (Phase::Ready, Activity::Idle));
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(!contents.contains("VIN"));
     assert!(!contents.contains("device_id"));
     assert!(!contents.contains("raw_command"));
     std::fs::remove_file(path).unwrap();
+    drop(client);
+    actor.await.unwrap();
 }

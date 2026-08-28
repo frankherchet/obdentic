@@ -127,16 +127,21 @@ pub async fn apply_runtime_event(
     recorder: Option<&mpsc::Sender<CaptureEvent>>,
     event: RuntimeEvent,
 ) -> Result<(), String> {
-    let snapshot = runtime
+    let transition = runtime
         .send(event)
         .await
         .map_err(|error| error.to_string())?;
-    let from = *state;
-    *state = snapshot.state();
+    *state = transition.to();
     emit(
         &recorder.cloned(),
-        CaptureEvent::runtime_state_changed(from, *state, event),
-    )
+        CaptureEvent::runtime_transition(
+            transition.sequence(),
+            transition.from(),
+            transition.to(),
+            transition.event(),
+        ),
+    )?;
+    Ok(())
 }
 
 /// Errors with a session/transport boundary are fatal to a live operation;
@@ -1000,6 +1005,7 @@ mod tests {
         assert_eq!(
             receiver.try_recv().unwrap(),
             CaptureEvent::RuntimeStateChanged {
+                transition_sequence: 1,
                 from: RuntimeState::default(),
                 to: RuntimeState::new(Phase::Ready, Activity::Idle, RuntimeContext::default()),
                 event: RuntimeEvent::InitializationCompleted,

@@ -1,8 +1,9 @@
 use crate::{
     capture_events::{
         validate_diagnostic_error, validate_diagnostic_job_id, validate_diagnostic_mode,
-        validate_diagnostic_source, CaptureEvent, CaptureValue, DiagnosticJobStepStatus,
-        ReadTiming, SubscriptionFilterOutcome,
+        validate_diagnostic_source, validate_diagnostic_text, validate_dtc_fact, CaptureEvent,
+        CaptureValue, DiagnosticJobStepStatus, DtcObservationFact, DtcTransportOutcome, ReadTiming,
+        SubscriptionFilterOutcome, MAX_DTC_DECODER_LEN, MAX_DTC_PROVENANCE_LEN,
     },
     diagnostic_job::JobStatus,
     runtime_reducer::{ContextUpdate, RuntimeEvent},
@@ -295,12 +296,19 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             object.push_str(",\"error\":");
             push_string(&mut object, error);
         }
-        CaptureEvent::RuntimeStateChanged { from, to, event } => {
+        CaptureEvent::RuntimeStateChanged {
+            transition_sequence,
+            from,
+            to,
+            event,
+        } => {
             if from.state_version() != to.state_version() {
                 return Err("runtime state transition versions do not match".into());
             }
             object.push_str("\"runtime_state_changed\",\"sequence\":");
             object.push_str(&sequence.to_string());
+            object.push_str(",\"transition_sequence\":");
+            object.push_str(&transition_sequence.to_string());
             object.push_str(",\"state_version\":");
             object.push_str(&from.state_version().to_string());
             object.push_str(",\"from\":");
@@ -395,6 +403,63 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             object.push_str(",\"job_id\":");
             push_string(&mut object, job_id);
         }
+        CaptureEvent::DtcTransportObserved {
+            job_id,
+            step_sequence,
+            responder,
+            outcome,
+        } => {
+            validate_diagnostic_job_id(job_id)?;
+            validate_diagnostic_source(responder.as_deref())?;
+            object.push_str("\"dtc_transport_observed\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"job_id\":");
+            push_string(&mut object, job_id);
+            object.push_str(",\"step_sequence\":");
+            object.push_str(&step_sequence.to_string());
+            object.push_str(",\"responder\":");
+            push_option_string(&mut object, responder.as_deref());
+            object.push_str(",\"outcome\":");
+            push_string(&mut object, dtc_transport_outcome_name(outcome));
+            object.push_str(",\"reason\":");
+            match outcome {
+                DtcTransportOutcome::Error(reason) => {
+                    validate_diagnostic_error(Some(reason))?;
+                    push_string(&mut object, reason);
+                }
+                DtcTransportOutcome::Response
+                | DtcTransportOutcome::NoResponse
+                | DtcTransportOutcome::Malformed => object.push_str("null"),
+            }
+        }
+        CaptureEvent::DtcObservation {
+            job_id,
+            step_sequence,
+            responder,
+            fact,
+            decoder,
+            provenance,
+        } => {
+            validate_diagnostic_job_id(job_id)?;
+            validate_diagnostic_source(responder.as_deref())?;
+            validate_dtc_fact(fact)?;
+            validate_diagnostic_text("decoder", decoder, MAX_DTC_DECODER_LEN)?;
+            validate_diagnostic_text("provenance", provenance, MAX_DTC_PROVENANCE_LEN)?;
+            object.push_str("\"dtc_observation\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"job_id\":");
+            push_string(&mut object, job_id);
+            object.push_str(",\"step_sequence\":");
+            object.push_str(&step_sequence.to_string());
+            object.push_str(",\"responder\":");
+            push_option_string(&mut object, responder.as_deref());
+            object.push_str(",\"fact\":");
+            push_dtc_fact(&mut object, fact);
+            object.push_str(",\"decoder\":");
+            push_string(&mut object, decoder);
+            object.push_str(",\"provenance\":");
+            push_string(&mut object, provenance);
+        }
     }
     object.push_str("}\n");
     Ok(object)
@@ -457,6 +522,31 @@ fn push_value(object: &mut String, value: &CaptureValue) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn dtc_transport_outcome_name(outcome: &DtcTransportOutcome) -> &'static str {
+    match outcome {
+        DtcTransportOutcome::Response => "response",
+        DtcTransportOutcome::NoResponse => "no_response",
+        DtcTransportOutcome::Malformed => "malformed",
+        DtcTransportOutcome::Error(_) => "error",
+    }
+}
+
+fn push_dtc_fact(object: &mut String, fact: &DtcObservationFact) {
+    match fact {
+        DtcObservationFact::DtcCode(code) => {
+            object.push_str("{\"type\":\"dtc\",\"code\":");
+            push_string(object, code);
+            object.push('}');
+        }
+        DtcObservationFact::NoDtcs => object.push_str("{\"type\":\"no_dtcs\"}"),
+        DtcObservationFact::DecodeError(error) => {
+            object.push_str("{\"type\":\"decode_error\",\"error\":");
+            push_string(object, error);
+            object.push('}');
+        }
+    }
 }
 
 fn push_option_u64(object: &mut String, value: Option<u64>) {
@@ -840,18 +930,33 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
             })
         }
         "runtime_state_changed" => {
+            let has_transition_sequence = object.contains_key("transition_sequence");
             fields_exact(
                 object,
-                &[
-                    "schema",
-                    "version",
-                    "type",
-                    "sequence",
-                    "state_version",
-                    "from",
-                    "to",
-                    "event",
-                ],
+                if has_transition_sequence {
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "transition_sequence",
+                        "state_version",
+                        "from",
+                        "to",
+                        "event",
+                    ]
+                } else {
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "state_version",
+                        "from",
+                        "to",
+                        "event",
+                    ]
+                },
                 line_number,
             )?;
             let state_version = u64_field(object, "state_version", line_number)?;
@@ -865,6 +970,11 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 ));
             }
             Ok(CaptureEvent::RuntimeStateChanged {
+                transition_sequence: if has_transition_sequence {
+                    u64_field(object, "transition_sequence", line_number)?
+                } else {
+                    0
+                },
                 from,
                 to,
                 event: parse_runtime_event(
@@ -999,6 +1109,102 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 .map_err(|error| format!("line {line_number}: {error}"))?;
             Ok(CaptureEvent::DiagnosticJobCancelled { job_id })
         }
+        "dtc_transport_observed" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "job_id",
+                    "step_sequence",
+                    "responder",
+                    "outcome",
+                    "reason",
+                ],
+                line_number,
+            )?;
+            let job_id = string_field(object, "job_id", line_number)?;
+            validate_diagnostic_job_id(&job_id)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let responder = optional_string_field(object, "responder", line_number)?;
+            validate_diagnostic_source(responder.as_deref())
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let outcome_name = string_field(object, "outcome", line_number)?;
+            let reason = match object.get("reason") {
+                Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(value.clone()),
+                _ => {
+                    return Err(format!(
+                        "line {line_number}: field reason must be a string or null"
+                    ))
+                }
+            };
+            let outcome = match outcome_name.as_str() {
+                "response" if reason.is_none() => DtcTransportOutcome::Response,
+                "no_response" if reason.is_none() => DtcTransportOutcome::NoResponse,
+                "malformed" if reason.is_none() => DtcTransportOutcome::Malformed,
+                "error" => {
+                    let reason = reason.ok_or_else(|| {
+                        format!("line {line_number}: transport error requires a reason")
+                    })?;
+                    validate_diagnostic_error(Some(&reason))
+                        .map_err(|error| format!("line {line_number}: {error}"))?;
+                    DtcTransportOutcome::Error(reason)
+                }
+                _ => return Err(format!("line {line_number}: invalid DTC transport outcome")),
+            };
+            Ok(CaptureEvent::DtcTransportObserved {
+                job_id,
+                step_sequence: u64_field(object, "step_sequence", line_number)?,
+                responder,
+                outcome,
+            })
+        }
+        "dtc_observation" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "job_id",
+                    "step_sequence",
+                    "responder",
+                    "fact",
+                    "decoder",
+                    "provenance",
+                ],
+                line_number,
+            )?;
+            let job_id = string_field(object, "job_id", line_number)?;
+            validate_diagnostic_job_id(&job_id)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let responder = optional_string_field(object, "responder", line_number)?;
+            validate_diagnostic_source(responder.as_deref())
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let fact = parse_dtc_fact(
+                object.get("fact").expect("fields_exact checked fact"),
+                line_number,
+            )?;
+            validate_dtc_fact(&fact).map_err(|error| format!("line {line_number}: {error}"))?;
+            let decoder = string_field(object, "decoder", line_number)?;
+            validate_diagnostic_text("decoder", &decoder, MAX_DTC_DECODER_LEN)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            let provenance = string_field(object, "provenance", line_number)?;
+            validate_diagnostic_text("provenance", &provenance, MAX_DTC_PROVENANCE_LEN)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            Ok(CaptureEvent::DtcObservation {
+                job_id,
+                step_sequence: u64_field(object, "step_sequence", line_number)?,
+                responder,
+                fact,
+                decoder,
+                provenance,
+            })
+        }
         _ => Err(format!(
             "line {line_number}: unknown capture event type {event_type:?}"
         )),
@@ -1065,6 +1271,37 @@ fn parse_value(value: &Value, line_number: usize) -> Result<CaptureValue, String
         }
         _ => Err(format!(
             "line {line_number}: unknown capture value type {value_type:?}"
+        )),
+    }
+}
+
+fn parse_dtc_fact(value: &Value, line_number: usize) -> Result<DtcObservationFact, String> {
+    let object = match value {
+        Value::Object(object) => object,
+        _ => return Err(format!("line {line_number}: DTC fact must be an object")),
+    };
+    match string_field(object, "type", line_number)?.as_str() {
+        "dtc" => {
+            fields_exact(object, &["type", "code"], line_number)?;
+            Ok(DtcObservationFact::DtcCode(string_field(
+                object,
+                "code",
+                line_number,
+            )?))
+        }
+        "no_dtcs" => {
+            fields_exact(object, &["type"], line_number)?;
+            Ok(DtcObservationFact::NoDtcs)
+        }
+        "decode_error" => {
+            fields_exact(object, &["type", "error"], line_number)?;
+            let error = string_field(object, "error", line_number)?;
+            validate_diagnostic_error(Some(&error))
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            Ok(DtcObservationFact::DecodeError(error))
+        }
+        fact => Err(format!(
+            "line {line_number}: unknown DTC fact type {fact:?}"
         )),
     }
 }
@@ -1879,6 +2116,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_trips_dtc_facts_without_raw_command_fields() {
+        let path = temp_path("dtc-facts");
+        let (sender, writer) = start(&path).unwrap();
+        let expected = vec![
+            CaptureEvent::DtcTransportObserved {
+                job_id: "dtc.scan".into(),
+                step_sequence: 0,
+                responder: Some("7E8".into()),
+                outcome: DtcTransportOutcome::NoResponse,
+            },
+            CaptureEvent::DtcObservation {
+                job_id: "dtc.scan".into(),
+                step_sequence: 0,
+                responder: Some("7E8".into()),
+                fact: DtcObservationFact::DtcCode("P010C".into()),
+                decoder: "SAE J1979 Mode 03".into(),
+                provenance: "OBD-II Mode 03 decoder v1".into(),
+            },
+            CaptureEvent::DtcObservation {
+                job_id: "dtc.scan".into(),
+                step_sequence: 0,
+                responder: None,
+                fact: DtcObservationFact::DecodeError("unknown_response".into()),
+                decoder: "SAE J1979 Mode 03".into(),
+                provenance: "OBD-II Mode 03 decoder v1".into(),
+            },
+        ];
+        for event in expected.iter().cloned() {
+            sender.send(event).await.unwrap();
+        }
+        finish(sender, writer).await;
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"outcome\":\"no_response\""));
+        assert!(contents.contains("\"code\":\"P010C\""));
+        assert!(contents.contains("\"type\":\"decode_error\""));
+        assert!(!contents.contains("raw_command"));
+        assert_eq!(read_events(&path).unwrap(), expected);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn writes_runtime_state_change_with_stable_state_and_event_ids() {
         let path = temp_path("runtime-state");
         let (sender, writer) = start(&path).unwrap();
@@ -1915,6 +2193,7 @@ mod tests {
         assert_eq!(
             read_events(&path).unwrap(),
             vec![CaptureEvent::RuntimeStateChanged {
+                transition_sequence: 0,
                 from,
                 to,
                 event: RuntimeEvent::InitializationCompleted,
