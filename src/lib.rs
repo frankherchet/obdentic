@@ -17,6 +17,7 @@ pub mod capture_events;
 pub mod capture_replay;
 pub mod capture_report;
 pub mod capture_tui;
+pub mod compound_fact;
 pub mod diagnostic_job;
 pub mod dtc;
 pub mod ea189;
