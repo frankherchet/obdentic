@@ -78,24 +78,24 @@ const ENGINE_BASELINE: CaptureProfile = CaptureProfile {
 ///
 /// `10-idle.jsonl` sustained roughly 5.4 completed logical reads/s while the
 /// denser baseline continuously overbooked the single sequential ELM path.
-/// This profile offers about 4.4 reads/s, leaving headroom for response-time
+/// This profile offers 3.75 reads/s, leaving headroom for response-time
 /// jitter.  It also omits PID 42 and PID 49, which repeatedly produced
 /// responder conflicts and therefore expensive retries in that capture.
 const ENGINE_DRIVE: CaptureProfile = CaptureProfile {
     name: "engine-drive",
     subscriptions: &[
         ("engine.rpm", 1_000),
-        ("engine.maf", 1_500),
-        ("engine.load", 3_000),
-        ("engine.intake_manifold_pressure", 1_500),
-        ("vehicle.speed", 3_000),
-        ("engine.egr.commanded", 3_000),
-        ("engine.egr.error", 3_000),
-        ("vehicle.accelerator_pedal_e", 3_000),
-        ("engine.coolant_temperature", 10_000),
-        ("engine.intake_air_temperature", 10_000),
-        ("engine.runtime", 10_000),
-        ("engine.barometric_pressure", 10_000),
+        ("engine.maf", 2_000),
+        ("engine.load", 4_000),
+        ("engine.intake_manifold_pressure", 2_000),
+        ("vehicle.speed", 4_000),
+        ("engine.egr.commanded", 4_000),
+        ("engine.egr.error", 4_000),
+        ("vehicle.accelerator_pedal_e", 4_000),
+        ("engine.coolant_temperature", 8_000),
+        ("engine.intake_air_temperature", 8_000),
+        ("engine.runtime", 8_000),
+        ("engine.barometric_pressure", 8_000),
     ],
 };
 
@@ -172,7 +172,13 @@ mod tests {
             .iter()
             .map(|subscription| 1.0 / subscription.interval().as_secs_f64())
             .sum::<f64>();
-        assert!(offered_reads_per_second < 4.5);
+        assert!(offered_reads_per_second < 4.0);
+        assert_eq!(
+            profile("engine-drive")
+                .unwrap()
+                .admit(HardwareCapability::conservative_default()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -191,7 +197,7 @@ mod tests {
         assert!(interval("engine.intake_manifold_pressure") < interval("engine.runtime"));
         assert_eq!(
             interval("engine.coolant_temperature"),
-            Duration::from_secs(10)
+            Duration::from_secs(8)
         );
     }
 
