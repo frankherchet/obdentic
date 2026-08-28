@@ -7,7 +7,12 @@ use obdentic::{
     ble, capture,
     capture_events::{CaptureEvent, CaptureSubscription, SubscriptionFilterOutcome},
     capture_report, hex, jsonl_capture, prepare_read, record, replay,
-    scheduler::{ObservationPlan, Subscription, TelemetryScheduler},
+    runtime_actor::RuntimeClient,
+    runtime_reducer::RuntimeEvent,
+    runtime_state::{
+        RecordingState, RuntimeState, SourceState, TopologyState, TransportState, VehicleState,
+    },
+    scheduler::{apply_runtime_event, ObservationPlan, Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
     tui, ReadRequest, Transaction,
@@ -75,126 +80,338 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     let args: Vec<_> = env::args().skip(1).collect();
-    match parse_command(&args)? {
-        Command::Signals => print!("{}", render_signals()),
-        Command::SupportedSignals { adapter_id } => {
-            let support = ble::supported_signals(&adapter_id).await?;
-            print!("{}", render_supported_signals(&support));
-        }
-        Command::Scan => {
-            for candidate in ble::scan().await? {
-                let rssi = candidate
-                    .rssi
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                println!(
-                    "adapter  {}  {}  RSSI {}",
-                    candidate.id.escape_default(),
-                    candidate.name.escape_default(),
-                    rssi
-                );
+    let command = parse_command(&args)?;
+    let (runtime, runtime_task) = obdentic::runtime_actor::start();
+    let mut runtime_state = RuntimeState::default();
+    let mut result = apply_runtime_event(
+        &runtime,
+        &mut runtime_state,
+        None,
+        RuntimeEvent::InitializationCompleted,
+    )
+    .await;
+    if result.is_ok() {
+        result = match command {
+            Command::Signals => {
+                print!("{}", render_signals());
+                Ok(())
             }
-        }
-        Command::VehicleIdentify { adapter_id } => {
-            let identity = ble::identify(&adapter_id).await?;
-            println!("VIN       {}", identity.vin());
-        }
-        Command::VehicleDiscover { adapter_id } => run_vehicle_discover(&adapter_id, false).await?,
-        Command::VehicleRefresh { adapter_id } => run_vehicle_discover(&adapter_id, true).await?,
-        Command::VehicleShow => run_vehicle_show()?,
-        Command::Capture {
-            adapter_id,
-            profile,
-            recording,
-        } => run_capture(&adapter_id, &profile, Path::new(&recording)).await?,
-        Command::CaptureInspect(path) => {
-            let capture = jsonl_capture::read(Path::new(&path))?;
-            print!("{}", capture_report::render_inspection(&path, &capture));
-        }
-        Command::CaptureCapability(path) => {
-            let capture = jsonl_capture::read(Path::new(&path))?;
-            print!("{}", capture_report::render_capability(&path, &capture));
-        }
-        Command::Demo => show(&demo().await?),
-        Command::Read {
-            request,
-            adapter_id,
-            recording,
-        } => {
-            let (mappings, cache_valid) = cached_routing_mappings(&adapter_id).await;
-            let transaction =
-                match route_request(request.metadata().semantic, &mappings, cache_valid)? {
-                    ReadRouting::Functional(request) => ble::read(&adapter_id, request).await?,
-                    ReadRouting::Targeted(request) => {
-                        ble::read_targeted(&adapter_id, request).await?
+            Command::SupportedSignals { adapter_id } => {
+                let support = ble::supported_signals(&adapter_id).await?;
+                print!("{}", render_supported_signals(&support));
+                Ok(())
+            }
+            Command::Scan => {
+                for candidate in ble::scan().await? {
+                    let rssi = candidate
+                        .rssi
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    println!(
+                        "adapter  {}  {}  RSSI {}",
+                        candidate.id.escape_default(),
+                        candidate.name.escape_default(),
+                        rssi
+                    );
+                }
+                Ok(())
+            }
+            Command::VehicleIdentify { adapter_id } => {
+                run_vehicle_identify(&adapter_id, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleDiscover { adapter_id } => {
+                run_vehicle_discover(&adapter_id, false, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleRefresh { adapter_id } => {
+                run_vehicle_discover(&adapter_id, true, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleShow => run_vehicle_show(),
+            Command::Capture {
+                adapter_id,
+                profile,
+                recording,
+            } => {
+                run_capture(
+                    &adapter_id,
+                    &profile,
+                    Path::new(&recording),
+                    &runtime,
+                    &mut runtime_state,
+                )
+                .await
+            }
+            Command::CaptureInspect(path) => {
+                let capture = jsonl_capture::read(Path::new(&path))?;
+                print!("{}", capture_report::render_inspection(&path, &capture));
+                Ok(())
+            }
+            Command::CaptureCapability(path) => {
+                let capture = jsonl_capture::read(Path::new(&path))?;
+                print!("{}", capture_report::render_capability(&path, &capture));
+                Ok(())
+            }
+            Command::Demo => {
+                show(&demo().await?);
+                Ok(())
+            }
+            Command::Read {
+                request,
+                adapter_id,
+                recording,
+            } => {
+                run_read(
+                    request,
+                    &adapter_id,
+                    recording.as_deref().map(Path::new),
+                    &runtime,
+                    &mut runtime_state,
+                )
+                .await
+            }
+            Command::Replay(path) => {
+                show(&replay(Path::new(&path)).await?);
+                Ok(())
+            }
+            Command::LayoutSave(path) => {
+                tui::save_layout(Path::new(&path), &tui::engine_overview())?;
+                println!("saved layout  {path}");
+                Ok(())
+            }
+            Command::TuiDemo(layout_path) => {
+                let transactions = demo_samples()?;
+                let layout = load_layout(layout_path.as_deref())?;
+                tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
+                Ok(())
+            }
+            Command::TuiReplay { recording, layout } => {
+                let transactions = [replay(Path::new(&recording)).await?];
+                let layout = load_layout(layout.as_deref())?;
+                tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
+                Ok(())
+            }
+            Command::TuiLive {
+                adapter_id,
+                layout,
+                recording,
+            } => {
+                let telemetry = Arc::new(Mutex::new(TelemetryState::new(600)?));
+                let audit = Arc::new(Mutex::new(AuditState::new(600)?));
+                let plans = routed_observation_plans(&adapter_id, live_subscriptions()?).await?;
+                let (recorder, writer) = match recording.as_deref() {
+                    Some(path) => {
+                        let (sender, writer) = jsonl_capture::start(Path::new(path))?;
+                        (Some(sender), Some(writer))
+                    }
+                    None => (None, None),
+                };
+                if let Some(sender) = recorder.as_ref() {
+                    apply_runtime_event(
+                        &runtime,
+                        &mut runtime_state,
+                        Some(sender),
+                        RuntimeEvent::recording(RecordingState::Active),
+                    )
+                    .await?;
+                }
+                let scheduler = match TelemetryScheduler::start_with_runtime(
+                    &adapter_id,
+                    plans,
+                    telemetry.clone(),
+                    audit.clone(),
+                    recorder.clone(),
+                    None,
+                    None,
+                    runtime.clone(),
+                )
+                .await
+                {
+                    Ok(scheduler) => scheduler,
+                    Err(error) => {
+                        if let Some(sender) = recorder.as_ref() {
+                            apply_runtime_event(
+                                &runtime,
+                                &mut runtime_state,
+                                Some(sender),
+                                RuntimeEvent::recording(RecordingState::Inactive),
+                            )
+                            .await?;
+                        }
+                        let shutdown =
+                            finish_runtime(&runtime, &mut runtime_state, recorder.as_ref()).await;
+                        let recorded = finish_capture(recorder, writer).await;
+                        shutdown?;
+                        recorded?;
+                        return Err(error);
                     }
                 };
-            if let Some(path) = recording.as_deref() {
-                record(Path::new(path), &transaction)?;
+                let result = tui::run_live(&load_layout(layout.as_deref())?, telemetry, audit);
+                let stopped = scheduler.stop().await;
+                let inactive = if let Some(sender) = recorder.as_ref() {
+                    apply_runtime_event(
+                        &runtime,
+                        &mut runtime_state,
+                        Some(sender),
+                        RuntimeEvent::recording(RecordingState::Inactive),
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                let shutdown =
+                    finish_runtime(&runtime, &mut runtime_state, recorder.as_ref()).await;
+                let recorded = finish_capture(recorder, writer).await;
+                result?;
+                stopped?;
+                inactive?;
+                shutdown?;
+                recorded?;
+                Ok(())
             }
-            show(&transaction);
-            if let Some(path) = recording {
-                println!("recorded  {path}");
-            }
-        }
-        Command::Replay(path) => show(&replay(Path::new(&path)).await?),
-        Command::LayoutSave(path) => {
-            tui::save_layout(Path::new(&path), &tui::engine_overview())?;
-            println!("saved layout  {path}");
-        }
-        Command::TuiDemo(layout_path) => {
-            let transactions = demo_samples()?;
-            let layout = load_layout(layout_path.as_deref())?;
-            tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
-        }
-        Command::TuiReplay { recording, layout } => {
-            let transactions = [replay(Path::new(&recording)).await?];
-            let layout = load_layout(layout.as_deref())?;
-            tui::run(&layout, &telemetry(&transactions)?, &transactions)?;
-        }
-        Command::TuiLive {
-            adapter_id,
-            layout,
-            recording,
-        } => {
-            let telemetry = Arc::new(Mutex::new(TelemetryState::new(600)?));
-            let audit = Arc::new(Mutex::new(AuditState::new(600)?));
-            let (recorder, writer) = match recording.as_deref() {
-                Some(path) => {
-                    let (sender, writer) = jsonl_capture::start(Path::new(path))?;
-                    (Some(sender), Some(writer))
-                }
-                None => (None, None),
-            };
-            let scheduler = match TelemetryScheduler::start(
-                &adapter_id,
-                routed_observation_plans(&adapter_id, live_subscriptions()?).await?,
-                telemetry.clone(),
-                audit.clone(),
-                recorder.clone(),
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(scheduler) => scheduler,
-                Err(error) => {
-                    finish_capture(recorder, writer).await?;
-                    return Err(error);
-                }
-            };
-            let result = tui::run_live(&load_layout(layout.as_deref())?, telemetry, audit);
-            let stopped = scheduler.stop().await;
-            let recorded = finish_capture(recorder, writer).await;
-            result?;
-            stopped?;
-            recorded?;
-        }
+        };
     }
-    Ok(())
+    let shutdown = if runtime_state.phase() == obdentic::runtime_state::Phase::Stopped {
+        Ok(())
+    } else {
+        finish_runtime(&runtime, &mut runtime_state, None).await
+    };
+    drop(runtime);
+    let actor = runtime_task
+        .await
+        .map_err(|error| format!("runtime actor stopped unexpectedly: {error}"));
+    match (result, shutdown, actor) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(()), Err(error), Ok(())) => Err(error),
+        (Ok(()), Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(shutdown), Ok(())) => {
+            Err(format!("{error}; runtime shutdown failed: {shutdown}"))
+        }
+        (Err(error), Ok(()), Err(actor)) => Err(format!("{error}; {actor}")),
+        (Ok(()), Err(shutdown), Err(actor)) => Err(format!("{shutdown}; {actor}")),
+        (Err(error), Err(shutdown), Err(actor)) => Err(format!(
+            "{error}; runtime shutdown failed: {shutdown}; {actor}"
+        )),
+    }
 }
 
-async fn run_vehicle_discover(adapter_id: &str, refresh: bool) -> Result<(), String> {
+async fn run_vehicle_identify(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryStarted).await?;
+    match ble::identify(adapter_id).await {
+        Ok(identity) => {
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::vehicle(VehicleState::Identified),
+            )
+            .await?;
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await?;
+            println!("VIN       {}", identity.vin());
+            Ok(())
+        }
+        Err(error) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryFailed).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Unhealthy),
+            )
+            .await?;
+            apply_runtime_event(runtime, state, None, RuntimeEvent::FatalRuntimeError).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_vehicle_discover(
+    adapter_id: &str,
+    refresh: bool,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryStarted).await?;
+
+    match run_vehicle_discover_inner(adapter_id, refresh).await {
+        Ok(()) => {
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::vehicle(VehicleState::Identified),
+            )
+            .await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::topology(TopologyState::Validated),
+            )
+            .await?;
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await
+        }
+        Err(error) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryFailed).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Unhealthy),
+            )
+            .await?;
+            apply_runtime_event(runtime, state, None, RuntimeEvent::FatalRuntimeError).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(), String> {
     let identity = ble::identify(adapter_id).await?;
     let root = vehicle_cache_root()?;
     let store = obdentic::vehicle_cache::CacheStore::new(&root);
@@ -276,6 +493,128 @@ async fn run_vehicle_discover(adapter_id: &str, refresh: bool) -> Result<(), Str
         );
     }
     println!("evidence\t{}", discovery.observations().len());
+    Ok(())
+}
+
+async fn run_read(
+    request: ReadRequest,
+    adapter_id: &str,
+    recording: Option<&Path>,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::ReadStarted).await?;
+
+    let (mappings, cache_valid) = cached_routing_mappings(adapter_id).await;
+    if cache_valid {
+        apply_runtime_event(
+            runtime,
+            state,
+            None,
+            RuntimeEvent::vehicle(VehicleState::Identified),
+        )
+        .await?;
+        apply_runtime_event(
+            runtime,
+            state,
+            None,
+            RuntimeEvent::topology(TopologyState::Validated),
+        )
+        .await?;
+    }
+    let outcome = match route_request(request.metadata().semantic, &mappings, cache_valid)? {
+        ReadRouting::Functional(request) => ble::read(adapter_id, request).await,
+        ReadRouting::Targeted(request) => ble::read_targeted(adapter_id, request).await,
+    };
+    match outcome {
+        Ok(transaction) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::ReadCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await?;
+            if let Some(path) = recording {
+                apply_runtime_event(
+                    runtime,
+                    state,
+                    None,
+                    RuntimeEvent::recording(RecordingState::Active),
+                )
+                .await?;
+                let recorded = record(path, &transaction);
+                let inactive = apply_runtime_event(
+                    runtime,
+                    state,
+                    None,
+                    RuntimeEvent::recording(RecordingState::Inactive),
+                )
+                .await;
+                match (recorded, inactive) {
+                    (Ok(()), Ok(())) => {}
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                    (Err(error), Err(inactive)) => {
+                        return Err(format!("{error}; recording shutdown failed: {inactive}"))
+                    }
+                }
+                println!("recorded  {}", path.display());
+            }
+            show(&transaction);
+            Ok(())
+        }
+        Err(error) if obdentic::scheduler::is_fatal_runtime_error(&error) => {
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Unhealthy),
+            )
+            .await?;
+            apply_runtime_event(runtime, state, None, RuntimeEvent::FatalRuntimeError).await?;
+            Err(error)
+        }
+        Err(error) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::ReadFailedRecoverable).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+async fn finish_runtime(
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+    recorder: Option<&tokio::sync::mpsc::Sender<CaptureEvent>>,
+) -> Result<(), String> {
+    if state.activity() == obdentic::runtime_state::Activity::Observe {
+        apply_runtime_event(runtime, state, recorder, RuntimeEvent::ObservationStopped).await?;
+    }
+    if state.phase() != obdentic::runtime_state::Phase::Stopped {
+        apply_runtime_event(runtime, state, recorder, RuntimeEvent::ShutdownRequested).await?;
+        apply_runtime_event(runtime, state, recorder, RuntimeEvent::ShutdownCompleted).await?;
+    }
     Ok(())
 }
 
@@ -402,7 +741,13 @@ fn render_vehicle_summaries(caches: &[obdentic::vehicle_cache::VehicleCache]) ->
     output
 }
 
-async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Result<(), String> {
+async fn run_capture(
+    adapter_id: &str,
+    profile_name: &str,
+    path: &Path,
+    runtime: &RuntimeClient,
+    runtime_state: &mut RuntimeState,
+) -> Result<(), String> {
     let profile = capture::profile(profile_name)?;
     let configured = profile.subscriptions()?;
     let advertised = ble::supported_signals(adapter_id).await?;
@@ -414,8 +759,16 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
             "capture profile {profile_name} has no signals supported by the adapter"
         ));
     }
+    let plans = routed_observation_plans(adapter_id, subscriptions.clone()).await?;
 
     let (sender, writer) = jsonl_capture::start(path)?;
+    apply_runtime_event(
+        runtime,
+        runtime_state,
+        Some(&sender),
+        RuntimeEvent::recording(RecordingState::Active),
+    )
+    .await?;
     println!("capture profile  {profile_name}");
     println!(
         "capture signals  {}/{} supported",
@@ -437,21 +790,33 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
     println!("capture record   {}", path.display());
     println!("capture connecting...  wait for session initialization");
 
-    let scheduler = match TelemetryScheduler::start(
+    let scheduler = match TelemetryScheduler::start_with_runtime(
         adapter_id,
-        routed_observation_plans(adapter_id, subscriptions).await?,
+        plans,
         Arc::new(Mutex::new(TelemetryState::new(600)?)),
         Arc::new(Mutex::new(AuditState::new(600)?)),
         Some(sender.clone()),
         Some(profile.name().into()),
         Some(capture_subscriptions),
+        runtime.clone(),
     )
     .await
     {
         Ok(scheduler) => scheduler,
         Err(error) => {
             record_capture_start_failure(&sender, profile.name(), &error).await?;
-            finish_capture(Some(sender), Some(writer)).await?;
+            let inactive = apply_runtime_event(
+                runtime,
+                runtime_state,
+                Some(&sender),
+                RuntimeEvent::recording(RecordingState::Inactive),
+            )
+            .await;
+            let shutdown = finish_runtime(runtime, runtime_state, Some(&sender)).await;
+            let recorded = finish_capture(Some(sender), Some(writer)).await;
+            inactive?;
+            shutdown?;
+            recorded?;
             return Err(error);
         }
     };
@@ -465,9 +830,19 @@ async fn run_capture(adapter_id: &str, profile_name: &str, path: &Path) -> Resul
         _ = wait_for_scheduler(&scheduler) => Err("capture session stopped unexpectedly".into()),
     };
     let stopped = scheduler.stop().await;
+    let inactive = apply_runtime_event(
+        runtime,
+        runtime_state,
+        Some(&sender),
+        RuntimeEvent::recording(RecordingState::Inactive),
+    )
+    .await;
+    let shutdown = finish_runtime(runtime, runtime_state, Some(&sender)).await;
     let recorded = finish_capture(Some(sender), Some(writer)).await;
     stopped?;
     wait_result?;
+    inactive?;
+    shutdown?;
     recorded?;
     println!("capture stopped");
     Ok(())
@@ -959,6 +1334,35 @@ mod tests {
             receiver.recv().await,
             Some(CaptureEvent::SessionStopped { offset_us: 0 })
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_shutdown_documents_observation_idle_then_stopped() {
+        let (runtime, task) = obdentic::runtime_actor::start();
+        let mut state = RuntimeState::default();
+        apply_runtime_event(
+            &runtime,
+            &mut state,
+            None,
+            RuntimeEvent::InitializationCompleted,
+        )
+        .await
+        .unwrap();
+        apply_runtime_event(&runtime, &mut state, None, RuntimeEvent::ObservationStarted)
+            .await
+            .unwrap();
+
+        finish_runtime(&runtime, &mut state, None).await.unwrap();
+
+        assert_eq!(
+            state.identity(),
+            (
+                obdentic::runtime_state::Phase::Stopped,
+                obdentic::runtime_state::Activity::Idle
+            )
+        );
+        drop(runtime);
+        task.await.unwrap();
     }
 
     #[test]

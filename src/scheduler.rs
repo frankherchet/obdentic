@@ -5,6 +5,9 @@ use crate::{
         CaptureEvent, CaptureSubscription, CaptureTimeUs, ReadTiming, SubscriptionFilterOutcome,
     },
     prepare_read,
+    runtime_actor::RuntimeClient,
+    runtime_reducer::RuntimeEvent,
+    runtime_state::RuntimeState,
     telemetry::TelemetryState,
     vehicle_knowledge::{ReadRouting, RoutingDecision},
     ReadRequest,
@@ -115,6 +118,42 @@ pub struct TelemetryScheduler {
     task: JoinHandle<Result<(), String>>,
 }
 
+/// Apply one authoritative runtime transition, then persist its before/after
+/// snapshot when a recorder is available. The actor remains the sole state
+/// owner; the recorder only receives evidence of the accepted transition.
+pub async fn apply_runtime_event(
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+    recorder: Option<&mpsc::Sender<CaptureEvent>>,
+    event: RuntimeEvent,
+) -> Result<(), String> {
+    let snapshot = runtime
+        .send(event)
+        .await
+        .map_err(|error| error.to_string())?;
+    let from = *state;
+    *state = snapshot.state();
+    emit(
+        &recorder.cloned(),
+        CaptureEvent::runtime_state_changed(from, *state, event),
+    )
+}
+
+/// Errors with a session/transport boundary are fatal to a live operation;
+/// semantic/data errors remain recoverable for bounded reads.
+pub fn is_fatal_runtime_error(error: &str) -> bool {
+    error.starts_with("diagnostic session became unresponsive")
+        || [
+            "Bluetooth ",
+            "BLE ",
+            "Carly ",
+            "diagnostic session is ",
+            "diagnostic session stopped ",
+        ]
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
+}
+
 impl TelemetryScheduler {
     pub async fn start<Plan: Into<ObservationPlan>>(
         adapter_id: &str,
@@ -125,6 +164,36 @@ impl TelemetryScheduler {
         capture_profile: Option<String>,
         capture_subscriptions: Option<Vec<CaptureSubscription>>,
     ) -> Result<Self, String> {
+        let (runtime, _runtime_task) = crate::runtime_actor::start();
+        runtime
+            .send(RuntimeEvent::InitializationCompleted)
+            .await
+            .map_err(|error| error.to_string())?;
+        Self::start_with_runtime(
+            adapter_id,
+            subscriptions,
+            telemetry,
+            audit,
+            recorder,
+            capture_profile,
+            capture_subscriptions,
+            runtime,
+        )
+        .await
+    }
+
+    /// Start observation using the caller-owned runtime actor clone.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_runtime<Plan: Into<ObservationPlan>>(
+        adapter_id: &str,
+        subscriptions: Vec<Plan>,
+        telemetry: Arc<Mutex<TelemetryState>>,
+        audit: Arc<Mutex<AuditState>>,
+        recorder: Option<mpsc::Sender<CaptureEvent>>,
+        capture_profile: Option<String>,
+        capture_subscriptions: Option<Vec<CaptureSubscription>>,
+        runtime: RuntimeClient,
+    ) -> Result<Self, String> {
         if subscriptions.is_empty() {
             return Err("telemetry scheduler needs at least one subscription".into());
         }
@@ -132,7 +201,52 @@ impl TelemetryScheduler {
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
-        let session = start_session(adapter_id).await?;
+        let mut runtime_state = runtime
+            .snapshot()
+            .await
+            .map_err(|error| error.to_string())?
+            .state();
+        apply_runtime_event(
+            &runtime,
+            &mut runtime_state,
+            recorder.as_ref(),
+            RuntimeEvent::source(crate::runtime_state::SourceState::Live),
+        )
+        .await?;
+        apply_runtime_event(
+            &runtime,
+            &mut runtime_state,
+            recorder.as_ref(),
+            RuntimeEvent::transport(crate::runtime_state::TransportState::Connecting),
+        )
+        .await?;
+        let session = match start_session(adapter_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = apply_runtime_event(
+                    &runtime,
+                    &mut runtime_state,
+                    recorder.as_ref(),
+                    RuntimeEvent::transport(crate::runtime_state::TransportState::Unhealthy),
+                )
+                .await;
+                let _ = apply_runtime_event(
+                    &runtime,
+                    &mut runtime_state,
+                    recorder.as_ref(),
+                    RuntimeEvent::FatalRuntimeError,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        apply_runtime_event(
+            &runtime,
+            &mut runtime_state,
+            recorder.as_ref(),
+            RuntimeEvent::transport(crate::runtime_state::TransportState::Connected),
+        )
+        .await?;
         let session_start = Instant::now();
         let started = CaptureEvent::capture_started(
             Some(
@@ -161,6 +275,20 @@ impl TelemetryScheduler {
             Ok(discovery) => discovery,
             Err(error) => {
                 let cleanup = session.shutdown().await;
+                let _ = apply_runtime_event(
+                    &runtime,
+                    &mut runtime_state,
+                    recorder.as_ref(),
+                    RuntimeEvent::transport(crate::runtime_state::TransportState::Unhealthy),
+                )
+                .await;
+                let _ = apply_runtime_event(
+                    &runtime,
+                    &mut runtime_state,
+                    recorder.as_ref(),
+                    RuntimeEvent::FatalRuntimeError,
+                )
+                .await;
                 return match cleanup {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
@@ -185,6 +313,13 @@ impl TelemetryScheduler {
                 Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
             };
         }
+        apply_runtime_event(
+            &runtime,
+            &mut runtime_state,
+            recorder.as_ref(),
+            RuntimeEvent::ObservationStarted,
+        )
+        .await?;
         let (cancel, cancelled) = oneshot::channel();
         let task = tokio::spawn(run(
             session,
@@ -194,6 +329,8 @@ impl TelemetryScheduler {
             recorder,
             session_start,
             cancelled,
+            runtime,
+            runtime_state,
         ));
         Ok(Self { cancel, task })
     }
@@ -210,6 +347,7 @@ impl TelemetryScheduler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     session: SessionClient,
     subscriptions: Vec<ObservationPlan>,
@@ -218,6 +356,8 @@ async fn run(
     recorder: Option<mpsc::Sender<CaptureEvent>>,
     session_start: Instant,
     mut cancelled: oneshot::Receiver<()>,
+    runtime: RuntimeClient,
+    mut runtime_state: RuntimeState,
 ) -> Result<(), String> {
     let mut schedule = subscriptions
         .into_iter()
@@ -228,6 +368,16 @@ async fn run(
         tokio::select! {
             _ = &mut cancelled => {
                 if let Err(error) = emit(&recorder, CaptureEvent::ShutdownRequested) {
+                    break Err(error);
+                }
+                if let Err(error) = apply_runtime_event(
+                    &runtime,
+                    &mut runtime_state,
+                    recorder.as_ref(),
+                    RuntimeEvent::ObservationStopped,
+                )
+                .await
+                {
                     break Err(error);
                 }
                 break Ok(())
@@ -241,6 +391,16 @@ async fn run(
                     let due_us = offset_us(session_start, *due);
                     let read_started = Instant::now();
                     let started_us = offset_us(session_start, read_started);
+                    if let Err(error) = apply_runtime_event(
+                        &runtime,
+                        &mut runtime_state,
+                        recorder.as_ref(),
+                        RuntimeEvent::ObservationReadStarted,
+                    )
+                    .await
+                    {
+                        break 'scheduler Err(error);
+                    }
                     let outcome = read_routed(&session, subscription.routing()).await;
                     let read_finished = Instant::now();
                     let finished_us = offset_us(session_start, read_finished);
@@ -266,6 +426,16 @@ async fn run(
                                 timing,
                             )?;
                             if let Err(error) = emit(&recorder, event) {
+                                break 'scheduler Err(error);
+                            }
+                            if let Err(error) = apply_runtime_event(
+                                &runtime,
+                                &mut runtime_state,
+                                recorder.as_ref(),
+                                RuntimeEvent::ObservationReadCompleted,
+                            )
+                            .await
+                            {
                                 break 'scheduler Err(error);
                             }
                         }
@@ -294,6 +464,28 @@ async fn run(
                                 ) {
                                     break 'scheduler Err(record_error);
                                 }
+                                if let Err(runtime_error) = apply_runtime_event(
+                                    &runtime,
+                                    &mut runtime_state,
+                                    recorder.as_ref(),
+                                    RuntimeEvent::transport(
+                                        crate::runtime_state::TransportState::Unhealthy,
+                                    ),
+                                )
+                                .await
+                                {
+                                    break 'scheduler Err(runtime_error);
+                                }
+                                if let Err(runtime_error) = apply_runtime_event(
+                                    &runtime,
+                                    &mut runtime_state,
+                                    recorder.as_ref(),
+                                    RuntimeEvent::FatalRuntimeError,
+                                )
+                                .await
+                                {
+                                    break 'scheduler Err(runtime_error);
+                                }
                                 break 'scheduler Err(fatal);
                             }
                             if let Err(error) = record_read_failure(
@@ -306,6 +498,16 @@ async fn run(
                                 &error,
                             ) {
                                 break 'scheduler Err(error);
+                            }
+                            if let Err(runtime_error) = apply_runtime_event(
+                                &runtime,
+                                &mut runtime_state,
+                                recorder.as_ref(),
+                                RuntimeEvent::ObservationReadFailedRecoverable,
+                            )
+                            .await
+                            {
+                                break 'scheduler Err(runtime_error);
                             }
                         }
                         Err(error) => {
@@ -322,6 +524,28 @@ async fn run(
                                 ) {
                                     break 'scheduler Err(record_error);
                                 }
+                                if let Err(runtime_error) = apply_runtime_event(
+                                    &runtime,
+                                    &mut runtime_state,
+                                    recorder.as_ref(),
+                                    RuntimeEvent::transport(
+                                        crate::runtime_state::TransportState::Unhealthy,
+                                    ),
+                                )
+                                .await
+                                {
+                                    break 'scheduler Err(runtime_error);
+                                }
+                                if let Err(runtime_error) = apply_runtime_event(
+                                    &runtime,
+                                    &mut runtime_state,
+                                    recorder.as_ref(),
+                                    RuntimeEvent::FatalRuntimeError,
+                                )
+                                .await
+                                {
+                                    break 'scheduler Err(runtime_error);
+                                }
                                 break 'scheduler Err(fatal);
                             }
                             if let Err(error) = record_read_failure(
@@ -334,6 +558,16 @@ async fn run(
                                 &error,
                             ) {
                                 break 'scheduler Err(error);
+                            }
+                            if let Err(runtime_error) = apply_runtime_event(
+                                &runtime,
+                                &mut runtime_state,
+                                recorder.as_ref(),
+                                RuntimeEvent::ObservationReadFailedRecoverable,
+                            )
+                            .await
+                            {
+                                break 'scheduler Err(runtime_error);
                             }
                         }
                     }
@@ -372,6 +606,30 @@ async fn run(
         (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
     };
+    if result.is_ok() && runtime_state.phase() == crate::runtime_state::Phase::Ready {
+        apply_runtime_event(
+            &runtime,
+            &mut runtime_state,
+            recorder.as_ref(),
+            RuntimeEvent::transport(crate::runtime_state::TransportState::Disconnected),
+        )
+        .await?;
+    } else if result.is_err() && runtime_state.phase() != crate::runtime_state::Phase::Fault {
+        let _ = apply_runtime_event(
+            &runtime,
+            &mut runtime_state,
+            recorder.as_ref(),
+            RuntimeEvent::transport(crate::runtime_state::TransportState::Unhealthy),
+        )
+        .await;
+        let _ = apply_runtime_event(
+            &runtime,
+            &mut runtime_state,
+            recorder.as_ref(),
+            RuntimeEvent::FatalRuntimeError,
+        )
+        .await;
+    }
     if let Err(error) = &result {
         audit
             .lock()
@@ -512,6 +770,10 @@ mod tests {
     use crate::topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
         RequestAddress, RequestTarget, RequestTargetEvidence, ResponderIdentity, RoleAssignment,
+    };
+    use crate::{
+        runtime_reducer::ContextUpdate,
+        runtime_state::{Activity, Phase, RuntimeContext, SourceState},
     };
 
     fn targeted_decision() -> RoutingDecision {
@@ -710,5 +972,58 @@ mod tests {
                 error: error.into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_observation_reads_keep_observe_activity_and_emit_state_evidence() {
+        let (runtime, task) = crate::runtime_actor::start();
+        let mut state = RuntimeState::default();
+        let (sender, mut receiver) = mpsc::channel(8);
+
+        for event in [
+            RuntimeEvent::InitializationCompleted,
+            RuntimeEvent::source(SourceState::Live),
+            RuntimeEvent::ObservationStarted,
+            RuntimeEvent::ObservationReadStarted,
+            RuntimeEvent::ObservationReadCompleted,
+            RuntimeEvent::ObservationReadStarted,
+            RuntimeEvent::ObservationReadFailedRecoverable,
+            RuntimeEvent::ObservationStopped,
+        ] {
+            apply_runtime_event(&runtime, &mut state, Some(&sender), event)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(state.identity(), (Phase::Ready, Activity::Idle));
+        assert_eq!(state.context().source(), SourceState::Live);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            CaptureEvent::RuntimeStateChanged {
+                from: RuntimeState::default(),
+                to: RuntimeState::new(Phase::Ready, Activity::Idle, RuntimeContext::default()),
+                event: RuntimeEvent::InitializationCompleted,
+            }
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            CaptureEvent::RuntimeStateChanged {
+                event: RuntimeEvent::ContextUpdated(ContextUpdate::Source(SourceState::Live)),
+                ..
+            }
+        ));
+        drop(runtime);
+        task.abort();
+    }
+
+    #[test]
+    fn only_session_health_errors_are_fatal_runtime_errors() {
+        assert!(is_fatal_runtime_error(
+            "diagnostic session became unresponsive after repeated transport failures: timeout"
+        ));
+        assert!(is_fatal_runtime_error(
+            "Bluetooth connection failed: unavailable"
+        ));
+        assert!(!is_fatal_runtime_error("conflicting 010C responses"));
     }
 }
