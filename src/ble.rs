@@ -2260,8 +2260,9 @@ fn mode01_responses(
             if payload_end > bytes.len() {
                 break;
             }
-            let frame_start = if payload_start > 0 && bytes[payload_start - 1] == expected_len as u8
-            {
+            let has_length_prefix =
+                payload_start > 0 && bytes[payload_start - 1] == expected_len as u8;
+            let frame_start = if has_length_prefix {
                 payload_start - 1
             } else if payload_start == 0 {
                 payload_start
@@ -2271,7 +2272,7 @@ fn mode01_responses(
             };
             if bytes[payload_end..]
                 .iter()
-                .any(|byte| !matches!(byte, 0x00 | 0xaa))
+                .any(|byte| !matches!(byte, 0x00 | 0xaa) && !(has_length_prefix && *byte == 0x55))
             {
                 return Err(format!("unexpected bytes after OBD-II response: {line}"));
             }
@@ -2622,6 +2623,26 @@ mod tests {
             normalize_mode01("SEARCHING...\r064100BE3EB813\r>", 0x00, 4),
             Ok(vec![0x41, 0x00, 0xbe, 0x3e, 0xb8, 0x13])
         );
+    }
+
+    #[test]
+    fn accepts_carly_targeted_rpm_frame_with_length_prefixed_55_padding() {
+        let responses =
+            normalize_mode01_responses("7E8 04 41 0C 00 00 55 55 55\r>", 0x0c, 2).unwrap();
+
+        assert_eq!(responses.as_slice().len(), 1);
+        assert_eq!(responses.as_slice()[0].payload, [0x41, 0x0c, 0x00, 0x00]);
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_55_padding_without_length_prefix() {
+        let error = normalize_mode01_responses("7E8 41 0C 00 00 55\r>", 0x0c, 2).unwrap_err();
+
+        assert!(error.contains("unexpected bytes after OBD-II response"));
     }
 
     #[test]
