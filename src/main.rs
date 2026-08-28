@@ -1,4 +1,4 @@
-use obdentic::vehicle_cache::VehicleCache;
+use obdentic::vehicle_cache::{TargetMappingSnapshot, VehicleCache};
 use obdentic::vehicle_knowledge::{
     EcuTargetMapping, FallbackPolicy, ReadRouting, VehicleKnowledge,
 };
@@ -22,6 +22,10 @@ use obdentic::{
     scheduler::{apply_runtime_event, ObservationPlan, Subscription, TelemetryScheduler},
     supported_signals,
     telemetry::TelemetryState,
+    topology::{
+        AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
+        RequestAddress, RequestTarget, ResponderIdentity, RoleAssignment,
+    },
     tui, ReadRequest, Transaction,
 };
 use std::{
@@ -465,8 +469,12 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
                 .and_then(snapshot_from_support_validation);
             match obdentic::cache_validation::validate_snapshot(cache, validation) {
                 obdentic::cache_validation::CacheValidation::Validated => {
-                    print_cached_vehicle_discovery(cache);
-                    return Ok(());
+                    if cache.snapshot().target_mappings().is_empty() {
+                        println!("cache\tmissing-engine-target; running full discovery");
+                    } else {
+                        print_cached_vehicle_discovery(cache);
+                        return Ok(());
+                    }
                 }
                 obdentic::cache_validation::CacheValidation::StaleMissingExpected(_) => {
                     println!("cache\tstale-missing; running full discovery");
@@ -483,8 +491,13 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
 
     let session = ble::start_session(adapter_id).await?;
     let discovery = obdentic::functional_discovery::discover_functional_responders(&session).await;
+    let target_mapping = match &discovery {
+        Ok(discovery) => validate_engine_target(&session, discovery).await,
+        Err(_) => Ok(None),
+    };
     let shutdown = session.shutdown().await;
     let discovery = discovery?;
+    let target_mapping = target_mapping?;
     shutdown?;
 
     let (local_key, _) = index.key_for_or_create(identity.vin())?;
@@ -493,10 +506,16 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         .as_ref()
         .map(VehicleCache::first_seen_ms)
         .unwrap_or(now);
-    let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
+    let base_snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
         &discovery.topology(),
         &discovery.capabilities(),
     );
+    let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::new(
+        base_snapshot.topology().to_vec(),
+        base_snapshot.ecu_capabilities().to_vec(),
+        target_mapping,
+    );
+    let engine_target_validated = !snapshot.target_mappings().is_empty();
     let mut history = existing
         .as_ref()
         .map(|cache| cache.history().to_vec())
@@ -528,7 +547,71 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         );
     }
     println!("evidence\t{}", discovery.observations().len());
+    if !engine_target_validated {
+        println!("target\tengine.rpm\tunavailable");
+    } else {
+        println!("target\tengine.rpm\t7E0 -> 7E8\tvalidated");
+    }
     Ok(())
+}
+
+async fn validate_engine_target(
+    session: &ble::SessionClient,
+    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
+) -> Result<Option<TargetMappingSnapshot>, String> {
+    if !engine_responder_observed(discovery) {
+        return Ok(None);
+    }
+
+    let transaction = session.read_targeted(engine_target_request()?).await?;
+    validate_engine_target_transaction(&transaction)?;
+    Ok(Some(confirmed_engine_target()?))
+}
+
+fn engine_responder_observed(
+    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
+) -> bool {
+    discovery.responders().iter().any(|responder| {
+        responder
+            .value()
+            .is_some_and(|value| value.eq_ignore_ascii_case("7E8"))
+    })
+}
+
+fn validate_engine_target_transaction(transaction: &Transaction) -> Result<(), String> {
+    if transaction.semantic() != "engine.rpm"
+        || transaction.request() != [0x01, 0x0C]
+        || transaction.response().len() != 4
+        || transaction.response().first() != Some(&0x41)
+        || transaction.response().get(1) != Some(&0x0C)
+    {
+        return Err("targeted engine validation returned an invalid 010C response".into());
+    }
+    Ok(())
+}
+
+fn engine_target_request() -> Result<ble::TargetedReadRequest, String> {
+    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+    ble::TargetedReadRequest::new(
+        prepare_read("engine.rpm")?,
+        RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E0")),
+        ble::ResponderIdentity::ElmHeader("7E8".into()),
+    )
+}
+
+fn confirmed_engine_target() -> Result<TargetMappingSnapshot, String> {
+    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+    let provenance = Provenance::new(
+        "targeted engine.rpm Mode 01 validation",
+        Confidence::Verified,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(TargetMappingSnapshot::new(
+        Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
+        Some(ResponderIdentity::address(context.clone(), "7E8")),
+        RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E0")),
+        provenance,
+    ))
 }
 
 async fn run_read(
@@ -2121,6 +2204,60 @@ mod tests {
             route_request("engine.rpm", &[], false),
             Ok(ReadRouting::Functional(_))
         ));
+    }
+
+    #[test]
+    fn engine_target_validation_is_explicit_and_read_only() {
+        let request = engine_target_request().unwrap();
+        assert_eq!(request.request().bytes(), [0x01, 0x0C]);
+        assert_eq!(request.target().address().unwrap().value(), "7E0");
+        assert_eq!(request.expected_responder().as_str(), "7E8");
+    }
+
+    #[test]
+    fn confirmed_engine_target_preserves_distinct_role_target_and_responder() {
+        let mapping = confirmed_engine_target().unwrap();
+        assert_eq!(mapping.role().unwrap().role(), &EcuRole::Engine);
+        assert_eq!(mapping.target().address().unwrap().value(), "7E0");
+        assert_eq!(mapping.responder().unwrap().value(), Some("7E8"));
+        assert_ne!(
+            mapping.target().address().unwrap().value(),
+            mapping.responder().unwrap().value().unwrap()
+        );
+    }
+
+    #[test]
+    fn target_validation_requires_the_expected_engine_transaction() {
+        let valid = prepare_read("engine.rpm")
+            .unwrap()
+            .complete("test", vec![0x41, 0x0C, 0x00, 0x00])
+            .unwrap();
+        assert!(validate_engine_target_transaction(&valid).is_ok());
+
+        let wrong_signal = prepare_read("vehicle.speed")
+            .unwrap()
+            .complete("test", vec![0x41, 0x0D, 0x00])
+            .unwrap();
+        assert!(validate_engine_target_transaction(&wrong_signal).is_err());
+    }
+
+    #[test]
+    fn target_validation_is_not_attempted_without_7e8_evidence() {
+        let discovery = obdentic::functional_discovery::FunctionalResponderDiscovery::new([]);
+        assert!(!engine_responder_observed(&discovery));
+
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Functional);
+        let provenance = Provenance::new("test", Confidence::High).unwrap();
+        let observation = obdentic::functional_discovery::FunctionalPageObservation::new(
+            [0x01, 0x00],
+            ResponderIdentity::opaque(context, "7E9"),
+            vec![0x41, 0x00, 0, 0, 0, 0],
+            provenance,
+        )
+        .unwrap();
+        let discovery =
+            obdentic::functional_discovery::FunctionalResponderDiscovery::new([observation]);
+        assert!(!engine_responder_observed(&discovery));
     }
 
     #[test]
