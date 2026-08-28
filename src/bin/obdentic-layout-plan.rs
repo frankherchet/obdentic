@@ -7,7 +7,7 @@ use layout_observation::{polling_plan, LayoutFreshnessPolicy};
 use obdentic::{
     capability::HardwareCapability, subscription_policy::SubscriptionPolicy, supported_signals,
 };
-use std::{env, path::Path};
+use std::{env, path::Path, time::Duration};
 
 fn main() {
     if let Err(error) = run() {
@@ -27,9 +27,15 @@ fn run() -> Result<(), String> {
         .iter()
         .map(|signal| signal.metadata().semantic)
         .collect::<Vec<_>>();
+    let freshness = LayoutFreshnessPolicy::new(
+        Duration::from_secs(1),
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    )?;
     let plan = polling_plan(
         &layout,
-        LayoutFreshnessPolicy::default(),
+        freshness,
         SubscriptionPolicy::new(HardwareCapability::conservative_default()),
         supported,
     )?;
