@@ -127,6 +127,63 @@ impl PollingPlan {
             .map(|interval| 1.0 / interval.as_secs_f64())
             .sum()
     }
+
+    /// Replace effective intervals with the intervals chosen by the runtime
+    /// scheduler while preserving the original requests.
+    pub fn update_effective_intervals<I, Name>(&mut self, intervals: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = (Name, Duration)>,
+        Name: AsRef<str>,
+    {
+        let mut updates = BTreeMap::new();
+        for (semantic, interval) in intervals {
+            if interval.is_zero() {
+                return Err("effective polling interval must be greater than zero".into());
+            }
+            let semantic = semantic.as_ref().to_owned();
+            if updates.insert(semantic.clone(), interval).is_some() {
+                return Err(format!(
+                    "duplicate effective polling interval for {semantic}"
+                ));
+            }
+        }
+
+        for entry in &self.entries {
+            if entry.status != PlanStatus::Unsupported && !updates.contains_key(&entry.semantic) {
+                return Err(format!(
+                    "missing effective polling interval for {}",
+                    entry.semantic
+                ));
+            }
+        }
+        for semantic in updates.keys() {
+            if !self.entries.iter().any(|entry| &entry.semantic == semantic) {
+                return Err(format!("unknown effective polling semantic {semantic}"));
+            }
+        }
+
+        for entry in &mut self.entries {
+            let Some(&effective_interval) = updates.get(&entry.semantic) else {
+                continue;
+            };
+            if entry.status == PlanStatus::Unsupported {
+                continue;
+            }
+            let reduced = effective_interval > entry.requested_interval;
+            entry.effective_interval = Some(effective_interval);
+            entry.status = if reduced {
+                PlanStatus::RateReduced
+            } else {
+                PlanStatus::Accepted
+            };
+            entry.reason = if reduced {
+                PlanReason::SessionRequestBudget
+            } else {
+                PlanReason::WithinBudget
+            };
+        }
+        Ok(())
+    }
 }
 
 /// Deterministic policy that translates semantic demand into a bounded plan.
@@ -425,5 +482,60 @@ mod tests {
         );
 
         assert!(plan.effective_request_rate_per_second() <= 5.0);
+    }
+
+    #[test]
+    fn runtime_intervals_refresh_status_without_changing_requests() {
+        let mut plan = policy(4).plan(
+            [
+                request("tui", "engine.rpm", 100),
+                request("tui", "engine.maf", 200),
+                request("tui", "vehicle.future", 500),
+            ],
+            ["engine.rpm", "engine.maf"],
+        );
+
+        plan.update_effective_intervals([
+            ("engine.rpm", Duration::from_millis(500)),
+            ("engine.maf", Duration::from_millis(100)),
+        ])
+        .unwrap();
+
+        let rpm = plan
+            .entries()
+            .iter()
+            .find(|entry| entry.semantic() == "engine.rpm")
+            .unwrap();
+        assert_eq!(rpm.requested_interval(), Duration::from_millis(100));
+        assert_eq!(rpm.effective_interval(), Some(Duration::from_millis(500)));
+        assert_eq!(rpm.status(), PlanStatus::RateReduced);
+        assert_eq!(rpm.reason(), PlanReason::SessionRequestBudget);
+        let maf = plan
+            .entries()
+            .iter()
+            .find(|entry| entry.semantic() == "engine.maf")
+            .unwrap();
+        assert_eq!(maf.requested_interval(), Duration::from_millis(200));
+        assert_eq!(maf.effective_interval(), Some(Duration::from_millis(100)));
+        assert_eq!(maf.status(), PlanStatus::Accepted);
+        assert_eq!(maf.reason(), PlanReason::WithinBudget);
+        let future = plan
+            .entries()
+            .iter()
+            .find(|entry| entry.semantic() == "vehicle.future")
+            .unwrap();
+        assert_eq!(future.status(), PlanStatus::Unsupported);
+        assert_eq!(future.effective_interval(), None);
+    }
+
+    #[test]
+    fn runtime_interval_update_is_validated_before_mutation() {
+        let mut plan = policy(4).plan([request("tui", "engine.rpm", 100)], ["engine.rpm"]);
+        let original = plan.clone();
+
+        assert!(plan
+            .update_effective_intervals([("engine.unknown", Duration::from_millis(100))])
+            .is_err());
+        assert_eq!(plan, original);
     }
 }

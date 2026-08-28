@@ -223,6 +223,11 @@ cargo run -- layout save engine-overview engine-overview.tsv
 cargo run -- tui demo --layout engine-overview.tsv
 ```
 
+In live mode, a layout expresses only semantic observation demand. OBDentic
+passes that demand through the hardware-capability policy and displays the
+requested and effective intervals; layouts never contain polling or protocol
+commands.
+
 This keeps presentation independent from transport and vehicle addressing, which is also the model intended for the future agent interface.
 
 ## Development rule of thumb
