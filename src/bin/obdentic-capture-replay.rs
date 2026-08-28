@@ -18,9 +18,7 @@ fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let (capture_path, layout_path) = match args.as_slice() {
         [capture] => (capture.as_str(), None),
-        [capture, flag, layout] if flag == "--layout" => {
-            (capture.as_str(), Some(layout.as_str()))
-        }
+        [capture, flag, layout] if flag == "--layout" => (capture.as_str(), Some(layout.as_str())),
         _ => {
             return Err(
                 "usage: obdentic-capture-replay <capture.jsonl> [--layout <layout.tsv>]".into(),
@@ -36,7 +34,9 @@ fn run() -> Result<(), String> {
             .first()
             .map(|issue| format!("; first replay issue: {}", issue.detail()))
             .unwrap_or_default();
-        return Err(format!("capture contains no replayable semantic reads{detail}"));
+        return Err(format!(
+            "capture contains no replayable semantic reads{detail}"
+        ));
     }
 
     let capacity = replay.transactions().len().max(1);
