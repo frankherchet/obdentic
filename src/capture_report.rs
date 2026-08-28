@@ -53,6 +53,7 @@ fn summary(capture: &ParsedCapture) -> Summary {
             }
             CaptureEvent::SessionInitialized
             | CaptureEvent::SupportDiscovery { .. }
+            | CaptureEvent::RuntimeStateChanged { .. }
             | CaptureEvent::ShutdownRequested => summary.lifecycle += 1,
             CaptureEvent::ResponsesObserved { .. } => {
                 // Raw responder evidence remains in ParsedCapture for an

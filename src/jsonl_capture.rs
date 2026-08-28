@@ -1,4 +1,11 @@
-use crate::capture_events::{CaptureEvent, CaptureValue, ReadTiming, SubscriptionFilterOutcome};
+use crate::{
+    capture_events::{CaptureEvent, CaptureValue, ReadTiming, SubscriptionFilterOutcome},
+    runtime_reducer::{ContextUpdate, RuntimeEvent},
+    runtime_state::{
+        RecordingState, RuntimeState, SafetyCapability, SourceState, TopologyState, TransportState,
+        VehicleState,
+    },
+};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -282,6 +289,21 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             object.push_str(&sequence.to_string());
             object.push_str(",\"error\":");
             push_string(&mut object, error);
+        }
+        CaptureEvent::RuntimeStateChanged { from, to, event } => {
+            if from.state_version() != to.state_version() {
+                return Err("runtime state transition versions do not match".into());
+            }
+            object.push_str("\"runtime_state_changed\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"state_version\":");
+            object.push_str(&from.state_version().to_string());
+            object.push_str(",\"from\":");
+            push_string(&mut object, &from.serialize());
+            object.push_str(",\"to\":");
+            push_string(&mut object, &to.serialize());
+            object.push_str(",\"event\":");
+            push_string(&mut object, &runtime_event_name(*event));
         }
         CaptureEvent::ShutdownRequested => {
             simple_event(&mut object, "shutdown_requested", sequence)
@@ -736,6 +758,40 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 error: string_field(object, "error", line_number)?,
             })
         }
+        "runtime_state_changed" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "state_version",
+                    "from",
+                    "to",
+                    "event",
+                ],
+                line_number,
+            )?;
+            let state_version = u64_field(object, "state_version", line_number)?;
+            let from = parse_runtime_state(object, "from", line_number)?;
+            let to = parse_runtime_state(object, "to", line_number)?;
+            if state_version != u64::from(from.state_version())
+                || state_version != u64::from(to.state_version())
+            {
+                return Err(format!(
+                    "line {line_number}: runtime state version does not match state payload"
+                ));
+            }
+            Ok(CaptureEvent::RuntimeStateChanged {
+                from,
+                to,
+                event: parse_runtime_event(
+                    &string_field(object, "event", line_number)?,
+                    line_number,
+                )?,
+            })
+        }
         "shutdown_requested" => {
             fields_exact(
                 object,
@@ -841,6 +897,167 @@ fn parse_responder_evidence(
         optional_string_field(object, "responder", line_number)?,
         parse_hex(&string_field(object, "payload", line_number)?, line_number)?,
     )
+}
+
+fn runtime_event_name(event: RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::InitializationCompleted => "initialization_completed".into(),
+        RuntimeEvent::InitializationFailed => "initialization_failed".into(),
+        RuntimeEvent::DiscoveryStarted => "discovery_started".into(),
+        RuntimeEvent::DiscoveryCompleted => "discovery_completed".into(),
+        RuntimeEvent::DiscoveryFailed => "discovery_failed".into(),
+        RuntimeEvent::ReadStarted => "read_started".into(),
+        RuntimeEvent::ReadCompleted => "read_completed".into(),
+        RuntimeEvent::ReadFailedRecoverable => "read_failed_recoverable".into(),
+        RuntimeEvent::ObservationStarted => "observation_started".into(),
+        RuntimeEvent::ObservationStopped => "observation_stopped".into(),
+        RuntimeEvent::ObservationReadStarted => "observation_read_started".into(),
+        RuntimeEvent::ObservationReadCompleted => "observation_read_completed".into(),
+        RuntimeEvent::ObservationReadFailedRecoverable => {
+            "observation_read_failed_recoverable".into()
+        }
+        RuntimeEvent::DiagnosticJobStarted => "diagnostic_job_started".into(),
+        RuntimeEvent::DiagnosticJobCompleted => "diagnostic_job_completed".into(),
+        RuntimeEvent::ShutdownRequested => "shutdown_requested".into(),
+        RuntimeEvent::ShutdownCompleted => "shutdown_completed".into(),
+        RuntimeEvent::FatalRuntimeError => "fatal_runtime_error".into(),
+        RuntimeEvent::WriteStarted => "write_started".into(),
+        RuntimeEvent::ContextUpdated(update) => {
+            format!("context_updated:{}", context_update_name(update))
+        }
+        RuntimeEvent::ContextChanged(update) => {
+            format!("context_changed:{}", context_update_name(update))
+        }
+        RuntimeEvent::TransportChanged(state) => {
+            format!("transport_changed:{}", state.id())
+        }
+        RuntimeEvent::VehicleChanged(state) => format!("vehicle_changed:{}", state.id()),
+        RuntimeEvent::TopologyChanged(state) => format!("topology_changed:{}", state.id()),
+        RuntimeEvent::RecordingChanged(state) => format!("recording_changed:{}", state.id()),
+        RuntimeEvent::SourceChanged(state) => format!("source_changed:{}", state.id()),
+        RuntimeEvent::SafetyChanged(state) => format!("safety_changed:{}", state.id()),
+    }
+}
+
+fn context_update_name(update: ContextUpdate) -> &'static str {
+    match update {
+        ContextUpdate::Transport(state) => state.id(),
+        ContextUpdate::Vehicle(state) => state.id(),
+        ContextUpdate::Topology(state) => state.id(),
+        ContextUpdate::Recording(state) => state.id(),
+        ContextUpdate::Source(state) => state.id(),
+        ContextUpdate::Safety(state) => state.id(),
+    }
+}
+
+fn parse_runtime_event(value: &str, line_number: usize) -> Result<RuntimeEvent, String> {
+    let event = match value {
+        "initialization_completed" => RuntimeEvent::InitializationCompleted,
+        "initialization_failed" => RuntimeEvent::InitializationFailed,
+        "discovery_started" => RuntimeEvent::DiscoveryStarted,
+        "discovery_completed" => RuntimeEvent::DiscoveryCompleted,
+        "discovery_failed" => RuntimeEvent::DiscoveryFailed,
+        "read_started" => RuntimeEvent::ReadStarted,
+        "read_completed" => RuntimeEvent::ReadCompleted,
+        "read_failed_recoverable" => RuntimeEvent::ReadFailedRecoverable,
+        "observation_started" => RuntimeEvent::ObservationStarted,
+        "observation_stopped" => RuntimeEvent::ObservationStopped,
+        "observation_read_started" => RuntimeEvent::ObservationReadStarted,
+        "observation_read_completed" => RuntimeEvent::ObservationReadCompleted,
+        "observation_read_failed_recoverable" => RuntimeEvent::ObservationReadFailedRecoverable,
+        "diagnostic_job_started" => RuntimeEvent::DiagnosticJobStarted,
+        "diagnostic_job_completed" => RuntimeEvent::DiagnosticJobCompleted,
+        "shutdown_requested" => RuntimeEvent::ShutdownRequested,
+        "shutdown_completed" => RuntimeEvent::ShutdownCompleted,
+        "fatal_runtime_error" => RuntimeEvent::FatalRuntimeError,
+        "write_started" => RuntimeEvent::WriteStarted,
+        value => {
+            let (kind, update) = value
+                .split_once(':')
+                .ok_or_else(|| format!("line {line_number}: unknown runtime event {value:?}"))?;
+            let update = parse_context_update(update, line_number)?;
+            match kind {
+                "context_updated" => RuntimeEvent::ContextUpdated(update),
+                "context_changed" => RuntimeEvent::ContextChanged(update),
+                "transport_changed" => match update {
+                    ContextUpdate::Transport(state) => RuntimeEvent::TransportChanged(state),
+                    _ => return Err(format!("line {line_number}: invalid transport event")),
+                },
+                "vehicle_changed" => match update {
+                    ContextUpdate::Vehicle(state) => RuntimeEvent::VehicleChanged(state),
+                    _ => return Err(format!("line {line_number}: invalid vehicle event")),
+                },
+                "topology_changed" => match update {
+                    ContextUpdate::Topology(state) => RuntimeEvent::TopologyChanged(state),
+                    _ => return Err(format!("line {line_number}: invalid topology event")),
+                },
+                "recording_changed" => match update {
+                    ContextUpdate::Recording(state) => RuntimeEvent::RecordingChanged(state),
+                    _ => return Err(format!("line {line_number}: invalid recording event")),
+                },
+                "source_changed" => match update {
+                    ContextUpdate::Source(state) => RuntimeEvent::SourceChanged(state),
+                    _ => return Err(format!("line {line_number}: invalid source event")),
+                },
+                "safety_changed" => match update {
+                    ContextUpdate::Safety(state) => RuntimeEvent::SafetyChanged(state),
+                    _ => return Err(format!("line {line_number}: invalid safety event")),
+                },
+                _ => {
+                    return Err(format!(
+                        "line {line_number}: unknown runtime event {value:?}"
+                    ))
+                }
+            }
+        }
+    };
+    Ok(event)
+}
+
+fn parse_context_update(value: &str, line_number: usize) -> Result<ContextUpdate, String> {
+    if value.starts_with("transport/") {
+        return TransportState::parse(value)
+            .map(ContextUpdate::Transport)
+            .map_err(|error| format!("line {line_number}: {error}"));
+    }
+    if value.starts_with("vehicle/") {
+        return VehicleState::parse(value)
+            .map(ContextUpdate::Vehicle)
+            .map_err(|error| format!("line {line_number}: {error}"));
+    }
+    if value.starts_with("topology/") {
+        return TopologyState::parse(value)
+            .map(ContextUpdate::Topology)
+            .map_err(|error| format!("line {line_number}: {error}"));
+    }
+    if value.starts_with("recording/") {
+        return RecordingState::parse(value)
+            .map(ContextUpdate::Recording)
+            .map_err(|error| format!("line {line_number}: {error}"));
+    }
+    if value.starts_with("source/") {
+        return SourceState::parse(value)
+            .map(ContextUpdate::Source)
+            .map_err(|error| format!("line {line_number}: {error}"));
+    }
+    if value.starts_with("safety/") {
+        return SafetyCapability::parse(value)
+            .map(ContextUpdate::Safety)
+            .map_err(|error| format!("line {line_number}: {error}"));
+    }
+    Err(format!(
+        "line {line_number}: unknown runtime context {value:?}"
+    ))
+}
+
+fn parse_runtime_state(
+    object: &Object,
+    name: &str,
+    line_number: usize,
+) -> Result<RuntimeState, String> {
+    RuntimeState::parse(&string_field(object, name, line_number)?).map_err(|error| {
+        format!("line {line_number}: field {name} has invalid runtime state: {error}")
+    })
 }
 
 fn fields_exact(object: &Object, fields: &[&str], line_number: usize) -> Result<(), String> {
@@ -1242,9 +1459,16 @@ mod tests {
     }
 
     fn events() -> Vec<CaptureEvent> {
+        let from = RuntimeState::default();
+        let to = RuntimeState::new(
+            crate::runtime_state::Phase::Ready,
+            crate::runtime_state::Activity::Idle,
+            crate::runtime_state::RuntimeContext::default(),
+        );
         vec![
             CaptureEvent::capture_started(Some(1_700_000_000_000), Some("engine-baseline".into())),
             CaptureEvent::SessionInitialized,
+            CaptureEvent::runtime_state_changed(from, to, RuntimeEvent::InitializationCompleted),
             CaptureEvent::subscription_configured(
                 "engine.rpm",
                 250_000,
@@ -1381,6 +1605,131 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"support_discovery\",\"sequence\":0,\"request_payload\":\"01 AB\",\"responder\":null,\"response_payload\":\"41 00 00 FF\"}\n"
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn writes_runtime_state_change_with_stable_state_and_event_ids() {
+        let path = temp_path("runtime-state");
+        let (sender, writer) = start(&path).unwrap();
+        let from = RuntimeState::default();
+        let to = RuntimeState::new(
+            crate::runtime_state::Phase::Ready,
+            crate::runtime_state::Activity::Idle,
+            crate::runtime_state::RuntimeContext::new(
+                TransportState::Connected,
+                VehicleState::Identified,
+                TopologyState::Validated,
+                RecordingState::Active,
+                SourceState::Live,
+                SafetyCapability::ReadOnly,
+            ),
+        );
+        sender
+            .send(CaptureEvent::runtime_state_changed(
+                from,
+                to,
+                RuntimeEvent::InitializationCompleted,
+            ))
+            .await
+            .unwrap();
+        finish(sender, writer).await;
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"type\":\"runtime_state_changed\""));
+        assert!(contents.contains("\"state_version\":1"));
+        assert!(contents.contains("\"event\":\"initialization_completed\""));
+        assert!(contents.contains("phase/init"));
+        assert!(contents.contains("phase/ready"));
+        assert!(!contents.contains("VIN"));
+        assert_eq!(
+            read_events(&path).unwrap(),
+            vec![CaptureEvent::RuntimeStateChanged {
+                from,
+                to,
+                event: RuntimeEvent::InitializationCompleted,
+            }]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_state_event_order_is_local_and_deterministic() {
+        let path = temp_path("runtime-state-order");
+        let (sender, writer) = start(&path).unwrap();
+        let state = RuntimeState::default();
+        for event in [
+            RuntimeEvent::InitializationCompleted,
+            RuntimeEvent::DiscoveryStarted,
+            RuntimeEvent::DiscoveryCompleted,
+        ] {
+            sender
+                .send(CaptureEvent::runtime_state_changed(state, state, event))
+                .await
+                .unwrap();
+        }
+        finish(sender, writer).await;
+
+        let lines = fs::read_to_string(&path).unwrap();
+        let sequences = ["\"sequence\":0", "\"sequence\":1", "\"sequence\":2"];
+        let positions = sequences.map(|sequence| lines.find(sequence).unwrap());
+        assert!(positions[0] < positions[1] && positions[1] < positions[2]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_state_event_ids_round_trip_without_debug_names() {
+        let path = temp_path("runtime-state-events");
+        let (sender, writer) = start(&path).unwrap();
+        let state = RuntimeState::default();
+        let runtime_events = [
+            RuntimeEvent::InitializationCompleted,
+            RuntimeEvent::InitializationFailed,
+            RuntimeEvent::DiscoveryStarted,
+            RuntimeEvent::DiscoveryCompleted,
+            RuntimeEvent::DiscoveryFailed,
+            RuntimeEvent::ReadStarted,
+            RuntimeEvent::ReadCompleted,
+            RuntimeEvent::ReadFailedRecoverable,
+            RuntimeEvent::ObservationStarted,
+            RuntimeEvent::ObservationStopped,
+            RuntimeEvent::ObservationReadStarted,
+            RuntimeEvent::ObservationReadCompleted,
+            RuntimeEvent::ObservationReadFailedRecoverable,
+            RuntimeEvent::DiagnosticJobStarted,
+            RuntimeEvent::DiagnosticJobCompleted,
+            RuntimeEvent::ShutdownRequested,
+            RuntimeEvent::ShutdownCompleted,
+            RuntimeEvent::FatalRuntimeError,
+            RuntimeEvent::WriteStarted,
+            RuntimeEvent::ContextUpdated(ContextUpdate::Transport(TransportState::Connected)),
+            RuntimeEvent::ContextChanged(ContextUpdate::Vehicle(VehicleState::Identified)),
+            RuntimeEvent::TransportChanged(TransportState::Unhealthy),
+            RuntimeEvent::VehicleChanged(VehicleState::Unknown),
+            RuntimeEvent::TopologyChanged(TopologyState::Validated),
+            RuntimeEvent::RecordingChanged(RecordingState::Active),
+            RuntimeEvent::SourceChanged(SourceState::Live),
+            RuntimeEvent::SafetyChanged(SafetyCapability::ReadOnly),
+        ];
+        for event in runtime_events {
+            sender
+                .send(CaptureEvent::runtime_state_changed(state, state, event))
+                .await
+                .unwrap();
+        }
+        finish(sender, writer).await;
+
+        let parsed = read_events(&path).unwrap();
+        assert_eq!(
+            parsed,
+            runtime_events
+                .into_iter()
+                .map(|event| CaptureEvent::runtime_state_changed(state, state, event))
+                .collect::<Vec<_>>()
+        );
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("InitializationCompleted"));
+        assert!(!contents.contains("ContextUpdated"));
         fs::remove_file(path).unwrap();
     }
 

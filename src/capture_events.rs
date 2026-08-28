@@ -1,4 +1,4 @@
-use crate::Transaction;
+use crate::{runtime_reducer::RuntimeEvent, runtime_state::RuntimeState, Transaction};
 
 /// Relative capture time in integer microseconds.
 pub type CaptureTimeUs = u64;
@@ -172,6 +172,13 @@ pub enum CaptureEvent {
     SessionError {
         error: String,
     },
+    /// An observational snapshot of one reducer transition. The recorder
+    /// persists this value; it never applies `event` or derives `to` itself.
+    RuntimeStateChanged {
+        from: RuntimeState,
+        to: RuntimeState,
+        event: RuntimeEvent,
+    },
     ShutdownRequested,
     SessionStopped {
         offset_us: CaptureTimeUs,
@@ -306,6 +313,25 @@ impl CaptureEvent {
         Self::SessionError {
             error: error.into(),
         }
+    }
+
+    /// Build an observational runtime-state transition for persistence.
+    pub const fn runtime_state_changed(
+        from: RuntimeState,
+        to: RuntimeState,
+        event: RuntimeEvent,
+    ) -> Self {
+        Self::RuntimeStateChanged { from, to, event }
+    }
+
+    /// Compatibility spelling for callers that call the observation a
+    /// transition rather than a state change.
+    pub const fn runtime_state_transition(
+        from: RuntimeState,
+        to: RuntimeState,
+        event: RuntimeEvent,
+    ) -> Self {
+        Self::runtime_state_changed(from, to, event)
     }
 }
 
@@ -467,5 +493,28 @@ mod tests {
         )
         .is_err());
         assert!(ResponderEvidence::new(Some("7E8".into()), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn runtime_state_change_is_typed_observational_data_and_has_no_vin() {
+        let from = RuntimeState::default();
+        let to = RuntimeState::new(
+            crate::runtime_state::Phase::Ready,
+            crate::runtime_state::Activity::Idle,
+            crate::runtime_state::RuntimeContext::default(),
+        );
+        let event =
+            CaptureEvent::runtime_state_changed(from, to, RuntimeEvent::InitializationCompleted);
+
+        assert_eq!(
+            event,
+            CaptureEvent::RuntimeStateChanged {
+                from,
+                to,
+                event: RuntimeEvent::InitializationCompleted,
+            }
+        );
+        assert!(!from.serialize().contains("VIN"));
+        assert!(!to.serialize().contains("VIN"));
     }
 }
