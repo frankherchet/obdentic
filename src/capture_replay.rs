@@ -104,7 +104,9 @@ impl CaptureReplay {
                         continue;
                     }
                     let transaction = match request.complete(source, response_payload.clone()) {
-                        Ok(transaction) => transaction.with_timestamp_ms(u128::from(*finished_us / 1_000)),
+                        Ok(transaction) => {
+                            transaction.with_timestamp_ms(u128::from(*finished_us / 1_000))
+                        }
                         Err(error) => {
                             issues.push(ReplayIssue {
                                 at_us: *finished_us,
