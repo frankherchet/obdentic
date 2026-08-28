@@ -904,9 +904,7 @@ impl DiagnosticSession {
             notifications: &mut self.notifications,
             show_adapter_io: self.show_adapter_io,
         };
-        let response = exchange.exchange("0902\r", COMMAND_TIMEOUT).await?;
-        let segments = normalize_mode09_segments(&response)?;
-        crate::identity::decode_mode09_pid02(&segments).map_err(|error| error.to_string())
+        read_elm_identity(&mut exchange).await
     }
 
     async fn validate_functional_support(&mut self) -> Result<Vec<SupportDiscovery>, String> {
@@ -1224,6 +1222,16 @@ where
 {
     let observations = validate_functional_support_exchange(exchange).await?;
     Ok(ProtocolNegotiation { observations })
+}
+
+async fn read_elm_identity<E>(exchange: &mut E) -> Result<crate::identity::VehicleIdentity, String>
+where
+    E: ElmExchange,
+{
+    establish_elm_protocol(exchange).await?;
+    let response = exchange.exchange("0902\r", COMMAND_TIMEOUT).await?;
+    let segments = normalize_mode09_segments(&response)?;
+    crate::identity::decode_mode09_pid02(&segments).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -2616,6 +2624,19 @@ mod tests {
             .as_slice()
             .iter()
             .all(|response| response.payload.first() == Some(&0x43)));
+    }
+
+    #[tokio::test]
+    async fn identity_negotiates_protocol_before_mode09_pid02() {
+        let mut exchange = ScriptedExchange::captured(vec![
+            "7E8 06 41 00 98 3B A0 13 00\r>".into(),
+            "49 02 01 57 56 57 5A 5A 5A 31 4A 5A 58 57 30 30 30 30 30 31\r>".into(),
+        ]);
+
+        let identity = read_elm_identity(&mut exchange).await.unwrap();
+
+        assert_eq!(identity.vin().as_str(), "WVWZZZ1JZXW000001");
+        assert_eq!(exchange.commands, ["0100\r", "0902\r"]);
     }
 
     #[tokio::test]

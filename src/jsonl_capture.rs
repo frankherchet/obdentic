@@ -644,7 +644,7 @@ pub fn read(path: &Path) -> Result<ParsedCapture, String> {
                 ));
             }
             stopped = true;
-        } else if stopped {
+        } else if stopped && !matches!(event, CaptureEvent::RuntimeStateChanged { .. }) {
             return Err(format!("line {line_number}: event follows session_stopped"));
         }
         events.push(event);
@@ -1933,7 +1933,11 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture_events::{CaptureEvent, DiagnosticJobStepStatus, SubscriptionFilterOutcome};
+    use crate::{
+        capture_events::{CaptureEvent, DiagnosticJobStepStatus, SubscriptionFilterOutcome},
+        runtime_reducer::RuntimeEvent,
+        runtime_state::RuntimeState,
+    };
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -2384,6 +2388,24 @@ mod tests {
         finish(sender, writer).await;
         assert_eq!(read(&path).unwrap().status, CaptureStatus::Partial);
         assert_eq!(read_events(&path).unwrap().len(), 3);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_runtime_shutdown_evidence_after_session_stopped() {
+        let path = temp_path("runtime-after-session");
+        let (sender, writer) = start(&path).unwrap();
+        let state = RuntimeState::default();
+        let events = vec![
+            CaptureEvent::SessionStopped { offset_us: 1 },
+            CaptureEvent::runtime_state_changed(state, state, RuntimeEvent::ShutdownCompleted),
+        ];
+        for event in events.iter().cloned() {
+            sender.send(event).await.unwrap();
+        }
+        finish(sender, writer).await;
+
+        assert_eq!(read(&path).unwrap().events, events);
         fs::remove_file(path).unwrap();
     }
 
