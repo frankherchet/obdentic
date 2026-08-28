@@ -9,7 +9,7 @@ use crate::{
     runtime_actor::RuntimeClient,
     runtime_reducer::RuntimeEvent,
     runtime_state::RuntimeState,
-    subscription_policy::{ObservationRequest, SubscriptionPolicy},
+    subscription_policy::{ObservationRequest, PollingPlan, SubscriptionPolicy},
     telemetry::TelemetryState,
     vehicle_knowledge::{ReadRouting, RoutingDecision},
     ReadRequest,
@@ -162,6 +162,7 @@ pub fn is_fatal_runtime_error(error: &str) -> bool {
 }
 
 impl TelemetryScheduler {
+    #[allow(clippy::too_many_arguments)]
     pub async fn start<Plan: Into<ObservationPlan>>(
         adapter_id: &str,
         subscriptions: Vec<Plan>,
@@ -170,6 +171,7 @@ impl TelemetryScheduler {
         recorder: Option<mpsc::Sender<CaptureEvent>>,
         capture_profile: Option<String>,
         capture_subscriptions: Option<Vec<CaptureSubscription>>,
+        policy_state: Option<Arc<Mutex<PollingPlan>>>,
     ) -> Result<Self, String> {
         let (runtime, _runtime_task) = crate::runtime_actor::start();
         runtime
@@ -185,6 +187,7 @@ impl TelemetryScheduler {
             capture_profile,
             capture_subscriptions,
             runtime,
+            policy_state,
         )
         .await
     }
@@ -200,6 +203,7 @@ impl TelemetryScheduler {
         capture_profile: Option<String>,
         capture_subscriptions: Option<Vec<CaptureSubscription>>,
         runtime: RuntimeClient,
+        policy_state: Option<Arc<Mutex<PollingPlan>>>,
     ) -> Result<Self, String> {
         if subscriptions.is_empty() {
             return Err("telemetry scheduler needs at least one subscription".into());
@@ -322,6 +326,13 @@ impl TelemetryScheduler {
                 };
             }
         };
+        if let Err(error) = synchronize_policy_state(policy_state.as_ref(), &subscriptions) {
+            let cleanup = session.shutdown().await;
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
+            };
+        }
         let mut events = std::iter::once(started)
             .chain(std::iter::once(CaptureEvent::SessionInitialized))
             .chain(configured.into_iter().map(CaptureSubscription::into_event))
@@ -358,6 +369,7 @@ impl TelemetryScheduler {
             cancelled,
             runtime,
             runtime_state,
+            policy_state,
         ));
         Ok(Self { cancel, task })
     }
@@ -385,6 +397,7 @@ async fn run(
     mut cancelled: oneshot::Receiver<()>,
     runtime: RuntimeClient,
     mut runtime_state: RuntimeState,
+    policy_state: Option<Arc<Mutex<PollingPlan>>>,
 ) -> Result<(), String> {
     let mut schedule = subscriptions
         .into_iter()
@@ -618,7 +631,12 @@ async fn run(
                     Ok(capability) => capability,
                     Err(error) => break 'scheduler Err(error),
                 };
-                if let Err(error) = reshape_schedule(&mut schedule, capability, Instant::now()) {
+                if let Err(error) = reshape_schedule(
+                    &mut schedule,
+                    capability,
+                    Instant::now(),
+                    policy_state.as_ref(),
+                ) {
                     break 'scheduler Err(error);
                 }
             }
@@ -728,6 +746,7 @@ fn reshape_schedule(
     schedule: &mut [(ObservationPlan, Instant)],
     capability: HardwareCapability,
     now: Instant,
+    policy_state: Option<&Arc<Mutex<PollingPlan>>>,
 ) -> Result<(), String> {
     let plans = schedule
         .iter()
@@ -740,7 +759,25 @@ fn reshape_schedule(
         }
         *plan = replacement;
     }
+    let current = schedule
+        .iter()
+        .map(|(plan, _)| plan.clone())
+        .collect::<Vec<_>>();
+    synchronize_policy_state(policy_state, &current)?;
     Ok(())
+}
+
+fn synchronize_policy_state(
+    policy_state: Option<&Arc<Mutex<PollingPlan>>>,
+    plans: &[ObservationPlan],
+) -> Result<(), String> {
+    let Some(policy_state) = policy_state else {
+        return Ok(());
+    };
+    let mut policy = policy_state
+        .lock()
+        .map_err(|_| "polling policy state lock poisoned".to_string())?;
+    policy.update_effective_intervals(plans.iter().map(|plan| (plan.semantic(), plan.interval())))
 }
 
 fn offset_us(origin: Instant, at: Instant) -> CaptureTimeUs {
@@ -943,6 +980,46 @@ mod tests {
         assert!(matches!(reshaped[1].routing(), ReadRouting::Functional(_)));
         assert!(reshaped[0].interval() > targeted.interval());
         assert!(reshaped[1].interval() > functional.interval());
+    }
+
+    #[test]
+    fn policy_state_sync_tracks_actual_observation_intervals() {
+        let policy = SubscriptionPolicy::new(
+            HardwareCapability::new(
+                4,
+                Duration::from_millis(250),
+                crate::capability::CapabilityProvenance::BuiltInDefault,
+            )
+            .unwrap(),
+        );
+        let plan = policy.plan(
+            [
+                ObservationRequest::new("layout:test", "engine.rpm", Duration::from_millis(100))
+                    .unwrap(),
+            ],
+            ["engine.rpm"],
+        );
+        let shared = Arc::new(Mutex::new(plan));
+        let observation = ObservationPlan::new(
+            ReadRouting::Functional(crate::prepare_read("engine.rpm").unwrap()),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+
+        synchronize_policy_state(Some(&shared), &[observation]).unwrap();
+
+        let plan = shared.lock().unwrap();
+        let entry = &plan.entries()[0];
+        assert_eq!(entry.requested_interval(), Duration::from_millis(100));
+        assert_eq!(entry.effective_interval(), Some(Duration::from_millis(500)));
+        assert_eq!(
+            entry.status(),
+            crate::subscription_policy::PlanStatus::RateReduced
+        );
+        assert_eq!(
+            entry.reason(),
+            crate::subscription_policy::PlanReason::SessionRequestBudget
+        );
     }
 
     #[test]

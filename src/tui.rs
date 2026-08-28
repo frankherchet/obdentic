@@ -1,6 +1,7 @@
 use crate::{
     audit::{AuditEntry, AuditState},
     hex,
+    subscription_policy::{PlanReason, PlanStatus, PollingPlan},
     telemetry::{Sample, TelemetryState},
     Transaction,
 };
@@ -263,6 +264,7 @@ pub fn run_live(
     layout: &DashboardLayout,
     telemetry: Arc<Mutex<TelemetryState>>,
     audit: Arc<Mutex<AuditState>>,
+    policy_state: Arc<Mutex<PollingPlan>>,
 ) -> Result<(), String> {
     enable_raw_mode().map_err(|error| error.to_string())?;
     let mut stdout = io::stdout();
@@ -281,8 +283,12 @@ pub fn run_live(
             .lock()
             .map_err(|_| "audit state lock poisoned")?
             .snapshot();
+        let plan = policy_state
+            .lock()
+            .map_err(|_| "polling policy state lock poisoned")?
+            .clone();
         terminal
-            .draw(|frame| render(frame, layout, &state, &audit))
+            .draw(|frame| render_live(frame, layout, &state, &audit, &plan))
             .map_err(|error| error.to_string())?;
         if event::poll(Duration::from_millis(100)).map_err(|error| error.to_string())?
             && matches!(event::read().map_err(|error| error.to_string())?, Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc))
@@ -321,12 +327,35 @@ fn render(
     state: &TelemetryState,
     audit: &[AuditEntry],
 ) {
-    let areas = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(15),
-        Constraint::Length(6),
-    ])
-    .split(frame.area());
+    render_with_policy(frame, layout, state, audit, None);
+}
+
+fn render_live(
+    frame: &mut Frame,
+    layout: &DashboardLayout,
+    state: &TelemetryState,
+    audit: &[AuditEntry],
+    plan: &PollingPlan,
+) {
+    render_with_policy(frame, layout, state, audit, Some(plan));
+}
+
+fn render_with_policy(
+    frame: &mut Frame,
+    layout: &DashboardLayout,
+    state: &TelemetryState,
+    audit: &[AuditEntry],
+    plan: Option<&PollingPlan>,
+) {
+    let mut constraints = vec![Constraint::Length(3)];
+    if let Some(plan) = plan {
+        let policy_height = u16::try_from(plan.entries().len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
+        constraints.push(Constraint::Length(policy_height));
+    }
+    constraints.extend([Constraint::Min(15), Constraint::Length(6)]);
+    let areas = Layout::vertical(constraints).split(frame.area());
     let source = audit
         .first()
         .map(|entry| entry.source.as_str())
@@ -340,9 +369,14 @@ fn render(
         areas[0],
     );
 
-    render_panels(frame, areas[1], layout, state);
+    let mut content_index = 1;
+    if let Some(plan) = plan {
+        render_policy(frame, areas[content_index], plan);
+        content_index += 1;
+    }
+    render_panels(frame, areas[content_index], layout, state);
     let bottom = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
-        .split(areas[2]);
+        .split(areas[content_index + 1]);
     let raw = audit.iter().map(|entry| {
         ListItem::new(format!(
             "{}  TX {}  RX {}",
@@ -362,6 +396,55 @@ fn render(
         List::new(activity).block(Block::default().borders(Borders::ALL).title("Activity")),
         bottom[1],
     );
+}
+
+fn render_policy(frame: &mut Frame, area: Rect, plan: &PollingPlan) {
+    let entries = plan.entries().iter().map(|entry| {
+        ListItem::new(format!(
+            "{}  requested={}  effective={}  status={}  reason={}",
+            entry.semantic(),
+            format_interval(entry.requested_interval()),
+            entry
+                .effective_interval()
+                .map(format_interval)
+                .unwrap_or_else(|| "not scheduled".into()),
+            plan_status(entry.status()),
+            plan_reason(entry.reason()),
+        ))
+    });
+    frame.render_widget(
+        List::new(entries).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Observation policy"),
+        ),
+        area,
+    );
+}
+
+fn format_interval(interval: Duration) -> String {
+    let milliseconds = interval.as_millis();
+    if milliseconds > 0 {
+        format!("{milliseconds} ms")
+    } else {
+        format!("{} us", interval.as_micros())
+    }
+}
+
+fn plan_status(status: PlanStatus) -> &'static str {
+    match status {
+        PlanStatus::Accepted => "accepted",
+        PlanStatus::RateReduced => "budget-limited/rate-reduced",
+        PlanStatus::Unsupported => "unsupported",
+    }
+}
+
+fn plan_reason(reason: PlanReason) -> &'static str {
+    match reason {
+        PlanReason::WithinBudget => "within budget",
+        PlanReason::SessionRequestBudget => "session request budget",
+        PlanReason::SignalUnsupported => "signal unsupported",
+    }
 }
 
 fn render_panels(frame: &mut Frame, area: Rect, layout: &DashboardLayout, state: &TelemetryState) {
@@ -622,7 +705,12 @@ fn chart_bounds(left: &[(f64, f64)], right: &[(f64, f64)]) -> (f64, f64, f64, f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{prepare_read, telemetry::TelemetryState};
+    use crate::{
+        capability::{CapabilityProvenance, HardwareCapability},
+        prepare_read,
+        subscription_policy::{ObservationRequest, SubscriptionPolicy},
+        telemetry::TelemetryState,
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -671,6 +759,27 @@ mod tests {
             .collect()
     }
 
+    fn policy(requests_per_second: u32) -> SubscriptionPolicy {
+        SubscriptionPolicy::new(
+            HardwareCapability::new(
+                requests_per_second,
+                Duration::from_millis(250),
+                CapabilityProvenance::BuiltInDefault,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn renders_decoded_samples_without_requesting_transport() {
         let transaction = prepare_read("engine.rpm")
@@ -691,13 +800,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &layout, &state, &audit))
             .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let text = buffer_text(&terminal);
         assert!(text.contains("Engine RPM"));
         assert!(text.contains("01 0C"));
         assert!(text.contains("1726.00 rpm"));
@@ -823,13 +926,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &layout, &state, &audit))
             .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let text = buffer_text(&terminal);
         for title in [
             "Custom value",
             "Custom sparkline",
@@ -881,13 +978,62 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &layout, &state, &audit))
             .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let text = buffer_text(&terminal);
         assert!(text.contains("unsupported: future.signal"));
+    }
+
+    #[test]
+    fn renders_live_policy_status_and_requested_effective_intervals() {
+        let requests = [
+            ObservationRequest::new("layout:test", "engine.rpm", Duration::from_secs(1)).unwrap(),
+            ObservationRequest::new("layout:test", "future.signal", Duration::from_secs(1))
+                .unwrap(),
+        ];
+        let plan = policy(4).plan(&requests, ["engine.rpm"]);
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_live(
+                    frame,
+                    &engine_overview(),
+                    &TelemetryState::new(1).unwrap(),
+                    &[],
+                    &plan,
+                )
+            })
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Observation policy"));
+        assert!(text.contains(
+            "engine.rpm  requested=1000 ms  effective=1000 ms  status=accepted  reason=within budget"
+        ));
+        assert!(text.contains(
+            "future.signal  requested=1000 ms  effective=not scheduled  status=unsupported  reason=signal unsupported"
+        ));
+    }
+
+    #[test]
+    fn renders_rate_reduced_policy_as_budget_limited() {
+        let request =
+            ObservationRequest::new("layout:test", "engine.rpm", Duration::from_millis(100))
+                .unwrap();
+        let plan = policy(1).plan([request], ["engine.rpm"]);
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_live(
+                    frame,
+                    &engine_overview(),
+                    &TelemetryState::new(1).unwrap(),
+                    &[],
+                    &plan,
+                )
+            })
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("requested=100 ms"));
+        assert!(text.contains("effective=1000 ms"));
+        assert!(text.contains("status=budget-limited/rate-reduced"));
+        assert!(text.contains("reason=session request budget"));
     }
 }

@@ -4,14 +4,18 @@ use obdentic::vehicle_knowledge::{
 };
 use obdentic::{
     audit::AuditState,
-    ble, capture,
+    ble,
+    capability::HardwareCapability,
+    capture,
     capture_events::{
         CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, DtcObservationFact,
         DtcTransportOutcome, SubscriptionFilterOutcome,
     },
     capture_report, capture_tui,
     diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus},
-    dtc, hex, jsonl_capture, prepare_read, record, replay,
+    dtc, hex, jsonl_capture,
+    layout_observation::{self, LayoutFreshnessPolicy},
+    prepare_read, record, replay,
     runtime_actor::RuntimeClient,
     runtime_reducer::RuntimeEvent,
     runtime_state::{
@@ -20,6 +24,7 @@ use obdentic::{
     },
     safety::{DtcReadKind, Operation, OperationRequest, SafetyPolicy},
     scheduler::{apply_runtime_event, ObservationPlan, Subscription, TelemetryScheduler},
+    subscription_policy::SubscriptionPolicy,
     supported_signals,
     telemetry::TelemetryState,
     topology::{
@@ -229,78 +234,88 @@ async fn run() -> Result<(), String> {
                 layout,
                 recording,
             } => {
+                let layout = load_layout(layout.as_deref())?;
+                let advertised = ble::supported_signals(&adapter_id).await?;
+                let (policy, subscriptions) = planned_layout_subscriptions(&layout, &advertised)?;
+                let policy_state = Arc::new(Mutex::new(policy));
                 let telemetry = Arc::new(Mutex::new(TelemetryState::new(600)?));
                 let audit = Arc::new(Mutex::new(AuditState::new(600)?));
-                let plans = routed_observation_plans(&adapter_id, live_subscriptions()?).await?;
-                let (recorder, writer) = match recording.as_deref() {
-                    Some(path) => {
-                        let (sender, writer) = jsonl_capture::start(Path::new(path))?;
-                        (Some(sender), Some(writer))
-                    }
-                    None => (None, None),
-                };
-                if let Some(sender) = recorder.as_ref() {
-                    apply_runtime_event(
-                        &runtime,
-                        &mut runtime_state,
-                        Some(sender),
-                        RuntimeEvent::recording(RecordingState::Active),
-                    )
-                    .await?;
-                }
-                let scheduler = match TelemetryScheduler::start_with_runtime(
-                    &adapter_id,
-                    plans,
-                    telemetry.clone(),
-                    audit.clone(),
-                    recorder.clone(),
-                    None,
-                    None,
-                    runtime.clone(),
-                )
-                .await
-                {
-                    Ok(scheduler) => scheduler,
-                    Err(error) => {
-                        if let Some(sender) = recorder.as_ref() {
-                            apply_runtime_event(
-                                &runtime,
-                                &mut runtime_state,
-                                Some(sender),
-                                RuntimeEvent::recording(RecordingState::Inactive),
-                            )
-                            .await?;
+                if subscriptions.is_empty() {
+                    tui::run_live(&layout, telemetry, audit, policy_state)
+                } else {
+                    let plans = routed_observation_plans(&adapter_id, subscriptions).await?;
+                    let (recorder, writer) = match recording.as_deref() {
+                        Some(path) => {
+                            let (sender, writer) = jsonl_capture::start(Path::new(path))?;
+                            (Some(sender), Some(writer))
                         }
-                        let shutdown =
-                            finish_runtime(&runtime, &mut runtime_state, recorder.as_ref()).await;
-                        let recorded = finish_capture(recorder, writer).await;
-                        shutdown?;
-                        recorded?;
-                        return Err(error);
+                        None => (None, None),
+                    };
+                    if let Some(sender) = recorder.as_ref() {
+                        apply_runtime_event(
+                            &runtime,
+                            &mut runtime_state,
+                            Some(sender),
+                            RuntimeEvent::recording(RecordingState::Active),
+                        )
+                        .await?;
                     }
-                };
-                let result = tui::run_live(&load_layout(layout.as_deref())?, telemetry, audit);
-                let stopped = scheduler.stop().await;
-                let inactive = if let Some(sender) = recorder.as_ref() {
-                    apply_runtime_event(
-                        &runtime,
-                        &mut runtime_state,
-                        Some(sender),
-                        RuntimeEvent::recording(RecordingState::Inactive),
+                    let scheduler = match TelemetryScheduler::start_with_runtime(
+                        &adapter_id,
+                        plans,
+                        telemetry.clone(),
+                        audit.clone(),
+                        recorder.clone(),
+                        None,
+                        None,
+                        runtime.clone(),
+                        Some(policy_state.clone()),
                     )
                     .await
-                } else {
+                    {
+                        Ok(scheduler) => scheduler,
+                        Err(error) => {
+                            if let Some(sender) = recorder.as_ref() {
+                                apply_runtime_event(
+                                    &runtime,
+                                    &mut runtime_state,
+                                    Some(sender),
+                                    RuntimeEvent::recording(RecordingState::Inactive),
+                                )
+                                .await?;
+                            }
+                            let shutdown =
+                                finish_runtime(&runtime, &mut runtime_state, recorder.as_ref())
+                                    .await;
+                            let recorded = finish_capture(recorder, writer).await;
+                            shutdown?;
+                            recorded?;
+                            return Err(error);
+                        }
+                    };
+                    let result = tui::run_live(&layout, telemetry, audit, policy_state);
+                    let stopped = scheduler.stop().await;
+                    let inactive = if let Some(sender) = recorder.as_ref() {
+                        apply_runtime_event(
+                            &runtime,
+                            &mut runtime_state,
+                            Some(sender),
+                            RuntimeEvent::recording(RecordingState::Inactive),
+                        )
+                        .await
+                    } else {
+                        Ok(())
+                    };
+                    let shutdown =
+                        finish_runtime(&runtime, &mut runtime_state, recorder.as_ref()).await;
+                    let recorded = finish_capture(recorder, writer).await;
+                    result?;
+                    stopped?;
+                    inactive?;
+                    shutdown?;
+                    recorded?;
                     Ok(())
-                };
-                let shutdown =
-                    finish_runtime(&runtime, &mut runtime_state, recorder.as_ref()).await;
-                let recorded = finish_capture(recorder, writer).await;
-                result?;
-                stopped?;
-                inactive?;
-                shutdown?;
-                recorded?;
-                Ok(())
+                }
             }
         };
     }
@@ -1426,6 +1441,7 @@ async fn run_capture(
         Some(profile.name().into()),
         Some(capture_subscriptions),
         runtime.clone(),
+        None,
     )
     .await
     {
@@ -1558,16 +1574,37 @@ async fn record_capture_start_failure(
     Ok(())
 }
 
-fn live_subscriptions() -> Result<Vec<Subscription>, String> {
-    [
-        ("engine.rpm", 200),
-        ("engine.maf", 500),
-        ("engine.coolant_temperature", 1_000),
-        ("vehicle.speed", 1_000),
-    ]
-    .into_iter()
-    .map(|(signal, milliseconds)| Subscription::new(signal, Duration::from_millis(milliseconds)))
-    .collect()
+fn planned_layout_subscriptions(
+    layout: &tui::DashboardLayout,
+    advertised: &[ble::SignalSupport],
+) -> Result<
+    (
+        obdentic::subscription_policy::PollingPlan,
+        Vec<Subscription>,
+    ),
+    String,
+> {
+    let supported = advertised.iter().filter_map(|signal| {
+        (signal.status == ble::SignalSupportStatus::Supported).then_some(signal.semantic)
+    });
+    let policy = layout_observation::polling_plan(
+        layout,
+        LayoutFreshnessPolicy::default(),
+        SubscriptionPolicy::new(HardwareCapability::conservative_default()),
+        supported,
+    )?;
+    let subscriptions = policy
+        .scheduled_entries()
+        .map(|entry| {
+            Subscription::new(
+                entry.semantic(),
+                entry
+                    .effective_interval()
+                    .expect("scheduled entry has an effective interval"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((policy, subscriptions))
 }
 
 async fn routed_observation_plans(
@@ -2484,6 +2521,46 @@ mod tests {
             SubscriptionFilterOutcome::Unsupported
         );
         assert_eq!(decisions[2].filter(), SubscriptionFilterOutcome::Unknown);
+    }
+
+    #[test]
+    fn layout_planning_schedules_only_supported_semantics() {
+        let layout = tui::DashboardLayout {
+            name: "custom".into(),
+            panels: vec![
+                tui::Panel {
+                    title: "RPM".into(),
+                    view: tui::View::Value,
+                    signals: vec!["engine.rpm".into()],
+                },
+                tui::Panel {
+                    title: "Future".into(),
+                    view: tui::View::Value,
+                    signals: vec!["vehicle.future_fact".into()],
+                },
+            ],
+        };
+        let (plan, subscriptions) = planned_layout_subscriptions(
+            &layout,
+            &[ble::SignalSupport {
+                semantic: "engine.rpm",
+                status: ble::SignalSupportStatus::Supported,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].semantic(), "engine.rpm");
+        let future = plan
+            .entries()
+            .iter()
+            .find(|entry| entry.semantic() == "vehicle.future_fact")
+            .unwrap();
+        assert_eq!(
+            future.status(),
+            obdentic::subscription_policy::PlanStatus::Unsupported
+        );
+        assert!(future.effective_interval().is_none());
     }
 
     #[test]
