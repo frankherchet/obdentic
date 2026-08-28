@@ -25,6 +25,7 @@ use ratatui::backend::TestBackend;
 const DEFAULT_WINDOW_US: u64 = 60_000_000;
 const MIN_WINDOW_US: u64 = 1_000_000;
 const STALE_AFTER_INTERVALS: u64 = 2;
+const FEED_ROWS: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 struct Sample {
@@ -337,6 +338,7 @@ impl Timeline {
                 ),
             }
         }
+
         for samples in timeline.samples.values_mut() {
             samples.sort_by_key(|sample| sample.at_us);
         }
@@ -743,6 +745,37 @@ fn offline_engine_overview() -> DashboardLayout {
     layout
 }
 
+fn is_evidence_feed_event(event: &Evidence) -> bool {
+    matches!(
+        event.kind,
+        "capture"
+            | "session"
+            | "shutdown"
+            | "read_ok"
+            | "read_error"
+            | "responses"
+            | "support"
+            | "protocol"
+            | "job"
+            | "job_step"
+            | "job_error"
+            | "dtc_fact"
+            | "dtc_transport"
+    )
+}
+
+fn is_problem_event(event: &Evidence) -> bool {
+    matches!(event.kind, "read_error" | "skipped" | "session_error" | "job_error")
+}
+
+fn problem_style(kind: &str) -> Style {
+    match kind {
+        "skipped" => Style::default().fg(Color::Yellow),
+        "read_error" | "session_error" | "job_error" => Style::default().fg(Color::Red),
+        _ => Style::default(),
+    }
+}
+
 fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav: Nav, path: &str) {
     let areas = Layout::vertical([
         Constraint::Length(4),
@@ -793,23 +826,13 @@ fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav:
 
     let bottom = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(areas[2]);
-    let relevant = timeline
-        .evidence_in(start_us, evidence_end_us)
+    let visible = timeline.evidence_in(start_us, evidence_end_us);
+
+    let relevant = visible
         .iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                "read_ok"
-                    | "read_error"
-                    | "responses"
-                    | "support"
-                    | "protocol"
-                    | "dtc_fact"
-                    | "dtc_transport"
-            )
-        })
+        .filter(|event| is_evidence_feed_event(event))
         .collect::<Vec<_>>();
-    let evidence = relevant.iter().rev().take(6).collect::<Vec<_>>();
+    let evidence = relevant.iter().rev().take(FEED_ROWS).collect::<Vec<_>>();
     frame.render_widget(
         List::new(evidence.into_iter().rev().map(|event| {
             ListItem::new(format!(
@@ -820,32 +843,46 @@ fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav:
                 event.text
             ))
         }))
-        .block(Block::default().borders(Borders::ALL).title("Evidence / TX / RX")),
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Evidence / TX / RX ({})", relevant.len())),
+        ),
         bottom[0],
     );
-    let problems = timeline
-        .evidence_in(start_us, evidence_end_us)
+
+    let problems = visible
         .iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                "read_error" | "skipped" | "session_error" | "job_error" | "runtime"
-            )
-        })
+        .filter(|event| is_problem_event(event))
         .collect::<Vec<_>>();
-    let problems = problems.iter().rev().take(6).collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(problems.into_iter().rev().map(|event| {
-            ListItem::new(format!(
-                "{:>7.2}s {} {}",
-                event.at_us as f64 / 1_000_000.0,
-                event.kind,
-                event.text
-            ))
-        }))
-        .block(Block::default().borders(Borders::ALL).title("Errors / lifecycle")),
-        bottom[1],
-    );
+    let problem_rows = problems.iter().rev().take(FEED_ROWS).collect::<Vec<_>>();
+    if problem_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("no problems <= cursor in visible window")
+                .style(Style::default().fg(Color::Green))
+                .block(Block::default().borders(Borders::ALL).title("Problems (0)")),
+            bottom[1],
+        );
+    } else {
+        frame.render_widget(
+            List::new(problem_rows.into_iter().rev().map(|event| {
+                ListItem::new(format!(
+                    "{:>7.2}s {} {} {}",
+                    event.at_us as f64 / 1_000_000.0,
+                    event.kind,
+                    event.semantic.as_deref().unwrap_or(""),
+                    event.text
+                ))
+                .style(problem_style(event.kind))
+            }))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Problems ({})", problems.len())),
+            ),
+            bottom[1],
+        );
+    }
 }
 
 fn run_tui(path: &Path, layout: &DashboardLayout) -> Result<(), String> {
@@ -1022,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_and_errors_never_look_ahead_of_cursor() {
+    fn evidence_and_problems_never_look_ahead_of_cursor() {
         let timeline = Timeline::from_capture(&fixture(CaptureStatus::Complete));
         let layout = DashboardLayout {
             name: "cursor".into(),
@@ -1049,8 +1086,60 @@ mod tests {
             .unwrap();
         let output = text(&terminal);
         assert!(output.contains("TX 01 0C"));
+        assert!(output.contains("Problems (0)"));
         assert!(!output.contains("conflicting responders"));
         assert!(!output.contains("skipped"));
+    }
+
+    #[test]
+    fn problems_feed_excludes_routine_runtime_noise() {
+        let timeline = Timeline::from_capture(&fixture(CaptureStatus::Complete));
+        assert!(!is_problem_event(&Evidence {
+            at_us: 1,
+            kind: "runtime",
+            semantic: None,
+            text: "routine state transition".into(),
+        }));
+        assert!(is_problem_event(&Evidence {
+            at_us: 1,
+            kind: "read_error",
+            semantic: Some("engine.rpm".into()),
+            text: "conflict".into(),
+        }));
+        assert!(timeline
+            .evidence
+            .iter()
+            .any(|event| event.kind == "read_error" && is_problem_event(event)));
+    }
+
+    #[test]
+    fn problems_feed_shows_semantic_and_count() {
+        let timeline = Timeline::from_capture(&fixture(CaptureStatus::Complete));
+        let layout = DashboardLayout {
+            name: "problems".into(),
+            panels: vec![Panel {
+                title: "RPM".into(),
+                view: View::Value,
+                signals: vec!["engine.rpm".into()],
+            }],
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &layout,
+                    &timeline,
+                    Nav::new(timeline.duration_us),
+                    "fixture.jsonl",
+                )
+            })
+            .unwrap();
+        let output = text(&terminal);
+        assert!(output.contains("Problems (2)"));
+        assert!(output.contains("engine.rpm"));
+        assert!(output.contains("conflicting responders"));
+        assert!(output.contains("slots=1"));
     }
 
     #[test]
