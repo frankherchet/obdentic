@@ -163,7 +163,10 @@ mod tests {
         assert_eq!(interval("engine.rpm"), Duration::from_secs(1));
         assert!(interval("engine.rpm") < interval("engine.coolant_temperature"));
         assert!(interval("engine.intake_manifold_pressure") < interval("engine.runtime"));
-        assert_eq!(interval("engine.coolant_temperature"), Duration::from_secs(10));
+        assert_eq!(
+            interval("engine.coolant_temperature"),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
