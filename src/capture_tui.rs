@@ -1,4 +1,4 @@
-use obdentic::{
+use crate::{
     capture_events::{CaptureEvent, CaptureValue, SubscriptionFilterOutcome},
     hex,
     jsonl_capture::{self, CaptureStatus, ParsedCapture},
@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use std::{collections::BTreeMap, env, io, path::Path};
+use std::{collections::BTreeMap, io, path::Path};
 
 #[cfg(test)]
 use ratatui::backend::TestBackend;
@@ -87,7 +87,10 @@ impl Timeline {
                         0,
                         "capture",
                         None,
-                        format!("started profile={}", profile.as_deref().unwrap_or("unknown")),
+                        format!(
+                            "started profile={}",
+                            profile.as_deref().unwrap_or("unknown")
+                        ),
                     );
                 }
                 CaptureEvent::SessionInitialized => {
@@ -106,7 +109,11 @@ impl Timeline {
                         clock_us,
                         "subscription",
                         Some(semantic.clone()),
-                        format!("{}ms {}", requested_interval_us / 1_000, filter_text(*filter)),
+                        format!(
+                            "{}ms {}",
+                            requested_interval_us / 1_000,
+                            filter_text(*filter)
+                        ),
                     );
                 }
                 CaptureEvent::SupportDiscovery {
@@ -388,7 +395,9 @@ impl Timeline {
     }
 
     fn evidence_in(&self, start_us: u64, end_us: u64) -> &[Evidence] {
-        let start = self.evidence.partition_point(|event| event.at_us < start_us);
+        let start = self
+            .evidence
+            .partition_point(|event| event.at_us < start_us);
         let end = self.evidence.partition_point(|event| event.at_us <= end_us);
         &self.evidence[start..end]
     }
@@ -438,7 +447,10 @@ impl Nav {
             }
             KeyCode::PageUp => self.cursor_us = self.cursor_us.saturating_sub(self.window_us),
             KeyCode::PageDown => {
-                self.cursor_us = self.cursor_us.saturating_add(self.window_us).min(duration_us);
+                self.cursor_us = self
+                    .cursor_us
+                    .saturating_add(self.window_us)
+                    .min(duration_us);
             }
             KeyCode::Home | KeyCode::Char('g') => self.cursor_us = 0,
             KeyCode::End | KeyCode::Char('G') => self.cursor_us = duration_us,
@@ -523,13 +535,7 @@ fn bounds(left: &[(f64, f64)], right: &[(f64, f64)]) -> (f64, f64) {
     (min, max)
 }
 
-fn unavailable(
-    frame: &mut Frame,
-    area: Rect,
-    panel: &Panel,
-    timeline: &Timeline,
-    semantic: &str,
-) {
+fn unavailable(frame: &mut Frame, area: Rect, panel: &Panel, timeline: &Timeline, semantic: &str) {
     let status = match timeline.availability(semantic) {
         Availability::Captured => "no sample in window",
         Availability::Unsupported => "unsupported / unavailable",
@@ -537,8 +543,11 @@ fn unavailable(
         Availability::NotCaptured => "not captured",
     };
     frame.render_widget(
-        Paragraph::new(format!("{status}: {semantic}"))
-            .block(Block::default().borders(Borders::ALL).title(panel.title.as_str())),
+        Paragraph::new(format!("{status}: {semantic}")).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(panel.title.as_str()),
+        ),
         area,
     );
 }
@@ -591,10 +600,17 @@ fn panel(
                         .style(Style::default().fg(Color::Cyan)),
                     Line::from(format!("{semantic} {}", freshness.0))
                         .style(Style::default().fg(freshness.1)),
-                    Line::from(format!("profile={} decoder={}", sample.profile, sample.decoder)),
+                    Line::from(format!(
+                        "profile={} decoder={}",
+                        sample.profile, sample.decoder
+                    )),
                     Line::from(format!("provenance={}", sample.provenance)),
                 ])
-                .block(Block::default().borders(Borders::ALL).title(panel.title.as_str())),
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(panel.title.as_str()),
+                ),
                 area,
             );
         }
@@ -625,11 +641,15 @@ fn panel(
             );
             frame.render_widget(
                 Chart::new(datasets)
-                    .block(Block::default().borders(Borders::ALL).title(panel.title.as_str()))
-                    .x_axis(Axis::default().bounds([
-                        start_us as f64 / 1_000_000.0,
-                        end_us as f64 / 1_000_000.0,
-                    ]))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(panel.title.as_str()),
+                    )
+                    .x_axis(
+                        Axis::default()
+                            .bounds([start_us as f64 / 1_000_000.0, end_us as f64 / 1_000_000.0]),
+                    )
                     .y_axis(Axis::default().bounds([y_min, y_max])),
                 area,
             );
@@ -654,14 +674,15 @@ fn panel(
                 .name(semantic.as_str())
                 .graph_type(GraphType::Line)
                 .data(&points)])
-            .block(Block::default().borders(Borders::ALL).title(panel.title.as_str()))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(panel.title.as_str()),
+            )
             .x_axis(
                 Axis::default()
                     .title("capture seconds")
-                    .bounds([
-                        start_us as f64 / 1_000_000.0,
-                        end_us as f64 / 1_000_000.0,
-                    ]),
+                    .bounds([start_us as f64 / 1_000_000.0, end_us as f64 / 1_000_000.0]),
             )
             .y_axis(Axis::default().title(unit).bounds([y_min, y_max]));
             frame.render_widget(chart, area);
@@ -675,13 +696,7 @@ fn panel(
             let left_points = numeric(left_samples);
             let right_points = numeric(right_samples);
             if left_points.is_empty() || right_points.is_empty() {
-                return unavailable(
-                    frame,
-                    area,
-                    panel,
-                    timeline,
-                    &format!("{left}/{right}"),
-                );
+                return unavailable(frame, area, panel, timeline, &format!("{left}/{right}"));
             }
             let left_unit = left_samples
                 .iter()
@@ -698,7 +713,11 @@ fn panel(
             if left_unit != right_unit {
                 frame.render_widget(
                     Paragraph::new(format!("incompatible units: {left_unit} vs {right_unit}"))
-                        .block(Block::default().borders(Borders::ALL).title(panel.title.as_str())),
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(panel.title.as_str()),
+                        ),
                     area,
                 );
                 return;
@@ -714,14 +733,15 @@ fn panel(
                     .graph_type(GraphType::Line)
                     .data(&right_points),
             ])
-            .block(Block::default().borders(Borders::ALL).title(panel.title.as_str()))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(panel.title.as_str()),
+            )
             .x_axis(
                 Axis::default()
                     .title("capture seconds")
-                    .bounds([
-                        start_us as f64 / 1_000_000.0,
-                        end_us as f64 / 1_000_000.0,
-                    ]),
+                    .bounds([start_us as f64 / 1_000_000.0, end_us as f64 / 1_000_000.0]),
             )
             .y_axis(Axis::default().title(left_unit).bounds([y_min, y_max]));
             frame.render_widget(chart, area);
@@ -765,7 +785,10 @@ fn is_evidence_feed_event(event: &Evidence) -> bool {
 }
 
 fn is_problem_event(event: &Evidence) -> bool {
-    matches!(event.kind, "read_error" | "skipped" | "session_error" | "job_error")
+    matches!(
+        event.kind,
+        "read_error" | "skipped" | "session_error" | "job_error"
+    )
 }
 
 fn problem_style(kind: &str) -> Style {
@@ -804,7 +827,11 @@ fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav:
                 end_us as f64 / 1_000_000.0
             )),
         ])
-        .block(Block::default().borders(Borders::ALL).title("Offline capture")),
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Offline capture"),
+        ),
         areas[0],
     );
 
@@ -813,11 +840,9 @@ fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav:
         let row_areas =
             Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(areas[1]);
         for (panel_def, area) in layout.panels.iter().zip(row_areas.iter().flat_map(|row| {
-            let columns = Layout::horizontal([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
-            .split(*row);
+            let columns =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(*row);
             [columns[0], columns[1]]
         })) {
             panel(frame, area, panel_def, timeline, nav, start_us, end_us);
@@ -902,7 +927,9 @@ fn run_tui(path: &Path, layout: &DashboardLayout) -> Result<(), String> {
             .draw(|frame| render(frame, layout, &timeline, nav, &path.display().to_string()))
             .map_err(|error| error.to_string())?;
         match event::read().map_err(|error| error.to_string())? {
-            Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => break Ok(()),
+            Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => {
+                break Ok(())
+            }
             Event::Key(key) => nav.key(key.code, timeline.duration_us),
             _ => {}
         }
@@ -913,36 +940,15 @@ fn run_tui(path: &Path, layout: &DashboardLayout) -> Result<(), String> {
     result
 }
 
-fn main() {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    let result = (|| {
-        let (capture, layout) = match args.as_slice() {
-            [capture] => (capture.as_str(), None),
-            [capture, flag, layout] if flag == "--layout" => {
-                (capture.as_str(), Some(layout.as_str()))
-            }
-            _ => {
-                return Err(
-                    "usage: obdentic-capture-tui <capture.jsonl> [--layout <layout.tsv>]".into(),
-                );
-            }
-        };
-        let layout = layout.map_or_else(
-            || Ok(offline_engine_overview()),
-            |path| tui::load_layout(Path::new(path)),
-        )?;
-        run_tui(Path::new(capture), &layout)
-    })();
-    if let Err(error) = result {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
+pub fn run_capture_tui(path: &Path, layout_path: Option<&Path>) -> Result<(), String> {
+    let layout = layout_path.map_or_else(|| Ok(offline_engine_overview()), tui::load_layout)?;
+    run_tui(path, &layout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use obdentic::capture_events::{ReadTiming, ResponderEvidence};
+    use crate::capture_events::{ReadTiming, ResponderEvidence};
 
     fn read(semantic: &str, at_us: u64, value: f64, unit: &str) -> CaptureEvent {
         CaptureEvent::ReadSucceeded {
@@ -978,11 +984,10 @@ mod tests {
             CaptureEvent::responses_observed(
                 "engine.rpm",
                 vec![0x01, 0x0c],
-                vec![ResponderEvidence::new(
-                    Some("7E8".into()),
-                    vec![0x41, 0x0c, 0x0c, 0x80],
-                )
-                .unwrap()],
+                vec![
+                    ResponderEvidence::new(Some("7E8".into()), vec![0x41, 0x0c, 0x0c, 0x80])
+                        .unwrap(),
+                ],
                 Some("7E8".into()),
                 None,
             )
