@@ -1,6 +1,7 @@
 use crate::{
     audit::AuditState,
     ble::{is_session_unhealthy, start_session, ReadOutcome, ResponseObservation, SessionClient},
+    capability::HardwareCapability,
     capture_events::{
         CaptureEvent, CaptureSubscription, CaptureTimeUs, ReadTiming, SubscriptionFilterOutcome,
     },
@@ -8,6 +9,7 @@ use crate::{
     runtime_actor::RuntimeClient,
     runtime_reducer::RuntimeEvent,
     runtime_state::RuntimeState,
+    subscription_policy::{ObservationRequest, SubscriptionPolicy},
     telemetry::TelemetryState,
     vehicle_knowledge::{ReadRouting, RoutingDecision},
     ReadRequest,
@@ -294,6 +296,26 @@ impl TelemetryScheduler {
                     RuntimeEvent::FatalRuntimeError,
                 )
                 .await;
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
+                };
+            }
+        };
+        let capability = match session.hardware_capability().await {
+            Ok(capability) => capability,
+            Err(error) => {
+                let cleanup = session.shutdown().await;
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
+                };
+            }
+        };
+        let subscriptions = match reshape_observation_plans(&subscriptions, capability) {
+            Ok(subscriptions) => subscriptions,
+            Err(error) => {
+                let cleanup = session.shutdown().await;
                 return match cleanup {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
@@ -592,6 +614,13 @@ async fn run(
                         }
                     }
                 }
+                let capability = match session.hardware_capability().await {
+                    Ok(capability) => capability,
+                    Err(error) => break 'scheduler Err(error),
+                };
+                if let Err(error) = reshape_schedule(&mut schedule, capability, Instant::now()) {
+                    break 'scheduler Err(error);
+                }
             }
         }
     };
@@ -667,6 +696,51 @@ fn duration_us(duration: Duration) -> Result<CaptureTimeUs, String> {
         .as_micros()
         .try_into()
         .map_err(|_| "subscription interval exceeds supported microseconds".into())
+}
+
+fn reshape_observation_plans(
+    plans: &[ObservationPlan],
+    capability: HardwareCapability,
+) -> Result<Vec<ObservationPlan>, String> {
+    let requests = plans
+        .iter()
+        .map(|plan| ObservationRequest::new("scheduler", plan.semantic(), plan.interval()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let supported = plans.iter().map(ObservationPlan::semantic);
+    let policy = SubscriptionPolicy::new(capability).plan(requests, supported);
+
+    plans
+        .iter()
+        .map(|plan| {
+            let effective_interval = policy
+                .entries()
+                .iter()
+                .find(|entry| entry.semantic() == plan.semantic())
+                .and_then(|entry| entry.effective_interval())
+                .ok_or_else(|| format!("scheduler policy rejected {}", plan.semantic()))?;
+            ObservationPlan::new(plan.routing.clone(), effective_interval)
+        })
+        .collect()
+}
+
+fn reshape_schedule(
+    schedule: &mut [(ObservationPlan, Instant)],
+    capability: HardwareCapability,
+    now: Instant,
+) -> Result<(), String> {
+    let plans = schedule
+        .iter()
+        .map(|(plan, _)| plan.clone())
+        .collect::<Vec<_>>();
+    let reshaped = reshape_observation_plans(&plans, capability)?;
+    for ((plan, due), replacement) in schedule.iter_mut().zip(reshaped) {
+        if plan.interval() != replacement.interval() {
+            *due = now + replacement.interval();
+        }
+        *plan = replacement;
+    }
+    Ok(())
 }
 
 fn offset_us(origin: Instant, at: Instant) -> CaptureTimeUs {
@@ -835,6 +909,40 @@ mod tests {
         .unwrap();
         assert!(matches!(fallback.routing(), ReadRouting::Functional(_)));
         assert_eq!(fallback.semantic(), "engine.rpm");
+    }
+
+    #[test]
+    fn capability_reshaping_preserves_order_and_routes() {
+        let targeted =
+            ObservationPlan::from_routing_decision(targeted_decision(), Duration::from_millis(100))
+                .unwrap();
+        let functional = ObservationPlan::new(
+            ReadRouting::Functional(crate::prepare_read("engine.maf").unwrap()),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let reshaped = reshape_observation_plans(
+            &[targeted.clone(), functional.clone()],
+            HardwareCapability::new(
+                1,
+                Duration::from_secs(1),
+                crate::capability::CapabilityProvenance::MeasuredFromCapture,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reshaped
+                .iter()
+                .map(ObservationPlan::semantic)
+                .collect::<Vec<_>>(),
+            vec!["engine.rpm", "engine.maf"]
+        );
+        assert!(matches!(reshaped[0].routing(), ReadRouting::Targeted(_)));
+        assert!(matches!(reshaped[1].routing(), ReadRouting::Functional(_)));
+        assert!(reshaped[0].interval() > targeted.interval());
+        assert!(reshaped[1].interval() > functional.interval());
     }
 
     #[test]

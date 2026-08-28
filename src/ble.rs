@@ -1,6 +1,9 @@
 use crate::{
-    topology::AddressingContext, topology::Protocol, topology::RequestTarget, ReadRequest,
-    Transaction,
+    capability::{CapabilityProvenance, HardwareCapability},
+    topology::AddressingContext,
+    topology::Protocol,
+    topology::RequestTarget,
+    ReadRequest, Transaction,
 };
 use btleplug::{
     api::{
@@ -10,7 +13,10 @@ use btleplug::{
     platform::{Adapter, Manager, Peripheral},
 };
 use futures_util::{Stream, StreamExt};
-use std::{pin::Pin, time::Duration};
+use std::{
+    pin::Pin,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 
@@ -539,6 +545,20 @@ pub struct SessionClient {
 }
 
 impl SessionClient {
+    /// Return the conservative capability learned by the sequential session
+    /// actor. The first result is the built-in fallback; completed reads then
+    /// replace its latency and budget with measured evidence.
+    pub async fn hardware_capability(&self) -> Result<HardwareCapability, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::Capability { reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())
+    }
+
     pub async fn read(&self, request: ReadRequest) -> Result<Transaction, String> {
         self.read_with_evidence(request).await?.into_transaction()
     }
@@ -629,6 +649,48 @@ enum SessionCommand {
     SupportDiscovery {
         reply: oneshot::Sender<Vec<SupportDiscovery>>,
     },
+    Capability {
+        reply: oneshot::Sender<HardwareCapability>,
+    },
+}
+
+/// Conservative, bounded session estimate. Keeping only the slowest completed
+/// request makes the budget deterministic and errs toward under-booking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RequestServiceEstimator {
+    maximum_service_time: Option<Duration>,
+}
+
+impl RequestServiceEstimator {
+    fn observe(&mut self, service_time: Duration) {
+        let service_time = service_time.max(Duration::from_nanos(1));
+        self.maximum_service_time = Some(
+            self.maximum_service_time
+                .map_or(service_time, |maximum| maximum.max(service_time)),
+        );
+    }
+
+    fn capability(self) -> HardwareCapability {
+        let (latency, provenance) = match self.maximum_service_time {
+            Some(latency) => (latency, CapabilityProvenance::MeasuredFromCapture),
+            None => {
+                let fallback = HardwareCapability::conservative_default();
+                (
+                    fallback.representative_read_latency(),
+                    CapabilityProvenance::BuiltInDefault,
+                )
+            }
+        };
+        let budget = request_budget_for(latency);
+        HardwareCapability::new(budget, latency, provenance)
+            .expect("request service estimator always produces a valid capability")
+    }
+}
+
+fn request_budget_for(service_time: Duration) -> u32 {
+    let nanos = service_time.as_nanos().max(1);
+    let budget = (1_000_000_000_u128 / nanos).max(1);
+    u32::try_from(budget).unwrap_or(u32::MAX)
 }
 
 async fn session_actor(
@@ -636,6 +698,7 @@ async fn session_actor(
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
     let mut health = SessionHealth::default();
+    let mut service = RequestServiceEstimator::default();
     let mut disconnect_done = false;
     while let Some(command) = commands.recv().await {
         match command {
@@ -644,12 +707,15 @@ async fn session_actor(
                     let _ = reply.send(Err(error.to_owned()));
                     continue;
                 }
+                let started = Instant::now();
                 let outcome = session.read_with_evidence(request).await;
                 process_read_outcome(
                     &mut session,
                     &mut health,
+                    &mut service,
                     &mut disconnect_done,
                     outcome,
+                    started.elapsed(),
                     reply,
                 )
                 .await;
@@ -659,12 +725,15 @@ async fn session_actor(
                     let _ = reply.send(Err(error.to_owned()));
                     continue;
                 }
+                let started = Instant::now();
                 let outcome = session.read_targeted_with_evidence(request).await;
                 process_read_outcome(
                     &mut session,
                     &mut health,
+                    &mut service,
                     &mut disconnect_done,
                     outcome,
+                    started.elapsed(),
                     reply,
                 )
                 .await;
@@ -674,8 +743,10 @@ async fn session_actor(
                     let _ = reply.send(Err(error.to_owned()));
                     continue;
                 }
+                let started = Instant::now();
                 match session.read_stored_dtcs().await {
                     Ok(responses) => {
+                        service.observe(started.elapsed());
                         health.success();
                         let _ = reply.send(Ok(responses));
                     }
@@ -686,6 +757,7 @@ async fn session_actor(
                             disconnect_done = true;
                             let _ = reply.send(Err(fatal));
                         } else {
+                            service.observe(started.elapsed());
                             let _ = reply.send(Err(error));
                         }
                     }
@@ -701,6 +773,9 @@ async fn session_actor(
             SessionCommand::SupportDiscovery { reply } => {
                 let _ = reply.send(session.supported.discovery.clone());
             }
+            SessionCommand::Capability { reply } => {
+                let _ = reply.send(service.capability());
+            }
         }
     }
     if !disconnect_done {
@@ -711,8 +786,10 @@ async fn session_actor(
 async fn process_read_outcome(
     session: &mut DiagnosticSession,
     health: &mut SessionHealth,
+    service: &mut RequestServiceEstimator,
     disconnect_done: &mut bool,
     outcome: ReadOutcome,
+    service_time: Duration,
     reply: oneshot::Sender<Result<ReadOutcome, String>>,
 ) {
     if let Some(error) = health.unhealthy() {
@@ -721,6 +798,7 @@ async fn process_read_outcome(
     }
     match outcome {
         ReadOutcome::Succeeded { .. } => {
+            service.observe(service_time);
             health.success();
             let _ = reply.send(Ok(outcome));
         }
@@ -737,6 +815,7 @@ async fn process_read_outcome(
                     observations,
                 }));
             } else {
+                service.observe(service_time);
                 let _ = reply.send(Ok(ReadOutcome::Failed {
                     error,
                     observations,
@@ -2348,6 +2427,9 @@ mod tests {
                     SessionCommand::SupportDiscovery { reply } => {
                         let _ = reply.send(Vec::new());
                     }
+                    SessionCommand::Capability { reply } => {
+                        let _ = reply.send(HardwareCapability::conservative_default());
+                    }
                 }
             }
             seen
@@ -2419,6 +2501,62 @@ mod tests {
             .read(crate::prepare_read("engine.rpm").unwrap())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn session_client_reads_actor_owned_hardware_capability() {
+        let (sender, mut commands) = mpsc::channel(1);
+        let actor = tokio::spawn(async move {
+            if let Some(SessionCommand::Capability { reply }) = commands.recv().await {
+                let _ = reply.send(
+                    HardwareCapability::new(
+                        3,
+                        Duration::from_millis(280),
+                        CapabilityProvenance::MeasuredFromCapture,
+                    )
+                    .unwrap(),
+                );
+            }
+        });
+        let client = SessionClient { sender };
+
+        let capability = client.hardware_capability().await.unwrap();
+
+        assert_eq!(capability.request_budget_per_second(), 3);
+        assert_eq!(
+            capability.representative_read_latency(),
+            Duration::from_millis(280)
+        );
+        assert_eq!(
+            capability.provenance(),
+            CapabilityProvenance::MeasuredFromCapture
+        );
+        actor.await.unwrap();
+    }
+
+    #[test]
+    fn request_service_estimator_uses_slowest_completed_attempt() {
+        let mut estimator = RequestServiceEstimator::default();
+        assert_eq!(
+            estimator.capability(),
+            HardwareCapability::conservative_default()
+        );
+
+        estimator.observe(Duration::from_millis(280));
+        estimator.observe(Duration::from_millis(220));
+        let capability = estimator.capability();
+        assert_eq!(capability.request_budget_per_second(), 3);
+        assert_eq!(
+            capability.representative_read_latency(),
+            Duration::from_millis(280)
+        );
+        assert_eq!(
+            capability.provenance(),
+            CapabilityProvenance::MeasuredFromCapture
+        );
+
+        estimator.observe(Duration::from_secs(2));
+        assert_eq!(estimator.capability().request_budget_per_second(), 1);
     }
 
     #[test]

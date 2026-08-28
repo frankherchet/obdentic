@@ -147,9 +147,9 @@ impl SubscriptionPolicy {
     }
 
     /// Merge duplicate semantics, omit unsupported semantics, and apply a
-    /// common fair rate cap when the merged demand exceeds the session budget.
-    /// Under overload every supported semantic receives at most an equal
-    /// `budget / signal_count` share; slower requested rates remain slower.
+    /// deterministic rate cap when the merged demand exceeds the session
+    /// budget. Under overload every interval is multiplied by the same
+    /// integer factor, preserving declared relative sampling priorities.
     pub fn plan<Requests, RequestItem, Supported, Name>(
         &self,
         requests: Requests,
@@ -197,15 +197,15 @@ impl SubscriptionPolicy {
             &supported_entries,
             self.capability.request_budget_per_second(),
         );
-        let fair_interval = overloaded.then(|| {
-            fair_interval(
-                supported_entries.len(),
+        let scale_factor = overloaded.then(|| {
+            request_scale_factor(
+                &supported_entries,
                 self.capability.request_budget_per_second(),
             )
         });
         for (semantic, sources, requested_interval) in supported_entries {
-            let effective_interval = fair_interval
-                .map(|fair| requested_interval.max(fair))
+            let effective_interval = scale_factor
+                .map(|factor| scale_interval(requested_interval, factor))
                 .unwrap_or(requested_interval);
             let reduced = effective_interval > requested_interval;
             entries.push(PlanEntry {
@@ -236,19 +236,29 @@ fn requested_rate_exceeds_budget(
     request_budget_per_second: u32,
 ) -> bool {
     let budget = u128::from(request_budget_per_second).saturating_mul(RATE_PRECISION);
-    let requested = entries.iter().fold(0_u128, |total, (_, _, interval)| {
-        let numerator = 1_000_000_000_u128.saturating_mul(RATE_PRECISION);
-        let rounded_up = numerator.div_ceil(interval.as_nanos());
-        total.saturating_add(rounded_up)
-    });
+    let requested = requested_rate_units(entries);
     requested > budget
 }
 
-fn fair_interval(entry_count: usize, request_budget_per_second: u32) -> Duration {
-    let numerator = (entry_count as u128) * 1_000_000_000;
-    let denominator = u128::from(request_budget_per_second);
-    let rounded_up = numerator.div_ceil(denominator);
-    Duration::from_nanos(u64::try_from(rounded_up).unwrap_or(u64::MAX))
+fn requested_rate_units(entries: &[(String, Vec<String>, Duration)]) -> u128 {
+    entries.iter().fold(0_u128, |total, (_, _, interval)| {
+        let numerator = 1_000_000_000_u128.saturating_mul(RATE_PRECISION);
+        let rounded_up = numerator.div_ceil(interval.as_nanos());
+        total.saturating_add(rounded_up)
+    })
+}
+
+fn request_scale_factor(
+    entries: &[(String, Vec<String>, Duration)],
+    request_budget_per_second: u32,
+) -> u128 {
+    requested_rate_units(entries)
+        .div_ceil(u128::from(request_budget_per_second).saturating_mul(RATE_PRECISION))
+}
+
+fn scale_interval(interval: Duration, factor: u128) -> Duration {
+    let nanos = interval.as_nanos().saturating_mul(factor);
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,21 +347,32 @@ mod tests {
     }
 
     #[test]
-    fn overload_uses_a_common_fair_rate_cap() {
+    fn overload_scales_intervals_without_losing_relative_priority() {
         let plan = policy(4).plan(
             [
                 request("tui", "engine.rpm", 100),
-                request("tui", "engine.maf", 100),
-                request("tui", "engine.load", 100),
+                request("tui", "engine.maf", 200),
+                request("tui", "engine.load", 400),
             ],
             ["engine.load", "engine.maf", "engine.rpm"],
         );
 
-        for entry in plan.entries() {
-            assert_eq!(entry.effective_interval(), Some(Duration::from_millis(750)));
-            assert_eq!(entry.status(), PlanStatus::RateReduced);
-            assert_eq!(entry.reason(), PlanReason::SessionRequestBudget);
-        }
+        assert_eq!(
+            plan.entries()[0].effective_interval(),
+            Some(Duration::from_millis(2000))
+        );
+        assert_eq!(
+            plan.entries()[1].effective_interval(),
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(
+            plan.entries()[2].effective_interval(),
+            Some(Duration::from_millis(500))
+        );
+        assert!(plan
+            .entries()
+            .iter()
+            .all(|entry| entry.status() == PlanStatus::RateReduced));
         assert!(plan.effective_request_rate_per_second() <= 4.0);
     }
 
