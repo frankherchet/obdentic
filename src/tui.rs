@@ -458,7 +458,13 @@ fn render_time_series(frame: &mut Frame, area: Rect, state: &TelemetryState, pan
     let Some(history) = state.history(signal).filter(|history| !history.is_empty()) else {
         return unsupported(frame, area, panel, signal);
     };
-    let points = time_points_from(history, history.front().unwrap().timestamp_ms);
+    let Some(origin_us) = state
+        .timed_history(signal)
+        .and_then(|mut history| history.next().map(|(timestamp_us, _)| timestamp_us))
+    else {
+        return unsupported(frame, area, panel, signal);
+    };
+    let points = time_points_from(state.timed_history(signal).unwrap(), origin_us);
     let (x_minimum, x_maximum, y_minimum, y_maximum) = chart_bounds(&points, &[]);
     let chart = Chart::new(vec![Dataset::default()
         .name(signal)
@@ -508,12 +514,14 @@ fn sparkline_values(history: Option<&VecDeque<Sample>>) -> Vec<u64> {
         .collect()
 }
 
-fn time_points_from(history: &VecDeque<Sample>, origin: u128) -> Vec<(f64, f64)> {
+fn time_points_from<'a>(
+    history: impl Iterator<Item = (u128, &'a Sample)>,
+    origin_us: u128,
+) -> Vec<(f64, f64)> {
     history
-        .iter()
-        .map(|sample| {
+        .map(|(timestamp_us, sample)| {
             (
-                sample.timestamp_ms.saturating_sub(origin) as f64 / 1_000.0,
+                timestamp_us.saturating_sub(origin_us) as f64 / 1_000_000.0,
                 sample.value,
             )
         })
@@ -546,9 +554,18 @@ fn render_compare(frame: &mut Frame, area: Rect, state: &TelemetryState, panel: 
         );
         return;
     }
-    let origin = left_unit.timestamp_ms.min(right_unit.timestamp_ms);
-    let left_points = time_points_from(left_history, origin);
-    let right_points = time_points_from(right_history, origin);
+    let left_origin = state
+        .timed_history(left)
+        .and_then(|mut history| history.next().map(|(timestamp_us, _)| timestamp_us));
+    let right_origin = state
+        .timed_history(right)
+        .and_then(|mut history| history.next().map(|(timestamp_us, _)| timestamp_us));
+    let (Some(left_origin), Some(right_origin)) = (left_origin, right_origin) else {
+        return unsupported(frame, area, panel, format!("{left} / {right}"));
+    };
+    let origin_us = left_origin.min(right_origin);
+    let left_points = time_points_from(state.timed_history(left).unwrap(), origin_us);
+    let right_points = time_points_from(state.timed_history(right).unwrap(), origin_us);
     let (x_minimum, x_maximum, y_minimum, y_maximum) = chart_bounds(&left_points, &right_points);
     let chart = Chart::new(vec![
         Dataset::default()
@@ -688,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn chart_data_respects_sample_order_timestamps_and_units() {
+    fn chart_data_respects_exact_sample_timestamps_and_units() {
         let history = VecDeque::from([
             Sample {
                 timestamp_ms: 1_000,
@@ -716,7 +733,12 @@ mod tests {
             [1]
         );
         assert_eq!(
-            time_points_from(&history, 1_000),
+            time_points_from(
+                [1_000_000_u128, 2_500_000, 6_000_000]
+                    .into_iter()
+                    .zip(history.iter()),
+                1_000_000,
+            ),
             [(0.0, 1.0), (1.5, 3.0), (5.0, 2.0)]
         );
 
@@ -725,7 +747,32 @@ mod tests {
             value: 1.0,
             unit: "rpm",
         }]);
-        assert_eq!(time_points_from(&compatible, 0), [(1.0, 1.0)]);
+        assert_eq!(
+            time_points_from([1_000_000_u128].into_iter().zip(compatible.iter()), 0,),
+            [(1.0, 1.0)]
+        );
+
+        let submillisecond = VecDeque::from([
+            Sample {
+                timestamp_ms: 1_000,
+                value: 1.0,
+                unit: "rpm",
+            },
+            Sample {
+                timestamp_ms: 1_000,
+                value: 2.0,
+                unit: "rpm",
+            },
+        ]);
+        let points = time_points_from(
+            [1_000_001_u128, 1_000_999]
+                .into_iter()
+                .zip(submillisecond.iter()),
+            1_000_001,
+        );
+        assert_eq!(points[0], (0.0, 1.0));
+        assert!((points[1].0 - 0.000_998).abs() < 1e-12);
+        assert_eq!(points[1].1, 2.0);
     }
 
     #[test]
