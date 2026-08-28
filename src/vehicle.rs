@@ -47,7 +47,7 @@ const PROFILES: [ProfileMetadata; 2] = [
     },
 ];
 
-const SIGNALS: [SignalDefinition; 15] = [
+const SIGNALS: [SignalDefinition; 22] = [
     SignalDefinition::new(
         SignalMetadata {
             semantic: "engine.rpm",
@@ -333,6 +333,139 @@ const SIGNALS: [SignalDefinition; 15] = [
         Mode01::new(0x42, 2),
         |data| u16::from_be_bytes([data[0], data[1]]) as f64 / 1000.0,
     ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "engine.throttle_position",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0x11],
+            decoder: "A * 100 / 255",
+            minimum: 0.0,
+            maximum: 100.0,
+            description: "Throttle position.",
+            subsystem: "powertrain",
+            unit: "%",
+            provenance: "SAE J1979 Mode 01 PID 11",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0x11, 1),
+        |data| data[0] as f64 * 100.0 / 255.0,
+    ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "vehicle.distance_with_mil_on",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0x21],
+            decoder: "(A * 256) + B",
+            minimum: 0.0,
+            maximum: 65535.0,
+            description: "Distance traveled while the malfunction indicator lamp is on.",
+            subsystem: "diagnostics",
+            unit: "km",
+            provenance: "SAE J1979 Mode 01 PID 21",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0x21, 2),
+        |data| u16::from_be_bytes([data[0], data[1]]) as f64,
+    ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "engine.fuel_rail_gauge_pressure",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0x23],
+            decoder: "((A * 256) + B) * 10",
+            minimum: 0.0,
+            maximum: 655350.0,
+            description: "Fuel rail gauge pressure for diesel/direct-injection systems.",
+            subsystem: "powertrain",
+            unit: "kPa",
+            provenance: "SAE J1979 Mode 01 PID 23",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0x23, 2),
+        |data| u16::from_be_bytes([data[0], data[1]]) as f64 * 10.0,
+    ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "vehicle.warmups_since_dtc_clear",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0x30],
+            decoder: "A",
+            minimum: 0.0,
+            maximum: 255.0,
+            description: "Warm-up cycles since diagnostic trouble codes were cleared.",
+            subsystem: "diagnostics",
+            unit: "count",
+            provenance: "SAE J1979 Mode 01 PID 30",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0x30, 1),
+        |data| data[0] as f64,
+    ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "vehicle.distance_since_dtc_clear",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0x31],
+            decoder: "(A * 256) + B",
+            minimum: 0.0,
+            maximum: 65535.0,
+            description: "Distance traveled since diagnostic trouble codes were cleared.",
+            subsystem: "diagnostics",
+            unit: "km",
+            provenance: "SAE J1979 Mode 01 PID 31",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0x31, 2),
+        |data| u16::from_be_bytes([data[0], data[1]]) as f64,
+    ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "vehicle.ambient_air_temperature",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0x46],
+            decoder: "A - 40",
+            minimum: -40.0,
+            maximum: 215.0,
+            description: "Ambient air temperature.",
+            subsystem: "environment",
+            unit: "°C",
+            provenance: "SAE J1979 Mode 01 PID 46",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0x46, 1),
+        |data| data[0] as f64 - 40.0,
+    ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "engine.throttle_actuator.commanded",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0x4c],
+            decoder: "A * 100 / 255",
+            minimum: 0.0,
+            maximum: 100.0,
+            description: "Commanded throttle actuator position.",
+            subsystem: "powertrain",
+            unit: "%",
+            provenance: "SAE J1979 Mode 01 PID 4C",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0x4c, 1),
+        |data| data[0] as f64 * 100.0 / 255.0,
+    ),
 ];
 
 impl SignalDefinition {
@@ -374,10 +507,13 @@ pub fn supported_profiles() -> &'static [ProfileMetadata] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{signal, signals};
+    use crate::prepare_read;
 
     #[test]
-    fn added_mode01_signals_decode_normal_and_boundary_values() {
+    fn mode01_scalar_signals_decode_normal_and_boundary_values() {
         for (semantic, normal, normal_value, minimum, minimum_value, maximum, maximum_value) in [
             (
                 "engine.load",
@@ -478,8 +614,71 @@ mod tests {
                 vec![0x41, 0x42, 0xff, 0xff],
                 65.535,
             ),
+            (
+                "engine.throttle_position",
+                vec![0x41, 0x11, 0x80],
+                128.0 * 100.0 / 255.0,
+                vec![0x41, 0x11, 0x00],
+                0.0,
+                vec![0x41, 0x11, 0xff],
+                100.0,
+            ),
+            (
+                "vehicle.distance_with_mil_on",
+                vec![0x41, 0x21, 0x01, 0x02],
+                258.0,
+                vec![0x41, 0x21, 0x00, 0x00],
+                0.0,
+                vec![0x41, 0x21, 0xff, 0xff],
+                65535.0,
+            ),
+            (
+                "engine.fuel_rail_gauge_pressure",
+                vec![0x41, 0x23, 0x01, 0x02],
+                2580.0,
+                vec![0x41, 0x23, 0x00, 0x00],
+                0.0,
+                vec![0x41, 0x23, 0xff, 0xff],
+                655350.0,
+            ),
+            (
+                "vehicle.warmups_since_dtc_clear",
+                vec![0x41, 0x30, 0x2a],
+                42.0,
+                vec![0x41, 0x30, 0x00],
+                0.0,
+                vec![0x41, 0x30, 0xff],
+                255.0,
+            ),
+            (
+                "vehicle.distance_since_dtc_clear",
+                vec![0x41, 0x31, 0x01, 0x02],
+                258.0,
+                vec![0x41, 0x31, 0x00, 0x00],
+                0.0,
+                vec![0x41, 0x31, 0xff, 0xff],
+                65535.0,
+            ),
+            (
+                "vehicle.ambient_air_temperature",
+                vec![0x41, 0x46, 0x80],
+                88.0,
+                vec![0x41, 0x46, 0x00],
+                -40.0,
+                vec![0x41, 0x46, 0xff],
+                215.0,
+            ),
+            (
+                "engine.throttle_actuator.commanded",
+                vec![0x41, 0x4c, 0x80],
+                128.0 * 100.0 / 255.0,
+                vec![0x41, 0x4c, 0x00],
+                0.0,
+                vec![0x41, 0x4c, 0xff],
+                100.0,
+            ),
         ] {
-            let definition = signal(semantic).expect("added signal is catalogued");
+            let definition = signal(semantic).expect("signal is catalogued");
             assert_eq!(
                 definition.decode(&normal).unwrap(),
                 normal_value,
@@ -499,15 +698,24 @@ mod tests {
     }
 
     #[test]
-    fn every_catalog_signal_rejects_truncated_and_wrong_pid_responses() {
+    fn every_catalog_signal_rejects_truncated_wrong_service_and_wrong_pid_responses() {
         for definition in signals() {
             let metadata = definition.metadata();
             let response_len = definition.request.data_len() + 2;
+
             let mut truncated = vec![0x41, metadata.request[1]];
             truncated.resize(response_len.saturating_sub(1), 0);
             assert!(
                 definition.decode(&truncated).is_err(),
                 "truncated response accepted for {}",
+                metadata.semantic
+            );
+
+            let mut wrong_service = vec![0x42, metadata.request[1]];
+            wrong_service.resize(response_len, 0);
+            assert!(
+                definition.decode(&wrong_service).is_err(),
+                "wrong service accepted for {}",
                 metadata.semantic
             );
 
@@ -522,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_semantics_have_the_expected_units() {
+    fn catalog_semantics_have_expected_units_and_unique_read_only_requests() {
         let expected = [
             ("engine.rpm", "rpm"),
             ("engine.coolant_temperature", "°C"),
@@ -539,9 +747,17 @@ mod tests {
             ("engine.relative_throttle", "%"),
             ("engine.barometric_pressure", "kPa"),
             ("engine.control_module_voltage", "V"),
+            ("engine.throttle_position", "%"),
+            ("vehicle.distance_with_mil_on", "km"),
+            ("engine.fuel_rail_gauge_pressure", "kPa"),
+            ("vehicle.warmups_since_dtc_clear", "count"),
+            ("vehicle.distance_since_dtc_clear", "km"),
+            ("vehicle.ambient_air_temperature", "°C"),
+            ("engine.throttle_actuator.commanded", "%"),
         ];
 
         assert_eq!(signals().len(), expected.len());
+        let mut semantics = BTreeSet::new();
         for definition in signals() {
             let metadata = definition.metadata();
             let (_, unit) = expected
@@ -549,6 +765,43 @@ mod tests {
                 .find(|(semantic, _)| *semantic == metadata.semantic)
                 .unwrap_or_else(|| panic!("unexpected catalog semantic: {}", metadata.semantic));
             assert_eq!(metadata.unit, *unit, "{}", metadata.semantic);
+            assert!(semantics.insert(metadata.semantic), "duplicate semantic");
+            assert_eq!(metadata.request[0], 0x01, "{}", metadata.semantic);
+            assert_eq!(metadata.protocol, "OBD-II Mode 01", "{}", metadata.semantic);
+        }
+    }
+
+    #[test]
+    fn issue_49_signals_have_expected_requests_and_provenance() {
+        for (semantic, pid) in [
+            ("engine.throttle_position", 0x11),
+            ("vehicle.distance_with_mil_on", 0x21),
+            ("engine.fuel_rail_gauge_pressure", 0x23),
+            ("vehicle.warmups_since_dtc_clear", 0x30),
+            ("vehicle.distance_since_dtc_clear", 0x31),
+            ("vehicle.ambient_air_temperature", 0x46),
+            ("engine.throttle_actuator.commanded", 0x4c),
+        ] {
+            let definition = signal(semantic).expect("issue #49 signal is catalogued");
+            let metadata = definition.metadata();
+            assert_eq!(metadata.request, [0x01, pid]);
+            assert_eq!(prepare_read(semantic).unwrap().bytes(), [0x01, pid]);
+            assert_eq!(metadata.profile, "obd2-v1");
+            assert_eq!(metadata.confidence, "standards-derived/offline-tested");
+            assert_eq!(metadata.hardware_validation, "rust-hardware-pending");
+            assert_eq!(
+                metadata.provenance,
+                match pid {
+                    0x11 => "SAE J1979 Mode 01 PID 11",
+                    0x21 => "SAE J1979 Mode 01 PID 21",
+                    0x23 => "SAE J1979 Mode 01 PID 23",
+                    0x30 => "SAE J1979 Mode 01 PID 30",
+                    0x31 => "SAE J1979 Mode 01 PID 31",
+                    0x46 => "SAE J1979 Mode 01 PID 46",
+                    0x4c => "SAE J1979 Mode 01 PID 4C",
+                    _ => unreachable!(),
+                }
+            );
         }
     }
 }
