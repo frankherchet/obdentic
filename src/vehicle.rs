@@ -347,7 +347,7 @@ const SIGNALS: [SignalDefinition; 22] = [
             unit: "%",
             provenance: "SAE J1979 Mode 01 PID 11",
             confidence: "standards-derived/offline-tested",
-            hardware_validation: "rust-hardware-pending",
+            hardware_validation: "rust-hardware-observed",
         },
         Mode01::new(0x11, 1),
         |data| data[0] as f64 * 100.0 / 255.0,
@@ -366,7 +366,7 @@ const SIGNALS: [SignalDefinition; 22] = [
             unit: "km",
             provenance: "SAE J1979 Mode 01 PID 21",
             confidence: "standards-derived/offline-tested",
-            hardware_validation: "rust-hardware-pending",
+            hardware_validation: "rust-hardware-observed",
         },
         Mode01::new(0x21, 2),
         |data| u16::from_be_bytes([data[0], data[1]]) as f64,
@@ -385,7 +385,7 @@ const SIGNALS: [SignalDefinition; 22] = [
             unit: "kPa",
             provenance: "SAE J1979 Mode 01 PID 23",
             confidence: "standards-derived/offline-tested",
-            hardware_validation: "rust-hardware-pending",
+            hardware_validation: "rust-hardware-observed",
         },
         Mode01::new(0x23, 2),
         |data| u16::from_be_bytes([data[0], data[1]]) as f64 * 10.0,
@@ -404,7 +404,7 @@ const SIGNALS: [SignalDefinition; 22] = [
             unit: "count",
             provenance: "SAE J1979 Mode 01 PID 30",
             confidence: "standards-derived/offline-tested",
-            hardware_validation: "rust-hardware-pending",
+            hardware_validation: "rust-hardware-observed",
         },
         Mode01::new(0x30, 1),
         |data| data[0] as f64,
@@ -423,7 +423,7 @@ const SIGNALS: [SignalDefinition; 22] = [
             unit: "km",
             provenance: "SAE J1979 Mode 01 PID 31",
             confidence: "standards-derived/offline-tested",
-            hardware_validation: "rust-hardware-pending",
+            hardware_validation: "rust-hardware-observed",
         },
         Mode01::new(0x31, 2),
         |data| u16::from_be_bytes([data[0], data[1]]) as f64,
@@ -442,7 +442,7 @@ const SIGNALS: [SignalDefinition; 22] = [
             unit: "°C",
             provenance: "SAE J1979 Mode 01 PID 46",
             confidence: "standards-derived/offline-tested",
-            hardware_validation: "rust-hardware-pending",
+            hardware_validation: "rust-hardware-observed",
         },
         Mode01::new(0x46, 1),
         |data| data[0] as f64 - 40.0,
@@ -461,7 +461,7 @@ const SIGNALS: [SignalDefinition; 22] = [
             unit: "%",
             provenance: "SAE J1979 Mode 01 PID 4C",
             confidence: "standards-derived/offline-tested",
-            hardware_validation: "rust-hardware-pending",
+            hardware_validation: "rust-hardware-observed",
         },
         Mode01::new(0x4c, 1),
         |data| data[0] as f64 * 100.0 / 255.0,
@@ -788,7 +788,7 @@ mod tests {
             assert_eq!(prepare_read(semantic).unwrap().bytes(), [0x01, pid]);
             assert_eq!(metadata.profile, "obd2-v1");
             assert_eq!(metadata.confidence, "standards-derived/offline-tested");
-            assert_eq!(metadata.hardware_validation, "rust-hardware-pending");
+            assert_eq!(metadata.hardware_validation, "rust-hardware-observed");
             assert_eq!(
                 metadata.provenance,
                 match pid {

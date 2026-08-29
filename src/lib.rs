@@ -444,6 +444,15 @@ mod tests {
 
     #[test]
     fn supported_signal_metadata_matches_the_closed_request_vocabulary() {
+        let hardware_observed = [
+            "engine.throttle_position",
+            "vehicle.distance_with_mil_on",
+            "engine.fuel_rail_gauge_pressure",
+            "vehicle.warmups_since_dtc_clear",
+            "vehicle.distance_since_dtc_clear",
+            "vehicle.ambient_air_temperature",
+            "engine.throttle_actuator.commanded",
+        ];
         let expected = [
             (
                 "engine.rpm",
@@ -627,7 +636,14 @@ mod tests {
             assert!(metadata.description.ends_with('.'));
             assert!(metadata.provenance.starts_with("SAE J1979"));
             assert_eq!(metadata.confidence, "standards-derived/offline-tested");
-            assert_eq!(metadata.hardware_validation, "rust-hardware-pending");
+            assert_eq!(
+                metadata.hardware_validation,
+                if hardware_observed.contains(&semantic) {
+                    "rust-hardware-observed"
+                } else {
+                    "rust-hardware-pending"
+                }
+            );
         }
     }
 
