@@ -7,6 +7,8 @@
 
 use std::{fmt, str::FromStr};
 
+use crate::ea189::Ea189DpfProbe;
+
 /// Version of the stable job vocabulary and its deterministic plan shape.
 pub const JOB_MODEL_VERSION: u16 = 1;
 
@@ -15,14 +17,18 @@ pub const JOB_MODEL_VERSION: u16 = 1;
 pub enum JobId {
     /// Read the bounded set of DTC information represented by this job.
     DtcScan,
+    /// Read the closed, candidate-only EA189 DPF probe set.
+    Ea189DpfProbe,
 }
 
 impl JobId {
     pub const DTC_SCAN: Self = Self::DtcScan;
+    pub const EA189_DPF_PROBE: Self = Self::Ea189DpfProbe;
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::DtcScan => "dtc.scan",
+            Self::Ea189DpfProbe => "ea189.dpf.probe",
         }
     }
 
@@ -33,6 +39,7 @@ impl JobId {
     pub fn parse(value: &str) -> Result<Self, JobError> {
         match value {
             "dtc.scan" => Ok(Self::DtcScan),
+            "ea189.dpf.probe" => Ok(Self::Ea189DpfProbe),
             value => Err(JobError::UnknownJobId(value.into())),
         }
     }
@@ -64,12 +71,14 @@ impl TryFrom<&str> for JobId {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum JobKind {
     DtcScan,
+    Ea189DpfProbe,
 }
 
 impl JobKind {
     pub const fn job_id(self) -> JobId {
         match self {
             Self::DtcScan => JobId::DtcScan,
+            Self::Ea189DpfProbe => JobId::Ea189DpfProbe,
         }
     }
 
@@ -102,6 +111,7 @@ impl From<JobId> for JobKind {
     fn from(id: JobId) -> Self {
         match id {
             JobId::DtcScan => Self::DtcScan,
+            JobId::Ea189DpfProbe => Self::Ea189DpfProbe,
         }
     }
 }
@@ -268,12 +278,36 @@ impl DiagnosticJob {
         }
     }
 
+    pub fn try_new(kind: JobKind, scope: DiagnosticScope) -> Result<Self, JobError> {
+        if matches!(kind, JobKind::Ea189DpfProbe)
+            && !matches!(
+                &scope,
+                DiagnosticScope::KnownEcu {
+                    role: EcuRole::Engine,
+                    ..
+                }
+            )
+        {
+            return Err(JobError::RequiresKnownEngineEcu);
+        }
+        Ok(Self::new(kind, scope))
+    }
+
     pub fn from_id(id: &str, scope: DiagnosticScope) -> Result<Self, JobError> {
-        Ok(Self::new(JobId::parse(id)?.into(), scope))
+        Self::try_new(JobId::parse(id)?.into(), scope)
     }
 
     pub fn dtc_scan(scope: DiagnosticScope) -> Self {
         Self::new(JobKind::DtcScan, scope)
+    }
+
+    /// Build the bounded EA189 DPF probe against one already-known engine
+    /// ECU. The constructor cannot create a vehicle-wide or functional scan.
+    pub fn ea189_dpf_probe(target: KnownTarget) -> Self {
+        Self::new(
+            JobKind::Ea189DpfProbe,
+            DiagnosticScope::known_ecu(EcuRole::Engine, target),
+        )
     }
 
     pub const fn id(&self) -> JobId {
@@ -301,6 +335,7 @@ impl DiagnosticJob {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum JobStepKind {
     ReadDtc,
+    ReadEa189Dpf(Ea189DpfProbe),
 }
 
 /// One planned, ordered semantic read.  The sequence is zero-based and is
@@ -313,10 +348,10 @@ pub struct JobStep {
 }
 
 impl JobStep {
-    fn new(sequence: usize, target: JobTarget) -> Self {
+    fn new(sequence: usize, kind: JobStepKind, target: JobTarget) -> Self {
         Self {
             sequence,
-            kind: JobStepKind::ReadDtc,
+            kind,
             target,
         }
     }
@@ -327,6 +362,13 @@ impl JobStep {
 
     pub const fn kind(&self) -> JobStepKind {
         self.kind
+    }
+
+    pub const fn dpf_probe(&self) -> Option<Ea189DpfProbe> {
+        match self.kind {
+            JobStepKind::ReadEa189Dpf(probe) => Some(probe),
+            JobStepKind::ReadDtc => None,
+        }
     }
 
     pub fn target(&self) -> &JobTarget {
@@ -347,13 +389,35 @@ pub struct JobPlan {
 
 impl JobPlan {
     pub fn for_job(job: &DiagnosticJob) -> Self {
-        let steps = job
-            .scope
-            .targets()
-            .into_iter()
-            .enumerate()
-            .map(|(sequence, target)| JobStep::new(sequence, target))
-            .collect();
+        let steps = match job.kind {
+            JobKind::DtcScan => job
+                .scope
+                .targets()
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, target)| JobStep::new(sequence, JobStepKind::ReadDtc, target))
+                .collect(),
+            JobKind::Ea189DpfProbe => match &job.scope {
+                DiagnosticScope::KnownEcu {
+                    role: EcuRole::Engine,
+                    target,
+                } => Ea189DpfProbe::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(sequence, probe)| {
+                        JobStep::new(
+                            sequence,
+                            JobStepKind::ReadEa189Dpf(probe),
+                            JobTarget::KnownEcu {
+                                role: EcuRole::Engine,
+                                target: target.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+        };
         Self {
             model_version: JOB_MODEL_VERSION,
             id: job.id,
@@ -709,6 +773,7 @@ impl JobStepResult {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum JobError {
     UnknownJobId(String),
+    RequiresKnownEngineEcu,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -738,6 +803,9 @@ impl fmt::Display for JobError {
         match self {
             Self::UnknownJobId(value) => {
                 write!(formatter, "unsupported diagnostic job id: {value}")
+            }
+            Self::RequiresKnownEngineEcu => {
+                formatter.write_str("EA189 DPF probe requires a known engine ECU scope")
             }
         }
     }
@@ -807,9 +875,38 @@ mod tests {
     fn only_supported_job_id_has_stable_serialization() {
         assert_eq!(JobId::DtcScan.to_string(), "dtc.scan");
         assert_eq!(JobId::parse("dtc.scan"), Ok(JobId::DtcScan));
+        assert_eq!(JobId::Ea189DpfProbe.to_string(), "ea189.dpf.probe");
+        assert_eq!(JobId::parse("ea189.dpf.probe"), Ok(JobId::Ea189DpfProbe));
         assert_eq!(
             JobId::parse("dtc.clear"),
             Err(JobError::UnknownJobId("dtc.clear".into()))
+        );
+    }
+
+    #[test]
+    fn ea189_dpf_probe_plan_is_bounded_to_the_known_engine() {
+        let target = KnownTarget::new("validated-engine").unwrap();
+        let plan = DiagnosticJob::ea189_dpf_probe(target).plan();
+        assert_eq!(plan.id(), JobId::Ea189DpfProbe);
+        assert_eq!(plan.steps().len(), 7);
+        for (sequence, step) in plan.steps().iter().enumerate() {
+            assert_eq!(step.sequence(), sequence);
+            assert!(matches!(step.kind(), JobStepKind::ReadEa189Dpf(_)));
+            assert!(matches!(
+                step.target(),
+                JobTarget::KnownEcu {
+                    role: EcuRole::Engine,
+                    target: KnownTarget(value),
+                } if value == "validated-engine"
+            ));
+        }
+    }
+
+    #[test]
+    fn ea189_dpf_probe_job_rejects_non_engine_scopes() {
+        assert_eq!(
+            DiagnosticJob::try_new(JobKind::Ea189DpfProbe, DiagnosticScope::vehicle_wide(),),
+            Err(JobError::RequiresKnownEngineEcu)
         );
     }
 

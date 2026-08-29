@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    diagnostic_job::{DiagnosticScope, EcuRole as JobEcuRole, KnownTarget},
     topology::{AddressingContext, Confidence, EcuRole, Protocol, Provenance},
     vehicle_knowledge::EcuTargetMapping,
     ReadRequest,
@@ -18,6 +19,184 @@ pub const PROFILE_ID: &str = "vw-ea189-v1";
 /// Human-readable platform identity.  This is intentionally not a VIN or a
 /// vehicle-specific identity.
 pub const PLATFORM: &str = "VW EA189";
+
+/// One candidate UDS ReadDataByIdentifier definition admitted by the closed
+/// Gate-A DPF probe.  The definition intentionally contains no interpretation
+/// of the returned payload.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Ea189DpfDid {
+    semantic: &'static str,
+    id: u16,
+    request_bytes: [u8; 3],
+}
+
+impl Ea189DpfDid {
+    pub const fn semantic(self) -> &'static str {
+        self.semantic
+    }
+
+    pub const fn id(self) -> u16 {
+        self.id
+    }
+
+    pub const fn request_bytes(self) -> [u8; 3] {
+        self.request_bytes
+    }
+}
+
+const DPF_SOOT_MASS_MEASURED: Ea189DpfDid = Ea189DpfDid {
+    semantic: "dpf.soot_mass_measured",
+    id: 0x114e,
+    request_bytes: [0x22, 0x11, 0x4e],
+};
+const DPF_SOOT_MASS_CALCULATED: Ea189DpfDid = Ea189DpfDid {
+    semantic: "dpf.soot_mass_calculated",
+    id: 0x114f,
+    request_bytes: [0x22, 0x11, 0x4f],
+};
+const DPF_DISTANCE_SINCE_REGENERATION: Ea189DpfDid = Ea189DpfDid {
+    semantic: "dpf.distance_since_regeneration",
+    id: 0x1156,
+    request_bytes: [0x22, 0x11, 0x56],
+};
+const DPF_TIME_SINCE_REGENERATION: Ea189DpfDid = Ea189DpfDid {
+    semantic: "dpf.time_since_regeneration",
+    id: 0x115e,
+    request_bytes: [0x22, 0x11, 0x5e],
+};
+const DPF_PRE_TEMPERATURE: Ea189DpfDid = Ea189DpfDid {
+    semantic: "exhaust.temperature.pre_dpf",
+    id: 0x11b2,
+    request_bytes: [0x22, 0x11, 0xb2],
+};
+const DPF_POST_TEMPERATURE: Ea189DpfDid = Ea189DpfDid {
+    semantic: "exhaust.temperature.post_dpf",
+    id: 0x10f9,
+    request_bytes: [0x22, 0x10, 0xf9],
+};
+const DPF_DIFFERENTIAL_PRESSURE: Ea189DpfDid = Ea189DpfDid {
+    semantic: "dpf.differential_pressure",
+    id: 0x14f5,
+    request_bytes: [0x22, 0x14, 0xf5],
+};
+
+/// Exactly the seven bounded EA189 DPF candidates admitted for Gate A.
+pub const EA189_DPF_DIDS: [Ea189DpfDid; 7] = [
+    DPF_SOOT_MASS_CALCULATED,
+    DPF_SOOT_MASS_MEASURED,
+    DPF_DISTANCE_SINCE_REGENERATION,
+    DPF_TIME_SINCE_REGENERATION,
+    DPF_PRE_TEMPERATURE,
+    DPF_POST_TEMPERATURE,
+    DPF_DIFFERENTIAL_PRESSURE,
+];
+
+/// A closed selection from the Gate-A DPF candidate set.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Ea189DpfProbe {
+    SootMassMeasured,
+    SootMassCalculated,
+    DistanceSinceRegeneration,
+    TimeSinceRegeneration,
+    PreDpfTemperature,
+    PostDpfTemperature,
+    DifferentialPressure,
+}
+
+impl Ea189DpfProbe {
+    pub const ALL: [Self; 7] = [
+        Self::SootMassCalculated,
+        Self::SootMassMeasured,
+        Self::DistanceSinceRegeneration,
+        Self::TimeSinceRegeneration,
+        Self::PreDpfTemperature,
+        Self::PostDpfTemperature,
+        Self::DifferentialPressure,
+    ];
+
+    pub const fn definition(self) -> Ea189DpfDid {
+        match self {
+            Self::SootMassMeasured => DPF_SOOT_MASS_MEASURED,
+            Self::SootMassCalculated => DPF_SOOT_MASS_CALCULATED,
+            Self::DistanceSinceRegeneration => DPF_DISTANCE_SINCE_REGENERATION,
+            Self::TimeSinceRegeneration => DPF_TIME_SINCE_REGENERATION,
+            Self::PreDpfTemperature => DPF_PRE_TEMPERATURE,
+            Self::PostDpfTemperature => DPF_POST_TEMPERATURE,
+            Self::DifferentialPressure => DPF_DIFFERENTIAL_PRESSURE,
+        }
+    }
+
+    pub const fn semantic(self) -> &'static str {
+        self.definition().semantic()
+    }
+
+    pub const fn id(self) -> u16 {
+        self.definition().id()
+    }
+
+    pub const fn request_bytes(self) -> [u8; 3] {
+        self.definition().request_bytes()
+    }
+}
+
+/// Target-bound DPF probe input. Construction only accepts an engine
+/// `KnownEcu` scope, so a candidate cannot be detached into a vehicle-wide or
+/// functional operation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Ea189DpfProbeRequest {
+    probe: Ea189DpfProbe,
+    scope: DiagnosticScope,
+}
+
+impl Ea189DpfProbeRequest {
+    pub fn for_engine(probe: Ea189DpfProbe, target: KnownTarget) -> Self {
+        Self {
+            probe,
+            scope: DiagnosticScope::known_ecu(JobEcuRole::Engine, target),
+        }
+    }
+
+    pub fn from_scope(
+        probe: Ea189DpfProbe,
+        scope: DiagnosticScope,
+    ) -> Result<Self, Ea189DpfProbeError> {
+        match &scope {
+            DiagnosticScope::KnownEcu {
+                role: JobEcuRole::Engine,
+                ..
+            } => Ok(Self { probe, scope }),
+            _ => Err(Ea189DpfProbeError::RequiresEngineKnownEcu),
+        }
+    }
+
+    pub const fn probe(&self) -> Ea189DpfProbe {
+        self.probe
+    }
+
+    pub fn scope(&self) -> &DiagnosticScope {
+        &self.scope
+    }
+
+    pub fn target(&self) -> &KnownTarget {
+        match &self.scope {
+            DiagnosticScope::KnownEcu { target, .. } => target,
+            _ => unreachable!("EA189 DPF probe scope is engine KnownEcu"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Ea189DpfProbeError {
+    RequiresEngineKnownEcu,
+}
+
+impl std::fmt::Display for Ea189DpfProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EA189 DPF probe requires a known engine ECU target")
+    }
+}
+
+impl std::error::Error for Ea189DpfProbeError {}
 
 /// Identity of the platform knowledge, independent of any one vehicle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +464,56 @@ mod tests {
         assert_ne!(profile.identity().id(), "obd2-v1");
         assert!(profile.signals().next().is_none());
         assert!(!format!("{profile:?}").contains("VIN"));
+    }
+
+    #[test]
+    fn gate_a_dpf_probe_is_exactly_seven_candidate_reads() {
+        let expected = [
+            ("dpf.soot_mass_calculated", 0x114f, [0x22, 0x11, 0x4f]),
+            ("dpf.soot_mass_measured", 0x114e, [0x22, 0x11, 0x4e]),
+            (
+                "dpf.distance_since_regeneration",
+                0x1156,
+                [0x22, 0x11, 0x56],
+            ),
+            ("dpf.time_since_regeneration", 0x115e, [0x22, 0x11, 0x5e]),
+            ("exhaust.temperature.pre_dpf", 0x11b2, [0x22, 0x11, 0xb2]),
+            ("exhaust.temperature.post_dpf", 0x10f9, [0x22, 0x10, 0xf9]),
+            ("dpf.differential_pressure", 0x14f5, [0x22, 0x14, 0xf5]),
+        ];
+        assert_eq!(EA189_DPF_DIDS.len(), expected.len());
+        assert_eq!(Ea189DpfProbe::ALL.len(), expected.len());
+        for ((definition, probe), expected) in
+            EA189_DPF_DIDS.iter().zip(Ea189DpfProbe::ALL).zip(expected)
+        {
+            assert_eq!(
+                (
+                    definition.semantic(),
+                    definition.id(),
+                    definition.request_bytes()
+                ),
+                expected
+            );
+            assert_eq!(probe.definition(), *definition);
+        }
+    }
+
+    #[test]
+    fn dpf_probe_request_requires_an_engine_known_ecu() {
+        let target = KnownTarget::new("validated-engine").unwrap();
+        let request =
+            Ea189DpfProbeRequest::for_engine(Ea189DpfProbe::SootMassMeasured, target.clone());
+        assert_eq!(request.target().as_str(), "validated-engine");
+        assert!(Ea189DpfProbeRequest::from_scope(
+            Ea189DpfProbe::SootMassMeasured,
+            DiagnosticScope::vehicle_wide(),
+        )
+        .is_err());
+        assert!(Ea189DpfProbeRequest::from_scope(
+            Ea189DpfProbe::SootMassMeasured,
+            DiagnosticScope::known_ecu(JobEcuRole::Unknown, target,),
+        )
+        .is_err());
     }
 
     #[test]
