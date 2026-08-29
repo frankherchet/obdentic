@@ -34,6 +34,7 @@ struct Summary {
     lifecycle: u64,
     first_offset_us: Option<CaptureTimeUs>,
     last_offset_us: Option<CaptureTimeUs>,
+    session_stopped_us: Option<CaptureTimeUs>,
     profile: Option<String>,
     wallclock_ms: Option<u64>,
     session_errors: Vec<String>,
@@ -105,6 +106,7 @@ fn summary(capture: &ParsedCapture) -> Summary {
             }
             CaptureEvent::SessionStopped { offset_us } => {
                 summary.lifecycle += 1;
+                summary.session_stopped_us = Some(*offset_us);
                 observe_offset(&mut summary, *offset_us);
             }
             CaptureEvent::SessionError { error } => {
@@ -236,7 +238,7 @@ pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
         status(capture.status),
         summary.profile.as_deref().unwrap_or("unavailable"),
         summary.wallclock_ms.map_or_else(|| "unavailable".into(), |value| value.to_string()),
-        duration(summary.first_offset_us, summary.last_offset_us),
+        duration(&summary),
         summary.events,
         summary.successes,
         summary.failures,
@@ -305,10 +307,7 @@ pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
 
 pub fn render_capability(path: &str, capture: &ParsedCapture) -> String {
     let summary = summary(capture);
-    let duration_us = summary
-        .last_offset_us
-        .zip(summary.first_offset_us)
-        .map(|(last, first)| last - first);
+    let duration_us = capture_duration(&summary);
     let success_rate = rate(summary.successes, duration_us);
     let attempted = summary.successes + summary.failures;
     let attempted_rate = rate(attempted, duration_us);
@@ -325,7 +324,7 @@ pub fn render_capability(path: &str, capture: &ParsedCapture) -> String {
     let mut output = format!(
         "Capture: {path}\nStatus: {}\nDuration: {}\n\nOverall\n  successful reads: {}\n  failed reads: {} ({})\n  observed successful throughput: {} reads/s\n  observed attempted throughput: {} reads/s\n  read latency p50/p95/max: {}\n  scheduler lateness p50/p95/max: {}\n  skipped slots: {} across {} events\n  diagnostic jobs: {} started, {} completed, {} failed, {} cancelled\n  diagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\n  session errors: {}\n\nSignals\n",
         status(capture.status),
-        duration(summary.first_offset_us, summary.last_offset_us),
+        duration(&summary),
         summary.successes,
         summary.failures,
         percentage(summary.failures, attempted),
@@ -386,11 +385,17 @@ fn offset(value: Option<CaptureTimeUs>) -> String {
     value.map_or_else(|| "unavailable".into(), format_us)
 }
 
-fn duration(first: Option<CaptureTimeUs>, last: Option<CaptureTimeUs>) -> String {
-    first.zip(last).map_or_else(
-        || "unavailable".into(),
-        |(first, last)| format_us(last - first),
-    )
+fn capture_duration(summary: &Summary) -> Option<CaptureTimeUs> {
+    summary.session_stopped_us.or_else(|| {
+        summary
+            .first_offset_us
+            .zip(summary.last_offset_us)
+            .map(|(first, last)| last - first)
+    })
+}
+
+fn duration(summary: &Summary) -> String {
+    capture_duration(summary).map_or_else(|| "unavailable".into(), format_us)
 }
 
 fn format_interval(value: CaptureTimeUs) -> String {
@@ -400,6 +405,8 @@ fn format_interval(value: CaptureTimeUs) -> String {
 fn format_us(value: CaptureTimeUs) -> String {
     if value.is_multiple_of(1_000_000) {
         format!("{} s", value / 1_000_000)
+    } else if value >= 1_000_000 {
+        format!("{:.3} s", value as f64 / 1_000_000.0)
     } else if value.is_multiple_of(1_000) {
         format!("{} ms", value / 1_000)
     } else {
@@ -635,6 +642,40 @@ mod tests {
         );
         assert!(rendered.contains("Diagnostic jobs: 1 started, 1 completed, 0 failed, 0 cancelled"));
         assert!(rendered.contains("Diagnostic steps: 1 success, 0 recoverable, 1 fatal, 0 skipped"));
+    }
+
+    #[test]
+    fn inspection_uses_session_stop_for_job_only_capture_duration() {
+        let rendered = render_inspection(
+            "job.jsonl",
+            &capture(vec![
+                CaptureEvent::capture_started(Some(1), Some("ea189.dpf.probe".into())),
+                CaptureEvent::DiagnosticJobStarted {
+                    job_id: "ea189.dpf.probe".into(),
+                    model_version: 1,
+                    step_count: 1,
+                },
+                CaptureEvent::DiagnosticJobCompleted {
+                    job_id: "ea189.dpf.probe".into(),
+                    status: JobStatus::Completed,
+                },
+                CaptureEvent::SessionStopped {
+                    offset_us: 12_000_000,
+                },
+            ]),
+        );
+        assert!(rendered.contains("Duration: 12 s"));
+    }
+
+    #[test]
+    fn inspection_formats_fractional_job_duration_in_seconds() {
+        let rendered = render_inspection(
+            "job.jsonl",
+            &capture(vec![CaptureEvent::SessionStopped {
+                offset_us: 12_345_678,
+            }]),
+        );
+        assert!(rendered.contains("Duration: 12.346 s"));
     }
 
     #[test]
