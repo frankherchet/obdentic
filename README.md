@@ -43,15 +43,17 @@ Responder identity and non-selected evidence are preserved. OBDentic must never 
 
 OBDentic keeps three concerns deliberately separate:
 
-1. **Protocol knowledge** — BLE, ELM327-style adapters, CAN, ISO-TP, OBD-II, UDS and later manufacturer-specific transports.
+1. **Protocol knowledge** — BLE, ELM327-compatible command dialects, CAN, ISO-TP, OBD-II, UDS and later manufacturer-specific transports.
 2. **Vehicle knowledge** — ECU identity, addressing, supported PIDs/DIDs, typed layouts, scaling, units and provenance.
 3. **Diagnostic knowledge** — correlation of facts into explanations, hypotheses and recommended next reads. This is where local agentic reasoning belongs.
+
+Physical adapter identity and command dialect are also kept separate. For example, the current Carly CUA-V200 is a Carly-specific multi-bus hardware platform that exposes an ELM327-compatible ASCII command surface; it is not modeled as ELM327 hardware.
 
 The vehicle profile translates bytes into facts. The diagnostic layer translates facts into understanding.
 
 ## Current architecture
 
-The first production path is Rust on macOS with a BLE ELM327-style adapter. One session actor owns the physical adapter and serializes all commands; schedulers, the TUI and future MCP consumers share semantic state rather than opening competing connections.
+The first production path is Rust on macOS with the Carly CUA-V200 over BLE. The Carly backend currently uses the adapter's ELM327-compatible command dialect, but adapter-specific BLE/GATT identity, capabilities and quirks are conceptually separate from reusable ELM command handling. One session actor owns the physical adapter and serializes all commands; schedulers, the TUI and future MCP consumers share semantic state rather than opening competing connections.
 
 The runtime model is explicit and deterministic. Lifecycle phase and current activity are separate so observation, bounded reads and diagnostic jobs do not create accidental state combinations.
 
@@ -78,8 +80,8 @@ A pure reducer applies typed events, while effects such as BLE I/O and persisten
 
 The repository already contains the main building blocks of the generic read-only path:
 
-- CoreBluetooth discovery and BLE communication with the current Carly/ELM-compatible adapter
-- bounded ELM initialization and protocol negotiation
+- CoreBluetooth discovery and BLE communication with the current Carly CUA-V200 adapter
+- bounded ELM-compatible initialization and protocol negotiation
 - generic OBD-II Mode 01 support discovery and a typed scalar signal catalog
 - vehicle identity, topology evidence, cache validation and targeted routing
 - deterministic multi-responder handling without plausibility-based selection
@@ -170,7 +172,7 @@ Captures are intended to remain local. They preserve enough transport and respon
 
 VIN is used as a local vehicle-identity anchor where necessary, but it is not intended as a normal capture/log field. Raw Bluetooth captures, authentication material and other sensitive vehicle-specific evidence should remain local and untracked.
 
-Adapter-specific findings for the current Carly CUA-V200 are documented in [`docs/carly-cua-v200.md`](docs/carly-cua-v200.md). Research notes live under [`docs/research/`](docs/research/).
+Adapter-specific findings for the current Carly CUA-V200, including its hardware architecture, BLE/GATT interface, ELM-compatible dialect and source references, are documented in [`docs/carly-cua-v200.md`](docs/carly-cua-v200.md). Research notes live under [`docs/research/`](docs/research/).
 
 ## Roadmap
 
@@ -210,7 +212,7 @@ It should **not** receive a raw CAN console.
 
 ### 6. Generalize across vehicles and adapters
 
-Grow the protocol and vehicle-knowledge layers independently: more ELM-compatible adapters, additional manufacturer profiles, more ECU roles and eventually other safe transport backends. Vehicle-specific knowledge remains versioned and provenance-aware so support can grow without weakening the generic safety model.
+Grow the protocol and vehicle-knowledge layers independently: more ELM-compatible adapters, additional manufacturer profiles, more ECU roles and eventually other safe transport backends. Physical adapter backends remain separate from shared command dialects and protocol knowledge, so adapter-specific BLE services, routing hardware and quirks do not leak into generic ELM/OBD behavior. Vehicle-specific knowledge remains versioned and provenance-aware so support can grow without weakening the generic safety model.
 
 ## Why EA189 still matters
 
