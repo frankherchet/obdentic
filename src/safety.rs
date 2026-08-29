@@ -5,7 +5,13 @@
 //! [`Operation`].  Since `Operation` has only read-only variants, a rejected
 //! request cannot be passed to a transport by accident.
 
-use crate::{prepare_read, runtime_state::Activity, ReadRequest};
+use crate::{
+    diagnostic_job::{DiagnosticScope, KnownTarget},
+    ea189::{Ea189DpfProbe, Ea189DpfProbeError, Ea189DpfProbeRequest},
+    prepare_read,
+    runtime_state::Activity,
+    ReadRequest,
+};
 use std::fmt;
 
 /// Standards-based OBD-II DTC read selection.
@@ -63,6 +69,7 @@ pub enum OperationKind {
     Write,
     SignalRead,
     DtcRead,
+    Ea189DpfProbe,
     DtcClear,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -82,10 +89,11 @@ pub enum OperationKind {
 ///
 /// The blocked variants are request vocabulary only.  They can never become
 /// an [`Operation`], and no variant carries caller-provided protocol bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationRequest {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
+    Ea189DpfProbe(Ea189DpfProbeRequest),
     ClearDtcs,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -123,10 +131,22 @@ impl OperationRequest {
         Self::ReadDtcs(kind)
     }
 
-    pub const fn kind(self) -> OperationKind {
+    pub fn ea189_dpf_probe(probe: Ea189DpfProbe, target: KnownTarget) -> Self {
+        Self::Ea189DpfProbe(Ea189DpfProbeRequest::for_engine(probe, target))
+    }
+
+    pub fn ea189_dpf_probe_for_scope(
+        probe: Ea189DpfProbe,
+        scope: DiagnosticScope,
+    ) -> Result<Self, Ea189DpfProbeError> {
+        Ea189DpfProbeRequest::from_scope(probe, scope).map(Self::Ea189DpfProbe)
+    }
+
+    pub const fn kind(&self) -> OperationKind {
         match self {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
+            Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
             Self::ClearDtcs => OperationKind::DtcClear,
             Self::SecurityAccess => OperationKind::SecurityAccess,
             Self::DiagnosticSessionControl => OperationKind::DiagnosticSessionControl,
@@ -145,17 +165,19 @@ impl OperationRequest {
 }
 
 /// The only operations that can leave the safety layer for transport.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
+    Ea189DpfProbe(Ea189DpfProbeRequest),
 }
 
 impl Operation {
-    pub const fn kind(self) -> OperationKind {
+    pub const fn kind(&self) -> OperationKind {
         match self {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
+            Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
         }
     }
 
@@ -169,6 +191,10 @@ impl Operation {
 
     pub const fn dtc(kind: DtcReadKind) -> Self {
         Self::ReadDtcs(kind)
+    }
+
+    pub fn ea189_dpf_probe(request: Ea189DpfProbeRequest) -> Self {
+        Self::Ea189DpfProbe(request)
     }
 }
 
@@ -194,7 +220,7 @@ impl Capability {
         match self {
             Self::ReadOnly => matches!(
                 operation,
-                OperationKind::SignalRead | OperationKind::DtcRead
+                OperationKind::SignalRead | OperationKind::DtcRead | OperationKind::Ea189DpfProbe
             ),
         }
     }
@@ -267,10 +293,13 @@ impl SafetyPolicy {
     }
 
     /// Authorize a concrete request independently of runtime activity.
-    pub const fn authorize(self, request: OperationRequest) -> Result<Operation, SafetyError> {
+    pub fn authorize(self, request: OperationRequest) -> Result<Operation, SafetyError> {
         match request {
             OperationRequest::ReadSignal(signal) => self.authorize_read(signal),
             OperationRequest::ReadDtcs(kind) => self.authorize_operation(Operation::ReadDtcs(kind)),
+            OperationRequest::Ea189DpfProbe(probe) => {
+                self.authorize_operation(Operation::Ea189DpfProbe(probe))
+            }
             OperationRequest::ClearDtcs => {
                 Err(SafetyError::OperationBlocked(OperationKind::DtcClear))
             }
@@ -332,7 +361,10 @@ impl SafetyPolicy {
                 matches!(operation, OperationKind::SignalRead)
             }
             Activity::Diagnose => {
-                matches!(operation, OperationKind::DtcRead)
+                matches!(
+                    operation,
+                    OperationKind::DtcRead | OperationKind::Ea189DpfProbe
+                )
             }
             Activity::Idle | Activity::Write => false,
         };
@@ -345,11 +377,11 @@ impl SafetyPolicy {
         Ok(executable)
     }
 
-    const fn authorize_read(self, request: ReadRequest) -> Result<Operation, SafetyError> {
+    fn authorize_read(self, request: ReadRequest) -> Result<Operation, SafetyError> {
         self.authorize_operation(Operation::signal(request))
     }
 
-    const fn authorize_operation(self, operation: Operation) -> Result<Operation, SafetyError> {
+    fn authorize_operation(self, operation: Operation) -> Result<Operation, SafetyError> {
         if self.capability.supports(operation.kind()) {
             Ok(operation)
         } else {
@@ -398,6 +430,39 @@ mod tests {
             ),
             Ok(Operation::ReadDtcs(DtcReadKind::Stored))
         );
+    }
+
+    #[test]
+    fn ea189_dpf_probe_is_read_only_and_engine_targeted() {
+        let target = crate::diagnostic_job::KnownTarget::new("validated-engine").unwrap();
+        let request = OperationRequest::ea189_dpf_probe(Ea189DpfProbe::SootMassMeasured, target);
+        assert_eq!(request.kind(), OperationKind::Ea189DpfProbe);
+        let operation = SafetyPolicy::default()
+            .authorize_activity(Activity::Diagnose, request)
+            .unwrap();
+        assert!(matches!(
+            operation,
+            Operation::Ea189DpfProbe(ref request)
+                if request.probe() == Ea189DpfProbe::SootMassMeasured
+                    && matches!(
+                        request.scope(),
+                        DiagnosticScope::KnownEcu {
+                            role: crate::diagnostic_job::EcuRole::Engine,
+                            ..
+                        }
+                    )
+        ));
+    }
+
+    #[test]
+    fn generic_signal_path_cannot_construct_an_ea189_dpf_did() {
+        assert!(OperationRequest::read_signal("dpf.soot_mass_measured").is_err());
+        let target = crate::diagnostic_job::KnownTarget::new("validated-engine").unwrap();
+        let request =
+            OperationRequest::ea189_dpf_probe(Ea189DpfProbe::DifferentialPressure, target);
+        assert!(SafetyPolicy::default()
+            .authorize_activity(Activity::Read, request)
+            .is_err());
     }
 
     #[test]

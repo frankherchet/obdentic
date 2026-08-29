@@ -12,7 +12,7 @@ use obdentic::{
         DtcTransportOutcome, SubscriptionFilterOutcome,
     },
     capture_report, capture_tui,
-    diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus},
+    diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus, KnownTarget},
     dtc, hex, jsonl_capture,
     layout_observation::{self, LayoutFreshnessPolicy},
     prepare_read, record, replay,
@@ -40,7 +40,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -50,6 +50,10 @@ enum Command {
     },
     Scan,
     DiagnoseDtcScan {
+        adapter_id: String,
+        recording: Option<String>,
+    },
+    DiagnoseEa189DpfProbe {
         adapter_id: String,
         recording: Option<String>,
     },
@@ -146,6 +150,18 @@ async fn run() -> Result<(), String> {
                 recording,
             } => {
                 run_diagnose_dtc_scan(
+                    &adapter_id,
+                    recording.as_deref().map(Path::new),
+                    &runtime,
+                    &mut runtime_state,
+                )
+                .await
+            }
+            Command::DiagnoseEa189DpfProbe {
+                adapter_id,
+                recording,
+            } => {
+                run_diagnose_ea189_dpf_probe(
                     &adapter_id,
                     recording.as_deref().map(Path::new),
                     &runtime,
@@ -1019,6 +1035,268 @@ async fn run_diagnose_dtc_scan_inner(
     }
 }
 
+async fn run_diagnose_ea189_dpf_probe(
+    adapter_id: &str,
+    recording: Option<&Path>,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let recorder = recording
+        .map(jsonl_capture::JsonlRecorder::start)
+        .transpose()?;
+    let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
+    let result = async {
+        if sender.is_some() {
+            emit_capture_event(
+                sender,
+                CaptureEvent::capture_started(
+                    Some(wallclock_ms()?),
+                    Some("ea189.dpf.probe".into()),
+                ),
+            )
+            .await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                sender,
+                RuntimeEvent::recording(RecordingState::Active),
+            )
+            .await?;
+        }
+        run_diagnose_ea189_dpf_probe_inner(adapter_id, runtime, state, sender).await
+    }
+    .await;
+    let inactive = if sender.is_some() {
+        apply_runtime_event(
+            runtime,
+            state,
+            sender,
+            RuntimeEvent::recording(RecordingState::Inactive),
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    let shutdown = finish_runtime(runtime, state, sender).await;
+    let stopped = emit_capture_event(
+        sender,
+        CaptureEvent::SessionStopped {
+            offset_us: started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .map_err(|_| "EA189 DPF capture duration exceeds supported range")?,
+        },
+    )
+    .await;
+    let recorded = match recorder {
+        Some(recorder) => recorder.close().await,
+        None => Ok(()),
+    };
+    result
+        .and(inactive)
+        .and(shutdown)
+        .and(stopped)
+        .and(recorded)
+}
+
+async fn run_diagnose_ea189_dpf_probe_inner(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+    recorder: Option<&jsonl_capture::Sender>,
+) -> Result<(), String> {
+    let mapping = cached_engine_mapping(adapter_id).await?;
+    let target = mapping
+        .target()
+        .target()
+        .address()
+        .ok_or_else(|| "validated engine target is missing a concrete address".to_string())?;
+    let job = DiagnosticJob::ea189_dpf_probe(
+        KnownTarget::new(target.value()).map_err(|error| error.to_string())?,
+    );
+    let plan = job.plan();
+
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::vehicle(VehicleState::Identified),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::topology(TopologyState::Validated),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    let prepared = ble::prepare_diagnostic_session(adapter_id).await?;
+    record_protocol_negotiation(recorder, prepared.negotiation()).await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        recorder,
+        RuntimeEvent::transport(TransportState::Connected),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, recorder, RuntimeEvent::DiagnosticJobStarted).await?;
+    emit_capture_event(recorder, CaptureEvent::diagnostic_job_started(&job)).await?;
+
+    let mut recoverable = false;
+    for step in plan.steps() {
+        let probe = step
+            .dpf_probe()
+            .ok_or_else(|| "EA189 DPF plan contains a non-probe step".to_string())?;
+        match SafetyPolicy::read_only().authorize_activity(
+            Activity::Diagnose,
+            OperationRequest::ea189_dpf_probe(probe, job_target(&job)?),
+        ) {
+            Ok(Operation::Ea189DpfProbe(_)) => {}
+            Ok(_) => {
+                return Err("read-only safety policy returned the wrong EA189 operation".into())
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        let request = ble::TargetedDpfProbeRequest::from_mapping(probe, &mapping)?;
+        match prepared.read_dpf_probe(request).await {
+            Ok(responses) => {
+                let response = responses.as_slice().first().ok_or_else(|| {
+                    format!("{} returned no normalized response", probe.semantic())
+                })?;
+                let expected_responder = mapping.expected_responder().value();
+                let responder_matches = response
+                    .responder
+                    .as_ref()
+                    .is_some_and(|responder| Some(responder.as_str()) == expected_responder);
+                let status = if response.payload.starts_with(&[
+                    0x62,
+                    probe.request_bytes()[1],
+                    probe.request_bytes()[2],
+                ]) && responder_matches
+                {
+                    DiagnosticJobStepStatus::Success
+                } else {
+                    recoverable = true;
+                    DiagnosticJobStepStatus::Recoverable
+                };
+                let selected = responder_matches.then(|| {
+                    response
+                        .responder
+                        .as_ref()
+                        .expect("matching responder is present")
+                        .as_str()
+                        .to_owned()
+                });
+                emit_capture_event(
+                    recorder,
+                    CaptureEvent::responses_observed(
+                        probe.semantic(),
+                        probe.request_bytes().into(),
+                        responses.capture_evidence(),
+                        selected.clone(),
+                        (status != DiagnosticJobStepStatus::Success)
+                            .then_some("unexpected_or_negative_uds_response".into()),
+                    )?,
+                )
+                .await?;
+                emit_capture_event(
+                    recorder,
+                    CaptureEvent::diagnostic_job_step(
+                        job.id().to_string(),
+                        step.sequence()
+                            .try_into()
+                            .map_err(|_| "EA189 DPF step index exceeds u64")?,
+                        0x22,
+                        selected.clone(),
+                        status,
+                        (status != DiagnosticJobStepStatus::Success)
+                            .then_some("negative_or_malformed_response".into()),
+                    )?,
+                )
+                .await?;
+                println!(
+                    "probe\t{}\t{:04X}\t{}\t{}",
+                    probe.semantic(),
+                    probe.id(),
+                    selected.unwrap_or_else(|| "unknown".into()),
+                    hex(&response.payload),
+                );
+            }
+            Err(error) => {
+                recoverable = true;
+                emit_capture_event(
+                    recorder,
+                    CaptureEvent::diagnostic_job_step(
+                        job.id().to_string(),
+                        step.sequence()
+                            .try_into()
+                            .map_err(|_| "EA189 DPF step index exceeds u64")?,
+                        0x22,
+                        None,
+                        DiagnosticJobStepStatus::Recoverable,
+                        Some(error.clone()),
+                    )?,
+                )
+                .await?;
+                println!(
+                    "probe\t{}\t{:04X}\terror\t{error}",
+                    probe.semantic(),
+                    probe.id()
+                );
+            }
+        }
+    }
+    let shutdown = prepared.shutdown().await;
+    emit_capture_event(
+        recorder,
+        CaptureEvent::DiagnosticJobCompleted {
+            job_id: job.id().to_string(),
+            status: if recoverable {
+                JobStatus::CompletedWithErrors
+            } else {
+                JobStatus::Completed
+            },
+        },
+    )
+    .await?;
+    finish_diagnostic(runtime, state, recorder).await?;
+    shutdown
+}
+
+fn job_target(job: &DiagnosticJob) -> Result<KnownTarget, String> {
+    match job.scope() {
+        DiagnosticScope::KnownEcu { target, .. } => Ok(target.clone()),
+        _ => Err("EA189 DPF job lost its known engine target".into()),
+    }
+}
+
+async fn cached_engine_mapping(adapter_id: &str) -> Result<EcuTargetMapping, String> {
+    let (mappings, cache_valid) = cached_routing_mappings(adapter_id).await;
+    if !cache_valid {
+        return Err("EA189 DPF probe requires a validated engine mapping; run `obdentic vehicle discover --adapter <UUID>` first".into());
+    }
+    mappings
+        .into_iter()
+        .find(|mapping| mapping.role().role() == &EcuRole::Engine)
+        .ok_or_else(|| "EA189 DPF probe requires a validated engine mapping; run `obdentic vehicle discover --adapter <UUID>` first".into())
+}
+
 async fn finish_diagnostic(
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
@@ -1714,6 +1992,15 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 recording: None,
             })
         }
+        [command, job, adapter_flag, adapter_id]
+            if command == "diagnose" && job == "ea189.dpf.probe" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::DiagnoseEa189DpfProbe {
+                adapter_id: adapter_id.clone(),
+                recording: None,
+            })
+        }
         [command, job, adapter_flag, adapter_id, record_flag, path]
             if command == "diagnose"
                 && job == "dtc.scan"
@@ -1722,6 +2009,18 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         {
             require_uuid(adapter_id)?;
             Ok(Command::DiagnoseDtcScan {
+                adapter_id: adapter_id.clone(),
+                recording: Some(path.clone()),
+            })
+        }
+        [command, job, adapter_flag, adapter_id, record_flag, path]
+            if command == "diagnose"
+                && job == "ea189.dpf.probe"
+                && adapter_flag == "--adapter"
+                && record_flag == "--record" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::DiagnoseEa189DpfProbe {
                 adapter_id: adapter_id.clone(),
                 recording: Some(path.clone()),
             })
@@ -2107,6 +2406,20 @@ mod tests {
             Ok(Command::DiagnoseDtcScan {
                 adapter_id: uuid.into(),
                 recording: Some("dtc.jsonl".into()),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "diagnose",
+                "ea189.dpf.probe",
+                "--adapter",
+                uuid,
+                "--record",
+                "dpf.jsonl",
+            ])),
+            Ok(Command::DiagnoseEa189DpfProbe {
+                adapter_id: uuid.into(),
+                recording: Some("dpf.jsonl".into()),
             })
         );
         assert_eq!(

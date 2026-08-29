@@ -1,8 +1,10 @@
 use crate::{
     capability::{CapabilityProvenance, HardwareCapability},
+    ea189::Ea189DpfProbe,
     topology::AddressingContext,
     topology::Protocol,
     topology::RequestTarget,
+    vehicle_knowledge::EcuTargetMapping,
     ReadRequest, Transaction,
 };
 use btleplug::{
@@ -114,6 +116,14 @@ impl PreparedDiagnosticSession {
         &self.negotiation
     }
 
+    /// Execute one closed EA189 candidate probe while retaining this session.
+    pub async fn read_dpf_probe(
+        &self,
+        request: TargetedDpfProbeRequest,
+    ) -> Result<DiagnosticResponses, String> {
+        self.session.read_dpf_probe(request).await
+    }
+
     /// Execute the one bounded stored-DTC request and deterministically close
     /// the physical session afterwards.
     pub async fn read_stored_dtcs(self) -> Result<DiagnosticResponses, String> {
@@ -167,6 +177,70 @@ impl TargetedReadRequest {
 
     pub fn request(&self) -> ReadRequest {
         self.request
+    }
+
+    pub fn target(&self) -> &RequestTarget {
+        &self.target
+    }
+
+    pub fn expected_responder(&self) -> &ResponderIdentity {
+        &self.expected_responder
+    }
+}
+
+/// The sole live UDS request admitted by the transport.  The profile owns
+/// the DID; callers cannot construct a generic UDS request or inject bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedDpfProbeRequest {
+    operation: crate::protocol::ReadOperation,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
+impl TargetedDpfProbeRequest {
+    /// Construct a closed EA189 probe from independently validated engine
+    /// routing evidence. The profile fixes the DID; callers provide no bytes.
+    pub fn from_mapping(probe: Ea189DpfProbe, mapping: &EcuTargetMapping) -> Result<Self, String> {
+        if mapping.role().role() != &crate::topology::EcuRole::Engine {
+            return Err("EA189 DPF probes require validated engine target evidence".into());
+        }
+        let target = mapping.target().target().clone();
+        if mapping.expected_responder().context() != target.context() {
+            return Err("EA189 DPF probe target and responder contexts differ".into());
+        }
+        let expected_responder = mapping
+            .expected_responder()
+            .value()
+            .ok_or_else(|| "EA189 DPF probes require an expected responder".to_string())?;
+        Self::new(
+            probe,
+            target,
+            ResponderIdentity::ElmHeader(expected_responder.to_owned()),
+        )
+    }
+
+    fn new(
+        probe: Ea189DpfProbe,
+        target: RequestTarget,
+        expected_responder: ResponderIdentity,
+    ) -> Result<Self, String> {
+        validate_request_target(&target)?;
+        validate_elm_header(&expected_responder, "expected responder")?;
+        Ok(Self {
+            operation: crate::protocol::ReadOperation::uds_read_data_by_identifier(probe.id()),
+            target,
+            expected_responder: ResponderIdentity::ElmHeader(
+                expected_responder.as_str().to_ascii_uppercase(),
+            ),
+        })
+    }
+
+    pub fn did(&self) -> u16 {
+        self.operation.did()
+    }
+
+    pub fn request_bytes(&self) -> [u8; 3] {
+        self.operation.request_bytes()
     }
 
     pub fn target(&self) -> &RequestTarget {
@@ -259,6 +333,27 @@ impl ReadOutcome {
     fn into_transaction(self) -> Result<Transaction, String> {
         match self {
             Self::Succeeded { transaction, .. } => Ok(transaction),
+            Self::Failed { error, .. } => Err(error),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum DpfProbeOutcome {
+    Succeeded {
+        responses: DiagnosticResponses,
+        observations: Vec<ResponseObservation>,
+    },
+    Failed {
+        error: String,
+        observations: Vec<ResponseObservation>,
+    },
+}
+
+impl DpfProbeOutcome {
+    fn into_result(self) -> Result<DiagnosticResponses, String> {
+        match self {
+            Self::Succeeded { responses, .. } => Ok(responses),
             Self::Failed { error, .. } => Err(error),
         }
     }
@@ -583,6 +678,32 @@ impl SessionClient {
             .into_transaction()
     }
 
+    /// Execute the closed EA189 DPF UDS probe and return its raw normalized
+    /// responses.  Negative or malformed responses are returned as errors,
+    /// while the crate-visible evidence variant retains responder payloads.
+    pub async fn read_dpf_probe(
+        &self,
+        request: TargetedDpfProbeRequest,
+    ) -> Result<DiagnosticResponses, String> {
+        self.read_dpf_probe_with_evidence(request)
+            .await?
+            .into_result()
+    }
+
+    pub(crate) async fn read_dpf_probe_with_evidence(
+        &self,
+        request: TargetedDpfProbeRequest,
+    ) -> Result<DpfProbeOutcome, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::ReadDpfProbe { request, reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
     pub async fn read_stored_dtcs(&self) -> Result<DiagnosticResponses, String> {
         let (reply, result) = oneshot::channel();
         self.sender
@@ -639,6 +760,10 @@ enum SessionCommand {
     ReadTargeted {
         request: TargetedReadRequest,
         reply: oneshot::Sender<Result<ReadOutcome, String>>,
+    },
+    ReadDpfProbe {
+        request: TargetedDpfProbeRequest,
+        reply: oneshot::Sender<Result<DpfProbeOutcome, String>>,
     },
     ReadStoredDtcs {
         reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
@@ -738,6 +863,24 @@ async fn session_actor(
                 )
                 .await;
             }
+            SessionCommand::ReadDpfProbe { request, reply } => {
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
+                }
+                let started = Instant::now();
+                let outcome = session.read_dpf_probe_with_evidence(request).await;
+                process_dpf_probe_outcome(
+                    &mut session,
+                    &mut health,
+                    &mut service,
+                    &mut disconnect_done,
+                    outcome,
+                    started.elapsed(),
+                    reply,
+                )
+                .await;
+            }
             SessionCommand::ReadStoredDtcs { reply } => {
                 if let Some(error) = health.unhealthy() {
                     let _ = reply.send(Err(error.to_owned()));
@@ -817,6 +960,48 @@ async fn process_read_outcome(
             } else {
                 service.observe(service_time);
                 let _ = reply.send(Ok(ReadOutcome::Failed {
+                    error,
+                    observations,
+                }));
+            }
+        }
+    }
+}
+
+async fn process_dpf_probe_outcome(
+    session: &mut DiagnosticSession,
+    health: &mut SessionHealth,
+    service: &mut RequestServiceEstimator,
+    disconnect_done: &mut bool,
+    outcome: DpfProbeOutcome,
+    service_time: Duration,
+    reply: oneshot::Sender<Result<DpfProbeOutcome, String>>,
+) {
+    if let Some(error) = health.unhealthy() {
+        let _ = reply.send(Err(error.to_owned()));
+        return;
+    }
+    match outcome {
+        DpfProbeOutcome::Succeeded { .. } => {
+            service.observe(service_time);
+            health.success();
+            let _ = reply.send(Ok(outcome));
+        }
+        DpfProbeOutcome::Failed {
+            error,
+            observations,
+        } => {
+            if health.observe(&error) {
+                let fatal = health.unhealthy().unwrap().to_owned();
+                session.disconnect_best_effort().await;
+                *disconnect_done = true;
+                let _ = reply.send(Ok(DpfProbeOutcome::Failed {
+                    error: fatal,
+                    observations,
+                }));
+            } else {
+                service.observe(service_time);
+                let _ = reply.send(Ok(DpfProbeOutcome::Failed {
                     error,
                     observations,
                 }));
@@ -964,6 +1149,31 @@ impl DiagnosticSession {
         self.read_targeted_with_evidence(request)
             .await
             .into_transaction()
+    }
+
+    async fn read_dpf_probe_with_evidence(
+        &mut self,
+        request: TargetedDpfProbeRequest,
+    ) -> DpfProbeOutcome {
+        let read = {
+            let mut exchange = LiveExchange {
+                peripheral: &self.peripheral,
+                channel: &self.channel,
+                notifications: &mut self.notifications,
+                show_adapter_io: self.show_adapter_io,
+            };
+            read_elm_dpf_probe_with_evidence(&mut exchange, &request).await
+        };
+        match read {
+            Ok(read) => DpfProbeOutcome::Succeeded {
+                responses: read.responses,
+                observations: read.observations,
+            },
+            Err(error) => DpfProbeOutcome::Failed {
+                error: error.error,
+                observations: error.observations,
+            },
+        }
     }
 
     async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
@@ -1408,7 +1618,9 @@ async fn read_elm_targeted_with_evidence<E>(
 where
     E: ElmExchange,
 {
-    if let Err(error) = configure_target(exchange, request).await {
+    if let Err(error) =
+        configure_target(exchange, request.target(), request.expected_responder()).await
+    {
         let restore = restore_functional(exchange).await;
         return Err(ReadEvidenceError {
             error: combine_setup_errors(error, restore),
@@ -1452,16 +1664,61 @@ where
     }
 }
 
-async fn configure_target<E>(exchange: &mut E, request: &TargetedReadRequest) -> Result<(), String>
+#[derive(Debug)]
+struct DpfProbeReadEvidence {
+    responses: DiagnosticResponses,
+    observations: Vec<ResponseObservation>,
+}
+
+async fn read_elm_dpf_probe_with_evidence<E>(
+    exchange: &mut E,
+    request: &TargetedDpfProbeRequest,
+) -> Result<DpfProbeReadEvidence, ReadEvidenceError>
 where
     E: ElmExchange,
 {
-    let address = request
-        .target()
+    if let Err(error) = configure_dpf_probe_target(exchange, request).await {
+        return Err(ReadEvidenceError {
+            error,
+            observations: Vec::new(),
+        });
+    }
+
+    match read_elm_uds_responses(exchange, request).await {
+        Ok(responses) => Ok(DpfProbeReadEvidence {
+            observations: vec![responses.observation(None)],
+            responses,
+        }),
+        Err(error) => Err(ReadEvidenceError {
+            error,
+            observations: Vec::new(),
+        }),
+    }
+}
+
+async fn configure_dpf_probe_target<E>(
+    exchange: &mut E,
+    request: &TargetedDpfProbeRequest,
+) -> Result<(), String>
+where
+    E: ElmExchange,
+{
+    configure_target(exchange, request.target(), request.expected_responder()).await
+}
+
+async fn configure_target<E>(
+    exchange: &mut E,
+    target: &RequestTarget,
+    expected_responder: &ResponderIdentity,
+) -> Result<(), String>
+where
+    E: ElmExchange,
+{
+    let address = target
         .address()
         .expect("validated targeted request has a concrete address");
     let target_header = address.value().to_ascii_uppercase();
-    let expected_header = request.expected_responder().as_str();
+    let expected_header = expected_responder.as_str();
     for (command, error) in [
         (
             format!("ATSH {target_header}\r"),
@@ -1533,6 +1790,19 @@ where
     normalize_mode01_responses(&response, request.pid(), request.data_len())
 }
 
+async fn read_elm_uds_responses<E>(
+    exchange: &mut E,
+    request: &TargetedDpfProbeRequest,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let operation = request.operation;
+    let command = uds_command(operation);
+    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    normalize_uds_responses(&response, operation.did())
+}
+
 pub(crate) async fn read_elm_mode03_responses<E>(
     exchange: &mut E,
 ) -> Result<DiagnosticResponses, String>
@@ -1564,6 +1834,7 @@ async fn elm_exchange<S>(
 where
     S: Stream<Item = ValueNotification> + Unpin,
 {
+    discard_queued_notifications(notifications).await;
     let write_type = if channel
         .properties
         .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
@@ -1590,6 +1861,19 @@ where
         println!("{line}");
     }
     Ok(response)
+}
+
+/// A Carly adapter can deliver a fragment just after the prompt that closed
+/// the preceding exchange. It cannot belong to the next command, so discard
+/// queued notifications before writing that command.
+async fn discard_queued_notifications<S>(notifications: &mut S)
+where
+    S: Stream<Item = ValueNotification> + Unpin,
+{
+    while matches!(
+        timeout(Duration::from_millis(2), notifications.next()).await,
+        Ok(Some(_))
+    ) {}
 }
 
 fn adapter_io_line(
@@ -1637,6 +1921,11 @@ fn obd_command(request: ReadRequest) -> String {
     }
     command.push('\r');
     command
+}
+
+fn uds_command(operation: crate::protocol::ReadOperation) -> String {
+    let [service, high, low] = operation.request_bytes();
+    format!("{service:02X}{high:02X}{low:02X}\r")
 }
 
 fn require_response(
@@ -2301,6 +2590,287 @@ fn mode01_responses(
         .ok_or_else(|| format!("01{pid:02X} response not found in {response:?}"))
 }
 
+#[derive(Debug)]
+struct UdsIsoTpAssembly {
+    declared_len: usize,
+    payload: Vec<u8>,
+    next_sequence: u8,
+}
+
+fn push_uds_payload(
+    matches: &mut Vec<DiagnosticResponse>,
+    responder: Option<ResponderIdentity>,
+    payload: &[u8],
+) {
+    if !payload.is_empty() {
+        matches.push(DiagnosticResponse {
+            responder,
+            payload: payload.to_vec(),
+        });
+    }
+}
+
+/// Normalize one ELM response to UDS application payloads while retaining
+/// every responder and the complete raw adapter text in `DiagnosticResponses`.
+fn normalize_uds_responses(response: &str, did: u16) -> Result<DiagnosticResponses, String> {
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+    let mut assemblies: Vec<(Option<ResponderIdentity>, UdsIsoTpAssembly)> = Vec::new();
+    let request_echo = format!("22{did:04X}");
+
+    for raw_line in response.split(['\r', '\n']) {
+        let line = raw_line.trim().trim_end_matches('>').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        let compact = upper.split_ascii_whitespace().collect::<String>();
+        if compact == request_echo
+            || upper.starts_with("SEARCHING")
+            || (upper.starts_with("BUS INIT") && !upper.contains("ERROR"))
+        {
+            continue;
+        }
+        if ["?", "NO DATA", "STOPPED", "UNABLE TO CONNECT", "ERROR"]
+            .iter()
+            .any(|status| upper == *status || upper.contains(status))
+        {
+            errors.push(DiagnosticResponseError {
+                responder: None,
+                error: format!("ELM327 rejected UDS 22 response: {line}"),
+            });
+            continue;
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let header = tokens.first().filter(|token| token.len() == 3).copied();
+        let responder = if let Some(header) = header {
+            if !header.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                errors.push(DiagnosticResponseError {
+                    responder: None,
+                    error: format!("malformed ELM327 UDS responder header: {line:?}"),
+                });
+                continue;
+            }
+            Some(ResponderIdentity::ElmHeader(header.to_ascii_uppercase()))
+        } else {
+            None
+        };
+        let data = if header.is_some() {
+            &tokens[1..]
+        } else {
+            tokens.as_slice()
+        };
+        let mut bytes = Vec::new();
+        let mut malformed = None;
+        for token in data {
+            if token.is_empty()
+                || token.len() % 2 != 0
+                || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                malformed = Some(format!("malformed ELM327 UDS response line: {line:?}"));
+                break;
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let pair = match std::str::from_utf8(pair) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        malformed = Some(error.to_string());
+                        break;
+                    }
+                };
+                match u8::from_str_radix(pair, 16) {
+                    Ok(byte) => bytes.push(byte),
+                    Err(error) => {
+                        malformed = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            if malformed.is_some() {
+                break;
+            }
+        }
+        if let Some(error) = malformed {
+            errors.push(DiagnosticResponseError { responder, error });
+            continue;
+        }
+
+        match bytes.first().map(|byte| byte >> 4) {
+            Some(0) => {
+                let declared_len = (bytes[0] & 0x0f) as usize;
+                let payload = &bytes[1..];
+                if declared_len == 0 {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed UDS single frame: {line:?}"),
+                    });
+                    continue;
+                }
+                if payload.len() < declared_len {
+                    push_uds_payload(&mut matches, responder.clone(), payload);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!(
+                            "truncated UDS single frame: declared {declared_len} bytes, received {}",
+                            payload.len()
+                        ),
+                    });
+                    continue;
+                }
+                if payload[declared_len..]
+                    .iter()
+                    .any(|byte| !matches!(byte, 0x00 | 0x55 | 0xaa))
+                {
+                    push_uds_payload(&mut matches, responder.clone(), &payload[..declared_len]);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("unexpected bytes after UDS single frame: {line:?}"),
+                    });
+                    continue;
+                }
+                push_uds_payload(&mut matches, responder, &payload[..declared_len]);
+            }
+            Some(1) => {
+                if bytes.len() < 3 {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed UDS first frame: {line:?}"),
+                    });
+                    continue;
+                }
+                let declared_len = (((bytes[0] & 0x0f) as usize) << 8) | bytes[1] as usize;
+                let payload = &bytes[2..];
+                if declared_len < 3 || payload.len() >= declared_len {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!(
+                            "malformed UDS first frame: declared {declared_len} bytes, received {}",
+                            payload.len()
+                        ),
+                    });
+                    continue;
+                }
+                if assemblies
+                    .iter()
+                    .any(|(identity, _)| *identity == responder)
+                {
+                    assemblies.retain(|(identity, _)| *identity != responder);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("duplicate UDS first frame: {line:?}"),
+                    });
+                    continue;
+                }
+                assemblies.push((
+                    responder,
+                    UdsIsoTpAssembly {
+                        declared_len,
+                        payload: payload.to_vec(),
+                        next_sequence: 1,
+                    },
+                ));
+            }
+            Some(2) => {
+                let Some(index) = assemblies
+                    .iter()
+                    .position(|(identity, _)| *identity == responder)
+                else {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("UDS consecutive frame without first frame: {line:?}"),
+                    });
+                    continue;
+                };
+                if bytes.len() < 2 {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed UDS consecutive frame: {line:?}"),
+                    });
+                    continue;
+                }
+                let sequence = bytes[0] & 0x0f;
+                let expected = assemblies[index].1.next_sequence;
+                if sequence != expected {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!(
+                            "UDS sequence mismatch: expected {expected}, got {sequence}"
+                        ),
+                    });
+                    continue;
+                }
+                let data = &bytes[1..];
+                let (declared_len, received_len) = {
+                    let assembly = &assemblies[index].1;
+                    (assembly.declared_len, assembly.payload.len())
+                };
+                if received_len >= declared_len {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("UDS payload exceeded declared length: {line:?}"),
+                    });
+                    continue;
+                }
+                let remaining = declared_len - received_len;
+                if data.len() > remaining
+                    && data[remaining..]
+                        .iter()
+                        .any(|byte| !matches!(byte, 0x00 | 0x55 | 0xaa))
+                {
+                    assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("UDS payload exceeded declared length: {line:?}"),
+                    });
+                    continue;
+                }
+                let complete = {
+                    let assembly = &mut assemblies[index].1;
+                    assembly
+                        .payload
+                        .extend_from_slice(&data[..data.len().min(remaining)]);
+                    assembly.next_sequence = (sequence + 1) & 0x0f;
+                    assembly.payload.len() == declared_len
+                };
+                if complete {
+                    let (_, assembly) = assemblies.remove(index);
+                    push_uds_payload(&mut matches, responder, &assembly.payload);
+                }
+            }
+            Some(3) => {
+                errors.push(DiagnosticResponseError {
+                    responder,
+                    error: format!("unexpected UDS flow-control frame: {line:?}"),
+                });
+            }
+            _ => push_uds_payload(&mut matches, responder, &bytes),
+        }
+    }
+
+    for (responder, assembly) in assemblies {
+        push_uds_payload(&mut matches, responder.clone(), &assembly.payload);
+        errors.push(DiagnosticResponseError {
+            responder,
+            error: format!(
+                "truncated UDS ISO-TP response: declared {} bytes, received {}",
+                assembly.declared_len,
+                assembly.payload.len()
+            ),
+        });
+    }
+    if matches.is_empty() && errors.is_empty() {
+        errors.push(DiagnosticResponseError {
+            responder: None,
+            error: "UDS 22 response not found".into(),
+        });
+    }
+    Ok(DiagnosticResponses::with_errors(matches, response, errors))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2379,6 +2949,21 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn normalizes_a_closed_uds_did_response_with_carly_padding() {
+        let responses = normalize_uds_responses("7E8 05 62 11 4F 04 F8 55 55\r>", 0x114f).unwrap();
+        assert_eq!(responses.as_slice().len(), 1);
+        assert_eq!(
+            responses.as_slice()[0].responder.as_ref().unwrap().as_str(),
+            "7E8"
+        );
+        assert_eq!(
+            responses.as_slice()[0].payload,
+            [0x62, 0x11, 0x4f, 0x04, 0xf8]
+        );
+        assert!(responses.errors().is_empty());
+    }
+
     fn channel() -> Characteristic {
         Characteristic {
             uuid: uuid_from_u16(CARLY_CHANNEL),
@@ -2417,6 +3002,9 @@ mod tests {
                     }
                     SessionCommand::ReadTargeted { reply, .. } => {
                         let _ = reply.send(Err("targeted test request not scripted".into()));
+                    }
+                    SessionCommand::ReadDpfProbe { reply, .. } => {
+                        let _ = reply.send(Err("DPF probe test request not scripted".into()));
                     }
                     SessionCommand::ReadStoredDtcs { reply } => {
                         let _ = reply.send(Err("stored DTC test request not scripted".into()));

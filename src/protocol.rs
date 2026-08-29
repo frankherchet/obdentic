@@ -51,6 +51,23 @@ impl ReadOperation {
         Self::UdsReadDataByIdentifier { did }
     }
 
+    pub(crate) const fn request_bytes(self) -> [u8; 3] {
+        match self {
+            Self::UdsReadDataByIdentifier { did } => {
+                let [high, low] = did.to_be_bytes();
+                [0x22, high, low]
+            }
+            Self::Mode01(_) => panic!("Mode01 request is not a UDS request"),
+        }
+    }
+
+    pub(crate) const fn did(self) -> u16 {
+        match self {
+            Self::UdsReadDataByIdentifier { did } => did,
+            Self::Mode01(_) => panic!("Mode01 request is not a UDS request"),
+        }
+    }
+
     pub(crate) fn validate_response<'a>(
         self,
         response: &'a [u8],
