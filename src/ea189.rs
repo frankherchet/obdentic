@@ -139,6 +139,132 @@ impl Ea189DpfProbe {
     }
 }
 
+/// A value decoded from a Gate-A response using a still-experimental EA189
+/// hypothesis.  This type is deliberately separate from [`Ea189Profile`]: a
+/// successful decode does not promote a candidate into production knowledge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ea189ExperimentalDpfReading {
+    probe: Ea189DpfProbe,
+    value: f64,
+    unit: &'static str,
+    decoder: &'static str,
+}
+
+impl Ea189ExperimentalDpfReading {
+    pub const fn probe(self) -> Ea189DpfProbe {
+        self.probe
+    }
+
+    pub const fn semantic(self) -> &'static str {
+        self.probe.semantic()
+    }
+
+    pub const fn did(self) -> u16 {
+        self.probe.id()
+    }
+
+    pub const fn value(self) -> f64 {
+        self.value
+    }
+
+    pub const fn unit(self) -> &'static str {
+        self.unit
+    }
+
+    pub const fn decoder(self) -> &'static str {
+        self.decoder
+    }
+
+    /// Every reading returned by this module is experimental by construction.
+    pub const fn is_experimental(self) -> bool {
+        true
+    }
+}
+
+/// Errors from the closed experimental Gate-B decoder set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ea189DpfDecodeError {
+    UnsupportedProbe(Ea189DpfProbe),
+    MalformedPositiveResponse,
+    WrongDid { expected: u16, actual: u16 },
+}
+
+impl std::fmt::Display for Ea189DpfDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedProbe(probe) => {
+                write!(
+                    formatter,
+                    "no experimental decoder for DID {:04X}",
+                    probe.id()
+                )
+            }
+            Self::MalformedPositiveResponse => {
+                formatter.write_str("malformed UDS positive DPF response")
+            }
+            Self::WrongDid { expected, actual } => write!(
+                formatter,
+                "UDS response DID {:04X} does not match requested DID {:04X}",
+                actual, expected
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Ea189DpfDecodeError {}
+
+/// Decode one exact, positive Gate-A response with an experimental hypothesis.
+///
+/// The accepted shape is exactly `62 <DID_hi> <DID_lo> <A> <B>`.  The three
+/// remaining Gate-A candidates have no decoder yet and are rejected.
+pub fn decode_experimental_dpf(
+    probe: Ea189DpfProbe,
+    response: &[u8],
+) -> Result<Ea189ExperimentalDpfReading, Ea189DpfDecodeError> {
+    let expected_did = probe.id();
+    if response.len() != 5 {
+        return Err(Ea189DpfDecodeError::MalformedPositiveResponse);
+    }
+    if response[0] != 0x62 {
+        return Err(Ea189DpfDecodeError::MalformedPositiveResponse);
+    }
+    let actual_did = u16::from_be_bytes([response[1], response[2]]);
+    if actual_did != expected_did {
+        return Err(Ea189DpfDecodeError::WrongDid {
+            expected: expected_did,
+            actual: actual_did,
+        });
+    }
+    let data = u16::from_be_bytes([response[3], response[4]]);
+    let (value, unit, decoder) = match probe {
+        Ea189DpfProbe::SootMassCalculated => {
+            (data as f64 / 100.0, "g", "BE u16 / 100 (experimental)")
+        }
+        Ea189DpfProbe::SootMassMeasured => (
+            i16::from_be_bytes([response[3], response[4]]) as f64 / 100.0,
+            "g",
+            "BE i16 / 100 (experimental)",
+        ),
+        Ea189DpfProbe::PreDpfTemperature | Ea189DpfProbe::PostDpfTemperature => (
+            (i32::from(data) - 2731) as f64 / 10.0,
+            "°C",
+            "(BE u16 - 2731) / 10 (Kelvin hypothesis; experimental)",
+        ),
+        Ea189DpfProbe::DistanceSinceRegeneration
+        | Ea189DpfProbe::TimeSinceRegeneration
+        | Ea189DpfProbe::DifferentialPressure => {
+            return Err(Ea189DpfDecodeError::UnsupportedProbe(probe));
+        }
+    };
+
+    Ok(Ea189ExperimentalDpfReading {
+        probe,
+        value,
+        unit,
+        decoder,
+    })
+}
+
 /// Target-bound DPF probe input. Construction only accepts an engine
 /// `KnownEcu` scope, so a candidate cannot be detached into a vehicle-wide or
 /// functional operation.
@@ -454,6 +580,101 @@ mod tests {
 
     fn evidence() -> ProfileEvidence {
         ProfileEvidence::new(provenance("sanitized hardware fixture"), "fixture-01").unwrap()
+    }
+
+    #[test]
+    fn experimental_decoder_uses_unsigned_calculated_soot() {
+        let reading = decode_experimental_dpf(
+            Ea189DpfProbe::SootMassCalculated,
+            &[0x62, 0x11, 0x4f, 0x04, 0xf8],
+        )
+        .unwrap();
+
+        assert_eq!(reading.semantic(), "dpf.soot_mass_calculated");
+        assert_eq!(reading.did(), 0x114f);
+        assert_eq!(reading.value(), 12.72);
+        assert_eq!(reading.unit(), "g");
+        assert!(reading.is_experimental());
+    }
+
+    #[test]
+    fn experimental_decoder_preserves_negative_measured_soot() {
+        let reading = decode_experimental_dpf(
+            Ea189DpfProbe::SootMassMeasured,
+            &[0x62, 0x11, 0x4e, 0xfe, 0xfc],
+        )
+        .unwrap();
+
+        assert_eq!(reading.value(), -2.6);
+        assert_eq!(reading.unit(), "g");
+        assert!(reading.decoder().contains("i16"));
+    }
+
+    #[test]
+    fn experimental_decoder_applies_temperature_hypothesis_to_both_candidates() {
+        for probe in [
+            Ea189DpfProbe::PreDpfTemperature,
+            Ea189DpfProbe::PostDpfTemperature,
+        ] {
+            let reading = decode_experimental_dpf(
+                probe,
+                &[0x62, (probe.id() >> 8) as u8, probe.id() as u8, 0x0b, 0xb9],
+            )
+            .unwrap();
+            assert_eq!(reading.value(), 27.0);
+            assert_eq!(reading.unit(), "°C");
+            assert!(reading.is_experimental());
+        }
+    }
+
+    #[test]
+    fn experimental_decoder_rejects_undecoded_gate_a_candidates() {
+        for probe in [
+            Ea189DpfProbe::DistanceSinceRegeneration,
+            Ea189DpfProbe::TimeSinceRegeneration,
+            Ea189DpfProbe::DifferentialPressure,
+        ] {
+            assert_eq!(
+                decode_experimental_dpf(
+                    probe,
+                    &[0x62, (probe.id() >> 8) as u8, probe.id() as u8, 0x00, 0x01],
+                ),
+                Err(Ea189DpfDecodeError::UnsupportedProbe(probe))
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_decoder_requires_exact_positive_two_byte_payload() {
+        let probe = Ea189DpfProbe::SootMassCalculated;
+        for response in [
+            vec![],
+            vec![0x62],
+            vec![0x62, 0x11],
+            vec![0x62, 0x11, 0x4f],
+            vec![0x62, 0x11, 0x4f, 0x00],
+            vec![0x62, 0x11, 0x4f, 0x00, 0x01, 0x00],
+            vec![0x61, 0x11, 0x4f, 0x00, 0x01],
+        ] {
+            assert_eq!(
+                decode_experimental_dpf(probe, &response),
+                Err(Ea189DpfDecodeError::MalformedPositiveResponse)
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_decoder_rejects_wrong_did() {
+        assert_eq!(
+            decode_experimental_dpf(
+                Ea189DpfProbe::SootMassCalculated,
+                &[0x62, 0x11, 0x4e, 0x00, 0x01],
+            ),
+            Err(Ea189DpfDecodeError::WrongDid {
+                expected: 0x114f,
+                actual: 0x114e,
+            })
+        );
     }
 
     #[test]
