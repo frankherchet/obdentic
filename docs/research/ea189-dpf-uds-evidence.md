@@ -224,6 +224,30 @@ Expected validation properties rather than hard-coded verdicts:
 - calculated and measured soot remain distinct facts and may differ significantly;
 - a negative measured-soot value remains a valid decoded candidate unless a separately evidenced sentinel rule applies.
 
+## Owned-hardware Gate B outcome
+
+Private captures from the owned EA189 vehicle now cover normal/highway driving,
+slow driving, ignition-on/engine-off, and confirmed warm idle. Every valid
+snapshot completed the same closed seven-DID probe against the validated engine
+target. Raw captures remain untracked and are not published.
+
+The behavior supports these **vehicle-specific experimental** decoders:
+
+- `114F`: two-byte BE unsigned `/100` gives a smooth calculated-soot trend;
+- `114E`: two-byte BE signed `/100` gives a distinct measured-soot trend;
+- `1156`: four-byte BE `/1000` increases plausibly with travelled distance;
+- `115E`: four-byte BE seconds increases plausibly with engine-on elapsed time;
+- `11B2` and `10F9`: two-byte `(raw - 2731) / 10` values change coherently
+  across driving, engine-off, and warm-idle conditions;
+- `14F5`: two-byte BE signed values show a negative engine-off offset, small
+  warm-idle values, and higher values under flow. The unscaled `hPa`
+  interpretation is admitted only as experimental for this vehicle.
+
+This is behavioral plausibility evidence, not a global EA189 proof. In
+particular, `11B2`/`10F9` sensor positions remain unverified, no sentinel rule
+is established, and none of these candidates is added to production
+`Ea189Profile` knowledge.
+
 ## Promotion rule
 
 A candidate becomes production Vehicle Knowledge only after OBDentic can record:

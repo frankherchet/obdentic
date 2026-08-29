@@ -65,6 +65,8 @@ const DPF_TIME_SINCE_REGENERATION: Ea189DpfDid = Ea189DpfDid {
     request_bytes: [0x22, 0x11, 0x5e],
 };
 const DPF_PRE_TEMPERATURE: Ea189DpfDid = Ea189DpfDid {
+    // The position labels remain hypotheses; hardware behavior did not verify
+    // the physical sensor locations independently.
     semantic: "exhaust.temperature.pre_dpf",
     id: 0x11b2,
     request_bytes: [0x22, 0x11, 0xb2],
@@ -215,14 +217,23 @@ impl std::error::Error for Ea189DpfDecodeError {}
 
 /// Decode one exact, positive Gate-A response with an experimental hypothesis.
 ///
-/// The accepted shape is exactly `62 <DID_hi> <DID_lo> <A> <B>`.  The three
-/// remaining Gate-A candidates have no decoder yet and are rejected.
+/// The accepted shape is `62 <DID_hi> <DID_lo> <data...>`, with the data width
+/// fixed by the closed candidate.  No decoder here promotes a candidate into
+/// production vehicle knowledge.
 pub fn decode_experimental_dpf(
     probe: Ea189DpfProbe,
     response: &[u8],
 ) -> Result<Ea189ExperimentalDpfReading, Ea189DpfDecodeError> {
     let expected_did = probe.id();
-    if response.len() != 5 {
+    let data_len = match probe {
+        Ea189DpfProbe::DistanceSinceRegeneration | Ea189DpfProbe::TimeSinceRegeneration => 4,
+        Ea189DpfProbe::SootMassMeasured
+        | Ea189DpfProbe::SootMassCalculated
+        | Ea189DpfProbe::PreDpfTemperature
+        | Ea189DpfProbe::PostDpfTemperature
+        | Ea189DpfProbe::DifferentialPressure => 2,
+    };
+    if response.len() != 3 + data_len {
         return Err(Ea189DpfDecodeError::MalformedPositiveResponse);
     }
     if response[0] != 0x62 {
@@ -235,25 +246,34 @@ pub fn decode_experimental_dpf(
             actual: actual_did,
         });
     }
-    let data = u16::from_be_bytes([response[3], response[4]]);
     let (value, unit, decoder) = match probe {
         Ea189DpfProbe::SootMassCalculated => {
+            let data = u16::from_be_bytes([response[3], response[4]]);
             (data as f64 / 100.0, "g", "BE u16 / 100 (experimental)")
         }
-        Ea189DpfProbe::SootMassMeasured => (
-            i16::from_be_bytes([response[3], response[4]]) as f64 / 100.0,
-            "g",
-            "BE i16 / 100 (experimental)",
-        ),
+        Ea189DpfProbe::SootMassMeasured => {
+            let data = i16::from_be_bytes([response[3], response[4]]);
+            (data as f64 / 100.0, "g", "BE i16 / 100 (experimental)")
+        }
         Ea189DpfProbe::PreDpfTemperature | Ea189DpfProbe::PostDpfTemperature => (
-            (i32::from(data) - 2731) as f64 / 10.0,
+            {
+                let data = u16::from_be_bytes([response[3], response[4]]);
+                (i32::from(data) - 2731) as f64 / 10.0
+            },
             "°C",
-            "(BE u16 - 2731) / 10 (Kelvin hypothesis; experimental)",
+            "(BE u16 - 2731) / 10 (temperature hypothesis; experimental)",
         ),
-        Ea189DpfProbe::DistanceSinceRegeneration
-        | Ea189DpfProbe::TimeSinceRegeneration
-        | Ea189DpfProbe::DifferentialPressure => {
-            return Err(Ea189DpfDecodeError::UnsupportedProbe(probe));
+        Ea189DpfProbe::DistanceSinceRegeneration => {
+            let data = u32::from_be_bytes([response[3], response[4], response[5], response[6]]);
+            (data as f64 / 1000.0, "km", "BE u32 / 1000 (experimental)")
+        }
+        Ea189DpfProbe::TimeSinceRegeneration => {
+            let data = u32::from_be_bytes([response[3], response[4], response[5], response[6]]);
+            (data as f64, "s", "BE u32 seconds (experimental)")
+        }
+        Ea189DpfProbe::DifferentialPressure => {
+            let data = i16::from_be_bytes([response[3], response[4]]);
+            (data as f64, "hPa", "BE i16 hPa (experimental)")
         }
     };
 
@@ -611,6 +631,36 @@ mod tests {
     }
 
     #[test]
+    fn experimental_decoder_decodes_four_byte_counters_and_signed_pressure() {
+        let distance = decode_experimental_dpf(
+            Ea189DpfProbe::DistanceSinceRegeneration,
+            &[0x62, 0x11, 0x56, 0x00, 0x00, 0x8c, 0xa0],
+        )
+        .unwrap();
+        assert_eq!(distance.value(), 36.0);
+        assert_eq!(distance.unit(), "km");
+        assert!(distance.is_experimental());
+
+        let time = decode_experimental_dpf(
+            Ea189DpfProbe::TimeSinceRegeneration,
+            &[0x62, 0x11, 0x5e, 0x00, 0x00, 0x0d, 0x2f],
+        )
+        .unwrap();
+        assert_eq!(time.value(), 3375.0);
+        assert_eq!(time.unit(), "s");
+        assert!(time.is_experimental());
+
+        let pressure = decode_experimental_dpf(
+            Ea189DpfProbe::DifferentialPressure,
+            &[0x62, 0x14, 0xf5, 0xff, 0xf6],
+        )
+        .unwrap();
+        assert_eq!(pressure.value(), -10.0);
+        assert_eq!(pressure.unit(), "hPa");
+        assert!(pressure.is_experimental());
+    }
+
+    #[test]
     fn experimental_decoder_applies_temperature_hypothesis_to_both_candidates() {
         for probe in [
             Ea189DpfProbe::PreDpfTemperature,
@@ -628,38 +678,26 @@ mod tests {
     }
 
     #[test]
-    fn experimental_decoder_rejects_undecoded_gate_a_candidates() {
-        for probe in [
-            Ea189DpfProbe::DistanceSinceRegeneration,
-            Ea189DpfProbe::TimeSinceRegeneration,
-            Ea189DpfProbe::DifferentialPressure,
-        ] {
-            assert_eq!(
-                decode_experimental_dpf(
-                    probe,
-                    &[0x62, (probe.id() >> 8) as u8, probe.id() as u8, 0x00, 0x01],
-                ),
-                Err(Ea189DpfDecodeError::UnsupportedProbe(probe))
-            );
-        }
-    }
+    fn experimental_decoder_requires_exact_candidate_payload_width() {
+        for probe in Ea189DpfProbe::ALL {
+            let data_len = match probe {
+                Ea189DpfProbe::DistanceSinceRegeneration | Ea189DpfProbe::TimeSinceRegeneration => {
+                    4
+                }
+                _ => 2,
+            };
+            let mut exact = vec![0x62, (probe.id() >> 8) as u8, probe.id() as u8];
+            exact.extend(std::iter::repeat_n(0, data_len));
+            assert!(decode_experimental_dpf(probe, &exact).is_ok());
 
-    #[test]
-    fn experimental_decoder_requires_exact_positive_two_byte_payload() {
-        let probe = Ea189DpfProbe::SootMassCalculated;
-        for response in [
-            vec![],
-            vec![0x62],
-            vec![0x62, 0x11],
-            vec![0x62, 0x11, 0x4f],
-            vec![0x62, 0x11, 0x4f, 0x00],
-            vec![0x62, 0x11, 0x4f, 0x00, 0x01, 0x00],
-            vec![0x61, 0x11, 0x4f, 0x00, 0x01],
-        ] {
-            assert_eq!(
-                decode_experimental_dpf(probe, &response),
-                Err(Ea189DpfDecodeError::MalformedPositiveResponse)
-            );
+            for invalid_data_len in [data_len - 1, data_len + 1] {
+                let mut invalid = vec![0x62, (probe.id() >> 8) as u8, probe.id() as u8];
+                invalid.extend(std::iter::repeat_n(0, invalid_data_len));
+                assert_eq!(
+                    decode_experimental_dpf(probe, &invalid),
+                    Err(Ea189DpfDecodeError::MalformedPositiveResponse)
+                );
+            }
         }
     }
 

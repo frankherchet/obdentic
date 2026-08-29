@@ -380,11 +380,6 @@ fn replay_dpf_responses(
             } else if matches!(
                 error,
                 crate::ea189::Ea189DpfDecodeError::UnsupportedProbe(_)
-            ) || matches!(
-                probe,
-                Ea189DpfProbe::DistanceSinceRegeneration
-                    | Ea189DpfProbe::TimeSinceRegeneration
-                    | Ea189DpfProbe::DifferentialPressure
             ) {
                 ReplayIssueKind::UnsupportedDpfCandidate
             } else {
@@ -631,20 +626,19 @@ mod tests {
     }
 
     #[test]
-    fn dpf_replay_reports_unsupported_candidate_without_telemetry() {
+    fn dpf_replay_decodes_validated_distance_without_generic_telemetry() {
         let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
             "dpf.distance_since_regeneration",
             vec![0x22, 0x11, 0x56],
             Some("7E8"),
-            vec![0x62, 0x11, 0x56, 0x00, 0x01, 0x4f, 0xf3],
+            vec![0x62, 0x11, 0x56, 0x00, 0x00, 0x03, 0xe8],
             Some("7E8"),
         )]));
 
-        assert!(replay.dpf_readings().is_empty());
-        assert!(replay
-            .issues()
-            .iter()
-            .any(|issue| issue.kind() == ReplayIssueKind::UnsupportedDpfCandidate));
+        assert_eq!(replay.dpf_readings().len(), 1);
+        assert_eq!(replay.dpf_readings()[0].reading().value(), 1.0);
+        assert_eq!(replay.dpf_readings()[0].reading().unit(), "km");
+        assert!(replay.issues().is_empty());
         assert!(replay.telemetry_full(8).unwrap().signals().next().is_none());
     }
 
