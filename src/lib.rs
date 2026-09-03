@@ -22,6 +22,7 @@ pub mod diagnostic_job;
 pub mod dpf_report;
 pub mod dtc;
 pub mod ea189;
+pub(crate) mod elm;
 pub mod evidence;
 pub mod functional_discovery;
 pub mod identity;

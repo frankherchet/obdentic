@@ -22,6 +22,8 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 
+pub(crate) use crate::elm::{initialize_elm, require_response, verify_elm327, ElmExchange};
+
 const CARLY_SERVICE: u16 = 0xFFE0;
 const CARLY_CHANNEL: u16 = 0xFFE1;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1299,6 +1301,14 @@ impl DiagnosticSession {
             notifications: &mut self.notifications,
             show_adapter_io: self.show_adapter_io,
         };
+        verify_elm327(&mut exchange).await?;
+        let identity = exchange.exchange("AT@1\r", Duration::from_secs(3)).await?;
+        require_response(
+            &identity,
+            "CARLY-UNIVERSAL",
+            false,
+            "AT@1 did not identify a Carly adapter",
+        )?;
         initialize_elm(&mut exchange).await
     }
 
@@ -1392,14 +1402,6 @@ fn carly_channel(peripheral: &Peripheral) -> Result<Characteristic, String> {
     Ok(channel)
 }
 
-pub(crate) trait ElmExchange {
-    async fn exchange(
-        &mut self,
-        command: &str,
-        command_timeout: Duration,
-    ) -> Result<String, String>;
-}
-
 struct LiveExchange<'a, S> {
     peripheral: &'a Peripheral,
     channel: &'a Characteristic,
@@ -1426,40 +1428,6 @@ where
         )
         .await
     }
-}
-
-async fn initialize_elm<E>(exchange: &mut E) -> Result<(), String>
-where
-    E: ElmExchange,
-{
-    let ati = exchange.exchange("ATI\r", Duration::from_secs(3)).await?;
-    require_response(
-        &ati,
-        "ELM327",
-        false,
-        "ATI did not identify an ELM327 adapter",
-    )?;
-    let identity = exchange.exchange("AT@1\r", Duration::from_secs(3)).await?;
-    require_response(
-        &identity,
-        "CARLY-UNIVERSAL",
-        false,
-        "AT@1 did not identify a Carly adapter",
-    )?;
-    let reset = exchange.exchange("ATZ\r", Duration::from_secs(3)).await?;
-    require_response(
-        &reset,
-        "ELM327",
-        false,
-        "ATZ did not reset an ELM327 adapter",
-    )?;
-    // Keep separators and adapter headers so responder identity survives the
-    // ELM normalization boundary. No identity is synthesized when absent.
-    for command in ["ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r"] {
-        let response = exchange.exchange(command, Duration::from_secs(3)).await?;
-        require_response(&response, "OK", true, &format!("{} failed", command.trim()))?;
-    }
-    Ok(())
 }
 
 async fn discover_pid_support<E>(exchange: &mut E) -> Result<PidSupport, String>
@@ -1926,36 +1894,6 @@ fn obd_command(request: ReadRequest) -> String {
 fn uds_command(operation: crate::protocol::ReadOperation) -> String {
     let [service, high, low] = operation.request_bytes();
     format!("{service:02X}{high:02X}{low:02X}\r")
-}
-
-fn require_response(
-    response: &str,
-    expected: &str,
-    exact: bool,
-    error: &str,
-) -> Result<(), String> {
-    let upper = response.to_ascii_uppercase();
-    if upper.split(['\r', '\n']).any(|line| {
-        let line = line.trim().trim_end_matches('>').trim();
-        line == "?"
-            || ["NO DATA", "STOPPED", "UNABLE TO CONNECT", "ERROR"]
-                .iter()
-                .any(|status| line.contains(status))
-    }) {
-        return Err(format!("{error}: {response:?}"));
-    }
-    upper
-        .split(['\r', '\n'])
-        .map(|line| line.trim().trim_end_matches('>').trim())
-        .any(|line| {
-            if exact {
-                line == expected
-            } else {
-                line.starts_with(expected)
-            }
-        })
-        .then_some(())
-        .ok_or_else(|| format!("{error}: {response:?}"))
 }
 
 #[cfg(test)]
@@ -2911,8 +2849,23 @@ mod tests {
     where
         E: ElmExchange,
     {
-        initialize_elm(exchange).await?;
+        initialize_carly_elm(exchange).await?;
         discover_pid_support(exchange).await
+    }
+
+    async fn initialize_carly_elm<E>(exchange: &mut E) -> Result<(), String>
+    where
+        E: ElmExchange,
+    {
+        verify_elm327(exchange).await?;
+        let identity = exchange.exchange("AT@1\r", Duration::from_secs(3)).await?;
+        require_response(
+            &identity,
+            "CARLY-UNIVERSAL",
+            false,
+            "AT@1 did not identify a Carly adapter",
+        )?;
+        initialize_elm(exchange).await
     }
 
     fn captured_responses() -> Vec<String> {
@@ -3632,7 +3585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elm_initialization_does_not_probe_pid_support() {
+    async fn carly_initialization_does_not_probe_pid_support() {
         let mut exchange = ScriptedExchange::captured(vec![
             "ELM327 v1.4 v100\r>".into(),
             "carly-universal v200\r>".into(),
@@ -3644,7 +3597,7 @@ mod tests {
             "OK\r>".into(),
         ]);
 
-        initialize_elm(&mut exchange).await.unwrap();
+        initialize_carly_elm(&mut exchange).await.unwrap();
 
         assert_eq!(
             exchange.commands,
