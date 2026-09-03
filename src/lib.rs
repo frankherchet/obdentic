@@ -28,6 +28,7 @@ pub mod evidence;
 pub mod functional_discovery;
 pub mod identity;
 pub mod jsonl_capture;
+pub mod knowledge_db;
 pub mod layout_observation;
 pub mod protocol;
 pub mod runtime_actor;
