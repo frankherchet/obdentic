@@ -1,0 +1,29 @@
+name: Apply MF4 integration patch
+
+on:
+  push:
+    branches:
+      - issue-1-mf4-writer-plugin
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ github.event.head_commit.message == 'Stage MF4 integration patch' || github.event.head_commit.message == 'Add MF4 patch applicator' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: issue-1-mf4-writer-plugin
+          fetch-depth: 0
+      - name: Apply patch and remove temporary machinery
+        run: |
+          git apply .github/mf4-integration.patch
+          rm .github/mf4-integration.patch
+          rm .github/workflows/apply-mf4-integration.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Wire MF4 writer through capture plugin registry"
+          git push origin HEAD:issue-1-mf4-writer-plugin
