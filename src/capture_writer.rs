@@ -61,9 +61,7 @@ pub fn start(path: &Path) -> Result<(Sender, Writer), String> {
         .copied()
         .find(|plugin| plugin.extension().eq_ignore_ascii_case(extension))
         .ok_or_else(|| {
-            format!(
-                "unsupported capture format .{extension}; expected .jsonl or .mf4"
-            )
+            format!("unsupported capture format .{extension}; expected .jsonl or .mf4")
         })?;
     plugin.start(path).map_err(|error| {
         format!(

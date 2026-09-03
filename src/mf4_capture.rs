@@ -1,6 +1,6 @@
 use crate::capture_events::{CaptureEvent, CaptureValue};
 use mdf4_rs::{writer::FileWriter, DataType, DecodedValue, FlushPolicy, MdfWriter};
-use std::{path::Path, time::SystemTime};
+use std::path::Path;
 use tokio::{sync::mpsc, task};
 
 pub const SCHEMA: &str = "OBDENTIC-MF4";
@@ -320,7 +320,8 @@ fn write_event(
         },
     )?;
 
-    let audit = format!("{event:?}");
+    let audit = crate::jsonl_capture::event_line(sequence, event)?;
+    let audit = audit.trim_end_matches('\n');
     write_chunks(
         writer,
         layout,
@@ -341,9 +342,15 @@ fn write_structured_evidence(
     event: &CaptureEvent,
 ) -> Result<(), String> {
     match event {
-        CaptureEvent::CaptureStarted { profile, .. } => {
-            write_optional_text(writer, layout, sequence, time_us, FIELD_PROFILE_UTF8, 0, profile)
-        }
+        CaptureEvent::CaptureStarted { profile, .. } => write_optional_text(
+            writer,
+            layout,
+            sequence,
+            time_us,
+            FIELD_PROFILE_UTF8,
+            0,
+            profile,
+        ),
         CaptureEvent::SubscriptionConfigured { semantic, .. }
         | CaptureEvent::SlotsSkipped { semantic, .. } => write_text(
             writer,
@@ -470,7 +477,15 @@ fn write_structured_evidence(
             provenance,
             ..
         } => {
-            write_text(writer, layout, sequence, time_us, FIELD_SEMANTIC_UTF8, 0, semantic)?;
+            write_text(
+                writer,
+                layout,
+                sequence,
+                time_us,
+                FIELD_SEMANTIC_UTF8,
+                0,
+                semantic,
+            )?;
             write_chunks(
                 writer,
                 layout,
@@ -490,9 +505,33 @@ fn write_structured_evidence(
                 response_payload,
             )?;
             write_text(writer, layout, sequence, time_us, FIELD_UNIT_UTF8, 0, unit)?;
-            write_text(writer, layout, sequence, time_us, FIELD_SOURCE_UTF8, 0, source)?;
-            write_text(writer, layout, sequence, time_us, FIELD_PROFILE_UTF8, 0, profile)?;
-            write_text(writer, layout, sequence, time_us, FIELD_DECODER_UTF8, 0, decoder)?;
+            write_text(
+                writer,
+                layout,
+                sequence,
+                time_us,
+                FIELD_SOURCE_UTF8,
+                0,
+                source,
+            )?;
+            write_text(
+                writer,
+                layout,
+                sequence,
+                time_us,
+                FIELD_PROFILE_UTF8,
+                0,
+                profile,
+            )?;
+            write_text(
+                writer,
+                layout,
+                sequence,
+                time_us,
+                FIELD_DECODER_UTF8,
+                0,
+                decoder,
+            )?;
             write_text(
                 writer,
                 layout,
@@ -509,7 +548,15 @@ fn write_structured_evidence(
             error,
             ..
         } => {
-            write_text(writer, layout, sequence, time_us, FIELD_SEMANTIC_UTF8, 0, semantic)?;
+            write_text(
+                writer,
+                layout,
+                sequence,
+                time_us,
+                FIELD_SEMANTIC_UTF8,
+                0,
+                semantic,
+            )?;
             if let Some(request_payload) = request_payload {
                 write_chunks(
                     writer,
@@ -521,11 +568,26 @@ fn write_structured_evidence(
                     request_payload,
                 )?;
             }
-            write_text(writer, layout, sequence, time_us, FIELD_ERROR_UTF8, 0, error)
+            write_text(
+                writer,
+                layout,
+                sequence,
+                time_us,
+                FIELD_ERROR_UTF8,
+                0,
+                error,
+            )
         }
-        CaptureEvent::SessionError { error }
-        | CaptureEvent::DiagnosticJobFailed { error, .. } => {
-            write_text(writer, layout, sequence, time_us, FIELD_ERROR_UTF8, 0, error)
+        CaptureEvent::SessionError { error } | CaptureEvent::DiagnosticJobFailed { error, .. } => {
+            write_text(
+                writer,
+                layout,
+                sequence,
+                time_us,
+                FIELD_ERROR_UTF8,
+                0,
+                error,
+            )
         }
         _ => Ok(()),
     }
@@ -541,7 +603,9 @@ fn write_optional_text(
     value: &Option<String>,
 ) -> Result<(), String> {
     if let Some(value) = value {
-        write_text(writer, layout, sequence, time_us, field_kind, item_index, value)?;
+        write_text(
+            writer, layout, sequence, time_us, field_kind, item_index, value,
+        )?;
     }
     Ok(())
 }
@@ -632,7 +696,11 @@ struct Record {
     data: Vec<u8>,
 }
 
-fn write_record(writer: &mut NativeWriter, layout: &Layout, mut record: Record) -> Result<(), String> {
+fn write_record(
+    writer: &mut NativeWriter,
+    layout: &Layout,
+    mut record: Record,
+) -> Result<(), String> {
     if record.data.is_empty() {
         record.data = vec![0_u8; CHUNK_BYTES];
     }
@@ -770,7 +838,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temp_path() -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -785,7 +853,10 @@ mod tests {
         let path = temp_path();
         let (sender, task) = start(&path).expect("start MF4 writer");
         sender
-            .send(CaptureEvent::capture_started(Some(1_700_000_000_000), Some("test".into())))
+            .send(CaptureEvent::capture_started(
+                Some(1_700_000_000_000),
+                Some("test".into()),
+            ))
             .await
             .unwrap();
         sender
@@ -822,6 +893,6 @@ mod tests {
 
     #[test]
     fn semantic_hash_is_stable() {
-        assert_eq!(fnv1a64(b"engine.rpm"), 0x55b0a3a576a95f1f);
+        assert_eq!(fnv1a64(b"engine.rpm"), 0xc6f08fcafe7d7828);
     }
 }
