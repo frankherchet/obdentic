@@ -1,4 +1,4 @@
-name: Apply MF4 integration patch
+name: Integrate MF4 writer
 
 on:
   push:
@@ -9,21 +9,72 @@ permissions:
   contents: write
 
 jobs:
-  apply:
-    if: ${{ github.event.head_commit.message == 'Stage MF4 integration patch' || github.event.head_commit.message == 'Add MF4 patch applicator' }}
+  integrate:
+    if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: issue-1-mf4-writer-plugin
           fetch-depth: 0
-      - name: Apply patch and remove temporary machinery
+          submodules: recursive
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - name: Wire plugins and normalize source
         run: |
-          git apply .github/mf4-integration.patch
-          rm .github/mf4-integration.patch
-          rm .github/workflows/apply-mf4-integration.yml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path("src/lib.rs")
+          text = lib.read_text()
+          text = text.replace(
+              "pub mod capture_replay;\npub mod capture_report;",
+              "pub mod capture_replay;\npub mod capture_writer;\npub mod capture_report;",
+              1,
+          )
+          text = text.replace(
+              "pub mod knowledge_db;\npub mod layout_observation;",
+              "pub mod knowledge_db;\npub mod mf4_capture;\npub mod layout_observation;",
+              1,
+          )
+          lib.write_text(text)
+
+          jsonl = Path("src/jsonl_capture.rs")
+          text = jsonl.read_text()
+          needle = "pub fn start(path: &Path) -> Result<(Sender, Writer), String> {\n    let mut options = OpenOptions::new();"
+          replacement = "pub fn start(path: &Path) -> Result<(Sender, Writer), String> {\n    crate::capture_writer::start(path)\n}\n\n/// JSONL plugin entry point used by the capture-writer registry.\npub(crate) fn start_jsonl(path: &Path) -> Result<(Sender, Writer), String> {\n    let mut options = OpenOptions::new();"
+          if needle not in text:
+              raise SystemExit("jsonl start seam not found")
+          text = text.replace(needle, replacement, 1)
+          text = text.replace("JSONL recorder stopped unexpectedly", "capture recorder stopped unexpectedly")
+          text = text.replace("fn event_line(sequence: u64, event: &CaptureEvent)", "pub(crate) fn event_line(sequence: u64, event: &CaptureEvent)", 1)
+          jsonl.write_text(text)
+
+          mf4 = Path("src/mf4_capture.rs")
+          text = mf4.read_text()
+          text = text.replace("use std::{path::Path, time::SystemTime};", "use std::path::Path;", 1)
+          text = text.replace(
+              '    let audit = format!("{event:?}");',
+              "    let audit = crate::jsonl_capture::event_line(sequence, event)?;\n    let audit = audit.trim_end_matches('\\n');",
+              1,
+          )
+          text = text.replace("use std::time::{Duration, UNIX_EPOCH};", "use std::time::{Duration, SystemTime, UNIX_EPOCH};", 1)
+          text = text.replace("0x55b0a3a576a95f1f", "0xc6f08fcafe7d7828", 1)
+          mf4.write_text(text)
+          PY
+          rm -f .github/mf4-integration.patch
+          cargo +1.98.0 generate-lockfile
+          cargo +1.98.0 fmt
+      - name: Validate branch
+        run: |
+          cargo +1.98.0 fmt --check
+          cargo +1.98.0 test --locked
+          cargo +1.98.0 clippy --all-targets --locked -- -D warnings
+          cargo +1.98.0 build --locked
+      - name: Commit integration
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add Cargo.lock src/lib.rs src/jsonl_capture.rs src/capture_writer.rs src/mf4_capture.rs .github/mf4-integration.patch
           git commit -m "Wire MF4 writer through capture plugin registry"
           git push origin HEAD:issue-1-mf4-writer-plugin
