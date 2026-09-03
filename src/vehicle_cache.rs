@@ -8,6 +8,9 @@ use std::{
 };
 
 use crate::{
+    ecu_identification::{
+        IdentificationObservation, IdentificationResponseEvidence, IdentificationResultStatus,
+    },
     functional_discovery::EcuCapability,
     topology::{
         AddressingContext, Confidence, EcuRole, EcuTopology, ObservationWindow, Protocol,
@@ -19,7 +22,8 @@ use crate::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-const HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t3";
+const HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t4";
+const V3_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t3";
 const V2_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t2";
 const LEGACY_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t1";
 const INDEX_HEADER: &str = "OBDENTIC-VEHICLE-INDEX\t1";
@@ -109,6 +113,7 @@ pub struct VehicleCacheSnapshot {
     topology: Vec<TopologyObservation>,
     ecu_capabilities: Vec<EcuCapabilitySnapshot>,
     target_mappings: Vec<TargetMappingSnapshot>,
+    ecu_identification: Vec<IdentificationObservation>,
 }
 
 impl VehicleCacheSnapshot {
@@ -117,14 +122,25 @@ impl VehicleCacheSnapshot {
         ecu_capabilities: impl IntoIterator<Item = EcuCapabilitySnapshot>,
         target_mappings: impl IntoIterator<Item = TargetMappingSnapshot>,
     ) -> Self {
+        Self::with_ecu_identification(topology, ecu_capabilities, target_mappings, [])
+    }
+
+    pub fn with_ecu_identification(
+        topology: impl IntoIterator<Item = TopologyObservation>,
+        ecu_capabilities: impl IntoIterator<Item = EcuCapabilitySnapshot>,
+        target_mappings: impl IntoIterator<Item = TargetMappingSnapshot>,
+        ecu_identification: impl IntoIterator<Item = IdentificationObservation>,
+    ) -> Self {
         let mut snapshot = Self {
             topology: topology.into_iter().collect(),
             ecu_capabilities: ecu_capabilities.into_iter().collect(),
             target_mappings: target_mappings.into_iter().collect(),
+            ecu_identification: ecu_identification.into_iter().collect(),
         };
         snapshot.topology.sort();
         snapshot.ecu_capabilities.sort();
         snapshot.target_mappings.sort();
+        snapshot.ecu_identification.sort();
         snapshot
     }
 
@@ -188,6 +204,10 @@ impl VehicleCacheSnapshot {
 
     pub fn target_mappings(&self) -> &[TargetMappingSnapshot] {
         &self.target_mappings
+    }
+
+    pub fn ecu_identification(&self) -> &[IdentificationObservation] {
+        &self.ecu_identification
     }
 
     pub fn validation_signature(&self) -> ValidationSignature {
@@ -506,6 +526,10 @@ impl CacheStore {
                 file.write_all(b"\ntarget_mapping\t")?;
                 file.write_all(encode_target_mapping(mapping).as_bytes())?;
             }
+            for observation in &cache.snapshot.ecu_identification {
+                file.write_all(b"\necu_identification\t")?;
+                file.write_all(encode_identification_observation(observation).as_bytes())?;
+            }
             for line in &cache.history {
                 file.write_all(b"\nhistory\t")?;
                 file.write_all(escape(line).as_bytes())?;
@@ -785,6 +809,71 @@ fn encode_target_mapping(mapping: &TargetMappingSnapshot) -> String {
     encode_fields(&fields)
 }
 
+fn encode_identification_observation(observation: &IdentificationObservation) -> String {
+    let mut fields = encode_target(observation.target());
+    fields.extend(encode_responder_fields(observation.expected_responder()));
+    fields.extend([
+        observation.semantic().into(),
+        observation.definition_id().into(),
+        observation.definition_version().to_string(),
+        observation.knowledge_repository().into(),
+        observation.knowledge_revision().into(),
+        hex(&observation.request()),
+        encode_identification_status(observation.status()).into(),
+        if observation.nrc().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    ]);
+    if let Some(nrc) = observation.nrc() {
+        fields.push(nrc.to_string());
+    }
+    fields.push(
+        if observation.value().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(value) = observation.value() {
+        fields.push(hex(value));
+    }
+    fields.push(observation.responses().len().to_string());
+    for response in observation.responses() {
+        fields.push(
+            if response.responder().is_some() {
+                "1"
+            } else {
+                "0"
+            }
+            .into(),
+        );
+        if let Some(responder) = response.responder() {
+            fields.extend(encode_responder_fields(responder));
+        }
+        fields.push(hex(response.payload()));
+    }
+    fields.push(observation.errors().len().to_string());
+    fields.extend(observation.errors().iter().cloned());
+    encode_fields(&fields)
+}
+
+fn encode_identification_status(status: IdentificationResultStatus) -> &'static str {
+    match status {
+        IdentificationResultStatus::Supported => "supported",
+        IdentificationResultStatus::Unsupported => "unsupported",
+        IdentificationResultStatus::NegativeResponse => "negative_response",
+        IdentificationResultStatus::Unavailable => "unavailable",
+        IdentificationResultStatus::Malformed => "malformed",
+        IdentificationResultStatus::Timeout => "timeout",
+        IdentificationResultStatus::TransportError => "transport_error",
+        IdentificationResultStatus::NotProbed => "not_probed",
+    }
+}
+
 fn encode_role_assignment(role: &RoleAssignment) -> Vec<String> {
     let mut fields = vec![encode_role(role.role())];
     fields.extend(encode_provenance(role.provenance()));
@@ -1016,7 +1105,8 @@ fn parse_target(fields: &[String], index: &mut usize) -> Result<RequestTarget, S
 fn parse(contents: &str, requested_key: &str) -> Result<VehicleCache, String> {
     let mut lines = contents.lines();
     match lines.next() {
-        Some(HEADER) => parse_v3(lines, requested_key),
+        Some(HEADER) => parse_v4(lines, requested_key),
+        Some(V3_HEADER) => parse_v3(lines, requested_key),
         Some(V2_HEADER) => parse_v2(lines, requested_key),
         Some(LEGACY_HEADER) => parse_v1(lines, requested_key),
         _ => Err("unsupported vehicle cache format".into()),
@@ -1071,20 +1161,28 @@ fn parse_v2<'a>(
     lines: impl Iterator<Item = &'a str>,
     requested_key: &str,
 ) -> Result<VehicleCache, String> {
-    parse_versioned(lines, requested_key, false)
+    parse_versioned(lines, requested_key, false, false)
 }
 
 fn parse_v3<'a>(
     lines: impl Iterator<Item = &'a str>,
     requested_key: &str,
 ) -> Result<VehicleCache, String> {
-    parse_versioned(lines, requested_key, true)
+    parse_versioned(lines, requested_key, true, false)
+}
+
+fn parse_v4<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    requested_key: &str,
+) -> Result<VehicleCache, String> {
+    parse_versioned(lines, requested_key, true, true)
 }
 
 fn parse_versioned<'a>(
     lines: impl Iterator<Item = &'a str>,
     requested_key: &str,
     has_role: bool,
+    has_identification: bool,
 ) -> Result<VehicleCache, String> {
     let mut local_key = None;
     let mut first_seen_ms = None;
@@ -1092,6 +1190,7 @@ fn parse_versioned<'a>(
     let mut topology = Vec::new();
     let mut capabilities = BTreeMap::new();
     let mut target_mappings = Vec::new();
+    let mut ecu_identification = Vec::new();
     let mut history = Vec::new();
     for line in lines {
         let (tag, fields) = parse_fields(line)?;
@@ -1151,6 +1250,9 @@ fn parse_versioned<'a>(
             "target_mapping" => {
                 target_mappings.push(parse_target_mapping_with_role(&fields, has_role)?);
             }
+            "ecu_identification" if has_identification => {
+                ecu_identification.push(parse_identification_observation(&fields)?);
+            }
             "history" => history.push(one_field(&fields, "history")?.to_owned()),
             "evidence" => history.push(one_field(&fields, "evidence")?.to_owned()),
             _ => return Err(format!("vehicle cache contains unsupported field {tag}")),
@@ -1167,7 +1269,12 @@ fn parse_versioned<'a>(
         cache.local_key,
         cache.first_seen_ms,
         cache.last_seen_ms,
-        VehicleCacheSnapshot::new(topology, capabilities.into_values(), target_mappings),
+        VehicleCacheSnapshot::with_ecu_identification(
+            topology,
+            capabilities.into_values(),
+            target_mappings,
+            ecu_identification,
+        ),
         cache.history,
     );
     finish_cache(cache, requested_key)
@@ -1272,6 +1379,100 @@ fn parse_target_mapping_with_role(
     ))
 }
 
+fn parse_identification_observation(
+    fields: &[String],
+) -> Result<IdentificationObservation, String> {
+    let mut index = 0;
+    let target = parse_target(fields, &mut index)?;
+    let expected_responder = parse_responder(fields, &mut index)?;
+    let semantic = field(fields, &mut index, "identification semantic")?.to_owned();
+    let definition_id = field(fields, &mut index, "identification definition")?.to_owned();
+    let definition_version = field(fields, &mut index, "identification definition version")?
+        .parse::<u32>()
+        .map_err(|error| format!("invalid identification definition version: {error}"))?;
+    let knowledge_repository =
+        field(fields, &mut index, "identification knowledge repository")?.to_owned();
+    let knowledge_revision =
+        field(fields, &mut index, "identification knowledge revision")?.to_owned();
+    let request_bytes = parse_bytes(field(fields, &mut index, "identification request")?)?;
+    let request: [u8; 3] = request_bytes
+        .try_into()
+        .map_err(|_| "ECU identification request must contain exactly three bytes".to_string())?;
+    let status = parse_identification_status(field(fields, &mut index, "identification status")?)?;
+    let nrc = if parse_optional_flag(fields, &mut index, "identification NRC")? {
+        Some(
+            field(fields, &mut index, "identification NRC value")?
+                .parse::<u8>()
+                .map_err(|error| format!("invalid identification NRC: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let value = if parse_optional_flag(fields, &mut index, "identification value")? {
+        Some(parse_bytes(field(
+            fields,
+            &mut index,
+            "identification value bytes",
+        )?)?)
+    } else {
+        None
+    };
+    let response_count = field(fields, &mut index, "identification response count")?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid identification response count: {error}"))?;
+    let mut responses = Vec::with_capacity(response_count);
+    for _ in 0..response_count {
+        let responder = if parse_optional_flag(fields, &mut index, "identification responder")? {
+            Some(parse_responder(fields, &mut index)?)
+        } else {
+            None
+        };
+        let payload = parse_bytes(field(
+            fields,
+            &mut index,
+            "identification response payload",
+        )?)?;
+        responses.push(IdentificationResponseEvidence::new(responder, payload));
+    }
+    let error_count = field(fields, &mut index, "identification error count")?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid identification error count: {error}"))?;
+    let mut errors = Vec::with_capacity(error_count);
+    for _ in 0..error_count {
+        errors.push(field(fields, &mut index, "identification error")?.to_owned());
+    }
+    finish_fields(fields, index)?;
+    IdentificationObservation::new(
+        target,
+        expected_responder,
+        semantic,
+        definition_id,
+        definition_version,
+        knowledge_repository,
+        knowledge_revision,
+        request,
+        status,
+        responses,
+        nrc,
+        value,
+        errors,
+    )
+}
+
+fn parse_identification_status(value: &str) -> Result<IdentificationResultStatus, String> {
+    match value {
+        "supported" => Ok(IdentificationResultStatus::Supported),
+        "unsupported" => Ok(IdentificationResultStatus::Unsupported),
+        "negative_response" => Ok(IdentificationResultStatus::NegativeResponse),
+        "unavailable" => Ok(IdentificationResultStatus::Unavailable),
+        "malformed" => Ok(IdentificationResultStatus::Malformed),
+        "timeout" => Ok(IdentificationResultStatus::Timeout),
+        "transport_error" => Ok(IdentificationResultStatus::TransportError),
+        "not_probed" => Ok(IdentificationResultStatus::NotProbed),
+        _ => Err("vehicle cache contains an invalid ECU identification status".into()),
+    }
+}
+
 fn parse_role_assignment(fields: &[String], index: &mut usize) -> Result<RoleAssignment, String> {
     let role = parse_role(field(fields, index, "mapping role")?)?;
     let provenance = parse_provenance(fields, index)?;
@@ -1323,6 +1524,36 @@ fn validate_snapshot(snapshot: &VehicleCacheSnapshot) -> Result<(), String> {
             }
         }
     }
+    for observation in &snapshot.ecu_identification {
+        observation.validate()?;
+        validate_context(observation.target().context())?;
+        if let Some(address) = observation.target().address() {
+            validate_text("identification target namespace", address.namespace())?;
+            validate_text("identification target value", address.value())?;
+        }
+        validate_responder(observation.expected_responder())?;
+        validate_text("identification semantic", observation.semantic())?;
+        validate_text("identification definition", observation.definition_id())?;
+        validate_text(
+            "identification knowledge repository",
+            observation.knowledge_repository(),
+        )?;
+        validate_knowledge_revision(observation.knowledge_revision())?;
+        if observation.value().is_some_and(|value| value.len() > 4096) {
+            return Err("vehicle cache ECU identification value is too large".into());
+        }
+        for response in observation.responses() {
+            if let Some(responder) = response.responder() {
+                validate_responder(responder)?;
+            }
+            if response.payload().len() > 4096 {
+                return Err("vehicle cache ECU identification response is too large".into());
+            }
+        }
+        for error in observation.errors() {
+            validate_text("identification error", error)?;
+        }
+    }
     for mapping in &snapshot.target_mappings {
         if let Some(role) = mapping.role() {
             validate_role(role)?;
@@ -1367,6 +1598,13 @@ fn validate_responder(responder: &ResponderIdentity) -> Result<(), String> {
 
 fn validate_provenance(provenance: &Provenance) -> Result<(), String> {
     validate_text("provenance", provenance.source())
+}
+
+fn validate_knowledge_revision(value: &str) -> Result<(), String> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("vehicle cache knowledge revision is not a full Git object id".into());
+    }
+    Ok(())
 }
 
 fn validate_text(field: &str, value: &str) -> Result<(), String> {
@@ -1471,7 +1709,7 @@ mod tests {
         let path = root.join("6c6f63616c2d6b6579.tsv");
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            "OBDENTIC-VEHICLE-CACHE\t3\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t2\nhistory\tevidence\n"
+            "OBDENTIC-VEHICLE-CACHE\t4\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t2\nhistory\tevidence\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1511,7 +1749,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("6c6f63616c2d6b6579.tsv"),
-            "OBDENTIC-VEHICLE-CACHE\t4\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
+            "OBDENTIC-VEHICLE-CACHE\t5\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
         )
         .unwrap();
         assert!(store.load("local-key").is_err());
@@ -1655,6 +1893,118 @@ mod tests {
         )
         .to_vehicle_knowledge_mapping()
         .is_none());
+    }
+
+    #[test]
+    fn round_trips_per_ecu_identification_without_affecting_validation_signature() {
+        let root = root("ecu-identification");
+        let store = CacheStore::new(&root);
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let target =
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0"));
+        let responder = ResponderIdentity::address(context, "7E8");
+        let supported = IdentificationObservation::new(
+            target.clone(),
+            responder.clone(),
+            "ecu.manufacturer_software_version",
+            "uds.f189.manufacturer_software_version",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "661fba8eed8ddce8fef5bba4c68dfcba85e2dd28",
+            [0x22, 0xF1, 0x89],
+            IdentificationResultStatus::Supported,
+            vec![IdentificationResponseEvidence::new(
+                Some(responder.clone()),
+                vec![0x62, 0xF1, 0x89, 0x31, 0x2E],
+            )],
+            None,
+            Some(vec![0x31, 0x2E]),
+            Vec::new(),
+        )
+        .unwrap();
+        let timeout = IdentificationObservation::new(
+            target,
+            responder,
+            "ecu.boot_software_identification",
+            "uds.f180.boot_software_identification",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "661fba8eed8ddce8fef5bba4c68dfcba85e2dd28",
+            [0x22, 0xF1, 0x80],
+            IdentificationResultStatus::Timeout,
+            Vec::new(),
+            None,
+            None,
+            vec!["Carly command timed out".into()],
+        )
+        .unwrap();
+        let snapshot =
+            VehicleCacheSnapshot::with_ecu_identification([], [], [], [supported, timeout]);
+        let signature = snapshot.validation_signature();
+        assert!(signature.topology().is_empty());
+        assert!(signature.ecu_capabilities().is_empty());
+        assert!(signature.target_mappings().is_empty());
+
+        store
+            .save(&VehicleCache::with_snapshot(
+                "local-key",
+                1,
+                2,
+                snapshot.clone(),
+                Vec::new(),
+            ))
+            .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert_eq!(loaded.snapshot(), &snapshot);
+        assert_eq!(
+            loaded
+                .snapshot()
+                .ecu_identification()
+                .iter()
+                .map(IdentificationObservation::status)
+                .collect::<Vec<_>>(),
+            vec![
+                IdentificationResultStatus::Timeout,
+                IdentificationResultStatus::Supported,
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_v3_cache_without_ecu_identification() {
+        let root = root("v3");
+        let store = CacheStore::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("6c6f63616c2d6b6579.tsv"),
+            "OBDENTIC-VEHICLE-CACHE\t3\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
+        )
+        .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert!(loaded.snapshot().ecu_identification().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_vin_did_in_ecu_identification_cache() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let observation = IdentificationObservation::new(
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0")),
+            ResponderIdentity::address(context, "7E8"),
+            "ecu.vin",
+            "uds.f190.vin",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "revision",
+            [0x22, 0xF1, 0x90],
+            IdentificationResultStatus::NotProbed,
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        );
+        assert!(observation.is_err());
     }
 
     #[test]
