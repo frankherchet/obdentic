@@ -1,4 +1,5 @@
 use crate::{
+    adapter::CarlyCuaV200,
     capability::{CapabilityProvenance, HardwareCapability},
     ea189::Ea189DpfProbe,
     topology::AddressingContext,
@@ -7,32 +8,13 @@ use crate::{
     vehicle_knowledge::EcuTargetMapping,
     ReadRequest, Transaction,
 };
-use btleplug::{
-    api::{
-        bleuuid::uuid_from_u16, Central, CharPropFlags, Characteristic, Manager as _,
-        Peripheral as _, ScanFilter, ValueNotification, WriteType,
-    },
-    platform::{Adapter, Manager, Peripheral},
-};
-use futures_util::{Stream, StreamExt};
-use std::{
-    pin::Pin,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{sleep, timeout};
 
-pub(crate) use crate::elm::{initialize_elm, require_response, verify_elm327, ElmExchange};
+pub use crate::adapter::AdapterCandidate;
+use crate::elm::{require_response, ElmExchange};
 
-const CARLY_SERVICE: u16 = 0xFFE0;
-const CARLY_CHANNEL: u16 = 0xFFE1;
-const SCAN_TIMEOUT: Duration = Duration::from_secs(5);
-const FIND_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const SHUTDOWN_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_RESPONSE: usize = 8 * 1024;
 const MODE03_COMMAND: &str = "03\r";
 // Two consecutive transport failures stop a live session; data failures reset the count.
 const TRANSPORT_FAILURE_THRESHOLD: u8 = 2;
@@ -62,13 +44,6 @@ impl PidSupport {
             None => SignalSupportStatus::Unknown,
         }
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct AdapterCandidate {
-    pub id: String,
-    pub name: String,
-    pub rssi: Option<i16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,35 +455,7 @@ impl DiagnosticResponses {
 }
 
 pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
-    let (_manager, adapter) = central().await?;
-    adapter
-        .start_scan(ScanFilter::default())
-        .await
-        .map_err(|error| format!("Bluetooth scan failed: {error}"))?;
-    sleep(SCAN_TIMEOUT).await;
-    let peripherals = adapter
-        .peripherals()
-        .await
-        .map_err(|error| format!("Bluetooth scan result failed: {error}"));
-    let _ = adapter.stop_scan().await;
-
-    let mut candidates = Vec::new();
-    for peripheral in peripherals? {
-        let Some(properties) = peripheral.properties().await.ok().flatten() else {
-            continue;
-        };
-        let Some(name) = properties.local_name else {
-            continue;
-        };
-        if name.to_ascii_lowercase().contains("carly") {
-            candidates.push(AdapterCandidate {
-                id: peripheral.id().to_string(),
-                name,
-                rssi: properties.rssi,
-            });
-        }
-    }
-    Ok(candidates)
+    crate::adapter::scan().await
 }
 
 pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction, String> {
@@ -1062,16 +1009,10 @@ fn is_transport_failure(error: &str) -> bool {
     .any(|marker| error.contains(marker))
 }
 
-type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
-
 /// One connected, initialized, read-only Carly diagnostic path.
 pub struct DiagnosticSession {
-    _manager: Manager,
-    peripheral: Peripheral,
-    channel: Characteristic,
-    notifications: Notifications,
+    backend: CarlyCuaV200,
     supported: PidSupport,
-    show_adapter_io: bool,
 }
 
 impl DiagnosticSession {
@@ -1098,46 +1039,18 @@ impl DiagnosticSession {
         show_adapter_io: bool,
         discover_support: bool,
     ) -> Result<Self, String> {
-        let (manager, adapter) = central().await?;
-        let peripheral = find_peripheral(&adapter, adapter_id).await?;
-        let cleanup_peripheral = peripheral.clone();
-        let result = async {
-            timeout(CONNECT_TIMEOUT, peripheral.connect())
-                .await
-                .map_err(|_| "Bluetooth connection timed out".to_string())?
-                .map_err(|error| format!("Bluetooth connection failed: {error}"))?;
-            timeout(SETUP_TIMEOUT, peripheral.discover_services())
-                .await
-                .map_err(|_| "BLE service discovery timed out".to_string())?
-                .map_err(|error| format!("BLE service discovery failed: {error}"))?;
-            let channel = carly_channel(&peripheral)?;
-            timeout(SETUP_TIMEOUT, peripheral.subscribe(&channel))
-                .await
-                .map_err(|_| "Carly notification activation timed out".to_string())?
-                .map_err(|error| format!("Carly notifications unavailable: {error}"))?;
-            let notifications = timeout(SETUP_TIMEOUT, peripheral.notifications())
-                .await
-                .map_err(|_| "Carly notification stream timed out".to_string())?
-                .map_err(|error| format!("Carly notification stream unavailable: {error}"))?;
-            let mut session = Self {
-                _manager: manager,
-                peripheral,
-                channel,
-                notifications,
-                supported: PidSupport::default(),
-                show_adapter_io,
-            };
-            session.initialize().await?;
-            if discover_support {
-                session.discover_support().await?;
+        let backend = CarlyCuaV200::connect(adapter_id, show_adapter_io).await?;
+        let mut session = Self {
+            backend,
+            supported: PidSupport::default(),
+        };
+        if discover_support {
+            if let Err(error) = session.discover_support().await {
+                session.disconnect_best_effort().await;
+                return Err(error);
             }
-            Ok(session)
         }
-        .await;
-        if result.is_err() {
-            best_effort_disconnect(&cleanup_peripheral).await;
-        }
-        result
+        Ok(session)
     }
 
     pub async fn read(&mut self, request: ReadRequest) -> Result<Transaction, String> {
@@ -1157,15 +1070,7 @@ impl DiagnosticSession {
         &mut self,
         request: TargetedDpfProbeRequest,
     ) -> DpfProbeOutcome {
-        let read = {
-            let mut exchange = LiveExchange {
-                peripheral: &self.peripheral,
-                channel: &self.channel,
-                notifications: &mut self.notifications,
-                show_adapter_io: self.show_adapter_io,
-            };
-            read_elm_dpf_probe_with_evidence(&mut exchange, &request).await
-        };
+        let read = read_elm_dpf_probe_with_evidence(&mut self.backend, &request).await;
         match read {
             Ok(read) => DpfProbeOutcome::Succeeded {
                 responses: read.responses,
@@ -1179,43 +1084,19 @@ impl DiagnosticSession {
     }
 
     async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
-        let mut exchange = LiveExchange {
-            peripheral: &self.peripheral,
-            channel: &self.channel,
-            notifications: &mut self.notifications,
-            show_adapter_io: self.show_adapter_io,
-        };
-        read_elm_mode03_responses(&mut exchange).await
+        read_elm_mode03_responses(&mut self.backend).await
     }
 
     pub async fn identify(&mut self) -> Result<crate::identity::VehicleIdentity, String> {
-        let mut exchange = LiveExchange {
-            peripheral: &self.peripheral,
-            channel: &self.channel,
-            notifications: &mut self.notifications,
-            show_adapter_io: self.show_adapter_io,
-        };
-        read_elm_identity(&mut exchange).await
+        read_elm_identity(&mut self.backend).await
     }
 
     async fn validate_functional_support(&mut self) -> Result<Vec<SupportDiscovery>, String> {
-        let mut exchange = LiveExchange {
-            peripheral: &self.peripheral,
-            channel: &self.channel,
-            notifications: &mut self.notifications,
-            show_adapter_io: self.show_adapter_io,
-        };
-        validate_functional_support_exchange(&mut exchange).await
+        validate_functional_support_exchange(&mut self.backend).await
     }
 
     async fn establish_protocol(&mut self) -> Result<ProtocolNegotiation, String> {
-        let mut exchange = LiveExchange {
-            peripheral: &self.peripheral,
-            channel: &self.channel,
-            notifications: &mut self.notifications,
-            show_adapter_io: self.show_adapter_io,
-        };
-        establish_elm_protocol(&mut exchange).await
+        establish_elm_protocol(&mut self.backend).await
     }
 
     async fn read_with_evidence(&mut self, request: ReadRequest) -> ReadOutcome {
@@ -1228,15 +1109,7 @@ impl DiagnosticSession {
                 observations: Vec::new(),
             };
         }
-        let read = {
-            let mut exchange = LiveExchange {
-                peripheral: &self.peripheral,
-                channel: &self.channel,
-                notifications: &mut self.notifications,
-                show_adapter_io: self.show_adapter_io,
-            };
-            read_elm_with_evidence(&mut exchange, request).await
-        };
+        let read = read_elm_with_evidence(&mut self.backend, request).await;
         match read {
             Ok(read) => match request.complete("user", read.payload) {
                 Ok(transaction) => ReadOutcome::Succeeded {
@@ -1256,15 +1129,7 @@ impl DiagnosticSession {
     }
 
     async fn read_targeted_with_evidence(&mut self, request: TargetedReadRequest) -> ReadOutcome {
-        let read = {
-            let mut exchange = LiveExchange {
-                peripheral: &self.peripheral,
-                channel: &self.channel,
-                notifications: &mut self.notifications,
-                show_adapter_io: self.show_adapter_io,
-            };
-            read_elm_targeted_with_evidence(&mut exchange, &request).await
-        };
+        let read = read_elm_targeted_with_evidence(&mut self.backend, &request).await;
         match read {
             Ok(read) => match request.request().complete("user", read.payload) {
                 Ok(transaction) => ReadOutcome::Succeeded {
@@ -1284,42 +1149,15 @@ impl DiagnosticSession {
     }
 
     pub async fn disconnect(&mut self) -> Result<(), String> {
-        timeout(CONNECT_TIMEOUT, self.peripheral.disconnect())
-            .await
-            .map_err(|_| "Bluetooth disconnect timed out".to_string())?
-            .map_err(|error| format!("Bluetooth disconnect failed: {error}"))
+        self.backend.disconnect().await
     }
 
     async fn disconnect_best_effort(&mut self) {
-        let _ = timeout(SHUTDOWN_DISCONNECT_TIMEOUT, self.peripheral.disconnect()).await;
-    }
-
-    async fn initialize(&mut self) -> Result<(), String> {
-        let mut exchange = LiveExchange {
-            peripheral: &self.peripheral,
-            channel: &self.channel,
-            notifications: &mut self.notifications,
-            show_adapter_io: self.show_adapter_io,
-        };
-        verify_elm327(&mut exchange).await?;
-        let identity = exchange.exchange("AT@1\r", Duration::from_secs(3)).await?;
-        require_response(
-            &identity,
-            "CARLY-UNIVERSAL",
-            false,
-            "AT@1 did not identify a Carly adapter",
-        )?;
-        initialize_elm(&mut exchange).await
+        self.backend.disconnect_best_effort().await;
     }
 
     async fn discover_support(&mut self) -> Result<(), String> {
-        let mut exchange = LiveExchange {
-            peripheral: &self.peripheral,
-            channel: &self.channel,
-            notifications: &mut self.notifications,
-            show_adapter_io: self.show_adapter_io,
-        };
-        self.supported = discover_pid_support(&mut exchange).await?;
+        self.supported = discover_pid_support(&mut self.backend).await?;
         Ok(())
     }
 
@@ -1331,102 +1169,6 @@ impl DiagnosticSession {
                 status: self.supported.status(signal.request().pid()),
             })
             .collect()
-    }
-}
-
-async fn best_effort_disconnect(peripheral: &Peripheral) {
-    let _ = timeout(CONNECT_TIMEOUT, peripheral.disconnect()).await;
-}
-
-async fn central() -> Result<(Manager, Adapter), String> {
-    let manager = Manager::new()
-        .await
-        .map_err(|error| format!("Bluetooth manager unavailable: {error}"))?;
-    let adapter = manager
-        .adapters()
-        .await
-        .map_err(|error| format!("Bluetooth adapter lookup failed: {error}"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no Bluetooth adapter available".to_string())?;
-    Ok((manager, adapter))
-}
-
-async fn find_peripheral(adapter: &Adapter, requested_id: &str) -> Result<Peripheral, String> {
-    adapter
-        .start_scan(ScanFilter::default())
-        .await
-        .map_err(|error| format!("Bluetooth scan failed: {error}"))?;
-    sleep(FIND_TIMEOUT).await;
-    let peripherals = adapter
-        .peripherals()
-        .await
-        .map_err(|error| format!("Bluetooth scan result failed: {error}"));
-    let _ = adapter.stop_scan().await;
-    peripherals?
-        .into_iter()
-        .find(|peripheral| {
-            peripheral
-                .id()
-                .to_string()
-                .eq_ignore_ascii_case(requested_id)
-        })
-        .ok_or_else(|| format!("adapter {requested_id} was not found after 10 seconds"))
-}
-
-fn carly_channel(peripheral: &Peripheral) -> Result<Characteristic, String> {
-    let service = uuid_from_u16(CARLY_SERVICE);
-    let channel = uuid_from_u16(CARLY_CHANNEL);
-    if !peripheral
-        .services()
-        .iter()
-        .any(|item| item.uuid == service)
-    {
-        return Err("Carly FFE0 service unavailable".into());
-    }
-    let channel = peripheral
-        .characteristics()
-        .iter()
-        .find(|item| item.service_uuid == service && item.uuid == channel)
-        .cloned()
-        .ok_or_else(|| "Carly FFE1 characteristic unavailable".to_string())?;
-    if !channel.properties.contains(CharPropFlags::NOTIFY) {
-        return Err("Carly FFE1 notifications unavailable".into());
-    }
-    if !channel
-        .properties
-        .intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE)
-    {
-        return Err("Carly FFE1 write unavailable".into());
-    }
-    Ok(channel)
-}
-
-struct LiveExchange<'a, S> {
-    peripheral: &'a Peripheral,
-    channel: &'a Characteristic,
-    notifications: &'a mut S,
-    show_adapter_io: bool,
-}
-
-impl<S> ElmExchange for LiveExchange<'_, S>
-where
-    S: Stream<Item = ValueNotification> + Unpin,
-{
-    async fn exchange(
-        &mut self,
-        command: &str,
-        command_timeout: Duration,
-    ) -> Result<String, String> {
-        elm_exchange(
-            self.peripheral,
-            self.channel,
-            self.notifications,
-            command,
-            command_timeout,
-            self.show_adapter_io,
-        )
-        .await
     }
 }
 
@@ -1789,97 +1531,6 @@ fn bitmap_supports_pid(bitmap: u32, pid: u8) -> bool {
     let offset = pid & 0x1f;
     let shift = if offset == 0 { 0 } else { 32 - offset };
     bitmap & (1 << shift) != 0
-}
-
-async fn elm_exchange<S>(
-    peripheral: &Peripheral,
-    channel: &Characteristic,
-    notifications: &mut S,
-    command: &str,
-    command_timeout: Duration,
-    show_adapter_io: bool,
-) -> Result<String, String>
-where
-    S: Stream<Item = ValueNotification> + Unpin,
-{
-    discard_queued_notifications(notifications).await;
-    let write_type = if channel
-        .properties
-        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
-    {
-        WriteType::WithoutResponse
-    } else {
-        WriteType::WithResponse
-    };
-    timeout(
-        command_timeout,
-        peripheral.write(channel, command.as_bytes(), write_type),
-    )
-    .await
-    .map_err(|_| format!("Carly write timed out: {}", command.trim()))?
-    .map_err(|error| format!("Carly write failed: {error}"))?;
-    if let Some(line) = adapter_io_line(show_adapter_io, "tx", command.trim()) {
-        println!("{line}");
-    }
-
-    let response = timeout(command_timeout, wait_for_prompt(notifications, channel))
-        .await
-        .map_err(|_| format!("Carly command timed out: {}", command.trim()))??;
-    if let Some(line) = adapter_io_line(show_adapter_io, "rx", response.escape_default()) {
-        println!("{line}");
-    }
-    Ok(response)
-}
-
-/// A Carly adapter can deliver a fragment just after the prompt that closed
-/// the preceding exchange. It cannot belong to the next command, so discard
-/// queued notifications before writing that command.
-async fn discard_queued_notifications<S>(notifications: &mut S)
-where
-    S: Stream<Item = ValueNotification> + Unpin,
-{
-    while matches!(
-        timeout(Duration::from_millis(2), notifications.next()).await,
-        Ok(Some(_))
-    ) {}
-}
-
-fn adapter_io_line(
-    show_adapter_io: bool,
-    direction: &str,
-    value: impl std::fmt::Display,
-) -> Option<String> {
-    show_adapter_io.then(|| format!("adapter {direction}  {value}"))
-}
-
-async fn wait_for_prompt<S>(
-    notifications: &mut S,
-    channel: &Characteristic,
-) -> Result<String, String>
-where
-    S: Stream<Item = ValueNotification> + Unpin,
-{
-    let mut response = Vec::new();
-    loop {
-        let notification = notifications
-            .next()
-            .await
-            .ok_or_else(|| "Carly notification stream ended".to_string())?;
-        if notification.uuid != channel.uuid {
-            continue;
-        }
-        if append_notification(&mut response, &notification.value)? {
-            return Ok(String::from_utf8_lossy(&response).into_owned());
-        }
-    }
-}
-
-fn append_notification(response: &mut Vec<u8>, fragment: &[u8]) -> Result<bool, String> {
-    response.extend_from_slice(fragment);
-    if response.len() > MAX_RESPONSE {
-        return Err("Carly response exceeded 8 KiB".into());
-    }
-    Ok(response.contains(&b'>'))
 }
 
 fn obd_command(request: ReadRequest) -> String {
@@ -2812,7 +2463,7 @@ fn normalize_uds_responses(response: &str, did: u16) -> Result<DiagnosticRespons
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::VecDeque;
 
     const INIT_COMMANDS: [&str; 9] = [
         "ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r", "0100\r",
@@ -2849,23 +2500,8 @@ mod tests {
     where
         E: ElmExchange,
     {
-        initialize_carly_elm(exchange).await?;
+        crate::adapter::initialize_carly(exchange).await?;
         discover_pid_support(exchange).await
-    }
-
-    async fn initialize_carly_elm<E>(exchange: &mut E) -> Result<(), String>
-    where
-        E: ElmExchange,
-    {
-        verify_elm327(exchange).await?;
-        let identity = exchange.exchange("AT@1\r", Duration::from_secs(3)).await?;
-        require_response(
-            &identity,
-            "CARLY-UNIVERSAL",
-            false,
-            "AT@1 did not identify a Carly adapter",
-        )?;
-        initialize_elm(exchange).await
     }
 
     fn captured_responses() -> Vec<String> {
@@ -2915,23 +2551,6 @@ mod tests {
             [0x62, 0x11, 0x4f, 0x04, 0xf8]
         );
         assert!(responses.errors().is_empty());
-    }
-
-    fn channel() -> Characteristic {
-        Characteristic {
-            uuid: uuid_from_u16(CARLY_CHANNEL),
-            service_uuid: uuid_from_u16(CARLY_SERVICE),
-            properties: CharPropFlags::NOTIFY,
-            descriptors: BTreeSet::new(),
-        }
-    }
-
-    fn notification(value: &[u8]) -> ValueNotification {
-        ValueNotification {
-            uuid: uuid_from_u16(CARLY_CHANNEL),
-            service_uuid: uuid_from_u16(CARLY_SERVICE),
-            value: value.into(),
-        }
     }
 
     #[tokio::test]
@@ -3479,20 +3098,7 @@ mod tests {
         assert!(normalize_mode01("037F0111\r410C0000\r>", 0x0c, 2).is_err());
         assert!(normalize_mode01("41 0C ZZ 00\r>", 0x0c, 2).is_err());
         assert!(require_response("OK\rERROR\r>", "OK", true, "command failed").is_err());
-        assert!(require_response("NOTCARLY\r>", "CARLY-UNIVERSAL", false, "identity").is_err());
-    }
-
-    #[test]
-    fn suppresses_adapter_io_for_live_sessions_but_keeps_one_shot_format() {
-        assert_eq!(adapter_io_line(false, "tx", "010C"), None);
-        assert_eq!(
-            adapter_io_line(true, "tx", "010C"),
-            Some("adapter tx  010C".into())
-        );
-        assert_eq!(
-            adapter_io_line(true, "rx", "410C0000\\r>"),
-            Some("adapter rx  410C0000\\r>".into())
-        );
+        assert!(require_response("NOT-EXPECTED\r>", "EXPECTED", false, "identity").is_err());
     }
 
     #[test]
@@ -3585,27 +3191,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carly_initialization_does_not_probe_pid_support() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "ELM327 v1.4 v100\r>".into(),
-            "carly-universal v200\r>".into(),
-            "ELM327 v1.4 v100\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
-        ]);
-
-        initialize_carly_elm(&mut exchange).await.unwrap();
-
-        assert_eq!(
-            exchange.commands,
-            ["ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r",]
-        );
-    }
-
-    #[tokio::test]
     async fn bounded_functional_validation_queries_once_and_preserves_responders() {
         let mut exchange = ScriptedExchange::captured(vec![
             "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>".into(),
@@ -3625,47 +3210,6 @@ mod tests {
             validation[1].responder,
             Some(ResponderIdentity::ElmHeader("7E9".into()))
         );
-    }
-
-    #[test]
-    fn assembles_fragmented_notifications_through_prompt_with_a_size_bound() {
-        let mut response = Vec::new();
-        assert!(!append_notification(&mut response, b"41 0C 00").unwrap());
-        assert!(append_notification(&mut response, b" 00\r>").unwrap());
-        assert_eq!(response, b"41 0C 00 00\r>");
-
-        let mut oversized = vec![b'0'; MAX_RESPONSE];
-        assert!(append_notification(&mut oversized, b"0").is_err());
-    }
-
-    #[tokio::test]
-    async fn frames_fragments_and_rejects_missing_prompt_or_oversize_response() {
-        let mut fragments =
-            futures_util::stream::iter(vec![notification(b"41 0C 00"), notification(b" 00\r>")]);
-        assert_eq!(
-            wait_for_prompt(&mut fragments, &channel()).await,
-            Ok("41 0C 00 00\r>".into())
-        );
-
-        let mut missing_prompt = futures_util::stream::iter(vec![notification(b"41 0C 00 00\r")]);
-        assert!(wait_for_prompt(&mut missing_prompt, &channel())
-            .await
-            .is_err());
-
-        let mut oversized =
-            futures_util::stream::iter(vec![notification(&vec![b'0'; MAX_RESPONSE + 1])]);
-        assert!(wait_for_prompt(&mut oversized, &channel()).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn prompt_wait_honors_timeout_without_hardware() {
-        let mut notifications = futures_util::stream::pending::<ValueNotification>();
-        assert!(timeout(
-            Duration::from_millis(1),
-            wait_for_prompt(&mut notifications, &channel())
-        )
-        .await
-        .is_err());
     }
 
     #[tokio::test]

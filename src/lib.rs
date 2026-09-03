@@ -8,6 +8,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+pub(crate) mod adapter;
 pub mod audit;
 pub mod ble;
 pub mod cache_validation;
