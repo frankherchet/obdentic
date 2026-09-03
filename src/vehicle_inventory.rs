@@ -9,9 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     ecu_identification::IdentificationObservation,
-    topology::{
-        ObservationWindow, Provenance, RequestTarget, ResponderIdentity, RoleAssignment,
-    },
+    topology::{ObservationWindow, Provenance, RequestTarget, ResponderIdentity, RoleAssignment},
     vehicle_cache::{TargetMappingSnapshot, VehicleCache},
 };
 
@@ -51,13 +49,15 @@ impl VehicleInventory {
             let builder = builders
                 .entry(capability.responder().clone())
                 .or_insert_with(|| EcuInstanceBuilder::new(capability.responder().clone()));
-            builder.capabilities.extend(capability.pages().iter().map(|page| {
-                ObservedCapabilityPage::new(
-                    page.request(),
-                    page.payload().to_vec(),
-                    page.provenance().clone(),
-                )
-            }));
+            builder
+                .capabilities
+                .extend(capability.pages().iter().map(|page| {
+                    ObservedCapabilityPage::new(
+                        page.request(),
+                        page.payload().to_vec(),
+                        page.provenance().clone(),
+                    )
+                }));
         }
 
         let mut unassigned_targets = Vec::new();
@@ -293,9 +293,7 @@ mod tests {
         ecu_identification::{
             IdentificationObservation, IdentificationResponseEvidence, IdentificationResultStatus,
         },
-        topology::{
-            AddressingContext, Confidence, Protocol, ProtocolContext, RequestAddress,
-        },
+        topology::{AddressingContext, Confidence, Protocol, ProtocolContext, RequestAddress},
         vehicle_cache::{
             CapabilityPageSnapshot, EcuCapabilitySnapshot, TopologyObservation,
             VehicleCacheSnapshot,
@@ -386,18 +384,8 @@ mod tests {
             ),
         ];
         let mut mappings = vec![
-            TargetMappingSnapshot::new(
-                None,
-                Some(ecu_a),
-                target("7E0"),
-                provenance("target A"),
-            ),
-            TargetMappingSnapshot::new(
-                None,
-                Some(ecu_b),
-                target("7E1"),
-                provenance("target B"),
-            ),
+            TargetMappingSnapshot::new(None, Some(ecu_a), target("7E0"), provenance("target A")),
+            TargetMappingSnapshot::new(None, Some(ecu_b), target("7E1"), provenance("target B")),
         ];
         let mut identifications = vec![
             supported_identification(
