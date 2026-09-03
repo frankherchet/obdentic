@@ -19,6 +19,7 @@ pub mod capture_report;
 pub mod capture_tui;
 pub mod compound_fact;
 pub mod diagnostic_job;
+pub mod dpf_report;
 pub mod dtc;
 pub mod ea189;
 pub mod evidence;
