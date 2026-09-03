@@ -1,0 +1,34 @@
+name: Issue 87 inventory-domain bootstrap
+
+on:
+  push:
+    branches:
+      - feature/87-observed-inventory-domain
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'Add temporary issue 87 inventory gate'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/87-observed-inventory-domain
+          fetch-depth: 0
+          submodules: recursive
+      - run: python3 tools/issue87_inventory_patch.py
+      - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.98.0 fmt
+      - run: cargo +1.98.0 test --locked
+      - run: cargo +1.98.0 clippy --all-targets --locked -- -D warnings
+      - run: cargo +1.98.0 build --locked
+      - name: Commit validated source change
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src
+          git diff --cached --exit-code && { echo 'patch produced no source changes'; exit 1; } || true
+          git commit -m 'Expose observed vehicle inventory domain'
+          git push origin HEAD:feature/87-observed-inventory-domain
