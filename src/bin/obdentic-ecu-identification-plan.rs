@@ -1,6 +1,4 @@
-use obdentic::knowledge_db::{
-    KnowledgeCatalog, STANDARD_UDS_ECU_IDENTIFICATION_SET,
-};
+use obdentic::knowledge_db::{KnowledgeCatalog, STANDARD_UDS_ECU_IDENTIFICATION_SET};
 use std::{env, path::Path};
 
 const VIN_DID: u16 = 0xF190;
