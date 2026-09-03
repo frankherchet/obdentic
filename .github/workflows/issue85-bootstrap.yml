@@ -18,6 +18,36 @@ jobs:
           ref: feature/85-live-ecu-identification
           fetch-depth: 0
           submodules: recursive
+      - name: Make the real session-actor anchor explicit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tools/issue85_live_patch.py')
+          text = path.read_text()
+          old = '''    count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement anchor, found {count}: {old[:80]!r}")
+              file.write_text(text.replace(old, new, 1))
+          '''
+          # Preserve strict one-anchor behavior everywhere except the one
+          # intentionally duplicated SessionCommand arm: the production actor
+          # precedes the test actor in ble.rs, so replace the first occurrence.
+          new = '''    count = text.count(old)
+              if count != 1:
+                  if (
+                      path == "src/ble.rs"
+                      and old == "            SessionCommand::ReadStoredDtcs { reply } => {"
+                      and count == 2
+                  ):
+                      file.write_text(text.replace(old, new, 1))
+                      return
+                  raise SystemExit(f"{path}: expected one replacement anchor, found {count}: {old[:80]!r}")
+              file.write_text(text.replace(old, new, 1))
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('bootstrap helper anchor changed unexpectedly')
+          path.write_text(text.replace(old, new, 1))
+          PY
       - run: python3 tools/issue85_live_patch.py
       - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
       - run: cargo +1.98.0 fmt
