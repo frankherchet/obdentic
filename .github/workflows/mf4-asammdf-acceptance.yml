@@ -39,8 +39,9 @@ jobs:
           printf '%s\n' "$path" > /tmp/obdentic-mf4-path
       - name: Open and inspect with independent asammdf
         run: |
-          python3 -m pip install --disable-pip-version-check 'asammdf==8.8.26'
-          python3 - "$(cat /tmp/obdentic-mf4-path)" <<'PY'
+          python3 -m venv /tmp/asammdf-venv
+          /tmp/asammdf-venv/bin/python -m pip install --disable-pip-version-check 'asammdf==8.8.26'
+          /tmp/asammdf-venv/bin/python - "$(cat /tmp/obdentic-mf4-path)" <<'PY'
           import sys
           from collections import defaultdict
           from asammdf import MDF
