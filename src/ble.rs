@@ -1,34 +1,31 @@
 use crate::{
     adapter::CarlyCuaV200,
     capability::{CapabilityProvenance, HardwareCapability},
-    ea189::Ea189DpfProbe,
-    topology::RequestTarget,
-    vehicle_knowledge::EcuTargetMapping,
     ReadRequest, Transaction,
 };
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 pub use crate::adapter::AdapterCandidate;
+#[cfg(test)]
 use crate::elm::ElmExchange;
-pub(crate) use crate::elm::{
-    configure_target, discover_pid_support as discover_pid_support_with_limit,
-    establish_elm_protocol, normalize_uds_responses, read_elm_identity, read_elm_mode03_responses,
-    read_elm_targeted_with_evidence, read_elm_with_evidence, supports_pid, uds_command,
-    validate_elm_header, validate_functional_support_exchange, validate_request_target, PidSupport,
-    ReadEvidenceError, ResponseObservation,
-};
+use crate::elm::ElmSession;
 #[cfg(test)]
 pub(crate) use crate::elm::{
+    discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
     normalize_mode01, normalize_mode01_responses, normalize_mode03_responses,
-    normalize_mode09_segments, normalize_pid_support_page, read_elm, require_response,
+    normalize_mode09_segments, normalize_pid_support_page, normalize_uds_responses, read_elm,
+    read_elm_identity, read_elm_mode03_responses, read_elm_targeted_with_evidence,
+    read_elm_with_evidence, require_response, supports_pid, validate_functional_support_exchange,
+    PidSupport,
 };
 pub use crate::elm::{
     DiagnosticResponse, DiagnosticResponseError, DiagnosticResponses, ProtocolNegotiation,
-    ResponderIdentity, SignalSupport, SignalSupportStatus, SupportDiscovery, TargetedReadRequest,
+    ResponderIdentity, SignalSupport, SignalSupportStatus, SupportDiscovery,
+    TargetedDpfProbeRequest, TargetedReadRequest,
 };
+pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 // Two consecutive transport failures stop a live session; data failures reset the count.
 const TRANSPORT_FAILURE_THRESHOLD: u8 = 2;
 const SESSION_UNHEALTHY_PREFIX: &str =
@@ -68,70 +65,6 @@ impl PreparedDiagnosticSession {
 
     pub async fn shutdown(self) -> Result<(), String> {
         self.session.shutdown().await
-    }
-}
-
-/// The sole live UDS request admitted by the transport.  The profile owns
-/// the DID; callers cannot construct a generic UDS request or inject bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TargetedDpfProbeRequest {
-    operation: crate::protocol::ReadOperation,
-    target: RequestTarget,
-    expected_responder: ResponderIdentity,
-}
-
-impl TargetedDpfProbeRequest {
-    /// Construct a closed EA189 probe from independently validated engine
-    /// routing evidence. The profile fixes the DID; callers provide no bytes.
-    pub fn from_mapping(probe: Ea189DpfProbe, mapping: &EcuTargetMapping) -> Result<Self, String> {
-        if mapping.role().role() != &crate::topology::EcuRole::Engine {
-            return Err("EA189 DPF probes require validated engine target evidence".into());
-        }
-        let target = mapping.target().target().clone();
-        if mapping.expected_responder().context() != target.context() {
-            return Err("EA189 DPF probe target and responder contexts differ".into());
-        }
-        let expected_responder = mapping
-            .expected_responder()
-            .value()
-            .ok_or_else(|| "EA189 DPF probes require an expected responder".to_string())?;
-        Self::new(
-            probe,
-            target,
-            ResponderIdentity::ElmHeader(expected_responder.to_owned()),
-        )
-    }
-
-    fn new(
-        probe: Ea189DpfProbe,
-        target: RequestTarget,
-        expected_responder: ResponderIdentity,
-    ) -> Result<Self, String> {
-        validate_request_target(&target)?;
-        validate_elm_header(&expected_responder, "expected responder")?;
-        Ok(Self {
-            operation: crate::protocol::ReadOperation::uds_read_data_by_identifier(probe.id()),
-            target,
-            expected_responder: ResponderIdentity::ElmHeader(
-                expected_responder.as_str().to_ascii_uppercase(),
-            ),
-        })
-    }
-
-    pub fn did(&self) -> u16 {
-        self.operation.did()
-    }
-
-    pub fn request_bytes(&self) -> [u8; 3] {
-        self.operation.request_bytes()
-    }
-
-    pub fn target(&self) -> &RequestTarget {
-        &self.target
-    }
-
-    pub fn expected_responder(&self) -> &ResponderIdentity {
-        &self.expected_responder
     }
 }
 
@@ -586,7 +519,11 @@ async fn session_actor(
                 return;
             }
             SessionCommand::SupportDiscovery { reply } => {
-                let _ = reply.send(session.supported.discovery.clone());
+                let _ = reply.send(
+                    session
+                        .elm_mut()
+                        .map_or_else(|_| Vec::new(), |elm| elm.supported().discovery.clone()),
+                );
             }
             SessionCommand::Capability { reply } => {
                 let _ = reply.send(service.capability());
@@ -734,8 +671,7 @@ fn is_transport_failure(error: &str) -> bool {
 
 /// One connected, initialized, read-only Carly diagnostic path.
 pub struct DiagnosticSession {
-    backend: CarlyCuaV200,
-    supported: PidSupport,
+    elm: Option<ElmSession<CarlyCuaV200>>,
 }
 
 impl DiagnosticSession {
@@ -764,8 +700,7 @@ impl DiagnosticSession {
     ) -> Result<Self, String> {
         let backend = CarlyCuaV200::connect(adapter_id, show_adapter_io).await?;
         let mut session = Self {
-            backend,
-            supported: PidSupport::default(),
+            elm: Some(ElmSession::new(backend)),
         };
         if discover_support {
             if let Err(error) = session.discover_support().await {
@@ -793,7 +728,13 @@ impl DiagnosticSession {
         &mut self,
         request: TargetedDpfProbeRequest,
     ) -> DpfProbeOutcome {
-        let read = read_elm_dpf_probe_with_evidence(&mut self.backend, &request).await;
+        let read = match self.elm_mut() {
+            Ok(session) => session.read_dpf_probe_with_evidence(&request).await,
+            Err(error) => Err(ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            }),
+        };
         match read {
             Ok(read) => DpfProbeOutcome::Succeeded {
                 responses: read.responses,
@@ -807,32 +748,29 @@ impl DiagnosticSession {
     }
 
     async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
-        read_elm_mode03_responses(&mut self.backend).await
+        self.elm_mut()?.read_stored_dtcs().await
     }
 
     pub async fn identify(&mut self) -> Result<crate::identity::VehicleIdentity, String> {
-        read_elm_identity(&mut self.backend).await
+        self.elm_mut()?.identify().await
     }
 
     async fn validate_functional_support(&mut self) -> Result<Vec<SupportDiscovery>, String> {
-        validate_functional_support_exchange(&mut self.backend).await
+        self.elm_mut()?.validate_functional_support().await
     }
 
     async fn establish_protocol(&mut self) -> Result<ProtocolNegotiation, String> {
-        establish_elm_protocol(&mut self.backend).await
+        self.elm_mut()?.establish_protocol().await
     }
 
     async fn read_with_evidence(&mut self, request: ReadRequest) -> ReadOutcome {
-        if !supports_pid(&self.supported, request.pid()) {
-            return ReadOutcome::Failed {
-                error: format!(
-                    "vehicle does not advertise support for {}",
-                    crate::hex(&request.bytes())
-                ),
+        let read = match self.elm_mut() {
+            Ok(session) => session.read_with_evidence(request).await,
+            Err(error) => Err(ReadEvidenceError {
+                error,
                 observations: Vec::new(),
-            };
-        }
-        let read = read_elm_with_evidence(&mut self.backend, request).await;
+            }),
+        };
         match read {
             Ok(read) => match request.complete("user", read.payload) {
                 Ok(transaction) => ReadOutcome::Succeeded {
@@ -852,7 +790,13 @@ impl DiagnosticSession {
     }
 
     async fn read_targeted_with_evidence(&mut self, request: TargetedReadRequest) -> ReadOutcome {
-        let read = read_elm_targeted_with_evidence(&mut self.backend, &request).await;
+        let read = match self.elm_mut() {
+            Ok(session) => session.read_targeted_with_evidence(&request).await,
+            Err(error) => Err(ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            }),
+        };
         match read {
             Ok(read) => match request.request().complete("user", read.payload) {
                 Ok(transaction) => ReadOutcome::Succeeded {
@@ -872,16 +816,24 @@ impl DiagnosticSession {
     }
 
     pub async fn disconnect(&mut self) -> Result<(), String> {
-        self.backend.disconnect().await
+        let Some(session) = self.elm.take() else {
+            return Ok(());
+        };
+        let mut backend = session.into_exchange();
+        backend.disconnect().await
     }
 
     async fn disconnect_best_effort(&mut self) {
-        self.backend.disconnect_best_effort().await;
+        if let Some(session) = self.elm.take() {
+            let mut backend = session.into_exchange();
+            backend.disconnect_best_effort().await;
+        }
     }
 
     async fn discover_support(&mut self) -> Result<(), String> {
-        self.supported = discover_pid_support(&mut self.backend).await?;
-        Ok(())
+        self.elm_mut()?
+            .discover_support(highest_catalog_page())
+            .await
     }
 
     fn signal_support(&self) -> Vec<SignalSupport> {
@@ -889,12 +841,24 @@ impl DiagnosticSession {
             .iter()
             .map(|signal| SignalSupport {
                 semantic: signal.metadata().semantic,
-                status: self.supported.status(signal.request().pid()),
+                status: self
+                    .elm
+                    .as_ref()
+                    .map_or(SignalSupportStatus::Unknown, |session| {
+                        session.supported().status(signal.request().pid())
+                    }),
             })
             .collect()
     }
+
+    fn elm_mut(&mut self) -> Result<&mut ElmSession<CarlyCuaV200>, String> {
+        self.elm
+            .as_mut()
+            .ok_or_else(|| "diagnostic session is closed".to_string())
+    }
 }
 
+#[cfg(test)]
 async fn discover_pid_support<E>(exchange: &mut E) -> Result<PidSupport, String>
 where
     E: ElmExchange,
@@ -908,61 +872,6 @@ fn highest_catalog_page() -> u8 {
         .map(|signal| signal.request().pid().saturating_sub(1) & !0x1f)
         .max()
         .unwrap_or(0)
-}
-
-#[derive(Debug)]
-struct DpfProbeReadEvidence {
-    responses: DiagnosticResponses,
-    observations: Vec<ResponseObservation>,
-}
-
-async fn read_elm_dpf_probe_with_evidence<E>(
-    exchange: &mut E,
-    request: &TargetedDpfProbeRequest,
-) -> Result<DpfProbeReadEvidence, ReadEvidenceError>
-where
-    E: ElmExchange,
-{
-    if let Err(error) = configure_dpf_probe_target(exchange, request).await {
-        return Err(ReadEvidenceError {
-            error,
-            observations: Vec::new(),
-        });
-    }
-
-    match read_elm_uds_responses(exchange, request).await {
-        Ok(responses) => Ok(DpfProbeReadEvidence {
-            observations: vec![responses.observation(None)],
-            responses,
-        }),
-        Err(error) => Err(ReadEvidenceError {
-            error,
-            observations: Vec::new(),
-        }),
-    }
-}
-
-async fn configure_dpf_probe_target<E>(
-    exchange: &mut E,
-    request: &TargetedDpfProbeRequest,
-) -> Result<(), String>
-where
-    E: ElmExchange,
-{
-    configure_target(exchange, request.target(), request.expected_responder()).await
-}
-
-async fn read_elm_uds_responses<E>(
-    exchange: &mut E,
-    request: &TargetedDpfProbeRequest,
-) -> Result<DiagnosticResponses, String>
-where
-    E: ElmExchange,
-{
-    let operation = request.operation;
-    let command = uds_command(operation);
-    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
-    normalize_uds_responses(&response, operation.did())
 }
 
 #[cfg(test)]

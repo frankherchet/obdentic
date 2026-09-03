@@ -161,6 +161,72 @@ pub struct TargetedReadRequest {
     expected_responder: ResponderIdentity,
 }
 
+/// The closed EA189 DPF UDS probe.  The profile fixes the DID; callers can
+/// provide only independently validated physical routing evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedDpfProbeRequest {
+    operation: crate::protocol::ReadOperation,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
+impl TargetedDpfProbeRequest {
+    /// Construct a closed EA189 probe from validated engine target evidence.
+    pub fn from_mapping(
+        probe: crate::ea189::Ea189DpfProbe,
+        mapping: &crate::vehicle_knowledge::EcuTargetMapping,
+    ) -> Result<Self, String> {
+        if mapping.role().role() != &crate::topology::EcuRole::Engine {
+            return Err("EA189 DPF probes require validated engine target evidence".into());
+        }
+        let target = mapping.target().target().clone();
+        if mapping.expected_responder().context() != target.context() {
+            return Err("EA189 DPF probe target and responder contexts differ".into());
+        }
+        let expected_responder = mapping
+            .expected_responder()
+            .value()
+            .ok_or_else(|| "EA189 DPF probes require an expected responder".to_string())?;
+        Self::new(
+            probe,
+            target,
+            ResponderIdentity::ElmHeader(expected_responder.to_owned()),
+        )
+    }
+
+    fn new(
+        probe: crate::ea189::Ea189DpfProbe,
+        target: RequestTarget,
+        expected_responder: ResponderIdentity,
+    ) -> Result<Self, String> {
+        validate_request_target(&target)?;
+        validate_elm_header(&expected_responder, "expected responder")?;
+        Ok(Self {
+            operation: crate::protocol::ReadOperation::uds_read_data_by_identifier(probe.id()),
+            target,
+            expected_responder: ResponderIdentity::ElmHeader(
+                expected_responder.as_str().to_ascii_uppercase(),
+            ),
+        })
+    }
+
+    pub fn did(&self) -> u16 {
+        self.operation.did()
+    }
+
+    pub fn request_bytes(&self) -> [u8; 3] {
+        self.operation.request_bytes()
+    }
+
+    pub fn target(&self) -> &RequestTarget {
+        &self.target
+    }
+
+    pub fn expected_responder(&self) -> &ResponderIdentity {
+        &self.expected_responder
+    }
+}
+
 impl TargetedReadRequest {
     pub fn new(
         request: ReadRequest,
@@ -464,6 +530,114 @@ pub(crate) struct ReadEvidenceError {
     pub(crate) observations: Vec<ResponseObservation>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DpfProbeReadEvidence {
+    pub(crate) responses: DiagnosticResponses,
+    pub(crate) observations: Vec<ResponseObservation>,
+}
+
+/// A reusable, closed ELM session over any adapter exchange.
+///
+/// The exchange is deliberately private: this type exposes only the
+/// allowlisted semantic operations and never a caller-supplied command path.
+pub(crate) struct ElmSession<E> {
+    exchange: E,
+    supported: PidSupport,
+}
+
+impl<E> ElmSession<E>
+where
+    E: ElmExchange,
+{
+    pub(crate) fn new(exchange: E) -> Self {
+        Self {
+            exchange,
+            supported: PidSupport::default(),
+        }
+    }
+
+    pub(crate) fn supported(&self) -> &PidSupport {
+        &self.supported
+    }
+
+    pub(crate) fn into_exchange(self) -> E {
+        self.exchange
+    }
+
+    pub(crate) async fn discover_support(&mut self, highest_page: u8) -> Result<(), String> {
+        self.supported = discover_pid_support(&mut self.exchange, highest_page).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn establish_protocol(&mut self) -> Result<ProtocolNegotiation, String> {
+        establish_elm_protocol(&mut self.exchange).await
+    }
+
+    pub(crate) async fn identify(&mut self) -> Result<crate::identity::VehicleIdentity, String> {
+        read_elm_identity(&mut self.exchange).await
+    }
+
+    pub(crate) async fn validate_functional_support(
+        &mut self,
+    ) -> Result<Vec<SupportDiscovery>, String> {
+        validate_functional_support_exchange(&mut self.exchange).await
+    }
+
+    pub(crate) async fn read_with_evidence(
+        &mut self,
+        request: ReadRequest,
+    ) -> Result<ReadEvidence, ReadEvidenceError> {
+        if !self.supported.supports_pid(request.pid()) {
+            return Err(ReadEvidenceError {
+                error: format!(
+                    "vehicle does not advertise support for {}",
+                    crate::hex(&request.bytes())
+                ),
+                observations: Vec::new(),
+            });
+        }
+        read_elm_with_evidence(&mut self.exchange, request).await
+    }
+
+    pub(crate) async fn read_targeted_with_evidence(
+        &mut self,
+        request: &TargetedReadRequest,
+    ) -> Result<ReadEvidence, ReadEvidenceError> {
+        read_elm_targeted_with_evidence(&mut self.exchange, request).await
+    }
+
+    pub(crate) async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
+        read_elm_mode03_responses(&mut self.exchange).await
+    }
+
+    pub(crate) async fn read_dpf_probe_with_evidence(
+        &mut self,
+        request: &TargetedDpfProbeRequest,
+    ) -> Result<DpfProbeReadEvidence, ReadEvidenceError> {
+        configure_target(
+            &mut self.exchange,
+            request.target(),
+            request.expected_responder(),
+        )
+        .await
+        .map_err(|error| ReadEvidenceError {
+            error,
+            observations: Vec::new(),
+        })?;
+
+        let responses = read_elm_uds_responses(&mut self.exchange, request)
+            .await
+            .map_err(|error| ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })?;
+        Ok(DpfProbeReadEvidence {
+            observations: vec![responses.observation(None)],
+            responses,
+        })
+    }
+}
+
 pub(crate) async fn read_elm_with_evidence<E>(
     exchange: &mut E,
     request: ReadRequest,
@@ -676,6 +850,19 @@ where
     normalize_mode03_responses(&response)
 }
 
+pub(crate) async fn read_elm_uds_responses<E>(
+    exchange: &mut E,
+    request: &TargetedDpfProbeRequest,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let command = uds_command(request.operation);
+    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    normalize_uds_responses(&response, request.did())
+}
+
+#[cfg(test)]
 pub(crate) fn supports_pid(support: &PidSupport, pid: u8) -> bool {
     support.supports_pid(pid)
 }
@@ -1676,5 +1863,18 @@ mod tests {
             responses.as_slice()[0].responder.as_ref().unwrap().as_str(),
             "7E8"
         );
+    }
+
+    #[tokio::test]
+    async fn generic_session_executes_closed_mode01_read_without_adapter_backend() {
+        let exchange = ScriptedExchange::new(["410000100000\r>", "7E8 04 41 0C 1A F8\r>"]);
+        let mut session = ElmSession::new(exchange);
+
+        session.discover_support(0).await.unwrap();
+        let request = crate::prepare_read("engine.rpm").unwrap();
+        let read = session.read_with_evidence(request).await.unwrap();
+
+        assert_eq!(read.payload, [0x41, 0x0c, 0x1a, 0xf8]);
+        assert_eq!(session.into_exchange().commands, ["0100\r", "010C\r"]);
     }
 }
