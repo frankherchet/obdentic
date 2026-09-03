@@ -146,6 +146,25 @@ cargo run -- capture inspect evidence/drive.jsonl
 cargo run -- capture capability evidence/drive.jsonl
 ```
 
+For a longer, read-only EA189 DPF trace, OBDentic repeats only the closed
+seven-DID probe on one persistent diagnostic session. The interval is a pause
+after each complete cycle; Ctrl-C stops after the active bounded read and
+flushes the JSONL capture.
+
+```sh
+cargo run -- capture \
+  --adapter "$ADAPTER_UUID" \
+  --profile ea189-dpf \
+  --record evidence/dpf-trace.jsonl \
+  --cycles 120 \
+  --interval-seconds 60
+
+cargo run -- capture dpf-report evidence/dpf-trace.jsonl
+```
+
+The trace records raw responder evidence and monotonic response offsets. Its
+decoded DPF report remains vehicle-specific and experimental.
+
 To validate the seven already advertised, standards-derived Mode 01 additions
 without overbooking the conservative session budget, use the dedicated profile:
 

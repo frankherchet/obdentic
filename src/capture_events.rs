@@ -199,6 +199,9 @@ pub enum CaptureEvent {
     /// Preserves every normalized response before semantic selection. This
     /// event may accompany either a successful read or an explicit ambiguity.
     ResponsesObserved {
+        /// Monotonic offset from the capture session start. `None` denotes a
+        /// legacy event that predates response-level timing evidence.
+        offset_us: Option<CaptureTimeUs>,
         semantic: String,
         request_payload: Vec<u8>,
         responses: Vec<ResponderEvidence>,
@@ -353,6 +356,27 @@ impl CaptureEvent {
         selected_responder: Option<String>,
         selection_error: Option<String>,
     ) -> Result<Self, String> {
+        Self::responses_observed_with_offset(
+            semantic,
+            request_payload,
+            responses,
+            selected_responder,
+            selection_error,
+            None,
+        )
+    }
+
+    /// Build response evidence with an optional monotonic session offset.
+    /// Keeping the offset optional lets callers continue producing captures
+    /// compatible with older adapters and replay those records unchanged.
+    pub fn responses_observed_with_offset(
+        semantic: impl Into<String>,
+        request_payload: Vec<u8>,
+        responses: Vec<ResponderEvidence>,
+        selected_responder: Option<String>,
+        selection_error: Option<String>,
+        offset_us: Option<CaptureTimeUs>,
+    ) -> Result<Self, String> {
         if request_payload.is_empty() {
             return Err("observed response request payload must not be empty".into());
         }
@@ -363,12 +387,32 @@ impl CaptureEvent {
             return Err("observed response payload must not be empty".into());
         }
         Ok(Self::ResponsesObserved {
+            offset_us,
             semantic: semantic.into(),
             request_payload,
             responses,
             selected_responder,
             selection_error,
         })
+    }
+
+    /// Build response evidence at a known capture offset.
+    pub fn responses_observed_at(
+        semantic: impl Into<String>,
+        request_payload: Vec<u8>,
+        responses: Vec<ResponderEvidence>,
+        selected_responder: Option<String>,
+        selection_error: Option<String>,
+        offset_us: CaptureTimeUs,
+    ) -> Result<Self, String> {
+        Self::responses_observed_with_offset(
+            semantic,
+            request_payload,
+            responses,
+            selected_responder,
+            selection_error,
+            Some(offset_us),
+        )
     }
 
     /// Copy a completed read into an owned event without rebuilding its
@@ -891,6 +935,44 @@ mod tests {
         )
         .is_err());
         assert!(ResponderEvidence::new(Some("7E8".into()), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn response_observation_constructor_preserves_optional_offset() {
+        let response = ResponderEvidence::new(Some("7E8".into()), vec![0x41, 0x0c]).unwrap();
+        assert_eq!(
+            CaptureEvent::responses_observed(
+                "engine.rpm",
+                vec![0x01, 0x0c],
+                vec![response.clone()],
+                Some("7E8".into()),
+                None,
+            )
+            .unwrap(),
+            CaptureEvent::ResponsesObserved {
+                offset_us: None,
+                semantic: "engine.rpm".into(),
+                request_payload: vec![0x01, 0x0c],
+                responses: vec![response.clone()],
+                selected_responder: Some("7E8".into()),
+                selection_error: None,
+            }
+        );
+        assert!(matches!(
+            CaptureEvent::responses_observed_at(
+                "engine.rpm",
+                vec![0x01, 0x0c],
+                vec![response],
+                Some("7E8".into()),
+                None,
+                42,
+            )
+            .unwrap(),
+            CaptureEvent::ResponsesObserved {
+                offset_us: Some(42),
+                ..
+            }
+        ));
     }
 
     #[test]

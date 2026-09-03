@@ -147,12 +147,16 @@ impl Timeline {
                     ),
                 ),
                 CaptureEvent::ResponsesObserved {
+                    offset_us,
                     semantic,
                     request_payload,
                     responses,
                     selected_responder,
                     selection_error,
                 } => {
+                    let observed_at_us = offset_us.unwrap_or(clock_us);
+                    clock_us = clock_us.max(observed_at_us);
+                    timeline.duration_us = timeline.duration_us.max(observed_at_us);
                     let responders = responses
                         .iter()
                         .map(|response| {
@@ -165,7 +169,7 @@ impl Timeline {
                         .collect::<Vec<_>>()
                         .join(" | ");
                     timeline.push(
-                        clock_us,
+                        observed_at_us,
                         "responses",
                         Some(semantic.clone()),
                         format!(

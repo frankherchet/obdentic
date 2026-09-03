@@ -58,6 +58,7 @@ impl ReplayIssue {
 pub struct DpfReplayReading {
     reading: Ea189ExperimentalDpfReading,
     responder: String,
+    offset_us: Option<u64>,
 }
 
 impl DpfReplayReading {
@@ -67,6 +68,12 @@ impl DpfReplayReading {
 
     pub fn responder(&self) -> &str {
         &self.responder
+    }
+
+    /// Monotonic session offset when recorded by a new capture. `None` is
+    /// preserved for legacy response evidence without timing metadata.
+    pub const fn offset_us(&self) -> Option<u64> {
+        self.offset_us
     }
 }
 
@@ -166,16 +173,20 @@ impl CaptureReplay {
                 }
                 CaptureEvent::ReadFailed { .. } => {}
                 CaptureEvent::ResponsesObserved {
+                    offset_us,
                     semantic,
                     request_payload,
                     responses,
                     selected_responder,
                     selection_error,
                 } => {
+                    if let Some(offset_us) = offset_us {
+                        duration_us = duration_us.max(*offset_us);
+                    }
                     let mut state = DpfReplayState {
                         readings: &mut dpf_readings,
                         issues: &mut issues,
-                        at_us: duration_us,
+                        at_us: offset_us.unwrap_or(duration_us),
                     };
                     replay_dpf_responses(
                         semantic,
@@ -183,6 +194,7 @@ impl CaptureReplay {
                         responses,
                         selected_responder,
                         selection_error,
+                        *offset_us,
                         &mut state,
                     );
                 }
@@ -271,6 +283,7 @@ fn replay_dpf_responses(
     responses: &[ResponderEvidence],
     selected_responder: &Option<String>,
     selection_error: &Option<String>,
+    offset_us: Option<u64>,
     state: &mut DpfReplayState<'_>,
 ) {
     if !is_dpf_semantic(semantic) {
@@ -369,6 +382,7 @@ fn replay_dpf_responses(
         Ok(reading) => state.readings.push(DpfReplayReading {
             reading,
             responder: selected_responder.to_owned(),
+            offset_us,
         }),
         Err(error) => {
             let alternate_decodes = responses.iter().any(|candidate| {
@@ -469,7 +483,26 @@ mod tests {
         payload: Vec<u8>,
         selected_responder: Option<&str>,
     ) -> CaptureEvent {
+        dpf_response_at(
+            semantic,
+            request,
+            responder,
+            payload,
+            selected_responder,
+            None,
+        )
+    }
+
+    fn dpf_response_at(
+        semantic: &str,
+        request: Vec<u8>,
+        responder: Option<&str>,
+        payload: Vec<u8>,
+        selected_responder: Option<&str>,
+        offset_us: Option<u64>,
+    ) -> CaptureEvent {
         CaptureEvent::ResponsesObserved {
+            offset_us,
             semantic: semantic.into(),
             request_payload: request,
             responses: vec![ResponderEvidence {
@@ -623,6 +656,40 @@ mod tests {
         assert_eq!(replay.dpf_readings()[0].reading().unit(), "g");
         assert!(replay.telemetry_full(8).unwrap().signals().next().is_none());
         assert!(replay.issues().is_empty());
+    }
+
+    #[test]
+    fn dpf_replay_preserves_response_offset_and_uses_it_for_duration() {
+        let replay = CaptureReplay::from_capture(&capture(vec![
+            dpf_response_at(
+                "dpf.soot_mass_calculated",
+                vec![0x22, 0x11, 0x4f],
+                Some("7E8"),
+                vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
+                Some("7E8"),
+                Some(4_000_001),
+            ),
+            CaptureEvent::SessionStopped {
+                offset_us: 5_000_000,
+            },
+        ]));
+
+        assert_eq!(replay.dpf_readings().len(), 1);
+        assert_eq!(replay.dpf_readings()[0].offset_us(), Some(4_000_001));
+        assert_eq!(replay.duration_us(), 5_000_000);
+    }
+
+    #[test]
+    fn legacy_dpf_replay_keeps_missing_response_offset() {
+        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
+            "dpf.soot_mass_calculated",
+            vec![0x22, 0x11, 0x4f],
+            Some("7E8"),
+            vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
+            Some("7E8"),
+        )]));
+
+        assert_eq!(replay.dpf_readings()[0].offset_us(), None);
     }
 
     #[test]
