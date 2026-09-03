@@ -209,16 +209,22 @@ impl IdentificationObservation {
         }
         match self.status {
             IdentificationResultStatus::Supported => {
-                if self.value.is_none() || self.nrc.is_some() || !self.errors.is_empty() {
+                if self.value.is_none() || self.nrc.is_some() {
                     return Err("supported ECU identification evidence is inconsistent".into());
                 }
             }
             IdentificationResultStatus::Unsupported
-            | IdentificationResultStatus::NegativeResponse
-            | IdentificationResultStatus::Unavailable => {
+            | IdentificationResultStatus::NegativeResponse => {
                 if self.nrc.is_none() || self.value.is_some() {
                     return Err(
                         "negative ECU identification evidence requires NRC and no value".into(),
+                    );
+                }
+            }
+            IdentificationResultStatus::Unavailable => {
+                if self.value.is_some() || (self.nrc.is_none() && self.errors.is_empty()) {
+                    return Err(
+                        "unavailable ECU identification evidence requires NRC or explicit error and no value".into(),
                     );
                 }
             }
