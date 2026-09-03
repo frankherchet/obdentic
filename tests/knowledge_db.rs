@@ -29,7 +29,9 @@ fn pinned_submodule_catalog_loads_without_git_or_network() {
     let set = catalog
         .set(STANDARD_UDS_ECU_IDENTIFICATION_SET)
         .expect("pinned Knowledge DB must provide the bounded ECU identification set");
-    assert!(set.members().contains(&"ecu.manufacturer_software_version".to_string()));
+    assert!(set
+        .members()
+        .contains(&"ecu.manufacturer_software_version".to_string()));
     assert!(!set.members().contains(&"vehicle.vin".to_string()));
 
     let definition = catalog
