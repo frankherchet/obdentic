@@ -18,7 +18,7 @@ jobs:
           ref: feature/85-ecu-identification-cache
           fetch-depth: 0
           submodules: recursive
-      - name: Tighten cache patch anchors and revision validation
+      - name: Make VehicleCacheSnapshot anchor explicit
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -36,31 +36,10 @@ jobs:
           )'''
           if text.count(old) != 1:
               raise SystemExit('cache helper snapshot anchor changed unexpectedly')
-          text = text.replace(old, new, 1)
-          old_validation = '        validate_text(\\"identification knowledge revision\\", observation.knowledge_revision())?;'
-          new_validation = '        validate_knowledge_revision(observation.knowledge_revision())?;'
-          if text.count(old_validation) != 1:
-              raise SystemExit('cache helper revision validation anchor changed unexpectedly')
-          text = text.replace(old_validation, new_validation, 1)
-          text += r'''
-
-replace_once(
-    "src/vehicle_cache.rs",
-    "\nfn validate_text(field: &str, value: &str) -> Result<(), String> {",
-    r'''
-fn validate_knowledge_revision(value: &str) -> Result<(), String> {
-    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("vehicle cache knowledge revision is not a full Git object id".into());
-    }
-    Ok(())
-}
-
-fn validate_text(field: &str, value: &str) -> Result<(), String> {''',
-)
-'''
-          path.write_text(text)
+          path.write_text(text.replace(old, new, 1))
           PY
       - run: python3 tools/issue85_cache_patch.py
+      - run: python3 tools/issue85_cache_revision_fix.py
       - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
       - run: cargo +1.98.0 fmt
       - run: cargo +1.98.0 test --locked
