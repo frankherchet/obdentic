@@ -11,6 +11,7 @@ use obdentic::{
         CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, DtcObservationFact,
         DtcTransportOutcome, SubscriptionFilterOutcome,
     },
+    capture_replay::CaptureReplay,
     capture_report, capture_tui,
     diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus, KnownTarget},
     dtc, hex, jsonl_capture,
@@ -40,7 +41,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -75,6 +76,7 @@ enum Command {
     },
     CaptureInspect(String),
     CaptureCapability(String),
+    CaptureDpfReport(Vec<String>),
     Read {
         request: ReadRequest,
         adapter_id: String,
@@ -203,6 +205,7 @@ async fn run() -> Result<(), String> {
                 print!("{}", capture_report::render_capability(&path, &capture));
                 Ok(())
             }
+            Command::CaptureDpfReport(paths) => run_capture_dpf_report(&paths),
             Command::Demo => {
                 show(&demo().await?);
                 Ok(())
@@ -1969,6 +1972,71 @@ fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
     )
 }
 
+fn run_capture_dpf_report(paths: &[String]) -> Result<(), String> {
+    let mut replays = Vec::with_capacity(paths.len());
+    for path in paths {
+        replays.push(CaptureReplay::from_capture(&jsonl_capture::read(
+            Path::new(path),
+        )?));
+    }
+
+    for (path, replay) in paths.iter().zip(&replays) {
+        print!(
+            "{}",
+            render_dpf_report(
+                path,
+                &obdentic::dpf_report::DpfReport::from_replay(replay),
+                "Capture duration",
+            )
+        );
+    }
+    if replays.len() > 1 {
+        print!(
+            "{}",
+            render_dpf_report(
+                "across input order",
+                &obdentic::dpf_report::DpfReport::from_replays(&replays),
+                "Accumulated capture duration",
+            )
+        );
+    }
+    Ok(())
+}
+
+fn render_dpf_report(
+    label: &str,
+    report: &obdentic::dpf_report::DpfReport,
+    duration_label: &str,
+) -> String {
+    let mut output = format!(
+        "DPF report: {label}\nStatus: vehicle-specific experimental replay\n{duration_label}: {:.3} s\n",
+        report.duration_us() as f64 / 1_000_000.0,
+    );
+    if report.is_empty() {
+        output.push_str("No decodable experimental DPF readings.\n\n");
+        return output;
+    }
+    output.push_str("Signals\n");
+    for summary in report.summaries() {
+        output.push_str(&format!(
+            "  {}\n    samples: {}; first/last: {:.3} / {:.3} {}; delta: {:+.3}; range: {:.3} .. {:.3}\n",
+            summary.semantic(),
+            summary.count(),
+            summary.first_value(),
+            summary.last_value(),
+            summary.unit(),
+            summary.delta(),
+            summary.min(),
+            summary.max(),
+        ));
+    }
+    if label == "across input order" {
+        output.push_str("Input order compares snapshots; it is not a continuous DPF timeline.\n");
+    }
+    output.push('\n');
+    output
+}
+
 fn parse_command(args: &[String]) -> Result<Command, String> {
     match args {
         [command] if command == "signals" => Ok(Command::Signals),
@@ -2070,6 +2138,11 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         [command, action, path] if command == "capture" && action == "capability" => {
             Ok(Command::CaptureCapability(path.clone()))
+        }
+        [command, action, paths @ ..]
+            if command == "capture" && action == "dpf-report" && !paths.is_empty() =>
+        {
+            Ok(Command::CaptureDpfReport(paths.to_vec()))
         }
         [command, path] if command == "replay" => Ok(Command::Replay(path.clone())),
         [command, action, name, path]
@@ -2452,6 +2525,18 @@ mod tests {
         assert_eq!(
             parse_command(&args(&["capture", "capability", "capture.jsonl"])),
             Ok(Command::CaptureCapability("capture.jsonl".into()))
+        );
+        assert_eq!(
+            parse_command(&args(&[
+                "capture",
+                "dpf-report",
+                "drive.jsonl",
+                "idle.jsonl",
+            ])),
+            Ok(Command::CaptureDpfReport(vec![
+                "drive.jsonl".into(),
+                "idle.jsonl".into(),
+            ]))
         );
         assert_eq!(
             parse_command(&args(&[
