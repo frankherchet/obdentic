@@ -14,7 +14,10 @@ use obdentic::{
     capture_replay::CaptureReplay,
     capture_report, capture_tui,
     diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus, KnownTarget},
-    dtc, hex, jsonl_capture,
+    dtc,
+    ecu_identification::EcuIdentificationPlan,
+    ecu_identification_discovery, hex, jsonl_capture,
+    knowledge_db::KnowledgeCatalog,
     layout_observation::{self, LayoutFreshnessPolicy},
     prepare_read, record, replay,
     runtime_actor::RuntimeClient,
@@ -514,6 +517,9 @@ async fn finish_discovery_failure(
 }
 
 async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(), String> {
+    let catalog = KnowledgeCatalog::load_pinned(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .map_err(|error| error.to_string())?;
+    let identification_plan = EcuIdentificationPlan::from_catalog(&catalog)?;
     let identity = ble::identify(adapter_id).await?;
     let root = vehicle_cache_root()?;
     let store = obdentic::vehicle_cache::CacheStore::new(&root);
@@ -534,6 +540,8 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
                 obdentic::cache_validation::CacheValidation::Validated => {
                     if cache.snapshot().target_mappings().is_empty() {
                         println!("cache\tmissing-engine-target; running full discovery");
+                    } else if cache.snapshot().ecu_identification().is_empty() {
+                        println!("cache\tmissing-ecu-identification; running full discovery");
                     } else {
                         print_cached_vehicle_discovery(cache);
                         return Ok(());
@@ -558,9 +566,21 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         Ok(discovery) => validate_engine_target(&session, discovery).await,
         Err(_) => Ok(None),
     };
+    let ecu_identification = match &target_mapping {
+        Ok(Some(mapping)) => {
+            ecu_identification_discovery::discover_known_ecus(
+                &session,
+                &identification_plan,
+                std::slice::from_ref(mapping),
+            )
+            .await
+        }
+        Ok(None) | Err(_) => Ok(Vec::new()),
+    };
     let shutdown = session.shutdown().await;
     let discovery = discovery?;
     let target_mapping = target_mapping?;
+    let ecu_identification = ecu_identification?;
     shutdown?;
 
     let (local_key, _) = index.key_for_or_create(identity.vin())?;
@@ -573,10 +593,11 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         &discovery.topology(),
         &discovery.capabilities(),
     );
-    let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::new(
+    let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::with_ecu_identification(
         base_snapshot.topology().to_vec(),
         base_snapshot.ecu_capabilities().to_vec(),
         target_mapping,
+        ecu_identification,
     );
     let engine_target_validated = !snapshot.target_mappings().is_empty();
     let mut history = existing

@@ -33,22 +33,15 @@ pub async fn discover_known_ecus(
     let mut session_unavailable = false;
 
     for mapping in eligible_mappings(mappings) {
-        let expected_responder = mapping
-            .responder()
-            .ok_or_else(|| "eligible ECU identification mapping lost responder evidence".to_string())?;
-        let target = RequestTargetEvidence::new(
-            mapping.target().clone(),
-            mapping.provenance().clone(),
-        );
+        let expected_responder = mapping.responder().ok_or_else(|| {
+            "eligible ECU identification mapping lost responder evidence".to_string()
+        })?;
+        let target =
+            RequestTargetEvidence::new(mapping.target().clone(), mapping.provenance().clone());
 
         for candidate in plan.candidates() {
             if session_unavailable {
-                observations.push(not_probed(
-                    plan,
-                    candidate,
-                    mapping,
-                    SESSION_ABORT_REASON,
-                )?);
+                observations.push(not_probed(plan, candidate, mapping, SESSION_ABORT_REASON)?);
                 continue;
             }
 
@@ -59,7 +52,9 @@ pub async fn discover_known_ecus(
                 )
                 .map_err(|error| error.to_string())?;
             let Operation::EcuIdentification(candidate) = authorized else {
-                return Err("ECU identification safety authorization returned a different operation".into());
+                return Err(
+                    "ECU identification safety authorization returned a different operation".into(),
+                );
             };
             let request = TargetedEcuIdentificationRequest::from_evidence(
                 &candidate,
@@ -69,19 +64,11 @@ pub async fn discover_known_ecus(
 
             match session.read_ecu_identification(request).await {
                 Ok(responses) => observations.push(classify_diagnostic_responses(
-                    plan,
-                    &candidate,
-                    mapping,
-                    &responses,
+                    plan, &candidate, mapping, &responses,
                 )?),
                 Err(error) => {
                     let fatal = is_fatal_runtime_error(&error);
-                    observations.push(transport_failure(
-                        plan,
-                        &candidate,
-                        mapping,
-                        error,
-                    )?);
+                    observations.push(transport_failure(plan, &candidate, mapping, error)?);
                     session_unavailable |= fatal;
                 }
             }
@@ -95,8 +82,10 @@ fn eligible_mappings(mappings: &[TargetMappingSnapshot]) -> Vec<&TargetMappingSn
     let mut eligible = mappings
         .iter()
         .filter(|mapping| {
-            matches!(mapping.confidence(), Confidence::High | Confidence::Verified)
-                && mapping.target().address().is_some()
+            matches!(
+                mapping.confidence(),
+                Confidence::High | Confidence::Verified
+            ) && mapping.target().address().is_some()
                 && mapping
                     .responder()
                     .and_then(ResponderIdentity::value)
@@ -117,9 +106,9 @@ fn classify_diagnostic_responses(
     let expected = mapping
         .responder()
         .ok_or_else(|| "ECU identification classification requires a responder".to_string())?;
-    let expected_value = expected
-        .value()
-        .ok_or_else(|| "ECU identification classification requires a responder value".to_string())?;
+    let expected_value = expected.value().ok_or_else(|| {
+        "ECU identification classification requires a responder value".to_string()
+    })?;
 
     let evidence = responses
         .as_slice()
@@ -179,9 +168,9 @@ fn classify_normalized(
     let expected = mapping
         .responder()
         .ok_or_else(|| "ECU identification classification requires a responder".to_string())?;
-    let expected_value = expected
-        .value()
-        .ok_or_else(|| "ECU identification classification requires a responder value".to_string())?;
+    let expected_value = expected.value().ok_or_else(|| {
+        "ECU identification classification requires a responder value".to_string()
+    })?;
     let matching = responses
         .iter()
         .filter(|response| {
@@ -242,14 +231,7 @@ fn classify_normalized(
     };
 
     build_observation(
-        plan,
-        candidate,
-        mapping,
-        status,
-        responses,
-        nrc,
-        value,
-        errors,
+        plan, candidate, mapping, status, responses, nrc, value, errors,
     )
 }
 
@@ -345,8 +327,7 @@ mod tests {
     use crate::{
         knowledge_db::KnowledgeCatalog,
         topology::{
-            AddressingContext, Protocol, ProtocolContext, Provenance, RequestAddress,
-            RequestTarget,
+            AddressingContext, Protocol, ProtocolContext, Provenance, RequestAddress, RequestTarget,
         },
     };
 
@@ -362,10 +343,7 @@ mod tests {
         TargetMappingSnapshot::new(
             None,
             Some(ResponderIdentity::address(context.clone(), responder)),
-            RequestTarget::concrete(
-                context,
-                RequestAddress::new("elm-header", target),
-            ),
+            RequestTarget::concrete(context, RequestAddress::new("elm-header", target)),
             Provenance::new("test mapping", confidence).unwrap(),
         )
     }
@@ -466,7 +444,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(wrong_did.status(), IdentificationResultStatus::Malformed);
-        assert_eq!(unavailable.status(), IdentificationResultStatus::Unavailable);
+        assert_eq!(
+            unavailable.status(),
+            IdentificationResultStatus::Unavailable
+        );
         assert_eq!(unavailable.nrc(), Some(0x7f));
     }
 
@@ -493,7 +474,10 @@ mod tests {
         let skipped = not_probed(&plan, &f189, &ecu, SESSION_ABORT_REASON).unwrap();
 
         assert_eq!(timeout.status(), IdentificationResultStatus::Timeout);
-        assert_eq!(transport.status(), IdentificationResultStatus::TransportError);
+        assert_eq!(
+            transport.status(),
+            IdentificationResultStatus::TransportError
+        );
         assert_eq!(skipped.status(), IdentificationResultStatus::NotProbed);
     }
 

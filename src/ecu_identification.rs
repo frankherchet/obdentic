@@ -209,7 +209,7 @@ impl IdentificationObservation {
         }
         match self.status {
             IdentificationResultStatus::Supported => {
-                if self.value.is_none() || self.nrc.is_some() || !self.errors.is_empty() {
+                if self.value.is_none() || self.nrc.is_some() {
                     return Err("supported ECU identification evidence is inconsistent".into());
                 }
             }

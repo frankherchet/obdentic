@@ -2075,4 +2075,61 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    async fn canonical_ecu_identification_preserves_negative_response_payload() {
+        let catalog =
+            crate::knowledge_db::KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let plan =
+            crate::ecu_identification::EcuIdentificationPlan::from_catalog(&catalog).unwrap();
+        let candidate = plan
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.did() == 0xF189)
+            .unwrap();
+        let context = crate::topology::ProtocolContext::new(
+            crate::topology::Protocol::Obd2,
+            crate::topology::AddressingContext::Physical,
+        );
+        let target = crate::topology::RequestTargetEvidence::new(
+            crate::topology::RequestTarget::concrete(
+                context.clone(),
+                crate::topology::RequestAddress::new("elm-header", "7E0"),
+            ),
+            crate::topology::Provenance::new("test target", crate::topology::Confidence::High)
+                .unwrap(),
+        );
+        let responder = crate::topology::ResponderIdentity::address(context, "7E8");
+        let request =
+            TargetedEcuIdentificationRequest::from_evidence(candidate, &target, &responder)
+                .unwrap();
+        let exchange = ScriptedExchange::new([
+            "OK\r>",
+            "OK\r>",
+            "7E8 03 7F 22 31 55 55\r>",
+            "OK\r>",
+            "OK\r>",
+            "OK\r>",
+        ]);
+        let mut session = ElmSession::new(exchange);
+
+        let read = session
+            .read_ecu_identification_with_evidence(&request)
+            .await
+            .unwrap();
+
+        assert_eq!(read.responses.as_slice()[0].payload, [0x7f, 0x22, 0x31]);
+        assert!(read.responses.errors().is_empty());
+        assert_eq!(
+            session.into_exchange().commands,
+            [
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "22F189\r",
+                "ATSP0\r",
+                "ATSH 7DF\r",
+                "ATCRA\r",
+            ]
+        );
+    }
 }
