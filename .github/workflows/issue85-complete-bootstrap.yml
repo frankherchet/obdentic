@@ -1,0 +1,34 @@
+name: Issue 85 completion bootstrap
+
+on:
+  push:
+    branches:
+      - feature/85-complete-identification-discovery
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'Run issue 85 completion patch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/85-complete-identification-discovery
+          fetch-depth: 0
+          submodules: recursive
+      - run: python3 tools/issue85_complete_patch.py
+      - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.98.0 fmt
+      - run: cargo +1.98.0 test --locked
+      - run: cargo +1.98.0 clippy --all-targets --locked -- -D warnings
+      - run: cargo +1.98.0 build --locked
+      - name: Commit validated product changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src
+          git diff --cached --exit-code && { echo 'patch produced no source changes'; exit 1; } || true
+          git commit -m 'Complete bounded ECU identification discovery'
+          git push origin HEAD:feature/85-complete-identification-discovery
