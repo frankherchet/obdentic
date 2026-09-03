@@ -170,6 +170,14 @@ pub struct TargetedDpfProbeRequest {
     expected_responder: ResponderIdentity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedEcuIdentificationRequest {
+    candidate: crate::ecu_identification::IdentificationCandidate,
+    operation: crate::protocol::ReadOperation,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
 impl TargetedDpfProbeRequest {
     /// Construct a closed EA189 probe from validated engine target evidence.
     pub fn from_mapping(
@@ -208,6 +216,67 @@ impl TargetedDpfProbeRequest {
                 expected_responder.as_str().to_ascii_uppercase(),
             ),
         })
+    }
+
+    pub fn did(&self) -> u16 {
+        self.operation.did()
+    }
+
+    pub fn request_bytes(&self) -> [u8; 3] {
+        self.operation.request_bytes()
+    }
+
+    pub fn target(&self) -> &RequestTarget {
+        &self.target
+    }
+
+    pub fn expected_responder(&self) -> &ResponderIdentity {
+        &self.expected_responder
+    }
+}
+
+impl TargetedEcuIdentificationRequest {
+    pub fn from_evidence(
+        candidate: &crate::ecu_identification::IdentificationCandidate,
+        target: &crate::topology::RequestTargetEvidence,
+        expected_responder: &crate::topology::ResponderIdentity,
+    ) -> Result<Self, String> {
+        if expected_responder.context() != target.target().context() {
+            return Err("ECU identification target and responder contexts differ".into());
+        }
+        let responder = expected_responder.value().ok_or_else(|| {
+            "ECU identification requires an evidenced expected responder".to_string()
+        })?;
+        Self::new(
+            candidate.clone(),
+            target.target().clone(),
+            ResponderIdentity::ElmHeader(responder.to_owned()),
+        )
+    }
+
+    fn new(
+        candidate: crate::ecu_identification::IdentificationCandidate,
+        target: RequestTarget,
+        expected_responder: ResponderIdentity,
+    ) -> Result<Self, String> {
+        validate_request_target(&target)?;
+        validate_elm_header(&expected_responder, "expected responder")?;
+        let operation = candidate.operation();
+        if operation.request_bytes() != candidate.request_bytes() {
+            return Err("ECU identification candidate did not resolve deterministically".into());
+        }
+        Ok(Self {
+            candidate,
+            operation,
+            target,
+            expected_responder: ResponderIdentity::ElmHeader(
+                expected_responder.as_str().to_ascii_uppercase(),
+            ),
+        })
+    }
+
+    pub fn candidate(&self) -> &crate::ecu_identification::IdentificationCandidate {
+        &self.candidate
     }
 
     pub fn did(&self) -> u16 {
@@ -536,6 +605,12 @@ pub(crate) struct DpfProbeReadEvidence {
     pub(crate) observations: Vec<ResponseObservation>,
 }
 
+#[derive(Debug)]
+pub(crate) struct EcuIdentificationReadEvidence {
+    pub(crate) responses: DiagnosticResponses,
+    pub(crate) observations: Vec<ResponseObservation>,
+}
+
 /// A reusable, closed ELM session over any adapter exchange.
 ///
 /// The exchange is deliberately private: this type exposes only the
@@ -635,6 +710,58 @@ where
             observations: vec![responses.observation(None)],
             responses,
         })
+    }
+
+    pub(crate) async fn read_ecu_identification_with_evidence(
+        &mut self,
+        request: &TargetedEcuIdentificationRequest,
+    ) -> Result<EcuIdentificationReadEvidence, ReadEvidenceError> {
+        if let Err(error) = configure_target(
+            &mut self.exchange,
+            request.target(),
+            request.expected_responder(),
+        )
+        .await
+        {
+            let restore = restore_functional(&mut self.exchange).await;
+            return Err(ReadEvidenceError {
+                error: combine_setup_errors(error, restore),
+                observations: Vec::new(),
+            });
+        }
+
+        let read = match read_elm_ecu_identification_responses(&mut self.exchange, request).await {
+            Ok(responses) => {
+                let selection_error =
+                    targeted_payload(&responses, request.expected_responder()).err();
+                Ok(EcuIdentificationReadEvidence {
+                    observations: vec![responses.observation(selection_error)],
+                    responses,
+                })
+            }
+            Err(error) => Err(ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            }),
+        };
+        let restore = restore_functional(&mut self.exchange).await;
+        match (read, restore) {
+            (Ok(read), Ok(())) => Ok(read),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(read), Err(error)) => Err(ReadEvidenceError {
+                error: format!(
+                    "ECU identification read succeeded; restoring functional addressing failed: {error}"
+                ),
+                observations: read.observations,
+            }),
+            (Err(mut error), Err(restore)) => {
+                error.error = format!(
+                    "{}; restoring functional addressing failed: {restore}",
+                    error.error
+                );
+                Err(error)
+            }
+        }
     }
 }
 
@@ -853,6 +980,18 @@ where
 pub(crate) async fn read_elm_uds_responses<E>(
     exchange: &mut E,
     request: &TargetedDpfProbeRequest,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let command = uds_command(request.operation);
+    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    normalize_uds_responses(&response, request.did())
+}
+
+pub(crate) async fn read_elm_ecu_identification_responses<E>(
+    exchange: &mut E,
+    request: &TargetedEcuIdentificationRequest,
 ) -> Result<DiagnosticResponses, String>
 where
     E: ElmExchange,
@@ -1876,5 +2015,64 @@ mod tests {
 
         assert_eq!(read.payload, [0x41, 0x0c, 0x1a, 0xf8]);
         assert_eq!(session.into_exchange().commands, ["0100\r", "010C\r"]);
+    }
+
+    #[tokio::test]
+    async fn generic_session_executes_only_a_canonical_ecu_identification_candidate() {
+        let catalog =
+            crate::knowledge_db::KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let plan =
+            crate::ecu_identification::EcuIdentificationPlan::from_catalog(&catalog).unwrap();
+        let candidate = plan
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.did() == 0xF189)
+            .unwrap();
+        let context = crate::topology::ProtocolContext::new(
+            crate::topology::Protocol::Obd2,
+            crate::topology::AddressingContext::Physical,
+        );
+        let target = crate::topology::RequestTargetEvidence::new(
+            crate::topology::RequestTarget::concrete(
+                context.clone(),
+                crate::topology::RequestAddress::new("elm-header", "7E0"),
+            ),
+            crate::topology::Provenance::new("test target", crate::topology::Confidence::High)
+                .unwrap(),
+        );
+        let responder = crate::topology::ResponderIdentity::address(context, "7E8");
+        let request =
+            TargetedEcuIdentificationRequest::from_evidence(candidate, &target, &responder)
+                .unwrap();
+        let exchange = ScriptedExchange::new([
+            "OK\r>",
+            "OK\r>",
+            "7E8 05 62 F1 89 31 2E 55 55\r>",
+            "OK\r>",
+            "OK\r>",
+            "OK\r>",
+        ]);
+        let mut session = ElmSession::new(exchange);
+
+        let read = session
+            .read_ecu_identification_with_evidence(&request)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read.responses.as_slice()[0].payload,
+            [0x62, 0xf1, 0x89, 0x31, 0x2e]
+        );
+        assert_eq!(
+            session.into_exchange().commands,
+            [
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "22F189\r",
+                "ATSP0\r",
+                "ATSH 7DF\r",
+                "ATCRA\r",
+            ]
+        );
     }
 }
