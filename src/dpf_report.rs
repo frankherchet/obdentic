@@ -15,6 +15,8 @@ pub struct DpfSummary {
     max: f64,
     delta: f64,
     unit: &'static str,
+    first_offset_us: Option<u64>,
+    last_offset_us: Option<u64>,
 }
 
 impl DpfSummary {
@@ -49,6 +51,14 @@ impl DpfSummary {
     pub const fn unit(&self) -> &'static str {
         self.unit
     }
+
+    pub const fn first_offset_us(&self) -> Option<u64> {
+        self.first_offset_us
+    }
+
+    pub const fn last_offset_us(&self) -> Option<u64> {
+        self.last_offset_us
+    }
 }
 
 /// The privacy-safe, offline view of a capture's successful DPF decodes.
@@ -61,12 +71,19 @@ pub struct DpfReport {
 impl DpfReport {
     /// Summarize only successful DPF readings from a deterministic replay.
     pub fn from_replay(replay: &CaptureReplay) -> Self {
-        Self::from_replays([replay])
+        Self::from_replays_with_offsets([replay], true)
     }
 
     /// Summarize captures in the caller-provided order.  Captures are
     /// snapshots, not one continuous timestamped DPF stream.
     pub fn from_replays<'a>(replays: impl IntoIterator<Item = &'a CaptureReplay>) -> Self {
+        Self::from_replays_with_offsets(replays, false)
+    }
+
+    fn from_replays_with_offsets<'a>(
+        replays: impl IntoIterator<Item = &'a CaptureReplay>,
+        preserve_offsets: bool,
+    ) -> Self {
         let mut accumulators = BTreeMap::new();
         let mut duration_us = 0_u64;
         for replay in replays {
@@ -75,8 +92,23 @@ impl DpfReport {
                 let reading = replay_reading.reading();
                 accumulators
                     .entry(reading.semantic())
-                    .and_modify(|summary: &mut Accumulator| summary.push(reading.value()))
-                    .or_insert_with(|| Accumulator::new(reading.value(), reading.unit()));
+                    .and_modify(|summary: &mut Accumulator| {
+                        summary.push(
+                            reading.value(),
+                            preserve_offsets
+                                .then(|| replay_reading.offset_us())
+                                .flatten(),
+                        )
+                    })
+                    .or_insert_with(|| {
+                        Accumulator::new(
+                            reading.value(),
+                            reading.unit(),
+                            preserve_offsets
+                                .then(|| replay_reading.offset_us())
+                                .flatten(),
+                        )
+                    });
             }
         }
 
@@ -109,10 +141,12 @@ struct Accumulator {
     min: f64,
     max: f64,
     unit: &'static str,
+    first_offset_us: Option<u64>,
+    last_offset_us: Option<u64>,
 }
 
 impl Accumulator {
-    fn new(value: f64, unit: &'static str) -> Self {
+    fn new(value: f64, unit: &'static str, offset_us: Option<u64>) -> Self {
         Self {
             count: 1,
             first_value: value,
@@ -120,14 +154,22 @@ impl Accumulator {
             min: value,
             max: value,
             unit,
+            first_offset_us: offset_us,
+            last_offset_us: offset_us,
         }
     }
 
-    fn push(&mut self, value: f64) {
+    fn push(&mut self, value: f64, offset_us: Option<u64>) {
         self.count += 1;
         self.last_value = value;
         self.min = self.min.min(value);
         self.max = self.max.max(value);
+        if offset_us.is_none() {
+            self.first_offset_us = None;
+            self.last_offset_us = None;
+        } else if self.last_offset_us.is_some() {
+            self.last_offset_us = offset_us;
+        }
     }
 
     fn finish(self, semantic: &'static str) -> DpfSummary {
@@ -140,6 +182,8 @@ impl Accumulator {
             max: self.max,
             delta: self.last_value - self.first_value,
             unit: self.unit,
+            first_offset_us: self.first_offset_us,
+            last_offset_us: self.last_offset_us,
         }
     }
 }
@@ -154,6 +198,7 @@ mod tests {
 
     fn dpf_response(value: [u8; 2]) -> CaptureEvent {
         CaptureEvent::ResponsesObserved {
+            offset_us: None,
             semantic: "dpf.soot_mass_calculated".into(),
             request_payload: vec![0x22, 0x11, 0x4f],
             responses: vec![ResponderEvidence {
@@ -215,5 +260,26 @@ mod tests {
         assert_eq!(summary.first_value(), 4.0);
         assert_eq!(summary.last_value(), 5.0);
         assert_eq!(summary.delta(), 1.0);
+    }
+
+    #[test]
+    fn one_timed_capture_keeps_per_signal_offsets() {
+        let event = CaptureEvent::responses_observed_at(
+            "dpf.soot_mass_calculated",
+            vec![0x22, 0x11, 0x4f],
+            vec![
+                ResponderEvidence::new(Some("7E8".into()), vec![0x62, 0x11, 0x4f, 0x04, 0xe2])
+                    .unwrap(),
+            ],
+            Some("7E8".into()),
+            None,
+            12_345_678,
+        )
+        .unwrap();
+
+        let report = DpfReport::from_replay(&replay(vec![event]));
+
+        assert_eq!(report.summaries()[0].first_offset_us(), Some(12_345_678));
+        assert_eq!(report.summaries()[0].last_offset_us(), Some(12_345_678));
     }
 }

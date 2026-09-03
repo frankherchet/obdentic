@@ -193,6 +193,7 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             push_string(&mut object, &hex(response_payload));
         }
         CaptureEvent::ResponsesObserved {
+            offset_us,
             semantic,
             request_payload,
             responses,
@@ -201,6 +202,8 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
         } => {
             object.push_str("\"responses_observed\",\"sequence\":");
             object.push_str(&sequence.to_string());
+            object.push_str(",\"offset_us\":");
+            push_option_u64(&mut object, *offset_us);
             object.push_str(",\"semantic\":");
             push_string(&mut object, semantic);
             object.push_str(",\"request_payload\":");
@@ -619,6 +622,7 @@ pub fn read(path: &Path) -> Result<ParsedCapture, String> {
 
     let mut events = Vec::new();
     let mut expected_sequence = 0_u64;
+    let mut last_response_offset_us = None;
     let mut stopped = false;
     for (line_number, line) in lines.enumerate() {
         let line_number = line_number + 2;
@@ -637,6 +641,16 @@ pub fn read(path: &Path) -> Result<ParsedCapture, String> {
             .checked_add(1)
             .ok_or_else(|| format!("line {line_number}: sequence exhausted"))?;
         let event = parse_event(&object, line_number)?;
+        if let CaptureEvent::ResponsesObserved {
+            offset_us: Some(offset_us),
+            ..
+        } = &event
+        {
+            if last_response_offset_us.is_some_and(|last| *offset_us < last) {
+                return Err(format!("line {line_number}: non-monotonic response offset"));
+            }
+            last_response_offset_us = Some(*offset_us);
+        }
         if matches!(event, CaptureEvent::SessionStopped { .. }) {
             if stopped {
                 return Err(format!(
@@ -798,19 +812,35 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
             .map_err(|error| format!("line {line_number}: {error}"))
         }
         "responses_observed" => {
+            let has_offset = object.contains_key("offset_us");
             fields_exact(
                 object,
-                &[
-                    "schema",
-                    "version",
-                    "type",
-                    "sequence",
-                    "semantic",
-                    "request_payload",
-                    "responses",
-                    "selected_responder",
-                    "selection_error",
-                ],
+                if has_offset {
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "offset_us",
+                        "semantic",
+                        "request_payload",
+                        "responses",
+                        "selected_responder",
+                        "selection_error",
+                    ]
+                } else {
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "semantic",
+                        "request_payload",
+                        "responses",
+                        "selected_responder",
+                        "selection_error",
+                    ]
+                },
                 line_number,
             )?;
             let responses = match object.get("responses") {
@@ -820,7 +850,7 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => return Err(format!("line {line_number}: responses must be an array")),
             };
-            CaptureEvent::responses_observed(
+            CaptureEvent::responses_observed_with_offset(
                 string_field(object, "semantic", line_number)?,
                 parse_hex(
                     &string_field(object, "request_payload", line_number)?,
@@ -829,6 +859,11 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 responses,
                 optional_string_field(object, "selected_responder", line_number)?,
                 optional_string_field(object, "selection_error", line_number)?,
+                if has_offset {
+                    optional_u64_field(object, "offset_us", line_number)?
+                } else {
+                    None
+                },
             )
             .map_err(|error| format!("line {line_number}: {error}"))
         }
@@ -2375,6 +2410,61 @@ mod tests {
                 response_payload: vec![0x41, 0x00, 0x80, 0x00, 0x00, 0x01],
             }]
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_offsets_round_trip_and_legacy_records_default_to_none() {
+        let path = temp_path("response-offset");
+        let expected = CaptureEvent::responses_observed_at(
+            "dpf.soot_mass_calculated",
+            vec![0x22, 0x11, 0x4f],
+            vec![crate::capture_events::ResponderEvidence::new(
+                Some("7E8".into()),
+                vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
+            )
+            .unwrap()],
+            Some("7E8".into()),
+            None,
+            12_345_678,
+        )
+        .unwrap();
+        let (sender, writer) = start(&path).unwrap();
+        sender.send(expected.clone()).await.unwrap();
+        finish(sender, writer).await;
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"offset_us\":12345678"));
+        assert_eq!(read_events(&path).unwrap(), vec![expected]);
+        fs::remove_file(path).unwrap();
+
+        let path = temp_path("legacy-response-offset");
+        fs::write(
+            &path,
+            "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"responses_observed\",\"sequence\":0,\"semantic\":\"dpf.soot_mass_calculated\",\"request_payload\":\"22 11 4F\",\"responses\":[{\"responder\":\"7E8\",\"payload\":\"62 11 4F 04 F8\"}],\"selected_responder\":\"7E8\",\"selection_error\":null}\n",
+        )
+        .unwrap();
+        let events = read_events(&path).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [CaptureEvent::ResponsesObserved {
+                offset_us: None,
+                ..
+            }]
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_response_offsets_that_go_backwards() {
+        let path = temp_path("response-offset-order");
+        fs::write(
+            &path,
+            "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"responses_observed\",\"sequence\":0,\"offset_us\":20,\"semantic\":\"dpf.soot_mass_calculated\",\"request_payload\":\"22 11 4F\",\"responses\":[{\"responder\":\"7E8\",\"payload\":\"62 11 4F 04 F8\"}],\"selected_responder\":\"7E8\",\"selection_error\":null}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"responses_observed\",\"sequence\":1,\"offset_us\":19,\"semantic\":\"dpf.soot_mass_calculated\",\"request_payload\":\"22 11 4F\",\"responses\":[{\"responder\":\"7E8\",\"payload\":\"62 11 4F 04 F8\"}],\"selected_responder\":\"7E8\",\"selection_error\":null}\n",
+        )
+        .unwrap();
+        assert!(read(&path)
+            .unwrap_err()
+            .contains("non-monotonic response offset"));
         fs::remove_file(path).unwrap();
     }
 
