@@ -452,6 +452,31 @@ mod tests {
     }
 
     #[test]
+    fn adapter_unavailable_without_nrc_remains_explicit() {
+        let plan = plan();
+        let f189 = candidate(&plan, 0xf189);
+        let ecu = mapping("7E0", "7E8", Confidence::Verified);
+
+        let unavailable = classify_normalized(
+            &plan,
+            &f189,
+            &ecu,
+            Vec::new(),
+            vec!["ELM327 rejected UDS 22 response: NO DATA".into()],
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unavailable.status(),
+            IdentificationResultStatus::Unavailable
+        );
+        assert_eq!(unavailable.nrc(), None);
+        assert!(!unavailable.errors().is_empty());
+    }
+
+    #[test]
     fn timeout_transport_error_and_not_probed_never_collapse() {
         let plan = plan();
         let f189 = candidate(&plan, 0xf189);
