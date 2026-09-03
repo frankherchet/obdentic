@@ -21,7 +21,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
-    let project_root = args.next().unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into());
+    let project_root = args
+        .next()
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into());
     if args.next().is_some() {
         return Err("usage: obdentic-ecu-identification-plan [project-root]".into());
     }
@@ -38,9 +40,7 @@ fn run() -> Result<(), String> {
     let set = catalog
         .set(STANDARD_UDS_ECU_IDENTIFICATION_SET)
         .ok_or_else(|| {
-            format!(
-                "canonical knowledge is missing set {STANDARD_UDS_ECU_IDENTIFICATION_SET:?}"
-            )
+            format!("canonical knowledge is missing set {STANDARD_UDS_ECU_IDENTIFICATION_SET:?}")
         })?;
     println!("set\t{}@{}", set.id(), set.version());
     for item in plan {
@@ -62,9 +62,7 @@ fn bounded_identification_plan(
     let set = catalog
         .set(STANDARD_UDS_ECU_IDENTIFICATION_SET)
         .ok_or_else(|| {
-            format!(
-                "canonical knowledge is missing set {STANDARD_UDS_ECU_IDENTIFICATION_SET:?}"
-            )
+            format!("canonical knowledge is missing set {STANDARD_UDS_ECU_IDENTIFICATION_SET:?}")
         })?;
 
     set.members()
@@ -117,10 +115,7 @@ mod tests {
             plan.iter()
                 .map(|item| item.semantic.as_str())
                 .collect::<Vec<_>>(),
-            set.members()
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
+            set.members().iter().map(String::as_str).collect::<Vec<_>>()
         );
     }
 
