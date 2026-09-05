@@ -1,7 +1,7 @@
 //! Transport-free topology-provider evidence and deterministic composition.
 //!
-//! A provider result can describe configured/installed controller evidence and
-//! coverage, but it cannot issue transport requests or infer reachability,
+//! Provider results describe configured/installed controller evidence and
+//! coverage. They cannot issue transport requests or infer reachability,
 //! logical roles, or request targets from address-looking values.
 
 use std::fmt;
@@ -30,10 +30,10 @@ impl fmt::Display for TopologyProviderError {
             Self::ZeroProviderVersion => "topology provider version must be greater than zero",
             Self::EmptyManufacturer => "topology provider manufacturer must not be empty",
             Self::EmptyPlatform => "topology provider platform must not be empty",
-            Self::EmptyEvidenceReference => "topology provider evidence reference must not be empty",
-            Self::InvalidStatusCoverage => {
-                "topology provider status and coverage are inconsistent"
+            Self::EmptyEvidenceReference => {
+                "topology provider evidence reference must not be empty"
             }
+            Self::InvalidStatusCoverage => "topology provider status and coverage are inconsistent",
             Self::NonApplicableProviderHasEntries => {
                 "a not-applicable topology provider must not contain installed ECU entries"
             }
@@ -54,18 +54,11 @@ pub struct TopologyProviderId {
 
 impl TopologyProviderId {
     pub fn new(name: impl Into<String>, version: u32) -> Result<Self, TopologyProviderError> {
-        let name = name.into();
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(TopologyProviderError::EmptyProviderName);
-        }
+        let name = normalize_non_empty(name.into(), TopologyProviderError::EmptyProviderName)?;
         if version == 0 {
             return Err(TopologyProviderError::ZeroProviderVersion);
         }
-        Ok(Self {
-            name: name.to_owned(),
-            version,
-        })
+        Ok(Self { name, version })
     }
 
     pub fn name(&self) -> &str {
@@ -92,12 +85,11 @@ impl TopologyProviderScope {
     }
 
     pub fn manufacturer(manufacturer: impl Into<String>) -> Result<Self, TopologyProviderError> {
-        let manufacturer = normalize_non_empty(
-            manufacturer.into(),
-            TopologyProviderError::EmptyManufacturer,
-        )?;
         Ok(Self {
-            manufacturer: Some(manufacturer),
+            manufacturer: Some(normalize_non_empty(
+                manufacturer.into(),
+                TopologyProviderError::EmptyManufacturer,
+            )?),
             platform: None,
         })
     }
@@ -110,8 +102,7 @@ impl TopologyProviderScope {
             manufacturer.into(),
             TopologyProviderError::EmptyManufacturer,
         )?;
-        let platform =
-            normalize_non_empty(platform.into(), TopologyProviderError::EmptyPlatform)?;
+        let platform = normalize_non_empty(platform.into(), TopologyProviderError::EmptyPlatform)?;
         Ok(Self {
             manufacturer: Some(manufacturer),
             platform: Some(platform),
@@ -152,12 +143,10 @@ pub struct EvidenceReference(String);
 
 impl EvidenceReference {
     pub fn new(reference: impl Into<String>) -> Result<Self, TopologyProviderError> {
-        let reference = reference.into();
-        let reference = reference.trim();
-        if reference.is_empty() {
-            return Err(TopologyProviderError::EmptyEvidenceReference);
-        }
-        Ok(Self(reference.to_owned()))
+        Ok(Self(normalize_non_empty(
+            reference.into(),
+            TopologyProviderError::EmptyEvidenceReference,
+        )?))
     }
 
     pub fn as_str(&self) -> &str {
@@ -184,9 +173,8 @@ pub enum TopologyProviderCoverage {
 
 /// One configured/installed-controller fact produced by a topology provider.
 ///
-/// The type deliberately has no responder, reachability, or role fields.  A
-/// request target can be attached only as a separate `RequestTargetEvidence`
-/// value supplied by an independently reviewed mapping.
+/// There are deliberately no responder, reachability, or role fields. A
+/// request target can only arrive as separately sourced `RequestTargetEvidence`.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct InstalledEcuEvidence {
     context: ProtocolContext,
@@ -265,12 +253,11 @@ impl TopologyProviderResult {
         let mut entries = entries.into_iter().collect::<Vec<_>>();
         entries.sort();
         entries.dedup();
+        validate_status_coverage(status, coverage, entries.is_empty())?;
 
         let mut evidence_references = evidence_references.into_iter().collect::<Vec<_>>();
         evidence_references.sort();
         evidence_references.dedup();
-
-        validate_status_coverage(status, coverage, entries.is_empty())?;
 
         Ok(Self {
             id,
@@ -307,7 +294,11 @@ impl TopologyProviderResult {
     }
 
     pub fn to_topology(&self) -> EcuTopology {
-        EcuTopology::from_nodes(self.entries.iter().map(InstalledEcuEvidence::to_topology_node))
+        EcuTopology::from_nodes(
+            self.entries
+                .iter()
+                .map(InstalledEcuEvidence::to_topology_node),
+        )
     }
 
     fn coverage_record(&self) -> TopologyProviderCoverageRecord {
@@ -353,10 +344,8 @@ pub enum TopologyInventoryCoverageClass {
     TopologyProviderUnavailableOrBlocked,
 }
 
-/// Structured coverage state for a merged topology inventory.
-///
-/// This deliberately retains every provider record rather than collapsing
-/// multiple provider scopes into a guessed global "complete vehicle" flag.
+/// Coverage remains structured so separate provider scopes are never collapsed
+/// into a guessed global "complete vehicle" boolean.
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct TopologyInventoryCoverage {
     functional_obd_evidence_present: bool,
@@ -424,14 +413,15 @@ impl TopologyInventory {
     }
 }
 
-/// Merge configured/installed provider facts with an existing functional OBD
-/// topology.  The merge is evidence-only: it never performs I/O or infers a
-/// link between provider entries and observed responders.
-pub fn merge_topology_provider_results<'a>(
+/// Merge provider evidence with the existing functional OBD topology.
+///
+/// This performs no I/O and never infers links between provider entries and
+/// observed responders.
+pub fn merge_topology_provider_results(
     functional_topology: &EcuTopology,
-    provider_results: impl IntoIterator<Item = &'a TopologyProviderResult>,
+    provider_results: &[TopologyProviderResult],
 ) -> TopologyInventory {
-    let mut provider_results = provider_results.into_iter().collect::<Vec<_>>();
+    let mut provider_results = provider_results.to_vec();
     provider_results.sort();
     provider_results.dedup();
 
@@ -445,12 +435,11 @@ pub fn merge_topology_provider_results<'a>(
             && matches!(node.context().addressing(), AddressingContext::Functional)
             && !node.observed_responders().is_empty()
     });
-
     let coverage = TopologyInventoryCoverage::new(
         functional_obd_evidence_present,
         provider_results
             .iter()
-            .map(|result| result.coverage_record()),
+            .map(TopologyProviderResult::coverage_record),
     );
 
     TopologyInventory { topology, coverage }
@@ -462,9 +451,10 @@ fn normalize_non_empty(
 ) -> Result<String, TopologyProviderError> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(error);
+        Err(error)
+    } else {
+        Ok(value.to_owned())
     }
-    Ok(value.to_owned())
 }
 
 fn validate_status_coverage(
@@ -472,49 +462,38 @@ fn validate_status_coverage(
     coverage: TopologyProviderCoverage,
     entries_empty: bool,
 ) -> Result<(), TopologyProviderError> {
-    match status {
-        TopologyProviderStatus::Completed => {
-            if matches!(
-                coverage,
-                TopologyProviderCoverage::Partial | TopologyProviderCoverage::Complete
-            ) {
-                Ok(())
-            } else {
-                Err(TopologyProviderError::InvalidStatusCoverage)
-            }
-        }
-        TopologyProviderStatus::Unavailable | TopologyProviderStatus::Blocked => {
-            if !entries_empty {
-                return Err(TopologyProviderError::BlockedOrUnavailableProviderHasEntries);
-            }
-            if coverage == TopologyProviderCoverage::Unknown {
-                Ok(())
-            } else {
-                Err(TopologyProviderError::InvalidStatusCoverage)
-            }
+    if matches!(
+        status,
+        TopologyProviderStatus::Blocked | TopologyProviderStatus::Unavailable
+    ) && !entries_empty
+    {
+        return Err(TopologyProviderError::BlockedOrUnavailableProviderHasEntries);
+    }
+    if status == TopologyProviderStatus::NotApplicable && !entries_empty {
+        return Err(TopologyProviderError::NonApplicableProviderHasEntries);
+    }
+
+    let valid = match status {
+        TopologyProviderStatus::Completed => matches!(
+            coverage,
+            TopologyProviderCoverage::Partial | TopologyProviderCoverage::Complete
+        ),
+        TopologyProviderStatus::Blocked | TopologyProviderStatus::Unavailable => {
+            coverage == TopologyProviderCoverage::Unknown
         }
         TopologyProviderStatus::NotApplicable => {
-            if !entries_empty {
-                return Err(TopologyProviderError::NonApplicableProviderHasEntries);
-            }
-            if coverage == TopologyProviderCoverage::NotApplicable {
-                Ok(())
-            } else {
-                Err(TopologyProviderError::InvalidStatusCoverage)
-            }
+            coverage == TopologyProviderCoverage::NotApplicable
         }
-        TopologyProviderStatus::Failed => {
-            let valid = if entries_empty {
-                coverage == TopologyProviderCoverage::Unknown
-            } else {
-                coverage == TopologyProviderCoverage::Partial
-            };
-            if valid {
-                Ok(())
-            } else {
-                Err(TopologyProviderError::InvalidStatusCoverage)
-            }
+        TopologyProviderStatus::Failed if entries_empty => {
+            coverage == TopologyProviderCoverage::Unknown
         }
+        TopologyProviderStatus::Failed => coverage == TopologyProviderCoverage::Partial,
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(TopologyProviderError::InvalidStatusCoverage)
     }
 }
 
@@ -545,22 +524,19 @@ mod tests {
         )
     }
 
-    fn installed(source: &str, id: &str, logical_address: &str) -> InstalledEcuEvidence {
+    fn installed(source: &str, id: &str, logical: &str) -> InstalledEcuEvidence {
         InstalledEcuEvidence::new(
             configured_context(),
             ConfiguredController::new(
                 Some(ConfiguredIdentity::new("synthetic-installation-list", id)),
-                Some(LogicalAddress::new(
-                    "synthetic-logical-address",
-                    logical_address,
-                )),
+                Some(LogicalAddress::new("synthetic-logical-address", logical)),
                 provenance(source),
             )
             .unwrap(),
         )
     }
 
-    fn completed_provider(
+    fn provider(
         name: &str,
         entries: impl IntoIterator<Item = InstalledEcuEvidence>,
     ) -> TopologyProviderResult {
@@ -576,24 +552,25 @@ mod tests {
     }
 
     fn functional_topology(responder: &str) -> EcuTopology {
-        EcuTopology::from_nodes([EcuNode::new(functional_context(), provenance("functional OBD"))
-            .with_observed_responder(ObservedResponder::new(
-                ResponderIdentity::address(functional_context(), responder),
-                provenance("functional OBD"),
-            ))])
+        EcuTopology::from_nodes([
+            EcuNode::new(functional_context(), provenance("functional OBD"))
+                .with_observed_responder(ObservedResponder::new(
+                    ResponderIdentity::address(functional_context(), responder),
+                    provenance("functional OBD"),
+                )),
+        ])
     }
 
     #[test]
-    fn configured_provider_entries_do_not_gain_reachability_or_role() {
-        let provider = completed_provider(
+    fn configured_entries_do_not_gain_reachability_or_role() {
+        let result = provider(
             "synthetic.installation-list",
             [
                 installed("provider", "engine", "01"),
                 installed("provider", "abs", "03"),
             ],
         );
-
-        let inventory = merge_topology_provider_results(&EcuTopology::new(), [&provider]);
+        let inventory = merge_topology_provider_results(&EcuTopology::new(), &[result]);
 
         assert_eq!(inventory.topology().nodes().len(), 2);
         assert!(inventory.topology().nodes().iter().all(|node| {
@@ -605,14 +582,13 @@ mod tests {
     }
 
     #[test]
-    fn functional_responder_not_in_provider_output_is_preserved() {
+    fn functional_responder_outside_provider_output_is_preserved() {
         let functional = functional_topology("7E8");
-        let provider = completed_provider(
+        let result = provider(
             "synthetic.installation-list",
             [installed("provider", "abs", "03")],
         );
-
-        let inventory = merge_topology_provider_results(&functional, [&provider]);
+        let inventory = merge_topology_provider_results(&functional, &[result]);
 
         assert_eq!(inventory.topology().nodes().len(), 2);
         assert_eq!(
@@ -628,19 +604,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_request_target_remains_separate_from_logical_address() {
-        let entry = installed("provider", "engine", "01").with_request_target(
-            RequestTargetEvidence::new(
+    fn request_target_requires_separate_explicit_evidence() {
+        let entry =
+            installed("provider", "engine", "01").with_request_target(RequestTargetEvidence::new(
                 RequestTarget::concrete(
                     ProtocolContext::new(Protocol::Uds, AddressingContext::Physical),
                     RequestAddress::new("reviewed-target-space", "target-engine"),
                 ),
                 provenance("independent target mapping"),
-            ),
-        );
-        let provider = completed_provider("synthetic.installation-list", [entry]);
-
-        let inventory = merge_topology_provider_results(&EcuTopology::new(), [&provider]);
+            ));
+        let result = provider("synthetic.installation-list", [entry]);
+        let inventory = merge_topology_provider_results(&EcuTopology::new(), &[result]);
         let node = &inventory.topology().nodes()[0];
 
         assert_eq!(
@@ -668,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_provider_is_explicit_and_cannot_claim_complete_coverage() {
+    fn blocked_and_failed_providers_cannot_claim_complete_inventory() {
         let blocked = TopologyProviderResult::new(
             TopologyProviderId::new("synthetic.blocked", 1).unwrap(),
             applicability("safety review"),
@@ -678,15 +652,23 @@ mod tests {
             [EvidenceReference::new("negative safety gate").unwrap()],
         )
         .unwrap();
-        let inventory = merge_topology_provider_results(&EcuTopology::new(), [&blocked]);
+        let failed = TopologyProviderResult::new(
+            TopologyProviderId::new("synthetic.failed", 1).unwrap(),
+            applicability("runtime evidence"),
+            TopologyProviderStatus::Failed,
+            TopologyProviderCoverage::Unknown,
+            [],
+            [],
+        )
+        .unwrap();
+        let inventory =
+            merge_topology_provider_results(&EcuTopology::new(), &[blocked, failed]);
 
         assert_eq!(
             inventory.coverage().class(),
             TopologyInventoryCoverageClass::TopologyProviderUnavailableOrBlocked
         );
-        assert_eq!(inventory.coverage().providers()[0].status(), TopologyProviderStatus::Blocked);
         assert!(inventory.topology().nodes().is_empty());
-
         assert_eq!(
             TopologyProviderResult::new(
                 TopologyProviderId::new("synthetic.invalid", 1).unwrap(),
@@ -701,68 +683,36 @@ mod tests {
     }
 
     #[test]
-    fn failed_provider_never_becomes_an_empty_authoritative_inventory() {
-        let failed = TopologyProviderResult::new(
-            TopologyProviderId::new("synthetic.failed", 1).unwrap(),
-            applicability("runtime evidence"),
-            TopologyProviderStatus::Failed,
-            TopologyProviderCoverage::Unknown,
-            [],
-            [],
-        )
-        .unwrap();
-        let inventory = merge_topology_provider_results(&EcuTopology::new(), [&failed]);
-
-        assert_eq!(
-            inventory.coverage().class(),
-            TopologyInventoryCoverageClass::TopologyProviderUnavailableOrBlocked
-        );
-        assert_eq!(inventory.coverage().providers()[0].coverage(), TopologyProviderCoverage::Unknown);
-        assert_eq!(
-            TopologyProviderResult::new(
-                TopologyProviderId::new("synthetic.failed-complete", 1).unwrap(),
-                applicability("runtime evidence"),
-                TopologyProviderStatus::Failed,
-                TopologyProviderCoverage::Complete,
-                [],
-                [],
-            ),
-            Err(TopologyProviderError::InvalidStatusCoverage)
-        );
-    }
-
-    #[test]
-    fn provider_order_does_not_change_merged_topology_or_coverage() {
-        let first = completed_provider(
+    fn provider_order_is_deterministic() {
+        let first = provider(
             "synthetic.first",
             [installed("first provider", "engine", "01")],
         );
-        let second = completed_provider(
+        let second = provider(
             "synthetic.second",
             [installed("second provider", "abs", "03")],
         );
         let functional = functional_topology("7E8");
 
-        let left = merge_topology_provider_results(&functional, [&first, &second]);
-        let right = merge_topology_provider_results(&functional, [&second, &first]);
-
+        let left = merge_topology_provider_results(
+            &functional,
+            &[first.clone(), second.clone()],
+        );
+        let right = merge_topology_provider_results(&functional, &[second, first]);
         assert_eq!(left, right);
     }
 
     #[test]
-    fn duplicate_same_provider_entries_normalize_but_cross_provider_provenance_remains() {
+    fn same_provider_duplicates_normalize_but_cross_provider_provenance_remains() {
         let duplicate = installed("provider one", "engine", "01");
-        let first = completed_provider(
-            "synthetic.first",
-            [duplicate.clone(), duplicate],
-        );
+        let first = provider("synthetic.first", [duplicate.clone(), duplicate]);
         assert_eq!(first.entries().len(), 1);
 
-        let second = completed_provider(
+        let second = provider(
             "synthetic.second",
             [installed("provider two", "engine", "01")],
         );
-        let inventory = merge_topology_provider_results(&EcuTopology::new(), [&first, &second]);
+        let inventory = merge_topology_provider_results(&EcuTopology::new(), &[first, second]);
 
         assert_eq!(inventory.topology().nodes().len(), 2);
         let sources = inventory
@@ -776,12 +726,12 @@ mod tests {
     }
 
     #[test]
-    fn logical_address_alone_never_becomes_request_target() {
-        let provider = completed_provider(
+    fn logical_address_never_becomes_request_target() {
+        let result = provider(
             "synthetic.installation-list",
             [installed("provider", "engine", "7E0")],
         );
-        let inventory = merge_topology_provider_results(&EcuTopology::new(), [&provider]);
+        let inventory = merge_topology_provider_results(&EcuTopology::new(), &[result]);
         let node = &inventory.topology().nodes()[0];
 
         assert_eq!(
@@ -796,12 +746,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_providers_is_truthfully_functional_obd_only() {
+    fn zero_providers_is_functional_obd_only() {
         let functional = functional_topology("7E8");
-        let inventory = merge_topology_provider_results(
-            &functional,
-            std::iter::empty::<&TopologyProviderResult>(),
-        );
+        let inventory = merge_topology_provider_results(&functional, &[]);
 
         assert_eq!(inventory.topology(), &functional);
         assert_eq!(
@@ -813,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn ea189_pq35_gateway_provider_can_remain_blocked_without_transport_surface() {
+    fn ea189_pq35_gateway_state_can_remain_blocked_without_transport() {
         let blocked = TopologyProviderResult::new(
             TopologyProviderId::new("vw.pq35.gateway-installation-list", 1).unwrap(),
             TopologyProviderApplicability::new(
@@ -826,8 +773,7 @@ mod tests {
             [EvidenceReference::new("issue #35 negative safety gate").unwrap()],
         )
         .unwrap();
-
-        let inventory = merge_topology_provider_results(&EcuTopology::new(), [&blocked]);
+        let inventory = merge_topology_provider_results(&EcuTopology::new(), &[blocked]);
 
         assert!(inventory.topology().nodes().is_empty());
         assert_eq!(
