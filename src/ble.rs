@@ -245,6 +245,13 @@ pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
     start_session_mode(adapter_id, true).await
 }
 
+/// Start the same closed session while mirroring adapter TX/RX for a bounded
+/// diagnostic probe. No caller-controlled ELM command path is exposed.
+pub async fn start_session_with_adapter_io(adapter_id: &str) -> Result<SessionClient, String> {
+    let session = DiagnosticSession::connect_with_adapter_io_mode(adapter_id, true, true).await?;
+    Ok(start_session_actor(session))
+}
+
 async fn start_session_mode(
     adapter_id: &str,
     discover_support: bool,

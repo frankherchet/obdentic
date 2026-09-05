@@ -622,7 +622,7 @@ async fn run_vehicle_mode09(
 
 async fn run_vehicle_mode09_inner(adapter_id: &str) -> Result<(), String> {
     let mapping = cached_engine_mapping(adapter_id).await?;
-    let session = ble::start_session(adapter_id).await?;
+    let session = ble::start_session_with_adapter_io(adapter_id).await?;
     let expected = mapping
         .expected_responder()
         .value()
