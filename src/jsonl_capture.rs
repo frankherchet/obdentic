@@ -45,6 +45,11 @@ pub struct ParsedCapture {
 
 /// Starts a private recorder, replacing an earlier capture at the same path.
 pub fn start(path: &Path) -> Result<(Sender, Writer), String> {
+    crate::capture_writer::start(path)
+}
+
+/// JSONL plugin entry point used by the capture-writer registry.
+pub(crate) fn start_jsonl(path: &Path) -> Result<(Sender, Writer), String> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -91,14 +96,14 @@ impl JsonlRecorder {
             .take()
             .expect("recorder task already closed")
             .await
-            .map_err(|error| format!("JSONL recorder stopped unexpectedly: {error}"))?
+            .map_err(|error| format!("capture recorder stopped unexpectedly: {error}"))?
     }
 }
 
 pub async fn close(sender: Sender, task: Writer) -> Result<(), String> {
     drop(sender);
     task.await
-        .map_err(|error| format!("JSONL recorder stopped unexpectedly: {error}"))?
+        .map_err(|error| format!("capture recorder stopped unexpectedly: {error}"))?
 }
 
 fn write_events(mut file: File, mut receiver: mpsc::Receiver<CaptureEvent>) -> Result<(), String> {
@@ -133,7 +138,7 @@ fn header() -> String {
     format!("{{\"schema\":\"{SCHEMA}\",\"version\":{VERSION},\"type\":\"header\"}}\n")
 }
 
-fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
+pub(crate) fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
     let mut object = format!("{{\"schema\":\"{SCHEMA}\",\"version\":{VERSION},\"type\":",);
     match event {
         CaptureEvent::CaptureStarted {
