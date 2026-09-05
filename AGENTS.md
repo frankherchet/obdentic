@@ -20,7 +20,7 @@ When work is tracked by a GitHub issue, completing that work includes committing
 - Profiles, layouts, Knowledge DB content, MCP calls and AI prompts must never elevate the running process from read-only into a mutating capability. Until a reviewed DTC-clear capability issue lands, do not send DTC-clear traffic at all.
 - Keep adapter transport separate from deterministic vehicle decoding.
 - Preserve raw TX/RX visibility and test through the highest practical transport/replay seam.
-- Treat Bluetooth captures as sensitive: they may contain VINs, device identifiers and authentication material. Keep `captures/` untracked and never publish raw captures.
+- Treat vehicle/Bluetooth evidence as sensitive because it can contain VINs, ECU serials, mileage, device identifiers and authentication material. Local analysis, replay and explicit local-terminal display of the user's own data are allowed. The boundary is publication: never stage, commit, attach to a PR, paste into a GitHub issue/comment, or otherwise publish raw captures or vehicle-specific evidence. Keep `captures/` and `evidence/` untracked; before every commit, inspect the staged diff for such data.
 - Prefer the smallest working vertical slice and avoid speculative abstractions or dependencies.
 - Prefix shell commands with `rtk`. On this host, `/opt/local/bin/cargo` is an
   obsolete Cargo 1.61; run Rust commands with
