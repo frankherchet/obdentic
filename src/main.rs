@@ -1991,8 +1991,86 @@ fn render_vehicle_summaries(caches: &[obdentic::vehicle_cache::VehicleCache]) ->
         for evidence in cache.history() {
             output.push_str(&format!("  {}\n", evidence.escape_default()));
         }
+        let observations = cache.snapshot().ecu_identification();
+        if !observations.is_empty() {
+            output.push_str(&format!("ecu_identification\t{}\n", observations.len()));
+            for observation in observations {
+                let target = observation
+                    .target()
+                    .address()
+                    .map(|address| {
+                        format!(
+                            "{}:{}",
+                            escape_field(address.namespace()),
+                            escape_field(address.value())
+                        )
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                let responder = observation
+                    .expected_responder()
+                    .value()
+                    .map(escape_field)
+                    .unwrap_or_else(|| "unknown".into());
+                let role = cache
+                    .snapshot()
+                    .target_mappings()
+                    .iter()
+                    .find(|mapping| {
+                        mapping.target() == observation.target()
+                            && mapping
+                                .responder()
+                                .is_some_and(|value| value == observation.expected_responder())
+                    })
+                    .and_then(|mapping| mapping.role())
+                    .map(|role| render_ecu_role(role.role()))
+                    .unwrap_or_else(|| "unassigned".into());
+                let sensitivity = if observation.semantic() == "ecu.serial_number" {
+                    "local-sensitive"
+                } else {
+                    "local"
+                };
+                let value = observation
+                    .value()
+                    .map(|value| format!("\tvalue_hex={}", hex(value)))
+                    .unwrap_or_default();
+                output.push_str(&format!(
+                    "identification\ttarget={target}\tresponder={responder}\trole={role}\tsemantic={}\tstatus={}\tsensitivity={sensitivity}{value}\n",
+                    escape_field(observation.semantic()),
+                    render_identification_status(observation.status()),
+                ));
+            }
+        }
     }
     output
+}
+
+fn render_ecu_role(role: &EcuRole) -> String {
+    match role {
+        EcuRole::Engine => "engine".into(),
+        EcuRole::Transmission => "transmission".into(),
+        EcuRole::Gateway => "gateway".into(),
+        EcuRole::Unknown => "unknown".into(),
+        EcuRole::VendorSpecific(value) => format!("vendor:{}", escape_field(value)),
+    }
+}
+
+fn render_identification_status(
+    status: obdentic::ecu_identification::IdentificationResultStatus,
+) -> &'static str {
+    match status {
+        obdentic::ecu_identification::IdentificationResultStatus::Supported => "supported",
+        obdentic::ecu_identification::IdentificationResultStatus::Unsupported => "unsupported",
+        obdentic::ecu_identification::IdentificationResultStatus::NegativeResponse => {
+            "negative_response"
+        }
+        obdentic::ecu_identification::IdentificationResultStatus::Unavailable => "unavailable",
+        obdentic::ecu_identification::IdentificationResultStatus::Malformed => "malformed",
+        obdentic::ecu_identification::IdentificationResultStatus::Timeout => "timeout",
+        obdentic::ecu_identification::IdentificationResultStatus::TransportError => {
+            "transport_error"
+        }
+        obdentic::ecu_identification::IdentificationResultStatus::NotProbed => "not_probed",
+    }
 }
 
 async fn run_capture(
@@ -3122,6 +3200,56 @@ mod tests {
         assert!(output.contains("signal\t7E9\tengine.rpm\tnot-advertised\n"));
         assert!(output.contains("signal\t7E9\tvehicle.speed\tadvertised\n"));
         assert!(!output.contains("7E0"));
+    }
+
+    #[test]
+    fn renders_cached_ecu_identification_with_role_and_sensitive_value_marker() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let target =
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0"));
+        let responder = ResponderIdentity::address(context, "7E8");
+        let provenance = Provenance::new("test", Confidence::Verified).unwrap();
+        let mapping = TargetMappingSnapshot::new(
+            Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
+            Some(responder.clone()),
+            target.clone(),
+            provenance,
+        );
+        let observation = obdentic::ecu_identification::IdentificationObservation::new(
+            target,
+            responder,
+            "ecu.serial_number",
+            "uds.f18c.serial_number",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "0123456789abcdef0123456789abcdef01234567",
+            [0x22, 0xF1, 0x8C],
+            obdentic::ecu_identification::IdentificationResultStatus::Supported,
+            Vec::new(),
+            None,
+            Some(vec![0x53, 0x31]),
+            Vec::new(),
+        )
+        .unwrap();
+        let cache = VehicleCache::with_snapshot(
+            "cache",
+            1,
+            2,
+            obdentic::vehicle_cache::VehicleCacheSnapshot::with_ecu_identification(
+                [],
+                [],
+                [mapping],
+                [observation],
+            ),
+            Vec::new(),
+        );
+
+        let output = render_vehicle_summaries(&[cache]);
+        assert!(output.contains("ecu_identification\t1\n"));
+        assert!(output.contains(
+            "identification\ttarget=elm-header:7E0\tresponder=7E8\trole=engine\tsemantic=ecu.serial_number\tstatus=supported\tsensitivity=local-sensitive\tvalue_hex=53 31\n"
+        ));
+        assert!(!output.contains("S1"));
     }
 
     #[test]
