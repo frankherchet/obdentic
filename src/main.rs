@@ -564,28 +564,9 @@ async fn run_vehicle_scan(
 async fn run_vehicle_scan_inner(adapter_id: &str) -> Result<(), String> {
     let session = ble::start_session(adapter_id).await?;
     let scan: Result<(), String> = async {
-        println!("vehicle obd scan");
-        println!("candidate\ttarget\tresponder\tstatus");
-
-        for candidate in obdentic::obd_candidate_scan::candidates() {
-            let status = match session
-                .read_targeted(candidate_target_request(*candidate)?)
-                .await
-            {
-                Ok(transaction) => match validate_vehicle_speed_target_transaction(&transaction) {
-                    Ok(()) => "present".to_owned(),
-                    Err(error) => format!("invalid ({error})"),
-                },
-                Err(error) => format!("unavailable ({error})"),
-            };
-            println!(
-                "{}\t{}\t{}\t{}",
-                candidate.name(),
-                candidate.target(),
-                candidate.expected_responder(),
-                status.escape_default(),
-            );
-        }
+        let discovery =
+            obdentic::functional_discovery::discover_functional_responders(&session).await?;
+        print!("{}", render_vehicle_scan(&discovery));
         Ok(())
     }
     .await;
@@ -594,18 +575,32 @@ async fn run_vehicle_scan_inner(adapter_id: &str) -> Result<(), String> {
     shutdown
 }
 
-fn candidate_target_request(
-    candidate: obdentic::obd_candidate_scan::ObdCandidate,
-) -> Result<ble::TargetedReadRequest, String> {
-    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
-    ble::TargetedReadRequest::new(
-        prepare_read("vehicle.speed")?,
-        RequestTarget::concrete(
-            context,
-            RequestAddress::new("elm-header", candidate.target()),
-        ),
-        ble::ResponderIdentity::ElmHeader(candidate.expected_responder().into()),
-    )
+fn render_vehicle_scan(
+    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
+) -> String {
+    let capabilities = discovery.capabilities();
+    let mut output = String::from("vehicle obd scan\nscope\tfunctional OBD-II Mode 01 only\n");
+    output.push_str(&format!("responders\t{}\n", capabilities.len()));
+    for capability in capabilities {
+        let responder = capability.responder().value().unwrap_or("unknown");
+        output.push_str(&format!("responder\t{}\n", responder.escape_default()));
+        for signal in supported_signals() {
+            let status = match capability.status(signal.metadata().semantic) {
+                Ok(obdentic::functional_discovery::CapabilityStatus::Supported) => "advertised",
+                Ok(obdentic::functional_discovery::CapabilityStatus::Unsupported) => {
+                    "not-advertised"
+                }
+                Ok(obdentic::functional_discovery::CapabilityStatus::Unknown) | Err(_) => "unknown",
+            };
+            output.push_str(&format!(
+                "signal\t{}\t{}\t{}\n",
+                responder.escape_default(),
+                signal.metadata().semantic,
+                status
+            ));
+        }
+    }
+    output
 }
 
 async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(), String> {
@@ -3097,6 +3092,36 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn renders_functional_scan_for_each_responder_without_physical_targets() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Functional);
+        let provenance = Provenance::new("test", Confidence::High).unwrap();
+        let discovery = obdentic::functional_discovery::FunctionalResponderDiscovery::new([
+            obdentic::functional_discovery::FunctionalPageObservation::new(
+                [0x01, 0x00],
+                ResponderIdentity::opaque(context.clone(), "7E8"),
+                vec![0x41, 0x00, 0x00, 0x18, 0x00, 0x00],
+                provenance.clone(),
+            )
+            .unwrap(),
+            obdentic::functional_discovery::FunctionalPageObservation::new(
+                [0x01, 0x00],
+                ResponderIdentity::opaque(context, "7E9"),
+                vec![0x41, 0x00, 0x00, 0x08, 0x00, 0x00],
+                provenance,
+            )
+            .unwrap(),
+        ]);
+
+        let output = render_vehicle_scan(&discovery);
+        assert!(output.contains("scope\tfunctional OBD-II Mode 01 only\n"));
+        assert!(output.contains("responders\t2\n"));
+        assert!(output.contains("signal\t7E8\tengine.rpm\tadvertised\n"));
+        assert!(output.contains("signal\t7E9\tengine.rpm\tnot-advertised\n"));
+        assert!(output.contains("signal\t7E9\tvehicle.speed\tadvertised\n"));
+        assert!(!output.contains("7E0"));
     }
 
     #[test]
