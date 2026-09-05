@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const SUPPORTED_KNOWLEDGE_SCHEMA_VERSION: u32 = 1;
+pub const SUPPORTED_KNOWLEDGE_SCHEMA_VERSION: u32 = 2;
 pub const CANONICAL_KNOWLEDGE_REPOSITORY: &str = "frankherchet/obdentic-knowledge";
 pub const STANDARD_UDS_ECU_IDENTIFICATION_SET: &str = "uds.standard.ecu_identification";
 const VIN_DID: u16 = 0xF190;
@@ -129,6 +129,7 @@ impl KnowledgePin {
 pub struct KnowledgeCatalog {
     pin: KnowledgePin,
     definitions: BTreeMap<String, KnowledgeDefinition>,
+    semantic_definitions: BTreeMap<String, Vec<String>>,
     sets: BTreeMap<String, KnowledgeSet>,
 }
 
@@ -163,7 +164,7 @@ impl KnowledgeCatalog {
         }
 
         let mut definitions = BTreeMap::new();
-        let mut semantics = BTreeMap::<String, String>::new();
+        let mut semantic_definitions = BTreeMap::<String, Vec<String>>::new();
         let mut sets = BTreeMap::new();
 
         for relative_path in files {
@@ -182,15 +183,10 @@ impl KnowledgeCatalog {
                         path: relative_path.clone(),
                     });
                 }
-                if let Some(first_id) =
-                    semantics.insert(definition.semantic().to_owned(), definition.id().to_owned())
-                {
-                    return Err(KnowledgeLoadError::DuplicateSemantic {
-                        semantic: definition.semantic().to_owned(),
-                        first_id,
-                        second_id: definition.id().to_owned(),
-                    });
-                }
+                semantic_definitions
+                    .entry(definition.semantic().to_owned())
+                    .or_default()
+                    .push(definition.id().to_owned());
                 definitions.insert(definition.id().to_owned(), definition);
             }
 
@@ -206,10 +202,21 @@ impl KnowledgeCatalog {
             }
         }
 
-        let semantic_definitions: BTreeMap<&str, &KnowledgeDefinition> = definitions
-            .values()
-            .map(|definition| (definition.semantic(), definition))
-            .collect();
+        for (semantic, definition_ids) in &semantic_definitions {
+            let mut applicability_keys = BTreeMap::<KnowledgeApplicabilityKey, String>::new();
+            for definition_id in definition_ids {
+                let definition = &definitions[definition_id];
+                let key = definition.applicability().key();
+                if let Some(first_id) = applicability_keys.insert(key, definition_id.clone()) {
+                    return Err(KnowledgeLoadError::DuplicateApplicability {
+                        semantic: semantic.clone(),
+                        first_id,
+                        second_id: definition_id.clone(),
+                    });
+                }
+            }
+        }
+
         for set in sets.values() {
             for member in set.members() {
                 if !semantic_definitions.contains_key(member.as_str()) {
@@ -223,12 +230,14 @@ impl KnowledgeCatalog {
 
         if let Some(set) = sets.get(STANDARD_UDS_ECU_IDENTIFICATION_SET) {
             for member in set.members() {
-                let definition = semantic_definitions[member.as_str()];
-                match definition.operation() {
-                    KnowledgeReadOperation::UdsReadDataByIdentifier { did, .. }
-                        if *did != VIN_DID => {}
-                    KnowledgeReadOperation::UdsReadDataByIdentifier { .. } => {
-                        return Err(KnowledgeLoadError::VinInEcuIdentificationSet)
+                for definition_id in &semantic_definitions[member.as_str()] {
+                    let definition = &definitions[definition_id];
+                    match definition.operation() {
+                        KnowledgeReadOperation::UdsReadDataByIdentifier { did, .. }
+                            if *did != VIN_DID => {}
+                        KnowledgeReadOperation::UdsReadDataByIdentifier { .. } => {
+                            return Err(KnowledgeLoadError::VinInEcuIdentificationSet)
+                        }
                     }
                 }
             }
@@ -237,6 +246,7 @@ impl KnowledgeCatalog {
         Ok(Self {
             pin,
             definitions,
+            semantic_definitions,
             sets,
         })
     }
@@ -249,10 +259,28 @@ impl KnowledgeCatalog {
         self.definitions.get(id)
     }
 
+    /// Resolve a semantic only when canonical Knowledge has exactly one
+    /// definition for it. Applicability-aware consumers should use
+    /// `definitions_for_semantic` instead of silently picking a candidate.
     pub fn semantic(&self, semantic: &str) -> Option<&KnowledgeDefinition> {
-        self.definitions
-            .values()
-            .find(|definition| definition.semantic() == semantic)
+        let ids = self.semantic_definitions.get(semantic)?;
+        if ids.len() != 1 {
+            return None;
+        }
+        self.definitions.get(&ids[0])
+    }
+
+    pub fn definitions_for_semantic(&self, semantic: &str) -> Vec<&KnowledgeDefinition> {
+        self.semantic_definitions
+            .get(semantic)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.definitions.get(id))
+            .collect()
+    }
+
+    pub fn semantic_ids(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.semantic_definitions.keys().map(String::as_str)
     }
 
     pub fn definitions(&self) -> impl ExactSizeIterator<Item = &KnowledgeDefinition> {
@@ -322,6 +350,7 @@ pub struct KnowledgeDefinition {
     semantic: String,
     version: u32,
     description: Option<String>,
+    applicability: KnowledgeApplicability,
     operation: KnowledgeReadOperation,
     response: KnowledgeResponse,
     decoder: KnowledgeDecoder,
@@ -341,6 +370,7 @@ impl KnowledgeDefinition {
                     .into(),
             });
         }
+        let applicability = KnowledgeApplicability::from_raw(path, raw.applicability)?;
         let operation = KnowledgeReadOperation::from_raw(path, raw.operation)?;
         let response = KnowledgeResponse::from_raw(path, &operation, raw.response)?;
         let decoder = KnowledgeDecoder::from_raw(path, raw.decoder)?;
@@ -355,6 +385,7 @@ impl KnowledgeDefinition {
             semantic: raw.semantic,
             version: raw.version,
             description: raw.description,
+            applicability,
             operation,
             response,
             decoder,
@@ -380,6 +411,10 @@ impl KnowledgeDefinition {
 
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
+    }
+
+    pub fn applicability(&self) -> &KnowledgeApplicability {
+        &self.applicability
     }
 
     pub fn operation(&self) -> &KnowledgeReadOperation {
@@ -424,6 +459,196 @@ impl KnowledgeDefinition {
             .map_err(|error| error.to_string())?;
         self.response.validate_payload(payload)?;
         Ok(payload)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KnowledgeApplicability {
+    Generic {
+        provenance: KnowledgeProvenance,
+    },
+    EcuFingerprint {
+        predicates: Vec<FingerprintPredicate>,
+        provenance: KnowledgeProvenance,
+    },
+}
+
+impl KnowledgeApplicability {
+    fn from_raw(path: &Path, raw: RawApplicability) -> Result<Self, KnowledgeLoadError> {
+        let provenance = KnowledgeProvenance::from_raw(path, raw.provenance)?;
+        match raw.kind.as_str() {
+            "generic" => {
+                if raw.predicates.is_some() {
+                    return Err(KnowledgeLoadError::InvalidDefinition {
+                        path: path.to_path_buf(),
+                        reason: "generic applicability must not contain predicates".into(),
+                    });
+                }
+                Ok(Self::Generic { provenance })
+            }
+            "ecu_fingerprint" => {
+                let raw_predicates =
+                    raw.predicates
+                        .ok_or_else(|| KnowledgeLoadError::InvalidDefinition {
+                            path: path.to_path_buf(),
+                            reason: "ecu_fingerprint applicability requires predicates".into(),
+                        })?;
+                if raw_predicates.is_empty() {
+                    return Err(KnowledgeLoadError::InvalidDefinition {
+                        path: path.to_path_buf(),
+                        reason: "ecu_fingerprint applicability requires at least one predicate"
+                            .into(),
+                    });
+                }
+                let predicates = raw_predicates
+                    .into_iter()
+                    .map(|predicate| FingerprintPredicate::from_raw(path, predicate))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let unique_fields: BTreeSet<FingerprintField> =
+                    predicates.iter().map(FingerprintPredicate::field).collect();
+                if unique_fields.len() != predicates.len() {
+                    return Err(KnowledgeLoadError::InvalidDefinition {
+                        path: path.to_path_buf(),
+                        reason: "ecu_fingerprint applicability repeats a predicate field".into(),
+                    });
+                }
+                Ok(Self::EcuFingerprint {
+                    predicates,
+                    provenance,
+                })
+            }
+            other => Err(KnowledgeLoadError::UnknownApplicability(other.into())),
+        }
+    }
+
+    pub const fn is_generic(&self) -> bool {
+        matches!(self, Self::Generic { .. })
+    }
+
+    pub fn predicates(&self) -> &[FingerprintPredicate] {
+        match self {
+            Self::Generic { .. } => &[],
+            Self::EcuFingerprint { predicates, .. } => predicates,
+        }
+    }
+
+    pub fn provenance(&self) -> &KnowledgeProvenance {
+        match self {
+            Self::Generic { provenance } | Self::EcuFingerprint { provenance, .. } => provenance,
+        }
+    }
+
+    fn key(&self) -> KnowledgeApplicabilityKey {
+        match self {
+            Self::Generic { .. } => KnowledgeApplicabilityKey::Generic,
+            Self::EcuFingerprint { predicates, .. } => {
+                let mut pairs = predicates
+                    .iter()
+                    .map(|predicate| (predicate.field, predicate.equals.clone()))
+                    .collect::<Vec<_>>();
+                pairs.sort();
+                KnowledgeApplicabilityKey::EcuFingerprint(pairs)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum KnowledgeApplicabilityKey {
+    Generic,
+    EcuFingerprint(Vec<(FingerprintField, String)>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FingerprintPredicate {
+    field: FingerprintField,
+    equals: String,
+}
+
+impl FingerprintPredicate {
+    fn from_raw(path: &Path, raw: RawFingerprintPredicate) -> Result<Self, KnowledgeLoadError> {
+        if raw.equals.is_empty() {
+            return Err(KnowledgeLoadError::InvalidDefinition {
+                path: path.to_path_buf(),
+                reason: "fingerprint predicate equality value must not be empty".into(),
+            });
+        }
+        Ok(Self {
+            field: FingerprintField::from_name(&raw.field)?,
+            equals: raw.equals,
+        })
+    }
+
+    pub const fn field(&self) -> FingerprintField {
+        self.field
+    }
+
+    pub fn equals(&self) -> &str {
+        &self.equals
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FingerprintField {
+    VehicleManufacturer,
+    EcuLogicalRole,
+    EcuAddressingFamily,
+    EcuBootSoftwareIdentification,
+    EcuApplicationSoftwareIdentification,
+    EcuManufacturerSparePartNumber,
+    EcuManufacturerSoftwareNumber,
+    EcuManufacturerSoftwareVersion,
+    EcuSystemSupplierIdentifier,
+    EcuManufacturerHardwareNumber,
+    EcuSystemSupplierHardwareNumber,
+    EcuSystemSupplierHardwareVersion,
+    EcuSystemSupplierSoftwareNumber,
+    EcuSystemSupplierSoftwareVersion,
+    EcuSystemName,
+}
+
+impl FingerprintField {
+    fn from_name(name: &str) -> Result<Self, KnowledgeLoadError> {
+        match name {
+            "vehicle.manufacturer" => Ok(Self::VehicleManufacturer),
+            "ecu.logical_role" => Ok(Self::EcuLogicalRole),
+            "ecu.addressing_family" => Ok(Self::EcuAddressingFamily),
+            "ecu.boot_software_identification" => Ok(Self::EcuBootSoftwareIdentification),
+            "ecu.application_software_identification" => {
+                Ok(Self::EcuApplicationSoftwareIdentification)
+            }
+            "ecu.manufacturer_spare_part_number" => Ok(Self::EcuManufacturerSparePartNumber),
+            "ecu.manufacturer_software_number" => Ok(Self::EcuManufacturerSoftwareNumber),
+            "ecu.manufacturer_software_version" => Ok(Self::EcuManufacturerSoftwareVersion),
+            "ecu.system_supplier_identifier" => Ok(Self::EcuSystemSupplierIdentifier),
+            "ecu.manufacturer_hardware_number" => Ok(Self::EcuManufacturerHardwareNumber),
+            "ecu.system_supplier_hardware_number" => Ok(Self::EcuSystemSupplierHardwareNumber),
+            "ecu.system_supplier_hardware_version" => Ok(Self::EcuSystemSupplierHardwareVersion),
+            "ecu.system_supplier_software_number" => Ok(Self::EcuSystemSupplierSoftwareNumber),
+            "ecu.system_supplier_software_version" => Ok(Self::EcuSystemSupplierSoftwareVersion),
+            "ecu.system_name" => Ok(Self::EcuSystemName),
+            other => Err(KnowledgeLoadError::UnknownFingerprintField(other.into())),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VehicleManufacturer => "vehicle.manufacturer",
+            Self::EcuLogicalRole => "ecu.logical_role",
+            Self::EcuAddressingFamily => "ecu.addressing_family",
+            Self::EcuBootSoftwareIdentification => "ecu.boot_software_identification",
+            Self::EcuApplicationSoftwareIdentification => "ecu.application_software_identification",
+            Self::EcuManufacturerSparePartNumber => "ecu.manufacturer_spare_part_number",
+            Self::EcuManufacturerSoftwareNumber => "ecu.manufacturer_software_number",
+            Self::EcuManufacturerSoftwareVersion => "ecu.manufacturer_software_version",
+            Self::EcuSystemSupplierIdentifier => "ecu.system_supplier_identifier",
+            Self::EcuManufacturerHardwareNumber => "ecu.manufacturer_hardware_number",
+            Self::EcuSystemSupplierHardwareNumber => "ecu.system_supplier_hardware_number",
+            Self::EcuSystemSupplierHardwareVersion => "ecu.system_supplier_hardware_version",
+            Self::EcuSystemSupplierSoftwareNumber => "ecu.system_supplier_software_number",
+            Self::EcuSystemSupplierSoftwareVersion => "ecu.system_supplier_software_version",
+            Self::EcuSystemName => "ecu.system_name",
+        }
     }
 }
 
@@ -931,6 +1156,11 @@ pub enum KnowledgeLoadError {
         first_id: String,
         second_id: String,
     },
+    DuplicateApplicability {
+        semantic: String,
+        first_id: String,
+        second_id: String,
+    },
     DuplicateSetId {
         id: String,
         path: PathBuf,
@@ -946,6 +1176,8 @@ pub enum KnowledgeLoadError {
     },
     OperationNotSupportedByCore(String),
     UnknownOperation(String),
+    UnknownApplicability(String),
+    UnknownFingerprintField(String),
     UnknownDecoder(String),
     UnknownProvenance(String),
     UnknownConfidence(String),
@@ -970,12 +1202,15 @@ impl fmt::Display for KnowledgeLoadError {
             Self::SymlinkNotAllowed(path) => write!(formatter, "knowledge repository symlink is not allowed: {}", path.display()),
             Self::DuplicateDefinitionId { id, path } => write!(formatter, "{}: duplicate knowledge definition id {id:?}", path.display()),
             Self::DuplicateSemantic { semantic, first_id, second_id } => write!(formatter, "duplicate semantic {semantic:?}: {first_id:?} and {second_id:?}"),
+            Self::DuplicateApplicability { semantic, first_id, second_id } => write!(formatter, "duplicate applicability for semantic {semantic:?}: {first_id:?} and {second_id:?}"),
             Self::DuplicateSetId { id, path } => write!(formatter, "{}: duplicate knowledge set id {id:?}", path.display()),
             Self::UnknownSetMember { set, semantic } => write!(formatter, "knowledge set {set:?} references unknown semantic {semantic:?}"),
             Self::VinInEcuIdentificationSet => formatter.write_str("standard ECU identification set must not include VIN/F190"),
             Self::InvalidDefinition { path, reason } => write!(formatter, "{}: invalid knowledge definition: {reason}", path.display()),
             Self::OperationNotSupportedByCore(operation) => write!(formatter, "knowledge operation {operation:?} is schema-known but not supported by this OBDentic core"),
             Self::UnknownOperation(operation) => write!(formatter, "unknown knowledge operation {operation:?}"),
+            Self::UnknownApplicability(value) => write!(formatter, "unknown knowledge applicability kind {value:?}"),
+            Self::UnknownFingerprintField(value) => write!(formatter, "unknown knowledge fingerprint field {value:?}"),
             Self::UnknownDecoder(decoder) => write!(formatter, "unknown knowledge decoder {decoder:?}"),
             Self::UnknownProvenance(value) => write!(formatter, "unknown knowledge provenance classification {value:?}"),
             Self::UnknownConfidence(value) => write!(formatter, "unknown knowledge confidence {value:?}"),
@@ -1016,6 +1251,7 @@ struct RawDefinition {
     semantic: String,
     version: u32,
     description: Option<String>,
+    applicability: RawApplicability,
     operation: RawOperation,
     response: RawResponse,
     decoder: RawDecoder,
@@ -1024,6 +1260,22 @@ struct RawDefinition {
     provenance: RawProvenance,
     hardware_validation: RawHardwareValidation,
     notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApplicability {
+    #[serde(rename = "kind")]
+    kind: String,
+    predicates: Option<Vec<RawFingerprintPredicate>>,
+    provenance: RawProvenance,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFingerprintPredicate {
+    field: String,
+    equals: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1236,12 +1488,12 @@ mod tests {
     const FIXTURE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn pin() -> KnowledgePin {
-        KnowledgePin::new(CANONICAL_KNOWLEDGE_REPOSITORY, FIXTURE_REVISION, 1).unwrap()
+        KnowledgePin::new(CANONICAL_KNOWLEDGE_REPOSITORY, FIXTURE_REVISION, 2).unwrap()
     }
 
     fn valid_document(extra: &str) -> String {
         format!(
-            r#"schema_version: 1
+            r#"schema_version: 2
 namespace: test.uds
 sets:
   - id: uds.standard.ecu_identification
@@ -1251,6 +1503,14 @@ definitions:
   - id: test.f189.software_version
     semantic: ecu.software_version
     version: 1
+    applicability:
+      kind: generic
+      provenance:
+        classification: VERIFIED
+        confidence: high
+        sources:
+          - kind: standard
+            citation: ISO 14229-1
     operation:
       type: uds.read_data_by_identifier
       identifier: "0xF189"
@@ -1276,7 +1536,7 @@ definitions:
         let parsed = KnowledgePin::parse(
             Path::new("knowledge.lock"),
             &format!(
-                "repository = {CANONICAL_KNOWLEDGE_REPOSITORY}\nrevision = {FIXTURE_REVISION}\nschema_version = 1\n"
+                "repository = {CANONICAL_KNOWLEDGE_REPOSITORY}\nrevision = {FIXTURE_REVISION}\nschema_version = 2\n"
             ),
         )
         .unwrap();
@@ -1284,7 +1544,7 @@ definitions:
         assert!(KnowledgePin::parse(
             Path::new("knowledge.lock"),
             &format!(
-                "repository = {CANONICAL_KNOWLEDGE_REPOSITORY}\nrevision = {FIXTURE_REVISION}\nschema_version = 1\nraw_command = 22114F\n"
+                "repository = {CANONICAL_KNOWLEDGE_REPOSITORY}\nrevision = {FIXTURE_REVISION}\nschema_version = 2\nraw_command = 22114F\n"
             ),
         )
         .is_err());
@@ -1293,7 +1553,7 @@ definitions:
     #[test]
     fn yaml_unknown_fields_fail_closed() {
         let text = valid_document("    raw_request: \"27 01\"\n");
-        let error = parse_document(Path::new("unsafe.yaml"), &text, 1).unwrap_err();
+        let error = parse_document(Path::new("unsafe.yaml"), &text, 2).unwrap_err();
         assert!(matches!(error, KnowledgeLoadError::Yaml { .. }));
     }
 
@@ -1303,7 +1563,7 @@ definitions:
             "type: uds.read_data_by_identifier\n      identifier: \"0xF189\"",
             "type: obd2.mode01.pid\n      pid: \"0x0C\"",
         );
-        let raw = parse_document(Path::new("obd2.yaml"), &text, 1).unwrap();
+        let raw = parse_document(Path::new("obd2.yaml"), &text, 2).unwrap();
         let error = KnowledgeDefinition::from_raw(
             Path::new("obd2.yaml"),
             raw.definitions.into_iter().next().unwrap(),
@@ -1317,7 +1577,7 @@ definitions:
 
     #[test]
     fn typed_uds_operation_uses_core_protocol_validation() {
-        let raw = parse_document(Path::new("uds.yaml"), &valid_document(""), 1).unwrap();
+        let raw = parse_document(Path::new("uds.yaml"), &valid_document(""), 2).unwrap();
         let definition = KnowledgeDefinition::from_raw(
             Path::new("uds.yaml"),
             raw.definitions.into_iter().next().unwrap(),
@@ -1337,10 +1597,10 @@ definitions:
 
     #[test]
     fn unsupported_schema_version_is_rejected_before_definition_conversion() {
-        let text = valid_document("").replace("schema_version: 1", "schema_version: 2");
+        let text = valid_document("").replace("schema_version: 2", "schema_version: 3");
         assert!(matches!(
-            parse_document(Path::new("future.yaml"), &text, 1),
-            Err(KnowledgeLoadError::UnsupportedSchemaVersion { found: 2, .. })
+            parse_document(Path::new("future.yaml"), &text, 2),
+            Err(KnowledgeLoadError::UnsupportedSchemaVersion { found: 3, .. })
         ));
     }
 
@@ -1349,7 +1609,7 @@ definitions:
         let raw = parse_document(
             Path::new("vin.yaml"),
             &valid_document("").replace("0xF189", "0xF190"),
-            1,
+            2,
         )
         .unwrap();
         let definition = KnowledgeDefinition::from_raw(

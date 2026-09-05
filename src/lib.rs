@@ -25,6 +25,7 @@ pub mod dtc;
 pub mod ea189;
 pub mod ecu_identification;
 pub mod ecu_identification_discovery;
+pub mod effective_knowledge;
 pub(crate) mod elm;
 pub mod evidence;
 pub mod functional_discovery;
