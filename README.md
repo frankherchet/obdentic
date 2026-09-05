@@ -1,22 +1,24 @@
 # OBDentic
 
-**Transparent, local-first and strictly read-only vehicle diagnostics for humans and agents.**
+**Transparent, local-first vehicle diagnostics with read-only-by-default safety for humans and agents.**
 
-OBDentic is building a deterministic diagnostic layer between a vehicle and higher-level diagnostic tooling. It owns the physical adapter connection, turns protocol traffic into typed vehicle facts, preserves the underlying evidence, and keeps unsafe operations outside the executable vocabulary.
+OBDentic is building a deterministic diagnostic layer between a vehicle and higher-level diagnostic tooling. It owns the physical adapter connection, turns protocol traffic into typed vehicle facts, preserves the underlying evidence, and keeps unsafe or unbounded operations outside the executable vocabulary.
 
 The long-term goal is not a single EA189/EGR tool. The VW EA189 is the first real vehicle profile and a useful proving ground for deeper diagnostics such as DPF, EGR and intake analysis. The project itself is intended to become a **generic agentic OBD vehicle-diagnostics platform**: an AI agent should be able to reason about a vehicle, request bounded semantic reads, inspect provenance and raw evidence, and explain a diagnosis without ever receiving an unrestricted CAN/UDS command path.
 
+The authoritative long-term product contract is documented in [`docs/project-goals.md`](docs/project-goals.md). GitHub issues and milestones track the implementation slices; when an architectural decision changes the product goals, update that document deliberately rather than allowing the contract to drift implicitly.
+
 ## Design principles
 
-### Strictly read-only
+### Read-only by default, closed service modes
 
-Safety is enforced below the CLI, TUI and future agent interface. The executable vocabulary is a closed set of known read-only semantic operations.
+Safety is enforced below the CLI, TUI and future agent interface. The default executable vocabulary is a closed set of known read-only semantic operations.
 
-No raw CAN/UDS command API is exposed to consumers. Coding, adaptation, actuator tests, DTC clearing, SecurityAccess and other state-changing operations are outside the current safety boundary.
+No raw CAN/UDS command API is exposed to consumers. Coding, adaptation, actuator tests, SecurityAccess and other unrestricted state-changing operations remain outside the product boundary. The only currently planned mutation is DTC clearing through a separately reviewed, narrow capability that must be enabled explicitly at process start; profiles, layouts, knowledge files, MCP calls and AI prompts must not be able to enable it dynamically.
 
 ```text
 semantic request
-    -> read-only safety policy
+    -> capability / safety policy
     -> vehicle/protocol knowledge
     -> bounded transport request
 ```
@@ -183,7 +185,7 @@ cargo run -- diagnose dtc.scan \
   --record evidence/dtc-scan.jsonl
 ```
 
-`dtc.scan` is currently a strictly read-only generic stored-DTC workflow. DTC clearing is deliberately not part of the executable API.
+`dtc.scan` is currently a strictly read-only generic stored-DTC workflow. DTC clearing is not executable on current `main`; the product goal allows it only as a future closed diagnostic job behind an explicit process-start capability, never as a generic write mode.
 
 ## Evidence and privacy
 
@@ -227,17 +229,29 @@ intent / hypothesis
     -> diagnostic reasoning
 ```
 
-It should **not** receive a raw CAN console.
+It should **not** receive a raw CAN console or a way to elevate the process into a mutating capability.
 
 ### 6. Generalize across vehicles and adapters
 
-Grow the protocol and vehicle-knowledge layers independently: more ELM-compatible adapters, additional manufacturer profiles, more ECU roles and eventually other safe transport backends. Physical adapter backends remain separate from shared command dialects and protocol knowledge, so adapter-specific BLE services, routing hardware and quirks do not leak into generic ELM/OBD behavior. Vehicle-specific knowledge remains versioned and provenance-aware so support can grow without weakening the generic safety model.
+Grow the protocol and vehicle-knowledge layers independently: more Bluetooth ELM-compatible adapters, additional manufacturer profiles and more ECU roles. Physical adapter backends remain separate from shared command dialects and protocol knowledge, so adapter-specific BLE services, routing hardware and quirks do not leak into generic ELM/OBD behavior. Vehicle-specific knowledge remains versioned and provenance-aware so support can grow without weakening the generic safety model.
+
+The current product scope remains Bluetooth. USB and Wi-Fi transports are not implementation targets unless the project goals are deliberately revised.
+
+### 7. Derive automatic ECU installation inventories
+
+Combine standards-based responder discovery, bounded ECU identification, validated private inventory and manufacturer-specific read-only topology providers to derive the most complete installation list available for the current platform.
+
+Configured/installed, observed/reachable, logical role and concrete request target remain separate facts. When a trustworthy full installation-list mechanism is unavailable, report a partial inventory instead of pretending functional OBD responders are the complete vehicle topology.
+
+### 8. Add narrowly gated DTC clearing
+
+Keep the default process read-only. Add DTC clearing only through a separately reviewed, typed diagnostic job behind an explicit process-start capability. Enabling that capability must not enable arbitrary writes, coding, adaptation, actuator tests, SecurityAccess, raw protocol commands or dynamic privilege escalation through MCP/AI/profile configuration.
 
 ## Why EA189 still matters
 
 The EA189 remains an excellent first deep-diagnostics target because it gives OBDentic real, non-trivial questions to solve: DPF loading/regeneration, EGR behavior, intake plausibility, ECU topology and manufacturer-specific diagnostic data.
 
-Those use cases now serve a larger purpose: proving that a generic diagnostic agent can move from protocol evidence to vehicle facts to an explainable diagnosis while the software remains local, deterministic and read-only.
+Those use cases now serve a larger purpose: proving that a generic diagnostic agent can move from protocol evidence to vehicle facts to an explainable diagnosis while the software remains local, deterministic and read-only by default, with any future service mutation isolated behind an explicit narrow capability.
 
 ## TUI
 
@@ -273,4 +287,4 @@ transport evidence
     -> presentation / agent reasoning
 ```
 
-Never invert it by letting a diagnosis, UI or agent guess an ECU address, select a responder by plausibility, or bypass the read-only vocabulary.
+Never invert it by letting a diagnosis, UI or agent guess an ECU address, select a responder by plausibility, or bypass the typed capability/safety vocabulary.
