@@ -3,42 +3,61 @@ use crate::{
     scheduler::Subscription,
     subscription_policy::{ObservationRequest, PlanStatus, SubscriptionPolicy},
 };
-use std::time::Duration;
+use serde::Deserialize;
+use std::{collections::HashSet, time::Duration};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const PROFILE_SCHEMA_VERSION: u32 = 1;
+const ENGINE_DRIVE_YAML: &str = include_str!("../profiles/engine-drive.yaml");
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureProfile {
-    name: &'static str,
-    subscriptions: &'static [(&'static str, u64)],
+    name: String,
+    description: Option<String>,
+    subscriptions: Vec<ProfileSubscription>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProfileSubscription {
+    semantic: String,
+    interval: Duration,
 }
 
 impl CaptureProfile {
-    pub fn name(self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    pub fn subscriptions(self) -> Result<Vec<Subscription>, String> {
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub fn subscriptions(&self) -> Result<Vec<Subscription>, String> {
         self.subscriptions
             .iter()
-            .map(|(semantic, interval_ms)| {
-                Subscription::new(semantic, Duration::from_millis(*interval_ms))
-            })
+            .map(|subscription| Subscription::new(&subscription.semantic, subscription.interval))
             .collect()
     }
 
     /// Reject a profile before connecting when its offered load exceeds the
     /// session's conservative sequential-command budget.
-    pub fn admit(self, capability: HardwareCapability) -> Result<(), String> {
+    pub fn admit(&self, capability: HardwareCapability) -> Result<(), String> {
         let requests = self
             .subscriptions
             .iter()
-            .map(|(semantic, interval_ms)| {
-                ObservationRequest::new("capture", *semantic, Duration::from_millis(*interval_ms))
+            .map(|subscription| {
+                ObservationRequest::new(
+                    "capture",
+                    subscription.semantic.clone(),
+                    subscription.interval,
+                )
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
         let plan = SubscriptionPolicy::new(capability).plan(
             &requests,
-            self.subscriptions.iter().map(|(semantic, _)| *semantic),
+            self.subscriptions
+                .iter()
+                .map(|subscription| subscription.semantic.as_str()),
         );
         if plan
             .entries()
@@ -55,76 +74,181 @@ impl CaptureProfile {
     }
 }
 
-const ENGINE_BASELINE: CaptureProfile = CaptureProfile {
-    name: "engine-baseline",
-    subscriptions: &[
-        ("engine.rpm", 1_000),
-        ("engine.maf", 2_000),
-        ("engine.load", 2_000),
-        ("engine.intake_manifold_pressure", 2_000),
-        ("vehicle.speed", 8_000),
-        ("engine.egr.commanded", 8_000),
-        ("engine.egr.error", 8_000),
-        ("vehicle.accelerator_pedal_e", 8_000),
-        ("engine.relative_throttle", 8_000),
-        ("engine.coolant_temperature", 8_000),
-        ("engine.intake_air_temperature", 8_000),
-        ("engine.runtime", 8_000),
-        ("engine.barometric_pressure", 8_000),
-    ],
-};
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileDocument {
+    version: u32,
+    id: String,
+    #[serde(default)]
+    description: Option<String>,
+    observations: Vec<ProfileObservationDocument>,
+}
 
-/// Conservative drive-test profile derived from real Carly/ELM hardware evidence.
-///
-/// `10-idle.jsonl` sustained roughly 5.4 completed logical reads/s while the
-/// denser baseline continuously overbooked the single sequential ELM path.
-/// This profile offers 3.75 reads/s, leaving headroom for response-time
-/// jitter.  It also omits PID 42 and PID 49, which repeatedly produced
-/// responder conflicts and therefore expensive retries in that capture.
-const ENGINE_DRIVE: CaptureProfile = CaptureProfile {
-    name: "engine-drive",
-    subscriptions: &[
-        ("engine.rpm", 1_000),
-        ("engine.maf", 2_000),
-        ("engine.load", 4_000),
-        ("engine.intake_manifold_pressure", 2_000),
-        ("vehicle.speed", 4_000),
-        ("engine.egr.commanded", 4_000),
-        ("engine.egr.error", 4_000),
-        ("vehicle.accelerator_pedal_e", 4_000),
-        ("engine.coolant_temperature", 8_000),
-        ("engine.intake_air_temperature", 8_000),
-        ("engine.runtime", 8_000),
-        ("engine.barometric_pressure", 8_000),
-    ],
-};
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileObservationDocument {
+    semantic: String,
+    interval: String,
+}
 
-const OBD2_EXPANSION_VALIDATION: CaptureProfile = CaptureProfile {
-    name: "obd2-expansion-validation",
-    subscriptions: &[
-        ("engine.throttle_position", 2_000),
-        ("vehicle.distance_with_mil_on", 2_000),
-        ("engine.fuel_rail_gauge_pressure", 2_000),
-        ("vehicle.warmups_since_dtc_clear", 2_000),
-        ("vehicle.distance_since_dtc_clear", 2_000),
-        ("vehicle.ambient_air_temperature", 2_000),
-        ("engine.throttle_actuator.commanded", 2_000),
-    ],
-};
+const ENGINE_BASELINE_SUBSCRIPTIONS: &[(&str, u64)] = &[
+    ("engine.rpm", 1_000),
+    ("engine.maf", 2_000),
+    ("engine.load", 2_000),
+    ("engine.intake_manifold_pressure", 2_000),
+    ("vehicle.speed", 8_000),
+    ("engine.egr.commanded", 8_000),
+    ("engine.egr.error", 8_000),
+    ("vehicle.accelerator_pedal_e", 8_000),
+    ("engine.relative_throttle", 8_000),
+    ("engine.coolant_temperature", 8_000),
+    ("engine.intake_air_temperature", 8_000),
+    ("engine.runtime", 8_000),
+    ("engine.barometric_pressure", 8_000),
+];
+
+const OBD2_EXPANSION_VALIDATION_SUBSCRIPTIONS: &[(&str, u64)] = &[
+    ("engine.throttle_position", 2_000),
+    ("vehicle.distance_with_mil_on", 2_000),
+    ("engine.fuel_rail_gauge_pressure", 2_000),
+    ("vehicle.warmups_since_dtc_clear", 2_000),
+    ("vehicle.distance_since_dtc_clear", 2_000),
+    ("vehicle.ambient_air_temperature", 2_000),
+    ("engine.throttle_actuator.commanded", 2_000),
+];
 
 pub fn profile(name: &str) -> Result<CaptureProfile, String> {
     match name {
-        "engine-baseline" => Ok(ENGINE_BASELINE),
-        "engine-drive" => Ok(ENGINE_DRIVE),
-        "obd2-expansion-validation" => Ok(OBD2_EXPANSION_VALIDATION),
+        "engine-baseline" => Ok(legacy_profile(
+            "engine-baseline",
+            ENGINE_BASELINE_SUBSCRIPTIONS,
+        )),
+        "engine-drive" => parse_profile_yaml(ENGINE_DRIVE_YAML),
+        "obd2-expansion-validation" => Ok(legacy_profile(
+            "obd2-expansion-validation",
+            OBD2_EXPANSION_VALIDATION_SUBSCRIPTIONS,
+        )),
         _ => Err(format!("unknown capture profile: {name}")),
     }
+}
+
+fn legacy_profile(name: &str, subscriptions: &[(&str, u64)]) -> CaptureProfile {
+    CaptureProfile {
+        name: name.to_owned(),
+        description: None,
+        subscriptions: subscriptions
+            .iter()
+            .map(|(semantic, interval_ms)| ProfileSubscription {
+                semantic: (*semantic).to_owned(),
+                interval: Duration::from_millis(*interval_ms),
+            })
+            .collect(),
+    }
+}
+
+fn parse_profile_yaml(input: &str) -> Result<CaptureProfile, String> {
+    let document: ProfileDocument = serde_yaml_ng::from_str(input)
+        .map_err(|error| format!("invalid capture profile YAML: {error}"))?;
+    if document.version != PROFILE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported capture profile schema version {}; expected {}",
+            document.version, PROFILE_SCHEMA_VERSION
+        ));
+    }
+    if !valid_profile_id(&document.id) {
+        return Err(format!("invalid capture profile id: {}", document.id));
+    }
+    if document.observations.is_empty() {
+        return Err(format!(
+            "capture profile {} must contain at least one observation",
+            document.id
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    let mut subscriptions = Vec::with_capacity(document.observations.len());
+    for observation in document.observations {
+        if observation.semantic.trim() != observation.semantic || observation.semantic.is_empty() {
+            return Err("capture profile semantic must be a non-empty exact identifier".into());
+        }
+        if observation.semantic.contains(['*', '?']) {
+            return Err(format!(
+                "capture profile {} uses forbidden semantic wildcard {}",
+                document.id, observation.semantic
+            ));
+        }
+        if !seen.insert(observation.semantic.clone()) {
+            return Err(format!(
+                "capture profile {} contains duplicate semantic {}",
+                document.id, observation.semantic
+            ));
+        }
+        let interval = parse_interval(&observation.interval)?;
+
+        // Profiles select only semantics. Constructing a Subscription performs
+        // the existing closed semantic -> ReadRequest resolution, without I/O,
+        // so an unknown semantic fails before any adapter is contacted.
+        Subscription::new(&observation.semantic, interval).map_err(|error| {
+            format!(
+                "capture profile {} references unavailable semantic {}: {error}",
+                document.id, observation.semantic
+            )
+        })?;
+        subscriptions.push(ProfileSubscription {
+            semantic: observation.semantic,
+            interval,
+        });
+    }
+
+    Ok(CaptureProfile {
+        name: document.id,
+        description: document.description,
+        subscriptions,
+    })
+}
+
+fn valid_profile_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+fn parse_interval(value: &str) -> Result<Duration, String> {
+    if value.trim() != value || value.is_empty() {
+        return Err(format!("invalid capture profile interval: {value:?}"));
+    }
+    let (number, multiplier_ms) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000_u64)
+    } else {
+        return Err(format!(
+            "invalid capture profile interval {value:?}; expected positive integer ms or s"
+        ));
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "invalid capture profile interval {value:?}; expected positive integer ms or s"
+        ));
+    }
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| format!("capture profile interval is too large: {value}"))?;
+    if amount == 0 {
+        return Err("capture profile interval must be greater than zero".into());
+    }
+    let milliseconds = amount
+        .checked_mul(multiplier_ms)
+        .ok_or_else(|| format!("capture profile interval is too large: {value}"))?;
+    Ok(Duration::from_millis(milliseconds))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
     fn exposes_engine_baseline_name_and_semantics() {
@@ -169,8 +293,41 @@ mod tests {
     }
 
     #[test]
+    fn engine_drive_is_loaded_from_yaml_with_exact_legacy_behavior() {
+        let profile = profile("engine-drive").unwrap();
+        assert_eq!(profile.name(), "engine-drive");
+        assert_eq!(
+            profile.description(),
+            Some("Conservative drive-test profile derived from real Carly/ELM hardware evidence.")
+        );
+        let subscriptions = profile.subscriptions().unwrap();
+        let actual = subscriptions
+            .iter()
+            .map(|subscription| (subscription.semantic(), subscription.interval()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                ("engine.rpm", Duration::from_secs(1)),
+                ("engine.maf", Duration::from_secs(2)),
+                ("engine.load", Duration::from_secs(4)),
+                ("engine.intake_manifold_pressure", Duration::from_secs(2)),
+                ("vehicle.speed", Duration::from_secs(4)),
+                ("engine.egr.commanded", Duration::from_secs(4)),
+                ("engine.egr.error", Duration::from_secs(4)),
+                ("vehicle.accelerator_pedal_e", Duration::from_secs(4)),
+                ("engine.coolant_temperature", Duration::from_secs(8)),
+                ("engine.intake_air_temperature", Duration::from_secs(8)),
+                ("engine.runtime", Duration::from_secs(8)),
+                ("engine.barometric_pressure", Duration::from_secs(8)),
+            ]
+        );
+    }
+
+    #[test]
     fn engine_drive_stays_below_observed_request_budget_and_avoids_conflict_pids() {
-        let subscriptions = profile("engine-drive").unwrap().subscriptions().unwrap();
+        let profile = profile("engine-drive").unwrap();
+        let subscriptions = profile.subscriptions().unwrap();
         let semantics = subscriptions
             .iter()
             .map(|subscription| subscription.semantic())
@@ -188,9 +345,7 @@ mod tests {
             .sum::<f64>();
         assert!(offered_reads_per_second < 4.0);
         assert_eq!(
-            profile("engine-drive")
-                .unwrap()
-                .admit(HardwareCapability::conservative_default()),
+            profile.admit(HardwareCapability::conservative_default()),
             Ok(())
         );
     }
@@ -297,5 +452,71 @@ mod tests {
                 .unwrap(),
             )
             .is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_yaml_and_unsupported_schema_versions() {
+        assert!(parse_profile_yaml("version: [").is_err());
+        assert_eq!(
+            parse_profile_yaml(
+                "version: 2\nid: future\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n"
+            )
+            .unwrap_err(),
+            "unsupported capture profile schema version 2; expected 1"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_unknown_and_wildcard_semantics() {
+        assert!(parse_profile_yaml(
+            "version: 1\nid: duplicate\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n  - semantic: engine.rpm\n    interval: 2s\n"
+        )
+        .unwrap_err()
+        .contains("duplicate semantic engine.rpm"));
+        assert!(parse_profile_yaml(
+            "version: 1\nid: unknown\nobservations:\n  - semantic: vehicle.not_real\n    interval: 1s\n"
+        )
+        .is_err());
+        assert!(parse_profile_yaml(
+            "version: 1\nid: wildcard\nobservations:\n  - semantic: engine.*\n    interval: 1s\n"
+        )
+        .unwrap_err()
+        .contains("forbidden semantic wildcard"));
+    }
+
+    #[test]
+    fn rejects_zero_invalid_and_overflowing_intervals() {
+        for interval in ["0s", "0ms", "1.5s", "1m", " 1s", "1s "] {
+            assert!(parse_interval(interval).is_err(), "accepted {interval}");
+        }
+        assert!(parse_interval("18446744073709551615s").is_err());
+        assert_eq!(parse_interval("250ms"), Ok(Duration::from_millis(250)));
+        assert_eq!(parse_interval("2s"), Ok(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn rejects_protocol_and_unknown_fields_fail_closed() {
+        for yaml in [
+            "version: 1\nid: raw\nrequest: 010C\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n",
+            "version: 1\nid: raw\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n    pid: 0x0C\n",
+            "version: 1\nid: raw\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n    elm_command: 010C\n",
+        ] {
+            assert!(parse_profile_yaml(yaml).is_err());
+        }
+    }
+
+    #[test]
+    fn yaml_observation_order_is_deterministic() {
+        let yaml = "version: 1\nid: ordered\nobservations:\n  - semantic: vehicle.speed\n    interval: 4s\n  - semantic: engine.rpm\n    interval: 1s\n";
+        let first = parse_profile_yaml(yaml).unwrap().subscriptions().unwrap();
+        let second = parse_profile_yaml(yaml).unwrap().subscriptions().unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|subscription| subscription.semantic())
+                .collect::<Vec<_>>(),
+            ["vehicle.speed", "engine.rpm"]
+        );
+        assert_eq!(first, second);
     }
 }
