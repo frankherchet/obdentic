@@ -42,6 +42,7 @@ pub mod semantic_snapshot;
 pub mod subscription_policy;
 pub mod telemetry;
 pub mod topology;
+pub mod topology_provider;
 pub mod tui;
 pub mod vehicle;
 pub mod vehicle_cache;
