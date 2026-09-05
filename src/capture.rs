@@ -7,7 +7,10 @@ use serde::Deserialize;
 use std::{collections::HashSet, time::Duration};
 
 const PROFILE_SCHEMA_VERSION: u32 = 1;
+const ENGINE_BASELINE_YAML: &str = include_str!("../profiles/engine-baseline.yaml");
 const ENGINE_DRIVE_YAML: &str = include_str!("../profiles/engine-drive.yaml");
+const OBD2_EXPANSION_VALIDATION_YAML: &str =
+    include_str!("../profiles/obd2-expansion-validation.yaml");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureProfile {
@@ -91,58 +94,12 @@ struct ProfileObservationDocument {
     interval: String,
 }
 
-const ENGINE_BASELINE_SUBSCRIPTIONS: &[(&str, u64)] = &[
-    ("engine.rpm", 1_000),
-    ("engine.maf", 2_000),
-    ("engine.load", 2_000),
-    ("engine.intake_manifold_pressure", 2_000),
-    ("vehicle.speed", 8_000),
-    ("engine.egr.commanded", 8_000),
-    ("engine.egr.error", 8_000),
-    ("vehicle.accelerator_pedal_e", 8_000),
-    ("engine.relative_throttle", 8_000),
-    ("engine.coolant_temperature", 8_000),
-    ("engine.intake_air_temperature", 8_000),
-    ("engine.runtime", 8_000),
-    ("engine.barometric_pressure", 8_000),
-];
-
-const OBD2_EXPANSION_VALIDATION_SUBSCRIPTIONS: &[(&str, u64)] = &[
-    ("engine.throttle_position", 2_000),
-    ("vehicle.distance_with_mil_on", 2_000),
-    ("engine.fuel_rail_gauge_pressure", 2_000),
-    ("vehicle.warmups_since_dtc_clear", 2_000),
-    ("vehicle.distance_since_dtc_clear", 2_000),
-    ("vehicle.ambient_air_temperature", 2_000),
-    ("engine.throttle_actuator.commanded", 2_000),
-];
-
 pub fn profile(name: &str) -> Result<CaptureProfile, String> {
     match name {
-        "engine-baseline" => Ok(legacy_profile(
-            "engine-baseline",
-            ENGINE_BASELINE_SUBSCRIPTIONS,
-        )),
+        "engine-baseline" => parse_profile_yaml(ENGINE_BASELINE_YAML),
         "engine-drive" => parse_profile_yaml(ENGINE_DRIVE_YAML),
-        "obd2-expansion-validation" => Ok(legacy_profile(
-            "obd2-expansion-validation",
-            OBD2_EXPANSION_VALIDATION_SUBSCRIPTIONS,
-        )),
+        "obd2-expansion-validation" => parse_profile_yaml(OBD2_EXPANSION_VALIDATION_YAML),
         _ => Err(format!("unknown capture profile: {name}")),
-    }
-}
-
-fn legacy_profile(name: &str, subscriptions: &[(&str, u64)]) -> CaptureProfile {
-    CaptureProfile {
-        name: name.to_owned(),
-        description: None,
-        subscriptions: subscriptions
-            .iter()
-            .map(|(semantic, interval_ms)| ProfileSubscription {
-                semantic: (*semantic).to_owned(),
-                interval: Duration::from_millis(*interval_ms),
-            })
-            .collect(),
     }
 }
 
