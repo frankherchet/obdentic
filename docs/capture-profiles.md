@@ -49,11 +49,15 @@ The diagnostic core and `SafetyPolicy` remain authoritative for which read-only 
 
 ## Built-in profile migration
 
-This first #88 migration slice moves only `engine-drive` to `profiles/engine-drive.yaml`. The YAML is embedded in the binary at build time so named profile loading does not depend on a source checkout being present next to an installed executable.
+All three generic built-in capture profiles are now versioned YAML files under `profiles/`:
 
-`engine-baseline` and `obd2-expansion-validation` remain legacy Rust definitions in this slice. EA189 DPF/longitudinal orchestration also remains separate and is tracked by #14/#88 and PR #105.
+- `engine-baseline.yaml`
+- `engine-drive.yaml`
+- `obd2-expansion-validation.yaml`
 
-The `engine-drive` YAML preserves the previous ordered semantic set and requested intervals exactly.
+The YAML files are embedded in the binary at build time so named profile loading does not depend on a source checkout being present next to an installed executable. Each migrated profile preserves its previous ordered semantic set and requested intervals exactly.
+
+EA189 DPF/longitudinal orchestration remains a separate temporary bridge tracked by #14/#88 and PR #105.
 
 ## Relationship to effective Vehicle Knowledge
 
