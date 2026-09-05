@@ -1764,7 +1764,7 @@ async fn capture_longitudinal_context_cycle(
         let timing = ReadTiming::new(due_us, read_started_us, finished_us);
 
         match outcome {
-            Ok(ble::ReadOutcome::Succeeded {
+            Ok(ble::TargetedReadOutcome::Succeeded {
                 transaction,
                 observations,
             }) => {
@@ -1798,7 +1798,7 @@ async fn capture_longitudinal_context_cycle(
                     transaction.unit()
                 );
             }
-            Ok(ble::ReadOutcome::Failed {
+            Ok(ble::TargetedReadOutcome::Failed {
                 error,
                 observations,
             }) => {
@@ -1886,7 +1886,7 @@ async fn capture_longitudinal_context_cycle(
 async fn emit_longitudinal_response_observations(
     recorder: Option<&jsonl_capture::Sender>,
     context_read: &LongitudinalContextRead,
-    observations: &[ble::ResponseObservation],
+    observations: &[ble::TargetedReadObservation],
     offset_us: u64,
 ) -> Result<(), String> {
     for observation in observations {

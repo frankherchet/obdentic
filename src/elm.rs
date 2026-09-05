@@ -6,6 +6,8 @@ use std::time::Duration;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MODE03_COMMAND: &str = "03\r";
+const IGNORED_MODE01_RESPONSE_PREFIX: &str =
+    "ignored unrelated OBD-II Mode 01 response from responder";
 
 /// The small protocol seam shared by ELM dialect users and transport
 /// backends.  The backend owns the actual byte exchange; this module owns
@@ -385,24 +387,10 @@ pub struct DiagnosticResponses {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResponseObservation {
+pub(crate) struct ResponseObservation {
     pub(crate) responses: Vec<crate::capture_events::ResponderEvidence>,
     pub(crate) selected_responder: Option<String>,
     pub(crate) selection_error: Option<String>,
-}
-
-impl ResponseObservation {
-    pub fn responses(&self) -> &[crate::capture_events::ResponderEvidence] {
-        &self.responses
-    }
-
-    pub fn selected_responder(&self) -> Option<&str> {
-        self.selected_responder.as_deref()
-    }
-
-    pub fn selection_error(&self) -> Option<&str> {
-        self.selection_error.as_deref()
-    }
 }
 
 impl DiagnosticResponses {
@@ -745,12 +733,34 @@ where
         }
 
         let read = match read_elm_ecu_identification_responses(&mut self.exchange, request).await {
-            Ok(responses) => {
-                let selection_error =
-                    targeted_payload(&responses, request.expected_responder()).err();
+            Ok(first) if should_retry_stale_uds_response(&first) => {
+                match read_elm_ecu_identification_responses(&mut self.exchange, request).await {
+                    Ok(retry) => {
+                        let responses = merge_response_attempts(first, retry);
+                        let selection_error =
+                            targeted_payload(&responses, request.expected_responder()).err();
+                        Ok(EcuIdentificationReadEvidence {
+                            observations: vec![responses.observation(selection_error)],
+                            responses,
+                        })
+                    }
+                    Err(retry_error) => {
+                        let first_error = format!(
+                            "ECU identification retry failed: {retry_error}; first ELM response={}",
+                            first.raw_response().escape_default()
+                        );
+                        Err(ReadEvidenceError {
+                            error: first_error.clone(),
+                            observations: vec![first.observation(Some(first_error))],
+                        })
+                    }
+                }
+            }
+            Ok(first) => {
+                let selection_error = targeted_payload(&first, request.expected_responder()).err();
                 Ok(EcuIdentificationReadEvidence {
-                    observations: vec![responses.observation(selection_error)],
-                    responses,
+                    observations: vec![first.observation(selection_error)],
+                    responses: first,
                 })
             }
             Err(error) => Err(ReadEvidenceError {
@@ -777,6 +787,27 @@ where
             }
         }
     }
+}
+
+fn should_retry_stale_uds_response(responses: &DiagnosticResponses) -> bool {
+    responses.responses.is_empty()
+        && !responses.errors.is_empty()
+        && responses.errors.iter().all(is_ignored_mode01_response)
+}
+
+fn is_ignored_mode01_response(error: &DiagnosticResponseError) -> bool {
+    error.responder.is_none() && error.error.starts_with(IGNORED_MODE01_RESPONSE_PREFIX)
+}
+
+fn merge_response_attempts(
+    mut first: DiagnosticResponses,
+    retry: DiagnosticResponses,
+) -> DiagnosticResponses {
+    first.responses.extend(retry.responses);
+    first.errors.extend(retry.errors);
+    first.raw_response.push('\n');
+    first.raw_response.push_str(&retry.raw_response);
+    first
 }
 
 pub(crate) async fn read_elm_with_evidence<E>(
@@ -1777,6 +1808,27 @@ pub(crate) fn normalize_uds_responses(
             continue;
         }
 
+        // A targeted UDS request can still receive a stale functional Mode 01
+        // frame from the adapter. It is not a malformed UDS response and must
+        // not compete with the requested 62 response during selection. Keep
+        // the raw line in `raw_response` and expose the ignored frame as an
+        // explicit parser issue without associating it with the expected
+        // responder; callers can therefore still accept a valid 62 response.
+        let is_mode01_response = bytes.first() == Some(&0x41)
+            || (bytes.first().is_some_and(|byte| byte >> 4 == 0) && bytes.get(1) == Some(&0x41));
+        if is_mode01_response {
+            let observed = responder
+                .as_ref()
+                .map_or("unknown", ResponderIdentity::as_str);
+            errors.push(DiagnosticResponseError {
+                responder: None,
+                error: format!(
+                    "ignored unrelated OBD-II Mode 01 response from responder {observed} while awaiting UDS 22 response: {line:?}"
+                ),
+            });
+            continue;
+        }
+
         match bytes.first().map(|byte| byte >> 4) {
             Some(0) => {
                 let declared_len = (bytes[0] & 0x0f) as usize;
@@ -1984,6 +2036,32 @@ mod tests {
         }
     }
 
+    fn canonical_ecu_identification_request() -> TargetedEcuIdentificationRequest {
+        let catalog =
+            crate::knowledge_db::KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let plan =
+            crate::ecu_identification::EcuIdentificationPlan::from_catalog(&catalog).unwrap();
+        let candidate = plan
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.did() == 0xF189)
+            .unwrap();
+        let context = crate::topology::ProtocolContext::new(
+            crate::topology::Protocol::Obd2,
+            crate::topology::AddressingContext::Physical,
+        );
+        let target = crate::topology::RequestTargetEvidence::new(
+            crate::topology::RequestTarget::concrete(
+                context.clone(),
+                crate::topology::RequestAddress::new("elm-header", "7E0"),
+            ),
+            crate::topology::Provenance::new("test target", crate::topology::Confidence::High)
+                .unwrap(),
+        );
+        let responder = crate::topology::ResponderIdentity::address(context, "7E8");
+        TargetedEcuIdentificationRequest::from_evidence(candidate, &target, &responder).unwrap()
+    }
+
     #[tokio::test]
     async fn generic_initialization_preserves_backend_identity_boundary() {
         let mut exchange = ScriptedExchange::new([
@@ -2145,5 +2223,113 @@ mod tests {
                 "ATCRA\r",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn ecu_identification_retries_only_stale_mode01_and_accepts_uds_response() {
+        let request = canonical_ecu_identification_request();
+        let exchange = ScriptedExchange::new([
+            "OK\r>",
+            "OK\r>",
+            "7E8 06 41 00 98 3B A0 13 00\r>",
+            "7E8 05 62 F1 89 31 2E 55 55\r>",
+            "OK\r>",
+            "OK\r>",
+            "OK\r>",
+        ]);
+        let mut session = ElmSession::new(exchange);
+
+        let read = session
+            .read_ecu_identification_with_evidence(&request)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read.responses.as_slice()[0].payload,
+            [0x62, 0xF1, 0x89, 0x31, 0x2E]
+        );
+        assert_eq!(read.responses.errors().len(), 1);
+        assert!(read.responses.raw_response().contains("41 00 98 3B A0 13"));
+        assert!(read.responses.raw_response().contains("62 F1 89 31 2E"));
+        assert_eq!(
+            session.into_exchange().commands,
+            [
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "22F189\r",
+                "22F189\r",
+                "ATSP0\r",
+                "ATSH 7DF\r",
+                "ATCRA\r",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ecu_identification_stops_after_one_stale_mode01_retry() {
+        let request = canonical_ecu_identification_request();
+        let stale = "7E8 06 41 00 98 3B A0 13 00\r>";
+        let exchange =
+            ScriptedExchange::new(["OK\r>", "OK\r>", stale, stale, "OK\r>", "OK\r>", "OK\r>"]);
+        let mut session = ElmSession::new(exchange);
+
+        let read = session
+            .read_ecu_identification_with_evidence(&request)
+            .await
+            .unwrap();
+
+        assert!(read.responses.as_slice().is_empty());
+        assert_eq!(read.responses.errors().len(), 2);
+        assert!(read.observations[0]
+            .selection_error
+            .as_deref()
+            .is_some_and(|error| error.contains("did not answer")));
+        assert_eq!(
+            session.into_exchange().commands,
+            [
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "22F189\r",
+                "22F189\r",
+                "ATSP0\r",
+                "ATSH 7DF\r",
+                "ATCRA\r",
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_stale_mode01_support_before_expected_uds_response() {
+        let responses = normalize_uds_responses(
+            "7E8 06 41 00 98 3B A0 13 00\r7E8 05 62 F1 89 31 2E 55 55\r>",
+            0xF189,
+        )
+        .unwrap();
+
+        assert_eq!(
+            responses.as_slice()[0].payload,
+            [0x62, 0xF1, 0x89, 0x31, 0x2E]
+        );
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+        assert_eq!(responses.errors().len(), 1);
+        assert!(responses.errors()[0]
+            .error
+            .contains("ignored unrelated OBD-II Mode 01 response from responder 7E8"));
+        assert!(responses.raw_response().contains("41 00 98 3B A0 13"));
+    }
+
+    #[test]
+    fn persistent_mode01_response_remains_an_explicit_uds_failure() {
+        let responses = normalize_uds_responses("7E8 06 41 00 98 3B A0 13 00\r>", 0xF189).unwrap();
+
+        assert!(responses.as_slice().is_empty());
+        assert_eq!(responses.errors().len(), 1);
+        assert!(responses.errors()[0]
+            .error
+            .contains("ignored unrelated OBD-II Mode 01 response"));
+        assert!(responses.raw_response().contains("41 00 98 3B A0 13"));
     }
 }

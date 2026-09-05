@@ -10,8 +10,6 @@ pub use crate::adapter::AdapterCandidate;
 #[cfg(test)]
 use crate::elm::ElmExchange;
 use crate::elm::ElmSession;
-pub(crate) use crate::elm::ReadEvidenceError;
-pub use crate::elm::ResponseObservation;
 #[cfg(test)]
 pub(crate) use crate::elm::{
     discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
@@ -26,6 +24,7 @@ pub use crate::elm::{
     ResponderIdentity, SignalSupport, SignalSupportStatus, SupportDiscovery,
     TargetedDpfProbeRequest, TargetedEcuIdentificationRequest, TargetedReadRequest,
 };
+pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
 // Two consecutive transport failures stop a live session; data failures reset the count.
 const TRANSPORT_FAILURE_THRESHOLD: u8 = 2;
@@ -46,12 +45,15 @@ impl PreparedDiagnosticSession {
     }
 
     /// Execute one already-typed targeted semantic read while retaining this session.
-    /// The outcome preserves every normalized responder observation.
+    /// The outcome preserves every normalized responder observation as passive evidence.
     pub async fn read_targeted_with_evidence(
         &self,
         request: TargetedReadRequest,
-    ) -> Result<ReadOutcome, String> {
-        self.session.read_targeted_with_evidence(request).await
+    ) -> Result<TargetedReadOutcome, String> {
+        self.session
+            .read_targeted_with_evidence(request)
+            .await
+            .map(TargetedReadOutcome::from_internal)
     }
 
     /// Execute one closed EA189 candidate probe while retaining this session.
@@ -78,8 +80,76 @@ impl PreparedDiagnosticSession {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedReadObservation {
+    responses: Vec<crate::capture_events::ResponderEvidence>,
+    selected_responder: Option<String>,
+    selection_error: Option<String>,
+}
+
+impl TargetedReadObservation {
+    fn from_internal(observation: ResponseObservation) -> Self {
+        Self {
+            responses: observation.responses,
+            selected_responder: observation.selected_responder,
+            selection_error: observation.selection_error,
+        }
+    }
+
+    pub fn responses(&self) -> &[crate::capture_events::ResponderEvidence] {
+        &self.responses
+    }
+
+    pub fn selected_responder(&self) -> Option<&str> {
+        self.selected_responder.as_deref()
+    }
+
+    pub fn selection_error(&self) -> Option<&str> {
+        self.selection_error.as_deref()
+    }
+}
+
 #[derive(Debug, PartialEq)]
-pub enum ReadOutcome {
+pub enum TargetedReadOutcome {
+    Succeeded {
+        transaction: Transaction,
+        observations: Vec<TargetedReadObservation>,
+    },
+    Failed {
+        error: String,
+        observations: Vec<TargetedReadObservation>,
+    },
+}
+
+impl TargetedReadOutcome {
+    fn from_internal(outcome: ReadOutcome) -> Self {
+        match outcome {
+            ReadOutcome::Succeeded {
+                transaction,
+                observations,
+            } => Self::Succeeded {
+                transaction,
+                observations: observations
+                    .into_iter()
+                    .map(TargetedReadObservation::from_internal)
+                    .collect(),
+            },
+            ReadOutcome::Failed {
+                error,
+                observations,
+            } => Self::Failed {
+                error,
+                observations: observations
+                    .into_iter()
+                    .map(TargetedReadObservation::from_internal)
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReadOutcome {
     Succeeded {
         transaction: Transaction,
         observations: Vec<ResponseObservation>,
