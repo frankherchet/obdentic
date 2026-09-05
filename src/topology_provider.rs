@@ -661,8 +661,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let inventory =
-            merge_topology_provider_results(&EcuTopology::new(), &[blocked, failed]);
+        let inventory = merge_topology_provider_results(&EcuTopology::new(), &[blocked, failed]);
 
         assert_eq!(
             inventory.coverage().class(),
@@ -694,10 +693,7 @@ mod tests {
         );
         let functional = functional_topology("7E8");
 
-        let left = merge_topology_provider_results(
-            &functional,
-            &[first.clone(), second.clone()],
-        );
+        let left = merge_topology_provider_results(&functional, &[first.clone(), second.clone()]);
         let right = merge_topology_provider_results(&functional, &[second, first]);
         assert_eq!(left, right);
     }
