@@ -4,7 +4,7 @@ use crate::{
     subscription_policy::{ObservationRequest, PlanStatus, SubscriptionPolicy},
 };
 use serde::Deserialize;
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, ffi::OsStr, fs, path::Path, time::Duration};
 
 const PROFILE_SCHEMA_VERSION: u32 = 1;
 const ENGINE_BASELINE_YAML: &str = include_str!("../profiles/engine-baseline.yaml");
@@ -94,13 +94,32 @@ struct ProfileObservationDocument {
     interval: String,
 }
 
-pub fn profile(name: &str) -> Result<CaptureProfile, String> {
-    match name {
+pub fn profile(spec: &str) -> Result<CaptureProfile, String> {
+    if is_explicit_profile_path(spec) {
+        return load_profile_path(Path::new(spec));
+    }
+    match spec {
         "engine-baseline" => parse_profile_yaml(ENGINE_BASELINE_YAML),
         "engine-drive" => parse_profile_yaml(ENGINE_DRIVE_YAML),
         "obd2-expansion-validation" => parse_profile_yaml(OBD2_EXPANSION_VALIDATION_YAML),
-        _ => Err(format!("unknown capture profile: {name}")),
+        _ => Err(format!("unknown capture profile: {spec}")),
     }
+}
+
+fn is_explicit_profile_path(spec: &str) -> bool {
+    let path = Path::new(spec);
+    path.is_absolute()
+        || path.components().count() > 1
+        || matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("yaml") | Some("yml")
+        )
+}
+
+fn load_profile_path(path: &Path) -> Result<CaptureProfile, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read capture profile {}: {error}", path.display()))?;
+    parse_profile_yaml(&input)
 }
 
 fn parse_profile_yaml(input: &str) -> Result<CaptureProfile, String> {
@@ -204,6 +223,19 @@ fn parse_interval(value: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_PROFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_profile(contents: &str) -> std::path::PathBuf {
+        let sequence = TEMP_PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "obdentic-capture-profile-{}-{sequence}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
 
     #[test]
     fn exposes_engine_baseline_name_and_semantics() {
@@ -388,6 +420,78 @@ mod tests {
             profile("not-a-profile"),
             Err("unknown capture profile: not-a-profile".into())
         );
+    }
+
+    #[test]
+    fn explicit_profile_path_classification_is_deterministic() {
+        assert!(is_explicit_profile_path("/tmp/custom-profile"));
+        assert!(is_explicit_profile_path("./custom-profile"));
+        assert!(is_explicit_profile_path("../custom-profile"));
+        assert!(is_explicit_profile_path("profiles/custom-profile"));
+        assert!(is_explicit_profile_path("custom-profile.yaml"));
+        assert!(is_explicit_profile_path("custom-profile.yml"));
+        assert!(!is_explicit_profile_path("engine-drive"));
+        assert!(!is_explicit_profile_path("not-a-profile"));
+    }
+
+    #[test]
+    fn loads_explicit_yaml_path_and_uses_document_id_as_profile_name() {
+        let path = temp_profile(
+            "version: 1
+id: local-drive
+description: Local explicit profile.
+observations:
+  - semantic: vehicle.speed
+    interval: 4s
+  - semantic: engine.rpm
+    interval: 1s
+",
+        );
+        let loaded = profile(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded.name(), "local-drive");
+        assert_eq!(loaded.description(), Some("Local explicit profile."));
+        assert_eq!(
+            loaded
+                .subscriptions()
+                .unwrap()
+                .iter()
+                .map(|subscription| (subscription.semantic(), subscription.interval()))
+                .collect::<Vec<_>>(),
+            [
+                ("vehicle.speed", Duration::from_secs(4)),
+                ("engine.rpm", Duration::from_secs(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_explicit_profile_fails_as_local_file_read() {
+        let sequence = TEMP_PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "obdentic-missing-profile-{}-{sequence}.yaml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let error = profile(path.to_str().unwrap()).unwrap_err();
+        assert!(error.starts_with("failed to read capture profile "));
+    }
+
+    #[test]
+    fn explicit_profile_uses_the_same_fail_closed_schema() {
+        let path = temp_profile(
+            "version: 1
+id: unsafe-local
+observations:
+  - semantic: engine.rpm
+    interval: 1s
+    pid: 0x0C
+",
+        );
+        let error = profile(path.to_str().unwrap()).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.contains("invalid capture profile YAML"));
     }
 
     #[test]
