@@ -1,0 +1,28 @@
+version: 1
+id: engine-drive
+description: Conservative drive-test profile derived from real Carly/ELM hardware evidence.
+observations:
+  - semantic: engine.rpm
+    interval: 1s
+  - semantic: engine.maf
+    interval: 2s
+  - semantic: engine.load
+    interval: 4s
+  - semantic: engine.intake_manifold_pressure
+    interval: 2s
+  - semantic: vehicle.speed
+    interval: 4s
+  - semantic: engine.egr.commanded
+    interval: 4s
+  - semantic: engine.egr.error
+    interval: 4s
+  - semantic: vehicle.accelerator_pedal_e
+    interval: 4s
+  - semantic: engine.coolant_temperature
+    interval: 8s
+  - semantic: engine.intake_air_temperature
+    interval: 8s
+  - semantic: engine.runtime
+    interval: 8s
+  - semantic: engine.barometric_pressure
+    interval: 8s
