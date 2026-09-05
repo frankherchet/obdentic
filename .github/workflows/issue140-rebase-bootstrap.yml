@@ -1,0 +1,47 @@
+name: Issue 140 rebase validation
+
+on:
+  push:
+    branches: [feature/140-inventory-fact-projection]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.event.head_commit.message != 'Validate rebased issue 140 projection'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/140-inventory-fact-projection
+          submodules: recursive
+      - name: Export inventory fact module
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/lib.rs')
+          text = path.read_text()
+          anchor = 'pub mod identity;\n'
+          line = 'pub mod inventory_facts;\n'
+          if line not in text:
+              if text.count(anchor) != 1:
+                  raise SystemExit(f'expected one lib.rs anchor, found {text.count(anchor)}')
+              path.write_text(text.replace(anchor, anchor + line, 1))
+          PY
+      - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.98.0 fmt
+      - run: cargo +1.98.0 test --locked
+      - run: cargo +1.98.0 clippy --all-targets --locked -- -D warnings
+      - run: cargo +1.98.0 build --locked
+      - name: Commit validated changes
+        run: |
+          git config user.name frankherchet
+          git config user.email 83370034+frankherchet@users.noreply.github.com
+          git add src/lib.rs src/inventory_facts.rs docs/observed-inventory-facts.md
+          if git diff --cached --quiet; then
+            echo 'No validated changes to commit'
+          else
+            git commit -m 'Validate rebased issue 140 projection'
+            git push origin HEAD:feature/140-inventory-fact-projection
+          fi
