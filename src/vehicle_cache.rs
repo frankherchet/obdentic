@@ -19,8 +19,8 @@ use crate::{
     },
     topology_provider::{
         EvidenceReference, InstalledEcuEvidence, TopologyProviderApplicability,
-        TopologyProviderCoverage, TopologyProviderId, TopologyProviderResult, TopologyProviderScope,
-        TopologyProviderStatus,
+        TopologyProviderCoverage, TopologyProviderId, TopologyProviderResult,
+        TopologyProviderScope, TopologyProviderStatus,
     },
 };
 
@@ -913,14 +913,12 @@ fn encode_topology_provider_result(result: &TopologyProviderResult) -> String {
 }
 
 fn encode_topology_provider_scope(scope: &TopologyProviderScope) -> Vec<String> {
-    let mut fields = vec![
-        if scope.manufacturer_name().is_some() {
-            "1"
-        } else {
-            "0"
-        }
-        .into(),
-    ];
+    let mut fields = vec![if scope.manufacturer_name().is_some() {
+        "1"
+    } else {
+        "0"
+    }
+    .into()];
     if let Some(manufacturer) = scope.manufacturer_name() {
         fields.push(manufacturer.into());
     }
@@ -941,7 +939,14 @@ fn encode_topology_provider_scope(scope: &TopologyProviderScope) -> Vec<String> 
 fn encode_installed_ecu_evidence(entry: &InstalledEcuEvidence) -> Vec<String> {
     let mut fields = encode_context(entry.context()).to_vec();
     let configured = entry.configured_controller();
-    fields.push(if configured.identity().is_some() { "1" } else { "0" }.into());
+    fields.push(
+        if configured.identity().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
     if let Some(identity) = configured.identity() {
         fields.extend([identity.authority().into(), identity.identifier().into()]);
     }
@@ -957,7 +962,14 @@ fn encode_installed_ecu_evidence(entry: &InstalledEcuEvidence) -> Vec<String> {
         fields.extend([logical.authority().into(), logical.value().into()]);
     }
     fields.extend(encode_provenance(configured.provenance()));
-    fields.push(if entry.request_target().is_some() { "1" } else { "0" }.into());
+    fields.push(
+        if entry.request_target().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
     if let Some(target) = entry.request_target() {
         fields.extend(encode_target(target.target()));
         fields.extend(encode_provenance(target.provenance()));
@@ -1549,17 +1561,12 @@ fn parse_topology_provider_result(fields: &[String]) -> Result<TopologyProviderR
     )
     .map_err(|error| error.to_string())?;
     let scope = parse_topology_provider_scope(fields, &mut index)?;
-    let applicability = TopologyProviderApplicability::new(scope, parse_provenance(fields, &mut index)?);
-    let status = parse_topology_provider_status(field(
-        fields,
-        &mut index,
-        "topology provider status",
-    )?)?;
-    let coverage = parse_topology_provider_coverage(field(
-        fields,
-        &mut index,
-        "topology provider coverage",
-    )?)?;
+    let applicability =
+        TopologyProviderApplicability::new(scope, parse_provenance(fields, &mut index)?);
+    let status =
+        parse_topology_provider_status(field(fields, &mut index, "topology provider status")?)?;
+    let coverage =
+        parse_topology_provider_coverage(field(fields, &mut index, "topology provider coverage")?)?;
     let reference_count = parse_count(
         fields,
         &mut index,
@@ -1608,11 +1615,16 @@ fn parse_topology_provider_scope(
     };
     match (manufacturer, platform) {
         (None, None) => Ok(TopologyProviderScope::generic()),
-        (Some(manufacturer), None) => TopologyProviderScope::manufacturer(manufacturer)
-            .map_err(|error| error.to_string()),
-        (Some(manufacturer), Some(platform)) => TopologyProviderScope::platform(manufacturer, platform)
-            .map_err(|error| error.to_string()),
-        (None, Some(_)) => Err("vehicle cache topology provider platform has no manufacturer".into()),
+        (Some(manufacturer), None) => {
+            TopologyProviderScope::manufacturer(manufacturer).map_err(|error| error.to_string())
+        }
+        (Some(manufacturer), Some(platform)) => {
+            TopologyProviderScope::platform(manufacturer, platform)
+                .map_err(|error| error.to_string())
+        }
+        (None, Some(_)) => {
+            Err("vehicle cache topology provider platform has no manufacturer".into())
+        }
     }
 }
 
@@ -1637,12 +1649,9 @@ fn parse_installed_ecu_evidence(
     } else {
         None
     };
-    let configured = ConfiguredController::new(
-        identity,
-        logical_address,
-        parse_provenance(fields, index)?,
-    )
-    .map_err(|error| error.to_string())?;
+    let configured =
+        ConfiguredController::new(identity, logical_address, parse_provenance(fields, index)?)
+            .map_err(|error| error.to_string())?;
     let mut entry = InstalledEcuEvidence::new(context, configured);
     if parse_optional_flag(fields, index, "configured request target")? {
         entry = entry.with_request_target(RequestTargetEvidence::new(
@@ -1658,12 +1667,8 @@ fn parse_installed_ecu_evidence(
     )?;
     for _ in 0..reference_count {
         entry = entry.with_evidence_reference(
-            EvidenceReference::new(field(
-                fields,
-                index,
-                "configured entry evidence reference",
-            )?)
-            .map_err(|error| error.to_string())?,
+            EvidenceReference::new(field(fields, index, "configured entry evidence reference")?)
+                .map_err(|error| error.to_string())?,
         );
     }
     Ok(entry)
@@ -1887,6 +1892,12 @@ fn validate_snapshot(snapshot: &VehicleCacheSnapshot) -> Result<(), String> {
 
 fn validate_topology_provider_result(result: &TopologyProviderResult) -> Result<(), String> {
     validate_text("topology provider id", result.id().name())?;
+    if result.evidence_references().len() > MAX_PROVIDER_EVIDENCE_REFERENCES {
+        return Err("vehicle cache topology provider has too many evidence references".into());
+    }
+    if result.entries().len() > MAX_PROVIDER_ENTRIES {
+        return Err("vehicle cache topology provider has too many entries".into());
+    }
     if let Some(manufacturer) = result.applicability().scope().manufacturer_name() {
         validate_text("topology provider manufacturer", manufacturer)?;
     }
@@ -1916,6 +1927,9 @@ fn validate_topology_provider_result(result: &TopologyProviderResult) -> Result<
                 validate_text("provider target value", address.value())?;
             }
             validate_provenance(target.provenance())?;
+        }
+        if entry.evidence_references().len() > MAX_PROVIDER_ENTRY_EVIDENCE_REFERENCES {
+            return Err("vehicle cache configured entry has too many evidence references".into());
         }
         for reference in entry.evidence_references() {
             validate_text("configured entry evidence reference", reference.as_str())?;
@@ -2057,7 +2071,10 @@ mod tests {
         .with_evidence_reference(EvidenceReference::new("synthetic entry evidence").unwrap())
     }
 
-    fn completed_provider(name: &str, entries: Vec<InstalledEcuEvidence>) -> TopologyProviderResult {
+    fn completed_provider(
+        name: &str,
+        entries: Vec<InstalledEcuEvidence>,
+    ) -> TopologyProviderResult {
         TopologyProviderResult::new(
             TopologyProviderId::new(name, 1).unwrap(),
             provider_applicability("synthetic applicability"),
@@ -2235,12 +2252,9 @@ mod tests {
         assert_eq!(loaded.snapshot().topology_provider_results(), &[provider]);
         let entries = loaded.snapshot().topology_provider_results()[0].entries();
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| {
-            entry
-                .to_topology_node()
-                .observed_responders()
-                .is_empty()
-        }));
+        assert!(entries
+            .iter()
+            .all(|entry| { entry.to_topology_node().observed_responders().is_empty() }));
         assert_eq!(
             entries
                 .iter()
@@ -2271,8 +2285,8 @@ mod tests {
             [EvidenceReference::new("issue #35 negative safety gate").unwrap()],
         )
         .unwrap();
-        let snapshot = VehicleCacheSnapshot::default()
-            .with_topology_provider_results([blocked.clone()]);
+        let snapshot =
+            VehicleCacheSnapshot::default().with_topology_provider_results([blocked.clone()]);
         store
             .save(&VehicleCache::with_snapshot(
                 "local-key",
@@ -2284,7 +2298,9 @@ mod tests {
             .unwrap();
         let loaded = store.load("local-key").unwrap().unwrap();
         assert_eq!(loaded.snapshot().topology_provider_results(), &[blocked]);
-        assert!(loaded.snapshot().topology_provider_results()[0].entries().is_empty());
+        assert!(loaded.snapshot().topology_provider_results()[0]
+            .entries()
+            .is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2300,8 +2316,7 @@ mod tests {
         );
         let left = VehicleCacheSnapshot::default()
             .with_topology_provider_results([second.clone(), first.clone()]);
-        let right = VehicleCacheSnapshot::default()
-            .with_topology_provider_results([first, second]);
+        let right = VehicleCacheSnapshot::default().with_topology_provider_results([first, second]);
         assert_eq!(left, right);
     }
 
@@ -2348,6 +2363,35 @@ mod tests {
         .unwrap();
         let snapshot = VehicleCacheSnapshot::default().with_topology_provider_results([provider]);
         let root = root("provider-vin");
+        let store = CacheStore::new(&root);
+        assert!(store
+            .save(&VehicleCache::with_snapshot(
+                "local-key",
+                1,
+                1,
+                snapshot,
+                Vec::new(),
+            ))
+            .is_err());
+        assert!(!root.join("6c6f63616c2d6b6579.tsv").exists());
+    }
+
+    #[test]
+    fn rejects_provider_evidence_counts_that_cannot_round_trip() {
+        let references = (0..=MAX_PROVIDER_EVIDENCE_REFERENCES)
+            .map(|index| EvidenceReference::new(format!("provider-ref-{index}")).unwrap())
+            .collect::<Vec<_>>();
+        let provider = TopologyProviderResult::new(
+            TopologyProviderId::new("synthetic.too-many-refs", 1).unwrap(),
+            provider_applicability("synthetic applicability"),
+            TopologyProviderStatus::Completed,
+            TopologyProviderCoverage::Partial,
+            [configured_provider_entry("provider", "engine", "01")],
+            references,
+        )
+        .unwrap();
+        let snapshot = VehicleCacheSnapshot::default().with_topology_provider_results([provider]);
+        let root = root("provider-count-bound");
         let store = CacheStore::new(&root);
         assert!(store
             .save(&VehicleCache::with_snapshot(
