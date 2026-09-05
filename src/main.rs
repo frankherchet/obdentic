@@ -743,11 +743,12 @@ async fn run_vehicle_ecu_serials_inner(adapter_id: &str) -> Result<(), String> {
         println!("responders\t{}", responses.as_slice().len());
         for response in responses.as_slice() {
             println!(
-                "responder\t{}\tpositive",
+                "responder\t{}\tpositive\tserial_hex={}",
                 response
                     .responder
                     .as_ref()
-                    .map_or("unknown", ble::ResponderIdentity::as_str)
+                    .map_or("unknown", ble::ResponderIdentity::as_str),
+                hex(&response.payload[3..])
             );
         }
         for error in responses.errors() {
