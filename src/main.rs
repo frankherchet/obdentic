@@ -44,7 +44,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle scan --adapter <CoreBluetooth UUID> | obdentic vehicle mode09 --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture --adapter <CoreBluetooth UUID> --profile ea189-dpf --record <capture.jsonl> --cycles <1..=1440> --interval-seconds <>=30> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle scan --adapter <CoreBluetooth UUID> | obdentic vehicle mode09 --adapter <CoreBluetooth UUID> | obdentic vehicle ecu-serials --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture --adapter <CoreBluetooth UUID> --profile ea189-dpf --record <capture.jsonl> --cycles <1..=1440> --interval-seconds <>=30> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -74,6 +74,9 @@ enum Command {
         adapter_id: String,
     },
     VehicleMode09 {
+        adapter_id: String,
+    },
+    VehicleEcuSerials {
         adapter_id: String,
     },
     VehicleShow,
@@ -200,6 +203,9 @@ async fn run() -> Result<(), String> {
             }
             Command::VehicleMode09 { adapter_id } => {
                 run_vehicle_mode09(&adapter_id, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleEcuSerials { adapter_id } => {
+                run_vehicle_ecu_serials(&adapter_id, &runtime, &mut runtime_state).await
             }
             Command::VehicleShow => run_vehicle_show(),
             Command::Capture {
@@ -671,6 +677,88 @@ async fn run_vehicle_mode09_inner(adapter_id: &str) -> Result<(), String> {
                 },
                 Err(error) => println!("pid\t{:02X}\terror\t{}", pid.pid(), escape_field(&error)),
             }
+        }
+        Ok(())
+    }
+    .await;
+    let shutdown = session.shutdown().await;
+    result?;
+    shutdown
+}
+
+async fn run_vehicle_ecu_serials(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryStarted).await?;
+
+    match run_vehicle_ecu_serials_inner(adapter_id).await {
+        Ok(()) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await
+        }
+        Err(error) => {
+            finish_discovery_failure(&error, runtime, state).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_vehicle_ecu_serials_inner(adapter_id: &str) -> Result<(), String> {
+    let catalog = KnowledgeCatalog::load_pinned(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .map_err(|error| error.to_string())?;
+    let candidate = EcuIdentificationPlan::from_catalog(&catalog)?
+        .candidates()
+        .iter()
+        .find(|candidate| candidate.did() == 0xF18C)
+        .cloned()
+        .ok_or_else(|| "canonical knowledge is missing standard F18C".to_string())?;
+    let probe = ble::FunctionalEcuSerialProbe::from_candidate(candidate)?;
+    let session = ble::start_session(adapter_id).await?;
+    let result: Result<(), String> = async {
+        let responses = session.read_functional_ecu_serials(probe).await?;
+        println!("vehicle ecu serial responders");
+        println!("request\t22 F1 8C");
+        println!("responders\t{}", responses.as_slice().len());
+        for response in responses.as_slice() {
+            println!(
+                "responder\t{}\tpositive",
+                response
+                    .responder
+                    .as_ref()
+                    .map_or("unknown", ble::ResponderIdentity::as_str)
+            );
+        }
+        for error in responses.errors() {
+            println!(
+                "responder\t{}\terror\t{}",
+                error
+                    .responder
+                    .as_ref()
+                    .map_or("unknown", ble::ResponderIdentity::as_str),
+                escape_field(&error.error)
+            );
         }
         Ok(())
     }
@@ -2665,6 +2753,14 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 adapter_id: adapter_id.clone(),
             })
         }
+        [command, action, adapter_flag, adapter_id]
+            if command == "vehicle" && action == "ecu-serials" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::VehicleEcuSerials {
+                adapter_id: adapter_id.clone(),
+            })
+        }
         [command, action] if command == "vehicle" && action == "show" => Ok(Command::VehicleShow),
         [command] if command == "demo" => Ok(Command::Demo),
         [command, adapter_flag, adapter_id, profile_flag, profile_name, record_flag, path]
@@ -3106,6 +3202,12 @@ mod tests {
         assert_eq!(
             parse_command(&args(&["vehicle", "mode09", "--adapter", uuid,])),
             Ok(Command::VehicleMode09 {
+                adapter_id: uuid.into(),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "ecu-serials", "--adapter", uuid,])),
+            Ok(Command::VehicleEcuSerials {
                 adapter_id: uuid.into(),
             })
         );
