@@ -6,17 +6,24 @@ use obdentic::{
         FingerprintField, KnowledgeCatalog, KnowledgePin, CANONICAL_KNOWLEDGE_REPOSITORY,
     },
 };
-use std::{fs, path::PathBuf, time::SystemTime};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::SystemTime,
+};
 
 const FIXTURE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn temp_dir() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "obdentic-effective-knowledge-{}-{nonce}",
+        "obdentic-effective-knowledge-{}-{nonce}-{sequence}",
         std::process::id()
     ));
     fs::create_dir_all(path.join("manufacturers/test")).unwrap();
