@@ -14,7 +14,10 @@ When work is tracked by a GitHub issue, completing that work includes committing
 
 ## Project constraints
 
-- OBDentic is read-only. Never send vehicle coding, adaptation, actuator-test, DTC-clear, SecurityAccess, write-oriented UDS or arbitrary CAN commands.
+- Treat `docs/project-goals.md` as the long-term product contract. If an implementation decision changes those goals, update that document deliberately rather than allowing architecture to drift implicitly.
+- OBDentic is read-only by default. Existing read-only invariants remain authoritative unless a separately reviewed issue explicitly implements one of the narrow process-start service capabilities allowed by `docs/project-goals.md`.
+- The first and currently only intended mutating capability is DTC clearing. It must be unavailable by default, enabled only explicitly at process start, represented as a closed typed operation/job, and must never become a generic `--write`, raw CAN/UDS/ELM, arbitrary-address, coding, adaptation, actuator, SecurityAccess or RoutineControl escape hatch.
+- Profiles, layouts, Knowledge DB content, MCP calls and AI prompts must never elevate the running process from read-only into a mutating capability. Until a reviewed DTC-clear capability issue lands, do not send DTC-clear traffic at all.
 - Keep adapter transport separate from deterministic vehicle decoding.
 - Preserve raw TX/RX visibility and test through the highest practical transport/replay seam.
 - Treat Bluetooth captures as sensitive: they may contain VINs, device identifiers and authentication material. Keep `captures/` untracked and never publish raw captures.
