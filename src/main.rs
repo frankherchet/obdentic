@@ -562,24 +562,37 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
 
     let session = ble::start_session(adapter_id).await?;
     let discovery = obdentic::functional_discovery::discover_functional_responders(&session).await;
-    let target_mapping = match &discovery {
-        Ok(discovery) => validate_engine_target(&session, discovery).await,
-        Err(_) => Ok(None),
+    let target_mappings = match &discovery {
+        Ok(discovery) => match validate_engine_target(&session, discovery).await {
+            Ok(Some(engine)) => {
+                let secondary = match validate_secondary_target(&session, discovery).await {
+                    Ok(mapping) => mapping,
+                    Err(error) => {
+                        eprintln!("secondary target unavailable; continuing discovery: {error}");
+                        None
+                    }
+                };
+                Ok(merge_target_mappings(engine, secondary))
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        },
+        Err(_) => Ok(Vec::new()),
     };
-    let ecu_identification = match &target_mapping {
-        Ok(Some(mapping)) => {
+    let ecu_identification = match &target_mappings {
+        Ok(mappings) if !mappings.is_empty() => {
             ecu_identification_discovery::discover_known_ecus(
                 &session,
                 &identification_plan,
-                std::slice::from_ref(mapping),
+                mappings,
             )
             .await
         }
-        Ok(None) | Err(_) => Ok(Vec::new()),
+        Ok(_) | Err(_) => Ok(Vec::new()),
     };
     let shutdown = session.shutdown().await;
     let discovery = discovery?;
-    let target_mapping = target_mapping?;
+    let target_mappings = target_mappings?;
     let ecu_identification = ecu_identification?;
     shutdown?;
 
@@ -596,10 +609,14 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
     let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::with_ecu_identification(
         base_snapshot.topology().to_vec(),
         base_snapshot.ecu_capabilities().to_vec(),
-        target_mapping,
+        target_mappings,
         ecu_identification,
     );
-    let engine_target_validated = !snapshot.target_mappings().is_empty();
+    let engine_target_validated = snapshot.target_mappings().iter().any(|mapping| {
+        mapping
+            .role()
+            .is_some_and(|role| role.role() == &EcuRole::Engine)
+    });
     let mut history = existing
         .as_ref()
         .map(|cache| cache.history().to_vec())
@@ -650,6 +667,82 @@ async fn validate_engine_target(
     let transaction = session.read_targeted(engine_target_request()?).await?;
     validate_engine_target_transaction(&transaction)?;
     Ok(Some(confirmed_engine_target()?))
+}
+
+async fn validate_secondary_target(
+    session: &ble::SessionClient,
+    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
+) -> Result<Option<TargetMappingSnapshot>, String> {
+    if !secondary_target_allowed(discovery) {
+        return Ok(None);
+    }
+
+    let transaction = session.read_targeted(secondary_target_request()?).await?;
+    validate_secondary_target_transaction(&transaction)?;
+    Ok(Some(confirmed_secondary_target()?))
+}
+
+fn secondary_target_allowed(
+    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
+) -> bool {
+    discovery.capabilities().iter().any(|capability| {
+        capability
+            .responder()
+            .value()
+            .is_some_and(|value| value.eq_ignore_ascii_case("7E9"))
+            && matches!(
+                capability.status("vehicle.speed"),
+                Ok(obdentic::functional_discovery::CapabilityStatus::Supported)
+            )
+    })
+}
+
+fn validate_secondary_target_transaction(transaction: &Transaction) -> Result<(), String> {
+    if transaction.semantic() != "vehicle.speed"
+        || transaction.request() != [0x01, 0x0D]
+        || transaction.response().len() != 3
+        || transaction.response().first() != Some(&0x41)
+        || transaction.response().get(1) != Some(&0x0D)
+    {
+        return Err("targeted secondary validation returned an invalid 010D response".into());
+    }
+    Ok(())
+}
+
+fn secondary_target_request() -> Result<ble::TargetedReadRequest, String> {
+    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+    ble::TargetedReadRequest::new(
+        prepare_read("vehicle.speed")?,
+        RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E1")),
+        ble::ResponderIdentity::ElmHeader("7E9".into()),
+    )
+}
+
+fn confirmed_secondary_target() -> Result<TargetMappingSnapshot, String> {
+    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+    let provenance = Provenance::new(
+        "targeted vehicle.speed Mode 01 validation",
+        Confidence::Verified,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(TargetMappingSnapshot::new(
+        None,
+        Some(ResponderIdentity::address(context.clone(), "7E9")),
+        RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E1")),
+        provenance,
+    ))
+}
+
+fn merge_target_mappings(
+    engine: TargetMappingSnapshot,
+    secondary: Option<TargetMappingSnapshot>,
+) -> Vec<TargetMappingSnapshot> {
+    let mut mappings = vec![engine];
+    if let Some(secondary) = secondary {
+        mappings.push(secondary);
+    }
+    mappings.sort();
+    mappings
 }
 
 fn engine_responder_observed(
@@ -2941,6 +3034,46 @@ mod tests {
             .complete("test", vec![0x41, 0x0D, 0x00])
             .unwrap();
         assert!(validate_engine_target_transaction(&wrong_signal).is_err());
+    }
+
+    #[test]
+    fn secondary_target_request_and_validation_are_explicit_and_read_only() {
+        let request = secondary_target_request().unwrap();
+        assert_eq!(request.request().bytes(), [0x01, 0x0D]);
+        assert_eq!(request.target().address().unwrap().value(), "7E1");
+        assert_eq!(request.expected_responder().as_str(), "7E9");
+
+        let valid = prepare_read("vehicle.speed")
+            .unwrap()
+            .complete("test", vec![0x41, 0x0D, 0x00])
+            .unwrap();
+        assert!(validate_secondary_target_transaction(&valid).is_ok());
+    }
+
+    #[test]
+    fn secondary_target_requires_7e9_functional_support() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Functional);
+        let provenance = Provenance::new("test", Confidence::High).unwrap();
+        let observation = obdentic::functional_discovery::FunctionalPageObservation::new(
+            [0x01, 0x00],
+            ResponderIdentity::opaque(context, "7E8"),
+            vec![0x41, 0x00, 0x00, 0x08, 0x00, 0x00],
+            provenance,
+        )
+        .unwrap();
+        let discovery =
+            obdentic::functional_discovery::FunctionalResponderDiscovery::new([observation]);
+
+        assert!(!secondary_target_allowed(&discovery));
+    }
+
+    #[test]
+    fn confirmed_secondary_target_has_no_inferred_logical_role() {
+        let mapping = confirmed_secondary_target().unwrap();
+        assert!(mapping.role().is_none());
+        assert_eq!(mapping.target().address().unwrap().value(), "7E1");
+        assert_eq!(mapping.responder().unwrap().value(), Some("7E9"));
+        assert_eq!(mapping.confidence(), Confidence::Verified);
     }
 
     #[test]
