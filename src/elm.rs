@@ -385,10 +385,24 @@ pub struct DiagnosticResponses {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResponseObservation {
+pub struct ResponseObservation {
     pub(crate) responses: Vec<crate::capture_events::ResponderEvidence>,
     pub(crate) selected_responder: Option<String>,
     pub(crate) selection_error: Option<String>,
+}
+
+impl ResponseObservation {
+    pub fn responses(&self) -> &[crate::capture_events::ResponderEvidence] {
+        &self.responses
+    }
+
+    pub fn selected_responder(&self) -> Option<&str> {
+        self.selected_responder.as_deref()
+    }
+
+    pub fn selection_error(&self) -> Option<&str> {
+        self.selection_error.as_deref()
+    }
 }
 
 impl DiagnosticResponses {

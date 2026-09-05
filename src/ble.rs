@@ -10,6 +10,8 @@ pub use crate::adapter::AdapterCandidate;
 #[cfg(test)]
 use crate::elm::ElmExchange;
 use crate::elm::ElmSession;
+pub(crate) use crate::elm::ReadEvidenceError;
+pub use crate::elm::ResponseObservation;
 #[cfg(test)]
 pub(crate) use crate::elm::{
     discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
@@ -24,7 +26,6 @@ pub use crate::elm::{
     ResponderIdentity, SignalSupport, SignalSupportStatus, SupportDiscovery,
     TargetedDpfProbeRequest, TargetedEcuIdentificationRequest, TargetedReadRequest,
 };
-pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
 // Two consecutive transport failures stop a live session; data failures reset the count.
 const TRANSPORT_FAILURE_THRESHOLD: u8 = 2;
@@ -42,6 +43,15 @@ pub struct PreparedDiagnosticSession {
 impl PreparedDiagnosticSession {
     pub fn negotiation(&self) -> &ProtocolNegotiation {
         &self.negotiation
+    }
+
+    /// Execute one already-typed targeted semantic read while retaining this session.
+    /// The outcome preserves every normalized responder observation.
+    pub async fn read_targeted_with_evidence(
+        &self,
+        request: TargetedReadRequest,
+    ) -> Result<ReadOutcome, String> {
+        self.session.read_targeted_with_evidence(request).await
     }
 
     /// Execute one closed EA189 candidate probe while retaining this session.
@@ -69,7 +79,7 @@ impl PreparedDiagnosticSession {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum ReadOutcome {
+pub enum ReadOutcome {
     Succeeded {
         transaction: Transaction,
         observations: Vec<ResponseObservation>,
