@@ -44,6 +44,18 @@ impl PreparedDiagnosticSession {
         &self.negotiation
     }
 
+    /// Execute one already-typed targeted semantic read while retaining this session.
+    /// The outcome preserves every normalized responder observation as passive evidence.
+    pub async fn read_targeted_with_evidence(
+        &self,
+        request: TargetedReadRequest,
+    ) -> Result<TargetedReadOutcome, String> {
+        self.session
+            .read_targeted_with_evidence(request)
+            .await
+            .map(TargetedReadOutcome::from_internal)
+    }
+
     /// Execute one closed EA189 candidate probe while retaining this session.
     pub async fn read_dpf_probe(
         &self,
@@ -65,6 +77,74 @@ impl PreparedDiagnosticSession {
 
     pub async fn shutdown(self) -> Result<(), String> {
         self.session.shutdown().await
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedReadObservation {
+    responses: Vec<crate::capture_events::ResponderEvidence>,
+    selected_responder: Option<String>,
+    selection_error: Option<String>,
+}
+
+impl TargetedReadObservation {
+    fn from_internal(observation: ResponseObservation) -> Self {
+        Self {
+            responses: observation.responses,
+            selected_responder: observation.selected_responder,
+            selection_error: observation.selection_error,
+        }
+    }
+
+    pub fn responses(&self) -> &[crate::capture_events::ResponderEvidence] {
+        &self.responses
+    }
+
+    pub fn selected_responder(&self) -> Option<&str> {
+        self.selected_responder.as_deref()
+    }
+
+    pub fn selection_error(&self) -> Option<&str> {
+        self.selection_error.as_deref()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TargetedReadOutcome {
+    Succeeded {
+        transaction: Transaction,
+        observations: Vec<TargetedReadObservation>,
+    },
+    Failed {
+        error: String,
+        observations: Vec<TargetedReadObservation>,
+    },
+}
+
+impl TargetedReadOutcome {
+    fn from_internal(outcome: ReadOutcome) -> Self {
+        match outcome {
+            ReadOutcome::Succeeded {
+                transaction,
+                observations,
+            } => Self::Succeeded {
+                transaction,
+                observations: observations
+                    .into_iter()
+                    .map(TargetedReadObservation::from_internal)
+                    .collect(),
+            },
+            ReadOutcome::Failed {
+                error,
+                observations,
+            } => Self::Failed {
+                error,
+                observations: observations
+                    .into_iter()
+                    .map(TargetedReadObservation::from_internal)
+                    .collect(),
+            },
+        }
     }
 }
 
