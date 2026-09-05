@@ -171,7 +171,7 @@ fn parse_profile_yaml(input: &str) -> Result<CaptureProfile, String> {
         if observation.semantic.trim() != observation.semantic || observation.semantic.is_empty() {
             return Err("capture profile semantic must be a non-empty exact identifier".into());
         }
-        if observation.semantic.contains(['*', '?']) {
+        if observation.semantic.contains('*') || observation.semantic.contains('?') {
             return Err(format!(
                 "capture profile {} uses forbidden semantic wildcard {}",
                 document.id, observation.semantic
@@ -210,9 +210,7 @@ fn parse_profile_yaml(input: &str) -> Result<CaptureProfile, String> {
 fn valid_profile_id(id: &str) -> bool {
     !id.is_empty()
         && id.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'-' | b'_' | b'.')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
         })
 }
 
