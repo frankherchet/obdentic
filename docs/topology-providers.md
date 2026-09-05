@@ -2,7 +2,7 @@
 
 Topology Providers are the domain seam for adding reviewed manufacturer/platform **configured or installed ECU evidence** to OBDentic without turning discovery into address scanning or a raw protocol surface.
 
-This document describes the transport-free contract introduced by issue #127, the first implementation slice of #125.
+This document describes the transport-free contract introduced by issue #127 and its private vehicle-cache persistence added by issue #130, both implementation slices of #125.
 
 ## Evidence meanings remain separate
 
@@ -93,22 +93,62 @@ The full provider records remain available so consumers can show which provider 
 
 An empty blocked/failed provider result therefore never means “the vehicle has no ECUs”. It means that the manufacturer/platform installation source did not produce authoritative inventory evidence in that run.
 
+## Private vehicle-cache persistence
+
+Topology-provider output is **vehicle-instance evidence**, not canonical Vehicle Knowledge. It is persisted in the same local private `VehicleCacheSnapshot` that already stores observed topology, capabilities, request-target mappings and bounded ECU-identification observations.
+
+Vehicle-cache schema v5 stores complete typed `TopologyProviderResult` values, including:
+
+- provider ID/version;
+- applicability scope and provenance;
+- provider status and coverage;
+- provider-level evidence references;
+- configured-controller identity/logical-address evidence and provenance;
+- entry-level evidence references;
+- optional `RequestTargetEvidence` only when it was already supplied independently.
+
+The cache normalizes provider-result ordering deterministically. Persisting a configured controller does **not** create a responder observation, a reachability fact or an ECU role. A logical address remains a logical address after reload; the decoder never promotes it into a request target.
+
+### Cache compatibility
+
+New cache writes use:
+
+```text
+OBDENTIC-VEHICLE-CACHE  5
+```
+
+The parser continues to read v1, v2, v3 and v4. Older cache records deserialize with an empty topology-provider result collection. They are not reinterpreted as having complete or absent manufacturer topology evidence.
+
+Provider status/coverage is reconstructed through the same domain constructor used by live/in-memory results, so inconsistent combinations fail closed while loading.
+
+### Privacy and validation
+
+Provider metadata passes through the existing private-cache validation rules. Raw VIN-like identifiers are rejected from provider IDs, applicability fields, provenance, evidence references, configured identifiers/logical addresses and request-target metadata.
+
+Provider entry/reference counts are bounded during parsing. Cache files remain local vehicle evidence and must not be committed to the repository.
+
+### Validation signature remains observation-based
+
+Topology-provider installation evidence is deliberately excluded from `VehicleCacheSnapshot::validation_signature()`.
+
+That signature remains based on the bounded functional OBD evidence already used for cache revalidation. A persisted manufacturer installation list therefore cannot silently become proof that an ECU is currently reachable or that a cached request target is live-valid.
+
 ## Current EA189 / PQ35 state
 
 The existing research in `docs/research/vw-gateway-installation-list.md` and issue #35 remains a negative safety result for the owned EA189/PQ35 context.
 
-OBDentic currently does **not** have sufficiently evidenced exact gateway request, address mapping and session semantics to execute a VW installation-list provider safely. The new domain contract can represent that provider as `Blocked` with unknown coverage, but it adds no VW gateway traffic.
+OBDentic currently does **not** have sufficiently evidenced exact gateway request, address mapping and session semantics to execute a VW installation-list provider safely. The domain/cache model can represent that provider as `Blocked` with unknown coverage and persist that fact across restarts, but it adds no VW gateway traffic.
 
 A future live VW provider requires new reviewed evidence that resolves the #35 gaps. It must not be implemented by blind address scanning, DID scanning, undocumented session escalation or copying third-party request sequences without provenance.
 
 ## Transport boundary
 
-This slice contains no provider execution trait, adapter handle, `DiagnosticSession`, BLE/ELM/CAN/UDS call or raw request field.
+The provider domain and cache persistence contain no provider execution trait, adapter handle, `DiagnosticSession`, BLE/ELM/CAN/UDS call or raw request field.
 
-Future orchestration may execute a reviewed provider and then produce this domain result, but transport remains below the typed diagnostic/safety boundary. The provider result itself is evidence only.
+Future orchestration may execute a reviewed provider and then persist the resulting domain evidence, but transport remains below the typed diagnostic/safety boundary. The provider result itself is evidence only.
 
-## Persistence and discovery follow-up
+## Discovery follow-up
 
-The current `VehicleCacheSnapshot::from_topology()` primarily persists observed responder/target information and does not yet retain configured-controller provider facts.
+With the provider domain and persistence seam established, the remaining #125 integration is discovery orchestration: applicable reviewed providers can later be composed with functional OBD discovery while preserving fallback and structured partial-coverage reporting.
 
-That integration is intentionally a separate follow-up slice of #125. It should extend the existing private inventory/cache and `vehicle discover` orchestration rather than creating a second topology database.
+That orchestration remains a separate slice. It must reuse the existing private cache and topology types, and it must not add live VW/PQ35 gateway traffic until new reviewed evidence resolves issue #35.
