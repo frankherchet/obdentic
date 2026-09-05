@@ -6,6 +6,7 @@ use std::time::Duration;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MODE03_COMMAND: &str = "03\r";
+const STALE_MODE01_RESPONSE_PREFIX: &str = "stale unrelated OBD-II Mode 01 response from responder";
 const IGNORED_MODE01_RESPONSE_PREFIX: &str =
     "ignored unrelated OBD-II Mode 01 response from responder";
 
@@ -488,6 +489,9 @@ impl DiagnosticResponses {
             .responses
             .first()
             .ok_or_else(|| format!("01{pid:02X} response not found"))?;
+        if !first.payload.starts_with(&[0x41, pid]) {
+            return Err(format!("01{pid:02X} response not found"));
+        }
         if self
             .responses
             .iter()
@@ -795,6 +799,22 @@ fn should_retry_stale_uds_response(responses: &DiagnosticResponses) -> bool {
         && responses.errors.iter().all(is_ignored_mode01_response)
 }
 
+fn should_retry_stale_mode01_response(responses: &DiagnosticResponses, pid: u8) -> bool {
+    !responses.responses.is_empty()
+        && responses.responses.len() == responses.errors.len()
+        && responses.responses.iter().all(|response| {
+            response.payload.first() == Some(&0x41)
+                && response
+                    .payload
+                    .get(1)
+                    .is_some_and(|observed| *observed != pid)
+        })
+        && responses
+            .errors
+            .iter()
+            .all(|error| error.error.starts_with(STALE_MODE01_RESPONSE_PREFIX))
+}
+
 fn is_ignored_mode01_response(error: &DiagnosticResponseError) -> bool {
     error.responder.is_none() && error.error.starts_with(IGNORED_MODE01_RESPONSE_PREFIX)
 }
@@ -831,6 +851,41 @@ where
             payload,
             observations: vec![first.observation(None)],
         }),
+        Err(error) if should_retry_stale_mode01_response(&first, request.pid()) => {
+            let mut observations = vec![first.observation(Some(error.clone()))];
+            let retry = match read_elm_responses(exchange, request).await {
+                Ok(retry) => retry,
+                Err(retry_error) => {
+                    return Err(ReadEvidenceError {
+                        error: format!(
+                            "{error}; first ELM response={}; retry failed: {retry_error}",
+                            first.raw_response().escape_default()
+                        ),
+                        observations,
+                    });
+                }
+            };
+            match retry.unambiguous_payload(request.pid()) {
+                Ok(payload) => {
+                    observations.push(retry.observation(None));
+                    Ok(ReadEvidence {
+                        payload,
+                        observations,
+                    })
+                }
+                Err(retry_error) => {
+                    observations.push(retry.observation(Some(retry_error.clone())));
+                    Err(ReadEvidenceError {
+                        error: format!(
+                            "{retry_error}; first ELM response={}; retry ELM response={}",
+                            first.raw_response().escape_default(),
+                            retry.raw_response().escape_default()
+                        ),
+                        observations,
+                    })
+                }
+            }
+        }
         Err(error)
             if error.starts_with(&format!("conflicting 01{:02X} responses", request.pid())) =>
         {
@@ -1009,7 +1064,13 @@ where
 {
     let command = obd_command(request);
     let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
-    normalize_mode01_responses(&response, request.pid(), request.data_len())
+    match normalize_mode01_responses(&response, request.pid(), request.data_len()) {
+        Ok(responses) => Ok(responses),
+        Err(error) => match normalize_stale_mode01_responses(&response, request.pid()) {
+            Ok(responses) => Ok(responses),
+            Err(_) => Err(error),
+        },
+    }
 }
 
 pub(crate) async fn read_elm_mode03_responses<E>(
@@ -1089,6 +1150,104 @@ pub(crate) fn normalize_mode01_responses(
         mode01_responses(response, pid, data_len)?,
         response,
     ))
+}
+
+/// Preserve a complete, length-prefixed response to a different Mode 01 PID
+/// so the caller can retry its already-authorized request once. Anything less
+/// definite remains the original normalization error.
+fn normalize_stale_mode01_responses(
+    response: &str,
+    requested_pid: u8,
+) -> Result<DiagnosticResponses, String> {
+    let mut responses = Vec::new();
+    let mut errors = Vec::new();
+
+    for raw_line in response.split(['\r', '\n']) {
+        let line = raw_line.trim().trim_end_matches('>').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        let compact = upper.split_ascii_whitespace().collect::<String>();
+        if compact == format!("01{requested_pid:02X}")
+            || upper.starts_with("SEARCHING")
+            || (upper.starts_with("BUS INIT") && !upper.contains("ERROR"))
+        {
+            continue;
+        }
+        if upper == "?"
+            || ["NO DATA", "STOPPED", "UNABLE TO CONNECT", "ERROR"]
+                .iter()
+                .any(|status| upper.contains(status))
+        {
+            return Err(format!("ELM327 rejected 01{requested_pid:02X}: {line}"));
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let header = tokens.first().filter(|token| token.len() == 3).copied();
+        if header.is_some_and(|value| !value.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+            return Err(format!("malformed ELM327 responder header: {line:?}"));
+        }
+        let data = if header.is_some() {
+            &tokens[1..]
+        } else {
+            tokens.as_slice()
+        };
+        let mut bytes = Vec::new();
+        for token in data {
+            if token.is_empty()
+                || token.len() % 2 != 0
+                || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!("malformed ELM327 response line: {line:?}"));
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+                bytes.push(u8::from_str_radix(pair, 16).map_err(|error| error.to_string())?);
+            }
+        }
+        let Some((&declared_len, payload_and_padding)) = bytes.split_first() else {
+            return Err(format!(
+                "01{requested_pid:02X} response not found in {response:?}"
+            ));
+        };
+        let declared_len = declared_len as usize;
+        if declared_len < 2
+            || payload_and_padding.len() < declared_len
+            || payload_and_padding[0] != 0x41
+            || payload_and_padding[1] == requested_pid
+            || payload_and_padding[declared_len..]
+                .iter()
+                .any(|byte| !matches!(byte, 0x00 | 0x55 | 0xaa))
+        {
+            return Err(format!(
+                "01{requested_pid:02X} response not found in {response:?}"
+            ));
+        }
+        let responder =
+            header.map(|value| ResponderIdentity::ElmHeader(value.to_ascii_uppercase()));
+        let payload = payload_and_padding[..declared_len].to_vec();
+        let observed = responder.as_ref().map_or_else(
+            || "unknown".to_owned(),
+            |responder| responder.as_str().to_owned(),
+        );
+        responses.push(DiagnosticResponse {
+            responder: responder.clone(),
+            payload,
+        });
+        errors.push(DiagnosticResponseError {
+            responder,
+            error: format!(
+                "stale unrelated OBD-II Mode 01 response from responder {observed} while awaiting 01{requested_pid:02X}: {line:?}"
+            ),
+        });
+    }
+
+    (!responses.is_empty())
+        .then_some(DiagnosticResponses::with_errors(
+            responses, response, errors,
+        ))
+        .ok_or_else(|| format!("01{requested_pid:02X} response not found in {response:?}"))
 }
 
 #[derive(Debug)]
@@ -2094,6 +2253,55 @@ mod tests {
             responses.as_slice()[0].responder.as_ref().unwrap().as_str(),
             "7E8"
         );
+    }
+
+    #[tokio::test]
+    async fn generic_mode01_retries_one_stale_different_pid_response() {
+        let mut exchange = ScriptedExchange::new([
+            "7E9 06 41 00 98 18 00 01 AA\r>",
+            "7E9 03 41 0D 00 00 00 00\r>",
+        ]);
+        let request = crate::prepare_read("vehicle.speed").unwrap();
+
+        let read = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap();
+
+        assert_eq!(read.payload, [0x41, 0x0d, 0x00]);
+        assert_eq!(read.observations.len(), 2);
+        assert!(read.observations[0]
+            .selection_error
+            .as_deref()
+            .is_some_and(|error| error == "010D response not found"));
+        assert_eq!(exchange.commands, ["010D\r", "010D\r"]);
+    }
+
+    #[tokio::test]
+    async fn generic_mode01_stops_after_one_stale_different_pid_retry() {
+        let stale = "7E9 06 41 00 98 18 00 01 AA\r>";
+        let mut exchange = ScriptedExchange::new([stale, stale]);
+        let request = crate::prepare_read("vehicle.speed").unwrap();
+
+        let error = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+
+        assert!(error.error.contains("first ELM response"));
+        assert_eq!(error.observations.len(), 2);
+        assert_eq!(exchange.commands, ["010D\r", "010D\r"]);
+    }
+
+    #[tokio::test]
+    async fn generic_mode01_does_not_retry_adapter_rejection() {
+        let mut exchange = ScriptedExchange::new(["NO DATA\r>"]);
+        let request = crate::prepare_read("vehicle.speed").unwrap();
+
+        let error = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+
+        assert!(error.error.contains("ELM327 rejected"));
+        assert_eq!(exchange.commands, ["010D\r"]);
     }
 
     #[tokio::test]
