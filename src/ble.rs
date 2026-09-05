@@ -21,9 +21,9 @@ pub(crate) use crate::elm::{
 };
 pub use crate::elm::{
     mode09_support_bitmap, DiagnosticResponse, DiagnosticResponseError, DiagnosticResponses,
-    Mode09Pid, ProtocolNegotiation, ResponderIdentity, SignalSupport, SignalSupportStatus,
-    SupportDiscovery, TargetedDpfProbeRequest, TargetedEcuIdentificationRequest,
-    TargetedMode09Request, TargetedReadRequest,
+    FunctionalEcuSerialProbe, Mode09Pid, ProtocolNegotiation, ResponderIdentity, SignalSupport,
+    SignalSupportStatus, SupportDiscovery, TargetedDpfProbeRequest,
+    TargetedEcuIdentificationRequest, TargetedMode09Request, TargetedReadRequest,
 };
 pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
@@ -361,6 +361,21 @@ impl SessionClient {
             .into_result()
     }
 
+    /// Execute a closed, standards-catalogued functional identification read.
+    pub async fn read_functional_ecu_serials(
+        &self,
+        probe: FunctionalEcuSerialProbe,
+    ) -> Result<DiagnosticResponses, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::ReadFunctionalEcuSerials { probe, reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
     pub(crate) async fn read_ecu_identification_with_evidence(
         &self,
         request: TargetedEcuIdentificationRequest,
@@ -443,6 +458,10 @@ enum SessionCommand {
     ReadEcuIdentification {
         request: TargetedEcuIdentificationRequest,
         reply: oneshot::Sender<Result<EcuIdentificationOutcome, String>>,
+    },
+    ReadFunctionalEcuSerials {
+        probe: FunctionalEcuSerialProbe,
+        reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
     },
     ReadStoredDtcs {
         reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
@@ -602,6 +621,31 @@ async fn session_actor(
                     reply,
                 )
                 .await;
+            }
+            SessionCommand::ReadFunctionalEcuSerials { probe, reply } => {
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
+                }
+                let started = Instant::now();
+                match session.read_functional_ecu_serials(probe).await {
+                    Ok(responses) => {
+                        service.observe(started.elapsed());
+                        health.success();
+                        let _ = reply.send(Ok(responses));
+                    }
+                    Err(error) => {
+                        if health.observe(&error) {
+                            let fatal = health.unhealthy().unwrap().to_owned();
+                            session.disconnect_best_effort().await;
+                            disconnect_done = true;
+                            let _ = reply.send(Err(fatal));
+                        } else {
+                            service.observe(started.elapsed());
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
             }
             SessionCommand::ReadStoredDtcs { reply } => {
                 if let Some(error) = health.unhealthy() {
@@ -940,6 +984,13 @@ impl DiagnosticSession {
         }
     }
 
+    async fn read_functional_ecu_serials(
+        &mut self,
+        probe: FunctionalEcuSerialProbe,
+    ) -> Result<DiagnosticResponses, String> {
+        self.elm_mut()?.read_functional_ecu_serials(&probe).await
+    }
+
     async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
         self.elm_mut()?.read_stored_dtcs().await
     }
@@ -1191,6 +1242,10 @@ mod tests {
                     SessionCommand::ReadEcuIdentification { reply, .. } => {
                         let _ =
                             reply.send(Err("ECU identification test request not scripted".into()));
+                    }
+                    SessionCommand::ReadFunctionalEcuSerials { reply, .. } => {
+                        let _ = reply
+                            .send(Err("functional ECU serial test request not scripted".into()));
                     }
                     SessionCommand::ReadStoredDtcs { reply } => {
                         let _ = reply.send(Err("stored DTC test request not scripted".into()));

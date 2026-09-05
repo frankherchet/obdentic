@@ -181,6 +181,32 @@ pub struct TargetedEcuIdentificationRequest {
     expected_responder: ResponderIdentity,
 }
 
+/// The one closed functional ECU responder probe. It can be built only from
+/// the catalogued standard ECU serial-number candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionalEcuSerialProbe {
+    candidate: crate::ecu_identification::IdentificationCandidate,
+}
+
+impl FunctionalEcuSerialProbe {
+    pub fn from_candidate(
+        candidate: crate::ecu_identification::IdentificationCandidate,
+    ) -> Result<Self, String> {
+        if candidate.did() != 0xF18C || candidate.semantic() != "ecu.serial_number" {
+            return Err("functional ECU responder probing is limited to standard F18C".into());
+        }
+        Ok(Self { candidate })
+    }
+
+    pub const fn request_bytes(&self) -> [u8; 3] {
+        self.candidate.request_bytes()
+    }
+
+    fn candidate(&self) -> &crate::ecu_identification::IdentificationCandidate {
+        &self.candidate
+    }
+}
+
 /// The closed standard OBD-II Mode 09 PID set used for engine identification.
 /// Callers cannot construct an arbitrary Mode 09 request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -926,6 +952,15 @@ where
             }
         }
     }
+
+    /// Execute one standards-catalogued functional ECU-identification read.
+    /// The candidate type has no caller-supplied DID constructor.
+    pub(crate) async fn read_functional_ecu_serials(
+        &mut self,
+        probe: &FunctionalEcuSerialProbe,
+    ) -> Result<DiagnosticResponses, String> {
+        read_elm_functional_ecu_serial_responses(&mut self.exchange, probe).await
+    }
 }
 
 fn should_retry_stale_uds_response(responses: &DiagnosticResponses) -> bool {
@@ -1240,6 +1275,36 @@ where
     let command = uds_command(request.operation);
     let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
     normalize_uds_responses(&response, request.did())
+}
+
+pub(crate) async fn read_elm_functional_ecu_serial_responses<E>(
+    exchange: &mut E,
+    probe: &FunctionalEcuSerialProbe,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let candidate = probe.candidate();
+    let command = uds_command(candidate.operation());
+    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    let responses = normalize_uds_responses(&response, candidate.did())?;
+    let mut accepted = Vec::new();
+    let mut errors = responses.errors;
+    for response in responses.responses {
+        if response.payload.starts_with(&[0x62, 0xF1, 0x8C]) {
+            accepted.push(response);
+        } else {
+            errors.push(DiagnosticResponseError {
+                responder: response.responder,
+                error: "unexpected response while awaiting UDS 22 F18C".into(),
+            });
+        }
+    }
+    Ok(DiagnosticResponses::with_errors(
+        accepted,
+        &responses.raw_response,
+        errors,
+    ))
 }
 
 pub(crate) async fn read_elm_mode09_responses<E>(
@@ -2791,6 +2856,37 @@ mod tests {
                 "ATCRA\r",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn functional_f18c_keeps_only_positive_responder_identity() {
+        let catalog =
+            crate::knowledge_db::KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let candidate = crate::ecu_identification::EcuIdentificationPlan::from_catalog(&catalog)
+            .unwrap()
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.did() == 0xF18C)
+            .unwrap()
+            .clone();
+        let probe = FunctionalEcuSerialProbe::from_candidate(candidate).unwrap();
+        let exchange =
+            ScriptedExchange::new(["7E8 05 62 F1 8C 01 02 55 55\r7E9 03 7F 22 31 55 55\r>"]);
+        let mut session = ElmSession::new(exchange);
+
+        let responses = session.read_functional_ecu_serials(&probe).await.unwrap();
+
+        assert_eq!(responses.as_slice().len(), 1);
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+        assert_eq!(
+            responses.as_slice()[0].payload,
+            [0x62, 0xF1, 0x8C, 0x01, 0x02]
+        );
+        assert_eq!(responses.errors().len(), 1);
+        assert_eq!(session.into_exchange().commands, ["22F18C\r"]);
     }
 
     #[tokio::test]
