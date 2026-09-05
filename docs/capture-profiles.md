@@ -59,6 +59,29 @@ The YAML files are embedded in the binary at build time so named profile loading
 
 EA189 DPF/longitudinal orchestration remains a separate temporary bridge tracked by #14/#88 and PR #105.
 
+## Profile file resolution
+
+`--profile` accepts either an embedded built-in name or an explicit local YAML path:
+
+```text
+--profile engine-drive
+--profile ./my-profile.yaml
+--profile ../profiles/my-profile.yml
+--profile /absolute/path/my-profile.yaml
+```
+
+Resolution is deterministic:
+
+1. a syntactically explicit path is read exactly from the local filesystem;
+2. otherwise the value must match an embedded built-in profile name;
+3. otherwise loading fails as an unknown profile.
+
+Absolute paths, multi-component paths (`./`, `../`, or nested paths), and plain `.yaml`/`.yml` filenames are treated as explicit paths. Extensionless files remain available when written explicitly, for example `./my-profile`.
+
+There is no implicit directory scan, globbing, URL/network loading, profile inheritance, or user-config-directory fallback in this slice. A future user-config search path can be added only with separately documented deterministic precedence.
+
+Explicit files pass through exactly the same closed schema-v1 parser as embedded profiles. File read and parse errors occur before any adapter connection. The semantic profile identity is the YAML `id`; the local filesystem path is not stored as the profile name used by capture metadata.
+
 ## Relationship to effective Vehicle Knowledge
 
 Issue #86, the effective Vehicle Knowledge resolver, is still open. Until that resolver is available, this migration slice validates profile semantics against OBDentic's existing closed semantic catalog and routes them through the existing Vehicle Knowledge path.
