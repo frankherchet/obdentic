@@ -44,7 +44,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture --adapter <CoreBluetooth UUID> --profile ea189-dpf --record <capture.jsonl> --cycles <1..=1440> --interval-seconds <>=30> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle scan --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture --adapter <CoreBluetooth UUID> --profile ea189-dpf --record <capture.jsonl> --cycles <1..=1440> --interval-seconds <>=30> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -68,6 +68,9 @@ enum Command {
         adapter_id: String,
     },
     VehicleRefresh {
+        adapter_id: String,
+    },
+    VehicleScan {
         adapter_id: String,
     },
     VehicleShow,
@@ -188,6 +191,9 @@ async fn run() -> Result<(), String> {
             }
             Command::VehicleRefresh { adapter_id } => {
                 run_vehicle_discover(&adapter_id, true, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleScan { adapter_id } => {
+                run_vehicle_scan(&adapter_id, &runtime, &mut runtime_state).await
             }
             Command::VehicleShow => run_vehicle_show(),
             Command::Capture {
@@ -516,6 +522,92 @@ async fn finish_discovery_failure(
     Ok(())
 }
 
+async fn run_vehicle_scan(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryStarted).await?;
+
+    match run_vehicle_scan_inner(adapter_id).await {
+        Ok(()) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await
+        }
+        Err(error) => {
+            finish_discovery_failure(&error, runtime, state).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_vehicle_scan_inner(adapter_id: &str) -> Result<(), String> {
+    let session = ble::start_session(adapter_id).await?;
+    let scan: Result<(), String> = async {
+        println!("vehicle obd scan");
+        println!("candidate\ttarget\tresponder\tstatus");
+
+        for candidate in obdentic::obd_candidate_scan::candidates() {
+            let status = match session
+                .read_targeted(candidate_target_request(*candidate)?)
+                .await
+            {
+                Ok(transaction) => match validate_vehicle_speed_target_transaction(&transaction) {
+                    Ok(()) => "present".to_owned(),
+                    Err(error) => format!("invalid ({error})"),
+                },
+                Err(error) => format!("unavailable ({error})"),
+            };
+            println!(
+                "{}\t{}\t{}\t{}",
+                candidate.name(),
+                candidate.target(),
+                candidate.expected_responder(),
+                status.escape_default(),
+            );
+        }
+        Ok(())
+    }
+    .await;
+    let shutdown = session.shutdown().await;
+    scan?;
+    shutdown
+}
+
+fn candidate_target_request(
+    candidate: obdentic::obd_candidate_scan::ObdCandidate,
+) -> Result<ble::TargetedReadRequest, String> {
+    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+    ble::TargetedReadRequest::new(
+        prepare_read("vehicle.speed")?,
+        RequestTarget::concrete(
+            context,
+            RequestAddress::new("elm-header", candidate.target()),
+        ),
+        ble::ResponderIdentity::ElmHeader(candidate.expected_responder().into()),
+    )
+}
+
 async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(), String> {
     let catalog = KnowledgeCatalog::load_pinned(Path::new(env!("CARGO_MANIFEST_DIR")))
         .map_err(|error| error.to_string())?;
@@ -678,7 +770,7 @@ async fn validate_secondary_target(
     }
 
     let transaction = session.read_targeted(secondary_target_request()?).await?;
-    validate_secondary_target_transaction(&transaction)?;
+    validate_vehicle_speed_target_transaction(&transaction)?;
     Ok(Some(confirmed_secondary_target()?))
 }
 
@@ -697,7 +789,7 @@ fn secondary_target_allowed(
     })
 }
 
-fn validate_secondary_target_transaction(transaction: &Transaction) -> Result<(), String> {
+fn validate_vehicle_speed_target_transaction(transaction: &Transaction) -> Result<(), String> {
     if transaction.semantic() != "vehicle.speed"
         || transaction.request() != [0x01, 0x0D]
         || transaction.response().len() != 3
@@ -2379,6 +2471,14 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 }
             })
         }
+        [command, action, adapter_flag, adapter_id]
+            if command == "vehicle" && action == "scan" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::VehicleScan {
+                adapter_id: adapter_id.clone(),
+            })
+        }
         [command, action] if command == "vehicle" && action == "show" => Ok(Command::VehicleShow),
         [command] if command == "demo" => Ok(Command::Demo),
         [command, adapter_flag, adapter_id, profile_flag, profile_name, record_flag, path]
@@ -2812,6 +2912,12 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command(&args(&["vehicle", "scan", "--adapter", uuid,])),
+            Ok(Command::VehicleScan {
+                adapter_id: uuid.into(),
+            })
+        );
+        assert_eq!(
             parse_command(&args(&["vehicle", "show"])),
             Ok(Command::VehicleShow)
         );
@@ -3047,7 +3153,7 @@ mod tests {
             .unwrap()
             .complete("test", vec![0x41, 0x0D, 0x00])
             .unwrap();
-        assert!(validate_secondary_target_transaction(&valid).is_ok());
+        assert!(validate_vehicle_speed_target_transaction(&valid).is_ok());
     }
 
     #[test]

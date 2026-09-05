@@ -32,6 +32,7 @@ pub mod identity;
 pub mod jsonl_capture;
 pub mod knowledge_db;
 pub mod layout_observation;
+pub mod obd_candidate_scan;
 pub mod protocol;
 pub mod runtime_actor;
 pub mod runtime_reducer;
