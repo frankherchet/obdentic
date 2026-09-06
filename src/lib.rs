@@ -29,6 +29,7 @@ pub mod effective_knowledge;
 pub(crate) mod elm;
 pub mod evidence;
 pub mod functional_discovery;
+pub mod identification_normalization;
 pub mod identity;
 pub mod inventory_facts;
 pub mod jsonl_capture;

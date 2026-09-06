@@ -4,7 +4,7 @@ use obdentic::knowledge_db::{
 };
 use std::{fs, path::PathBuf, time::SystemTime};
 
-const PINNED_REVISION: &str = "b356ff5afb850017ec546945f41d739071c74d76";
+const PINNED_REVISION: &str = "4f19ad8e7b081122d2110ef56ec11cac9d6d91c7";
 
 fn temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
