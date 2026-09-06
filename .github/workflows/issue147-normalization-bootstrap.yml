@@ -16,18 +16,30 @@ jobs:
         with:
           ref: feature/147-identification-normalization
           submodules: recursive
-      - name: Export identification normalization module
+      - name: Export normalization module and update pinned provenance expectation
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('src/lib.rs')
-          text = path.read_text()
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
           anchor = 'pub mod inventory_facts;\n'
           replacement = anchor + 'pub mod identification_normalization;\n'
           if 'pub mod identification_normalization;\n' not in text:
               if text.count(anchor) != 1:
                   raise SystemExit(f'expected one lib.rs anchor, found {text.count(anchor)}')
-              path.write_text(text.replace(anchor, replacement, 1))
+              lib.write_text(text.replace(anchor, replacement, 1))
+
+          identification = Path('src/ecu_identification.rs')
+          text = identification.read_text()
+          old = 'b356ff5afb850017ec546945f41d739071c74d76'
+          new = '4f19ad8e7b081122d2110ef56ec11cac9d6d91c7'
+          if old in text:
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected one old pinned revision in ecu_identification.rs, found {text.count(old)}')
+              identification.write_text(text.replace(old, new, 1))
+          elif new not in text:
+              raise SystemExit('pinned revision expectation is neither old nor new')
           PY
       - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
       - run: cargo +1.98.0 fmt
@@ -38,7 +50,7 @@ jobs:
         run: |
           git config user.name frankherchet
           git config user.email 83370034+frankherchet@users.noreply.github.com
-          git add src/lib.rs src/identification_normalization.rs docs/identification-normalization.md
+          git add src/lib.rs src/ecu_identification.rs src/identification_normalization.rs docs/identification-normalization.md
           if git diff --cached --quiet; then
             echo 'No validated changes to commit'
           else
