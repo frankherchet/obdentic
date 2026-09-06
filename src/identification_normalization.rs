@@ -140,16 +140,12 @@ fn fingerprint_field_for_identification_semantic(semantic: &str) -> Option<Finge
         "ecu.manufacturer_spare_part_number" => {
             Some(FingerprintField::EcuManufacturerSparePartNumber)
         }
-        "ecu.manufacturer_software_number" => {
-            Some(FingerprintField::EcuManufacturerSoftwareNumber)
-        }
+        "ecu.manufacturer_software_number" => Some(FingerprintField::EcuManufacturerSoftwareNumber),
         "ecu.manufacturer_software_version" => {
             Some(FingerprintField::EcuManufacturerSoftwareVersion)
         }
         "ecu.system_supplier_identifier" => Some(FingerprintField::EcuSystemSupplierIdentifier),
-        "ecu.manufacturer_hardware_number" => {
-            Some(FingerprintField::EcuManufacturerHardwareNumber)
-        }
+        "ecu.manufacturer_hardware_number" => Some(FingerprintField::EcuManufacturerHardwareNumber),
         "ecu.system_supplier_hardware_number" => {
             Some(FingerprintField::EcuSystemSupplierHardwareNumber)
         }
@@ -175,9 +171,7 @@ fn decode_ascii(payload: &[u8], trim: AsciiTrim) -> Result<String, String> {
         AsciiTrim::None => payload.len(),
         AsciiTrim::Space => trailing_start(payload, |byte| byte == 0x20),
         AsciiTrim::Nul => trailing_start(payload, |byte| byte == 0x00),
-        AsciiTrim::SpaceAndNul => {
-            trailing_start(payload, |byte| matches!(byte, 0x00 | 0x20))
-        }
+        AsciiTrim::SpaceAndNul => trailing_start(payload, |byte| matches!(byte, 0x00 | 0x20)),
     };
     let text = &payload[..end];
     if text.is_empty() {
@@ -186,10 +180,7 @@ fn decode_ascii(payload: &[u8], trim: AsciiTrim) -> Result<String, String> {
     if text.iter().any(|byte| *byte > 0x7f) {
         return Err("canonical ASCII normalization encountered a non-ASCII byte".into());
     }
-    if text
-        .iter()
-        .any(|byte| *byte <= 0x1f || *byte == 0x7f)
-    {
+    if text.iter().any(|byte| *byte <= 0x1f || *byte == 0x7f) {
         return Err("canonical ASCII normalization encountered an untrimmed control byte".into());
     }
     // The 7-bit check above guarantees valid UTF-8 without introducing a fallback or lossy path.
@@ -218,9 +209,7 @@ mod tests {
     use crate::{
         effective_knowledge::{EffectiveVehicleKnowledge, SemanticResolutionState},
         knowledge_db::{KnowledgePin, CANONICAL_KNOWLEDGE_REPOSITORY},
-        topology::{
-            AddressingContext, Protocol, ProtocolContext, RequestAddress, RequestTarget,
-        },
+        topology::{AddressingContext, Protocol, ProtocolContext, RequestAddress, RequestTarget},
         vehicle_cache::{TargetMappingSnapshot, VehicleCacheSnapshot},
     };
     use std::{
@@ -342,7 +331,10 @@ definitions:
         let definition = catalog
             .semantic("ecu.manufacturer_software_version")
             .unwrap();
-        assert!(matches!(definition.decoder(), KnowledgeDecoder::OpaqueBytes));
+        assert!(matches!(
+            definition.decoder(),
+            KnowledgeDecoder::OpaqueBytes
+        ));
         let observation = observation(
             &catalog,
             definition.id(),
@@ -365,11 +357,8 @@ definitions:
             ("space_and_nul", b"ABC \0 ", "ABC"),
         ];
         for (trim, bytes, expected) in cases {
-            let (root, catalog) = ascii_catalog(
-                "ecu.manufacturer_software_version",
-                "test.ascii",
-                trim,
-            );
+            let (root, catalog) =
+                ascii_catalog("ecu.manufacturer_software_version", "test.ascii", trim);
             let observation = observation(
                 &catalog,
                 "test.ascii",
@@ -405,11 +394,8 @@ definitions:
             ("space", vec![b'A', 0x00, b' ']),
             ("space_and_nul", vec![b' ', 0x00, b' ']),
         ] {
-            let (root, catalog) = ascii_catalog(
-                "ecu.manufacturer_software_version",
-                "test.ascii",
-                trim,
-            );
+            let (root, catalog) =
+                ascii_catalog("ecu.manufacturer_software_version", "test.ascii", trim);
             let observation = observation(
                 &catalog,
                 "test.ascii",
@@ -424,11 +410,8 @@ definitions:
 
     #[test]
     fn non_supported_statuses_never_create_identity_facts() {
-        let (root, catalog) = ascii_catalog(
-            "ecu.manufacturer_software_version",
-            "test.ascii",
-            "none",
-        );
+        let (root, catalog) =
+            ascii_catalog("ecu.manufacturer_software_version", "test.ascii", "none");
         for status in [
             IdentificationResultStatus::Unsupported,
             IdentificationResultStatus::NegativeResponse,
@@ -455,11 +438,8 @@ definitions:
 
     #[test]
     fn binding_mismatches_fail_before_decoder_execution() {
-        let (root, catalog) = ascii_catalog(
-            "ecu.manufacturer_software_version",
-            "test.ascii",
-            "none",
-        );
+        let (root, catalog) =
+            ascii_catalog("ecu.manufacturer_software_version", "test.ascii", "none");
         let exact = observation(
             &catalog,
             "test.ascii",
@@ -473,35 +453,101 @@ definitions:
 
         let mismatches = [
             IdentificationObservation::new(
-                target(), responder(), "ecu.manufacturer_software_version", "test.ascii", 1,
-                "other/repository", catalog.pin().revision(), [0x22, 0xF1, 0x89],
-                IdentificationResultStatus::Supported, Vec::new(), None, Some(b"9980".to_vec()), Vec::new(),
-            ).unwrap(),
+                target(),
+                responder(),
+                "ecu.manufacturer_software_version",
+                "test.ascii",
+                1,
+                "other/repository",
+                catalog.pin().revision(),
+                [0x22, 0xF1, 0x89],
+                IdentificationResultStatus::Supported,
+                Vec::new(),
+                None,
+                Some(b"9980".to_vec()),
+                Vec::new(),
+            )
+            .unwrap(),
             IdentificationObservation::new(
-                target(), responder(), "ecu.manufacturer_software_version", "test.ascii", 1,
-                catalog.pin().repository(), "1111111111111111111111111111111111111111", [0x22, 0xF1, 0x89],
-                IdentificationResultStatus::Supported, Vec::new(), None, Some(b"9980".to_vec()), Vec::new(),
-            ).unwrap(),
+                target(),
+                responder(),
+                "ecu.manufacturer_software_version",
+                "test.ascii",
+                1,
+                catalog.pin().repository(),
+                "1111111111111111111111111111111111111111",
+                [0x22, 0xF1, 0x89],
+                IdentificationResultStatus::Supported,
+                Vec::new(),
+                None,
+                Some(b"9980".to_vec()),
+                Vec::new(),
+            )
+            .unwrap(),
             IdentificationObservation::new(
-                target(), responder(), "ecu.manufacturer_software_version", "missing.definition", 1,
-                catalog.pin().repository(), catalog.pin().revision(), [0x22, 0xF1, 0x89],
-                IdentificationResultStatus::Supported, Vec::new(), None, Some(b"9980".to_vec()), Vec::new(),
-            ).unwrap(),
+                target(),
+                responder(),
+                "ecu.manufacturer_software_version",
+                "missing.definition",
+                1,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xF1, 0x89],
+                IdentificationResultStatus::Supported,
+                Vec::new(),
+                None,
+                Some(b"9980".to_vec()),
+                Vec::new(),
+            )
+            .unwrap(),
             IdentificationObservation::new(
-                target(), responder(), "ecu.manufacturer_software_version", "test.ascii", 2,
-                catalog.pin().repository(), catalog.pin().revision(), [0x22, 0xF1, 0x89],
-                IdentificationResultStatus::Supported, Vec::new(), None, Some(b"9980".to_vec()), Vec::new(),
-            ).unwrap(),
+                target(),
+                responder(),
+                "ecu.manufacturer_software_version",
+                "test.ascii",
+                2,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xF1, 0x89],
+                IdentificationResultStatus::Supported,
+                Vec::new(),
+                None,
+                Some(b"9980".to_vec()),
+                Vec::new(),
+            )
+            .unwrap(),
             IdentificationObservation::new(
-                target(), responder(), "ecu.system_name", "test.ascii", 1,
-                catalog.pin().repository(), catalog.pin().revision(), [0x22, 0xF1, 0x89],
-                IdentificationResultStatus::Supported, Vec::new(), None, Some(b"9980".to_vec()), Vec::new(),
-            ).unwrap(),
+                target(),
+                responder(),
+                "ecu.system_name",
+                "test.ascii",
+                1,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xF1, 0x89],
+                IdentificationResultStatus::Supported,
+                Vec::new(),
+                None,
+                Some(b"9980".to_vec()),
+                Vec::new(),
+            )
+            .unwrap(),
             IdentificationObservation::new(
-                target(), responder(), "ecu.manufacturer_software_version", "test.ascii", 1,
-                catalog.pin().repository(), catalog.pin().revision(), [0x22, 0xF1, 0x88],
-                IdentificationResultStatus::Supported, Vec::new(), None, Some(b"9980".to_vec()), Vec::new(),
-            ).unwrap(),
+                target(),
+                responder(),
+                "ecu.manufacturer_software_version",
+                "test.ascii",
+                1,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xF1, 0x88],
+                IdentificationResultStatus::Supported,
+                Vec::new(),
+                None,
+                Some(b"9980".to_vec()),
+                Vec::new(),
+            )
+            .unwrap(),
         ];
         for mismatch in &mismatches {
             assert!(normalize_identification_observation(mismatch, &catalog).is_err());
@@ -530,11 +576,8 @@ definitions:
 
     #[test]
     fn normalized_fact_feeds_inventory_projection_and_effective_knowledge_without_mutation() {
-        let (root, catalog) = ascii_catalog(
-            "ecu.manufacturer_software_version",
-            "test.ascii",
-            "space",
-        );
+        let (root, catalog) =
+            ascii_catalog("ecu.manufacturer_software_version", "test.ascii", "space");
         let observation = observation(
             &catalog,
             "test.ascii",
@@ -555,7 +598,8 @@ definitions:
             Provenance::new("known target", Confidence::High).unwrap(),
         );
         let snapshot = VehicleCacheSnapshot::new([], [], [mapping]);
-        let projected = crate::inventory_facts::project_observed_ecu_facts(&snapshot, [fact]).unwrap();
+        let projected =
+            crate::inventory_facts::project_observed_ecu_facts(&snapshot, [fact]).unwrap();
         let effective = EffectiveVehicleKnowledge::resolve(
             &catalog,
             projected.into_iter().map(|ecu| ecu.into_observed()),
