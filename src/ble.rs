@@ -9,7 +9,6 @@ use tokio::sync::{mpsc, oneshot};
 pub use crate::adapter::AdapterCandidate;
 #[cfg(test)]
 use crate::elm::ElmExchange;
-use crate::elm::ElmSession;
 #[cfg(test)]
 pub(crate) use crate::elm::{
     discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
@@ -22,9 +21,10 @@ pub(crate) use crate::elm::{
 pub use crate::elm::{
     mode09_support_bitmap, DiagnosticResponse, DiagnosticResponseError, DiagnosticResponses,
     FunctionalEcuSerialProbe, Mode09Pid, ProtocolNegotiation, ResponderIdentity, SignalSupport,
-    SignalSupportStatus, SupportDiscovery, TargetedDpfProbeRequest,
-    TargetedEcuIdentificationRequest, TargetedMode09Request, TargetedReadRequest,
+    SignalSupportStatus, SupportDiscovery, TargetedEcuIdentificationRequest, TargetedMode09Request,
+    TargetedReadRequest,
 };
+use crate::elm::{ElmSession, TargetedDpfProbeRequest};
 pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
 // Two consecutive transport failures stop a live session; data failures reset the count.
@@ -48,9 +48,14 @@ impl PreparedDiagnosticSession {
     /// Execute one closed EA189 candidate probe while retaining this session.
     pub async fn read_dpf_probe(
         &self,
-        request: TargetedDpfProbeRequest,
+        probe: crate::ea189::Ea189DpfProbe,
+        mapping: &crate::vehicle_knowledge::EcuTargetMapping,
     ) -> Result<DiagnosticResponses, String> {
-        self.session.read_dpf_probe(request).await
+        self.session
+            .read_dpf_probe(crate::elm::TargetedDpfProbeRequest::from_mapping(
+                probe, mapping,
+            )?)
+            .await
     }
 
     /// Execute the one bounded stored-DTC request and deterministically close
@@ -329,7 +334,7 @@ impl SessionClient {
     /// Execute the closed EA189 DPF UDS probe and return its raw normalized
     /// responses.  Negative or malformed responses are returned as errors,
     /// while the crate-visible evidence variant retains responder payloads.
-    pub async fn read_dpf_probe(
+    pub(crate) async fn read_dpf_probe(
         &self,
         request: TargetedDpfProbeRequest,
     ) -> Result<DiagnosticResponses, String> {
