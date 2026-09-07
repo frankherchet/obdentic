@@ -1682,8 +1682,7 @@ async fn run_diagnose_ea189_dpf_probe_inner(
                 }
                 Err(error) => return Err(error.to_string()),
             }
-            let request = ble::TargetedDpfProbeRequest::from_mapping(probe, &mapping)?;
-            match prepared.read_dpf_probe(request).await {
+            match prepared.read_dpf_probe(probe, &mapping).await {
                 Ok(responses) => {
                     let response = responses.as_slice().first().ok_or_else(|| {
                         format!("{} returned no normalized response", probe.semantic())

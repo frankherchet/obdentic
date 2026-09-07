@@ -167,7 +167,7 @@ pub struct TargetedReadRequest {
 /// The closed EA189 DPF UDS probe.  The profile fixes the DID; callers can
 /// provide only independently validated physical routing evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TargetedDpfProbeRequest {
+pub(crate) struct TargetedDpfProbeRequest {
     operation: crate::protocol::ReadOperation,
     target: RequestTarget,
     expected_responder: ResponderIdentity,
@@ -252,7 +252,7 @@ pub struct TargetedMode09Request {
 
 impl TargetedDpfProbeRequest {
     /// Construct a closed EA189 probe from validated engine target evidence.
-    pub fn from_mapping(
+    pub(crate) fn from_mapping(
         probe: crate::ea189::Ea189DpfProbe,
         mapping: &crate::vehicle_knowledge::EcuTargetMapping,
     ) -> Result<Self, String> {
@@ -292,10 +292,6 @@ impl TargetedDpfProbeRequest {
 
     pub fn did(&self) -> u16 {
         self.operation.did()
-    }
-
-    pub fn request_bytes(&self) -> [u8; 3] {
-        self.operation.request_bytes()
     }
 
     pub fn target(&self) -> &RequestTarget {
