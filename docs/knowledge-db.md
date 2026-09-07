@@ -35,7 +35,7 @@ The canonical repository is checked in as the `knowledge/` Git submodule. `knowl
 ```text
 repository = frankherchet/obdentic-knowledge
 revision = <40-character commit SHA>
-schema_version = 1
+schema_version = 2
 ```
 
 The Git submodule is the source pin. `knowledge.lock` exists so runtime/capture code can expose deterministic Knowledge provenance without shelling out to Git.
@@ -76,7 +76,7 @@ CI verifies that the initialized submodule HEAD matches `knowledge.lock`.
 `knowledge_db::KnowledgeCatalog` is transport-free. It:
 
 - reads only local files;
-- accepts schema version 1 only;
+- accepts schema version 2 only;
 - enumerates canonical YAML files deterministically;
 - rejects symlinked canonical entries;
 - uses strict `serde(deny_unknown_fields)` input structs;
@@ -94,4 +94,19 @@ The schema already reserves an `obd2.mode01.pid` descriptor for staged migration
 
 ## Capture provenance
 
-Issue #89 will persist the active Knowledge repository revision/schema and resolved definition identities in captures. This #84 loader exposes the information needed for that later step but does not change the capture schema itself.
+New JSONL captures record a session-level Knowledge context: OBDentic core
+version, optional build commit, canonical repository, exact pinned revision and
+schema version. A capture may additionally record the selected canonical
+definition ID/version, confidence, hardware-validation status and a
+privacy-safe local ECU context for an individual decoded fact.
+
+Current generic Mode-01 signals are still implemented by the closed built-in
+catalog, rather than canonical Knowledge definitions. Their definition fields
+are therefore explicitly absent; OBDentic never invents a canonical definition
+ID. When a later effective-Knowledge profile resolves a definition, it can fill
+the same fields.
+
+Old captures without a Knowledge context remain readable and are reported as
+`legacy/unavailable`. Replay preserves their original recorded interpretation
+separately from a current deterministic re-decode. It neither fetches Knowledge
+from the network nor rewrites recorded raw evidence or old capture files.

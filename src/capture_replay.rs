@@ -6,9 +6,13 @@
 //! differences are reported as issues rather than rewritten.
 
 use crate::{
-    capture_events::{CaptureEvent, CaptureValue, ResponderEvidence},
+    capture_events::{
+        CaptureDefinitionReference, CaptureEvent, CaptureKnowledgeContext, CaptureValue,
+        ResponderEvidence,
+    },
     ea189::{decode_experimental_dpf, Ea189DpfProbe, Ea189ExperimentalDpfReading},
     jsonl_capture::ParsedCapture,
+    knowledge_db::KnowledgePin,
     prepare_read,
     telemetry::TelemetryState,
     Transaction,
@@ -77,10 +81,55 @@ impl DpfReplayReading {
     }
 }
 
+/// The interpretation recorded at capture time, preserved separately from a
+/// later replay decode of the same raw response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedReadInterpretation {
+    at_us: u64,
+    semantic: String,
+    value: CaptureValue,
+    unit: String,
+    decoder: String,
+    provenance: String,
+    definition: Option<CaptureDefinitionReference>,
+}
+
+impl RecordedReadInterpretation {
+    pub const fn at_us(&self) -> u64 {
+        self.at_us
+    }
+
+    pub fn semantic(&self) -> &str {
+        &self.semantic
+    }
+
+    pub fn value(&self) -> &CaptureValue {
+        &self.value
+    }
+
+    pub fn unit(&self) -> &str {
+        &self.unit
+    }
+
+    pub fn decoder(&self) -> &str {
+        &self.decoder
+    }
+
+    pub fn provenance(&self) -> &str {
+        &self.provenance
+    }
+
+    pub fn definition(&self) -> Option<&CaptureDefinitionReference> {
+        self.definition.as_ref()
+    }
+}
+
 pub struct CaptureReplay {
     duration_us: u64,
+    knowledge_context: Option<CaptureKnowledgeContext>,
     offsets_us: Vec<u64>,
     transactions: Vec<Transaction>,
+    recorded_interpretations: Vec<RecordedReadInterpretation>,
     dpf_readings: Vec<DpfReplayReading>,
     issues: Vec<ReplayIssue>,
 }
@@ -93,7 +142,12 @@ impl CaptureReplay {
     /// not make the rest of the capture unusable.
     pub fn from_capture(capture: &ParsedCapture) -> Self {
         let mut duration_us = 0_u64;
+        let knowledge_context = capture.events.iter().find_map(|event| match event {
+            CaptureEvent::KnowledgeContext { context } => Some(context.clone()),
+            _ => None,
+        });
         let mut decoded = Vec::<(u64, Transaction)>::new();
+        let mut recorded_interpretations = Vec::new();
         let mut dpf_readings = Vec::new();
         let mut issues = Vec::new();
 
@@ -107,9 +161,21 @@ impl CaptureReplay {
                     value,
                     unit,
                     source,
+                    decoder,
+                    provenance,
+                    definition,
                     ..
                 } => {
                     duration_us = duration_us.max(*finished_us);
+                    recorded_interpretations.push(RecordedReadInterpretation {
+                        at_us: *finished_us,
+                        semantic: semantic.clone(),
+                        value: value.clone(),
+                        unit: unit.clone(),
+                        decoder: decoder.clone(),
+                        provenance: provenance.clone(),
+                        definition: definition.as_deref().cloned(),
+                    });
                     let request = match prepare_read(semantic) {
                         Ok(request) => request,
                         Err(error) => {
@@ -213,8 +279,10 @@ impl CaptureReplay {
         issues.sort_by_key(ReplayIssue::at_us);
         Self {
             duration_us,
+            knowledge_context,
             offsets_us,
             transactions,
+            recorded_interpretations,
             dpf_readings,
             issues,
         }
@@ -224,6 +292,22 @@ impl CaptureReplay {
         self.duration_us
     }
 
+    /// The exact Knowledge pin recorded by a new capture, or `None` for a
+    /// legacy capture that predates provenance events.
+    pub fn knowledge_context(&self) -> Option<&CaptureKnowledgeContext> {
+        self.knowledge_context.as_ref()
+    }
+
+    /// Compares only recorded pin identity; it never fetches or rewrites
+    /// Knowledge during offline replay.
+    pub fn matches_knowledge_pin(&self, pin: &KnowledgePin) -> Option<bool> {
+        self.knowledge_context().map(|context| {
+            context.knowledge_repository() == pin.repository()
+                && context.knowledge_revision() == pin.revision()
+                && context.knowledge_schema_version() == pin.schema_version()
+        })
+    }
+
     /// Exact monotonic JSONL timestamps aligned one-to-one with [`Self::transactions`].
     pub fn offsets_us(&self) -> &[u64] {
         &self.offsets_us
@@ -231,6 +315,10 @@ impl CaptureReplay {
 
     pub fn transactions(&self) -> &[Transaction] {
         &self.transactions
+    }
+
+    pub fn recorded_interpretations(&self) -> &[RecordedReadInterpretation] {
+        &self.recorded_interpretations
     }
 
     /// Successful Gate-B DPF decodes. These remain outside [`TelemetryState`]
@@ -440,8 +528,11 @@ fn capture_value_text(value: &CaptureValue) -> String {
 mod tests {
     use super::*;
     use crate::{
-        capture_events::{ReadTiming, ResponderEvidence},
+        capture_events::{
+            CaptureDefinitionReference, CaptureKnowledgeContext, ReadTiming, ResponderEvidence,
+        },
         jsonl_capture::CaptureStatus,
+        knowledge_db::KnowledgePin,
     };
 
     fn successful_read(
@@ -466,6 +557,7 @@ mod tests {
             profile: "obd2-v1".into(),
             decoder: "recorded-decoder".into(),
             provenance: "recorded-provenance".into(),
+            definition: None,
         }
     }
 
@@ -516,15 +608,37 @@ mod tests {
 
     #[test]
     fn raw_response_is_redecoded_instead_of_trusting_recorded_value() {
+        let context = CaptureKnowledgeContext::new(
+            "0.1.0",
+            None,
+            "frankherchet/obdentic-knowledge",
+            "0123456789abcdef0123456789abcdef01234567",
+            2,
+        )
+        .unwrap();
+        let mut recorded = successful_read(
+            "engine.rpm",
+            1_234_567,
+            vec![0x01, 0x0c],
+            vec![0x41, 0x0c, 0x0c, 0x80],
+            9_999.0,
+            "rpm",
+        );
+        if let CaptureEvent::ReadSucceeded { definition, .. } = &mut recorded {
+            *definition = Some(Box::new(
+                CaptureDefinitionReference::new(
+                    Some("obd2.engine.rpm".into()),
+                    Some(1),
+                    Some("high".into()),
+                    Some("validated".into()),
+                    Some("local-engine".into()),
+                )
+                .unwrap(),
+            ));
+        }
         let replay = CaptureReplay::from_capture(&capture(vec![
-            successful_read(
-                "engine.rpm",
-                1_234_567,
-                vec![0x01, 0x0c],
-                vec![0x41, 0x0c, 0x0c, 0x80],
-                9_999.0,
-                "rpm",
-            ),
+            CaptureEvent::knowledge_context(context.clone()),
+            recorded,
             CaptureEvent::SessionStopped {
                 offset_us: 2_000_000,
             },
@@ -540,6 +654,31 @@ mod tests {
             replay.issues()[0].kind(),
             ReplayIssueKind::RecordedDecodeChanged
         );
+        assert_eq!(replay.recorded_interpretations().len(), 1);
+        assert_eq!(
+            replay.recorded_interpretations()[0].value(),
+            &CaptureValue::Number(9_999.0)
+        );
+        assert_eq!(
+            replay.recorded_interpretations()[0]
+                .definition()
+                .and_then(CaptureDefinitionReference::definition_id),
+            Some("obd2.engine.rpm")
+        );
+        let matching_pin = KnowledgePin::new(
+            context.knowledge_repository(),
+            context.knowledge_revision(),
+            context.knowledge_schema_version(),
+        )
+        .unwrap();
+        assert_eq!(replay.matches_knowledge_pin(&matching_pin), Some(true));
+        let different_pin = KnowledgePin::new(
+            "frankherchet/obdentic-knowledge",
+            "fedcba9876543210fedcba9876543210fedcba98",
+            2,
+        )
+        .unwrap();
+        assert_eq!(replay.matches_knowledge_pin(&different_pin), Some(false));
     }
 
     #[test]
