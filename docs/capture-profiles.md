@@ -24,6 +24,7 @@ description: Conservative drive-test profile.
 observations:
   - semantic: engine.rpm
     interval: 1s
+    required: true
   - semantic: engine.maf
     interval: 2s
 ```
@@ -32,6 +33,9 @@ Allowed observation fields are only:
 
 - `semantic`: one exact semantic identifier
 - `interval`: a positive integer duration using `ms` or `s`
+- `required`: optional; defaults to `true`. A `false` observation remains
+  visible as unavailable when its effective-Knowledge resolution is not
+  usable.
 
 The top-level fields are `version`, `id`, optional `description`, and `observations`.
 
@@ -84,9 +88,23 @@ Explicit files pass through exactly the same closed schema-v1 parser as embedded
 
 ## Relationship to effective Vehicle Knowledge
 
-Issue #86, the effective Vehicle Knowledge resolver, is still open. Until that resolver is available, this migration slice validates profile semantics against OBDentic's existing closed semantic catalog and routes them through the existing Vehicle Knowledge path.
+`CaptureProfile::resolve_against()` is a pure admission seam over one observed
+ECU in `EffectiveVehicleKnowledge`. It preserves the original profile order
+and intervals and produces one of these outcomes per observation:
 
-This is deliberately a migration seam, not a claim that #88's final effective-catalog resolution is complete. Required/optional availability and ambiguity handling should be added only on top of the #86 resolver contract rather than invented in the profile loader.
+- selected canonical definition ID/version;
+- explicit `LegacyGenericMode01` for an existing closed Mode-01 semantic that
+  has no canonical definition yet;
+- visible optional unavailability; or
+- a required-observation admission failure for ambiguous, insufficient or
+  non-matching canonical knowledge.
+
+Once canonical Knowledge contains a semantic, an unresolved canonical result
+never falls back to the legacy catalog. The current scheduler integration
+remains deliberately separate: this seam performs no I/O and cannot turn a
+canonical UDS definition into a runnable Mode-01 subscription. Wiring a
+resolved profile through the effective catalog, routing and the existing
+read-only scheduler is the next #88 slice.
 
 ## Hardware acceptance
 
