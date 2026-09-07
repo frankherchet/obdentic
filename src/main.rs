@@ -342,6 +342,7 @@ async fn run() -> Result<(), String> {
                         Ok(scheduler) => scheduler,
                         Err(error) => {
                             if let Some(sender) = recorder.as_ref() {
+                                record_capture_start_failure(sender, "tui.live", &error).await?;
                                 apply_runtime_event(
                                     &runtime,
                                     &mut runtime_state,
@@ -1060,11 +1061,7 @@ async fn run_diagnose_dtc_scan(
     let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
     let result = async {
         if sender.is_some() {
-            emit_capture_event(
-                sender,
-                CaptureEvent::capture_started(Some(wallclock_ms()?), Some("dtc.scan".into())),
-            )
-            .await?;
+            emit_capture_started(sender, Some("dtc.scan".into())).await?;
             apply_runtime_event(
                 runtime,
                 state,
@@ -1382,11 +1379,7 @@ async fn run_ea189_dpf_capture(
     let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
     let result = async {
         if sender.is_some() {
-            emit_capture_event(
-                sender,
-                CaptureEvent::capture_started(Some(wallclock_ms()?), Some(profile.into())),
-            )
-            .await?;
+            emit_capture_started(sender, Some(profile.into())).await?;
             apply_runtime_event(
                 runtime,
                 state,
@@ -2338,6 +2331,22 @@ async fn emit_capture_event(
     Ok(())
 }
 
+async fn emit_capture_started(
+    recorder: Option<&jsonl_capture::Sender>,
+    profile: Option<String>,
+) -> Result<(), String> {
+    let Some(recorder) = recorder else {
+        return Ok(());
+    };
+    let context = obdentic::capture_events::CaptureKnowledgeContext::current()?;
+    emit_capture_event(
+        Some(recorder),
+        CaptureEvent::capture_started(Some(wallclock_ms()?), profile),
+    )
+    .await?;
+    emit_capture_event(Some(recorder), CaptureEvent::knowledge_context(context)).await
+}
+
 async fn record_capture_start_failure(
     sender: &jsonl_capture::Sender,
     profile: &str,
@@ -2349,8 +2358,10 @@ async fn record_capture_start_failure(
         .as_millis()
         .try_into()
         .map_err(|_| "wall clock timestamp exceeds supported range")?;
+    let context = obdentic::capture_events::CaptureKnowledgeContext::current()?;
     for event in [
         CaptureEvent::capture_started(Some(wallclock_ms), Some(profile.into())),
+        CaptureEvent::knowledge_context(context),
         CaptureEvent::session_error(error),
         CaptureEvent::SessionStopped { offset_us: 0 },
     ] {
@@ -2977,7 +2988,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_failure_is_preserved_in_the_capture_event_stream() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         record_capture_start_failure(&sender, "engine-baseline", "Carly setup timed out")
             .await
             .unwrap();
@@ -2988,6 +2999,10 @@ mod tests {
                 profile: Some(profile),
                 ..
             }) if profile == "engine-baseline"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(CaptureEvent::KnowledgeContext { .. })
         ));
         assert_eq!(
             receiver.recv().await,
