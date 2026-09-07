@@ -163,12 +163,61 @@ pub enum TopologyProviderStatus {
     Failed,
 }
 
+impl TopologyProviderStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Unavailable => "unavailable",
+            Self::Blocked => "blocked",
+            Self::NotApplicable => "not-applicable",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub enum TopologyProviderCoverage {
     Unknown,
     Partial,
     Complete,
     NotApplicable,
+}
+
+impl TopologyProviderCoverage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Partial => "partial",
+            Self::Complete => "complete",
+            Self::NotApplicable => "not-applicable",
+        }
+    }
+}
+
+/// Reviewed provider states available in this build.
+///
+/// The EA189/PQ35 gateway source is explicitly blocked by the evidence review.
+/// Returning its state records that limit without issuing any gateway request.
+pub fn reviewed_topology_provider_results() -> Vec<TopologyProviderResult> {
+    vec![TopologyProviderResult::new(
+        TopologyProviderId::new("vw.pq35.gateway-installation-list", 1)
+            .expect("static provider id is valid"),
+        TopologyProviderApplicability::new(
+            TopologyProviderScope::platform("Volkswagen", "PQ35 / EA189")
+                .expect("static provider scope is valid"),
+            Provenance::new(
+                "docs/research/vw-gateway-installation-list.md",
+                crate::topology::Confidence::High,
+            )
+            .expect("static provider provenance is valid"),
+        ),
+        TopologyProviderStatus::Blocked,
+        TopologyProviderCoverage::Unknown,
+        [],
+        [EvidenceReference::new("issue #35 negative safety gate")
+            .expect("static provider evidence is valid")],
+    )
+    .expect("static blocked provider result is valid")]
 }
 
 /// One configured/installed-controller fact produced by a topology provider.
@@ -342,6 +391,18 @@ pub enum TopologyInventoryCoverageClass {
     FunctionalObdOnly,
     TopologyProviderEvidenceAvailable,
     TopologyProviderUnavailableOrBlocked,
+}
+
+impl TopologyInventoryCoverageClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FunctionalObdOnly => "functional-obd-only",
+            Self::TopologyProviderEvidenceAvailable => "manufacturer-provider-evidence-available",
+            Self::TopologyProviderUnavailableOrBlocked => {
+                "manufacturer-provider-unavailable-or-blocked"
+            }
+        }
+    }
 }
 
 /// Coverage remains structured so separate provider scopes are never collapsed
@@ -780,5 +841,16 @@ mod tests {
             inventory.coverage().providers()[0].id().name(),
             "vw.pq35.gateway-installation-list"
         );
+    }
+
+    #[test]
+    fn reviewed_provider_selection_is_deterministic_and_blocked() {
+        let results = reviewed_topology_provider_results();
+        assert_eq!(results, reviewed_topology_provider_results());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id().name(), "vw.pq35.gateway-installation-list");
+        assert_eq!(results[0].status(), TopologyProviderStatus::Blocked);
+        assert_eq!(results[0].coverage(), TopologyProviderCoverage::Unknown);
+        assert!(results[0].entries().is_empty());
     }
 }

@@ -876,8 +876,13 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         .as_ref()
         .map(VehicleCache::first_seen_ms)
         .unwrap_or(now);
-    let base_snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
+    let provider_results = obdentic::topology_provider::reviewed_topology_provider_results();
+    let inventory = obdentic::topology_provider::merge_topology_provider_results(
         &discovery.topology(),
+        &provider_results,
+    );
+    let base_snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
+        inventory.topology(),
         &discovery.capabilities(),
     );
     let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::with_ecu_identification(
@@ -885,7 +890,8 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         base_snapshot.ecu_capabilities().to_vec(),
         target_mappings,
         ecu_identification,
-    );
+    )
+    .with_topology_provider_results(provider_results);
     let engine_target_validated = snapshot.target_mappings().iter().any(|mapping| {
         mapping
             .role()
@@ -922,6 +928,10 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         );
     }
     println!("evidence\t{}", discovery.observations().len());
+    print!(
+        "{}",
+        render_topology_inventory_coverage(inventory.coverage())
+    );
     if !engine_target_validated {
         println!("target\tengine.rpm\tunavailable");
     } else {
@@ -1956,6 +1966,37 @@ fn print_cached_vehicle_discovery(cache: &VehicleCache) {
         );
     }
     println!("evidence\t{}", signature.topology().len());
+    let inventory = obdentic::topology_provider::merge_topology_provider_results(
+        &obdentic::topology::EcuTopology::new(),
+        cache.snapshot().topology_provider_results(),
+    );
+    print!(
+        "{}",
+        render_topology_inventory_coverage(inventory.coverage())
+    );
+}
+
+fn render_topology_inventory_coverage(
+    coverage: &obdentic::topology_provider::TopologyInventoryCoverage,
+) -> String {
+    let mut output = format!(
+        "inventory_coverage\t{}\ntopology_providers\t{}\n",
+        coverage.class().as_str(),
+        coverage.providers().len()
+    );
+    for provider in coverage.providers() {
+        let scope = provider.applicability().scope();
+        output.push_str(&format!(
+            "topology_provider\t{}@{}\tstatus={}\tcoverage={}\tmanufacturer={}\tplatform={}\n",
+            provider.id().name(),
+            provider.id().version(),
+            provider.status().as_str(),
+            provider.coverage().as_str(),
+            scope.manufacturer_name().unwrap_or("-"),
+            scope.platform_name().unwrap_or("-"),
+        ));
+    }
+    output
 }
 
 fn run_vehicle_show() -> Result<(), String> {
@@ -3279,6 +3320,24 @@ mod tests {
         assert!(output.contains("signal\t7E9\tengine.rpm\tnot-advertised\n"));
         assert!(output.contains("signal\t7E9\tvehicle.speed\tadvertised\n"));
         assert!(!output.contains("7E0"));
+    }
+
+    #[test]
+    fn renders_blocked_provider_coverage_without_claiming_complete_inventory() {
+        let inventory = obdentic::topology_provider::merge_topology_provider_results(
+            &obdentic::topology::EcuTopology::new(),
+            &obdentic::topology_provider::reviewed_topology_provider_results(),
+        );
+        let output = render_topology_inventory_coverage(inventory.coverage());
+
+        assert!(
+            output.contains("inventory_coverage\tmanufacturer-provider-unavailable-or-blocked\n")
+        );
+        assert!(output.contains(
+            "topology_provider\tvw.pq35.gateway-installation-list@1\tstatus=blocked\tcoverage=unknown\tmanufacturer=Volkswagen\tplatform=PQ35 / EA189\n"
+        ));
+        assert!(!output.contains("complete vehicle"));
+        assert!(!output.contains("all ECUs"));
     }
 
     #[test]
