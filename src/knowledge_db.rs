@@ -574,7 +574,7 @@ impl FingerprintPredicate {
             });
         }
         Ok(Self {
-            field: FingerprintField::from_name(&raw.field)?,
+            field: FingerprintField::from_semantic(&raw.field)?,
             equals: raw.equals,
         })
     }
@@ -608,7 +608,7 @@ pub enum FingerprintField {
 }
 
 impl FingerprintField {
-    fn from_name(name: &str) -> Result<Self, KnowledgeLoadError> {
+    pub fn from_semantic(name: &str) -> Result<Self, KnowledgeLoadError> {
         match name {
             "vehicle.manufacturer" => Ok(Self::VehicleManufacturer),
             "ecu.logical_role" => Ok(Self::EcuLogicalRole),

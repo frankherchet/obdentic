@@ -6,9 +6,12 @@
 //! hexadecimal semantic identity, or another canonical fingerprint representation.
 
 use crate::{
+    ecu_identification::{IdentificationObservation, IdentificationResultStatus},
     effective_knowledge::ObservedEcuFacts,
-    knowledge_db::FingerprintField,
-    topology::{EcuRole, Provenance, ResponderIdentity},
+    knowledge_db::{
+        AsciiTrim, FingerprintField, KnowledgeCatalog, KnowledgeConfidence, KnowledgeDecoder,
+    },
+    topology::{Confidence, EcuRole, Provenance, ResponderIdentity},
     vehicle_cache::VehicleCacheSnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,6 +66,107 @@ impl NormalizedInventoryFact {
     pub fn provenance(&self) -> &Provenance {
         &self.provenance
     }
+}
+
+/// Normalize one successful, pinned canonical ECU-identification observation.
+///
+/// This is deliberately an offline, fail-closed seam.  It accepts only the exact
+/// canonical definition that produced the observation; private serial/date fields,
+/// opaque bytes and numeric decoders remain unprojected evidence.
+pub fn normalize_identification_observation(
+    observation: &IdentificationObservation,
+    catalog: &KnowledgeCatalog,
+) -> Result<Option<NormalizedInventoryFact>, String> {
+    let definition = catalog
+        .definition(observation.definition_id())
+        .ok_or_else(|| {
+            format!(
+                "ECU identification definition {:?} is absent from pinned canonical knowledge",
+                observation.definition_id()
+            )
+        })?;
+    if observation.knowledge_repository() != catalog.pin().repository()
+        || observation.knowledge_revision() != catalog.pin().revision()
+        || observation.definition_version() != definition.version()
+        || observation.semantic() != definition.semantic()
+        || observation.request() != definition.operation().request_bytes()
+    {
+        return Err(format!(
+            "ECU identification observation does not match canonical definition {}@{}",
+            definition.id(),
+            definition.version()
+        ));
+    }
+    if observation.status() != IdentificationResultStatus::Supported {
+        return Ok(None);
+    }
+
+    let Ok(field) = FingerprintField::from_semantic(definition.semantic()) else {
+        return Ok(None);
+    };
+    let KnowledgeDecoder::Ascii { trim } = definition.decoder() else {
+        return Ok(None);
+    };
+    let value = observation
+        .value()
+        .ok_or_else(|| "supported ECU identification observation has no payload".to_string())?;
+    let mut response = vec![
+        definition.response().positive_service(),
+        observation.request()[1],
+        observation.request()[2],
+    ];
+    response.extend_from_slice(value);
+    let value = normalize_ascii(definition.validate_response(&response)?, *trim)?;
+    NormalizedInventoryFact::new(
+        observation.expected_responder().clone(),
+        field,
+        value,
+        Provenance::new(
+            format!(
+                "canonical-knowledge:{}@{}:{}@{}",
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                definition.id(),
+                definition.version()
+            ),
+            confidence(definition.provenance().confidence()),
+        )
+        .map_err(|error| error.to_string())?,
+    )
+    .map(Some)
+}
+
+const fn confidence(confidence: KnowledgeConfidence) -> Confidence {
+    match confidence {
+        KnowledgeConfidence::High => Confidence::High,
+        KnowledgeConfidence::Medium => Confidence::Medium,
+        KnowledgeConfidence::Low => Confidence::Low,
+    }
+}
+
+fn normalize_ascii(payload: &[u8], trim: AsciiTrim) -> Result<String, String> {
+    if !payload.is_ascii() {
+        return Err("canonical ASCII decoder received non-ASCII ECU identification bytes".into());
+    }
+    let trim_byte = |byte: &u8| match trim {
+        AsciiTrim::None => false,
+        AsciiTrim::Space => *byte == b' ',
+        AsciiTrim::Nul => *byte == 0,
+        AsciiTrim::SpaceAndNul => matches!(*byte, b' ' | 0),
+    };
+    let end = payload
+        .iter()
+        .rposition(|byte| !trim_byte(byte))
+        .map_or(0, |index| index + 1);
+    let payload = &payload[..end];
+    if payload.is_empty() {
+        return Err("canonical ASCII decoder produced an empty ECU identification value".into());
+    }
+    if payload.iter().any(u8::is_ascii_control) {
+        return Err("canonical ASCII decoder received control characters".into());
+    }
+    String::from_utf8(payload.to_vec())
+        .map_err(|_| "canonical ASCII decoder received invalid UTF-8 bytes".into())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,6 +394,84 @@ mod tests {
         Provenance::new(source, Confidence::High).unwrap()
     }
 
+    const TEST_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn catalog(semantic: &str, id: &str, did: u16, decoder: &str) -> KnowledgeCatalog {
+        let root = std::env::temp_dir().join(format!(
+            "obdentic-inventory-facts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let standards = root.join("standards");
+        std::fs::create_dir_all(&standards).unwrap();
+        std::fs::write(
+            standards.join("fixture.yaml"),
+            format!(
+                r#"schema_version: 2
+namespace: test.inventory
+definitions:
+  - id: {id}
+    semantic: {semantic}
+    version: 1
+    applicability:
+      kind: generic
+      provenance:
+        classification: VERIFIED
+        confidence: high
+        sources: [{{kind: standard, citation: fixture}}]
+    operation: {{type: uds.read_data_by_identifier, identifier: "0x{did:04X}"}}
+    response: {{positive_service: "0x62", identifier_echo: true}}
+    decoder: {decoder}
+    provenance:
+      classification: VERIFIED
+      confidence: high
+      sources: [{{kind: standard, citation: fixture}}]
+    hardware_validation: {{status: not_applicable}}
+"#
+            ),
+        )
+        .unwrap();
+        let catalog = KnowledgeCatalog::load_from_directory(
+            &root,
+            crate::knowledge_db::KnowledgePin::new(
+                crate::knowledge_db::CANONICAL_KNOWLEDGE_REPOSITORY,
+                TEST_REVISION,
+                2,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        catalog
+    }
+
+    fn observation(
+        catalog: &KnowledgeCatalog,
+        semantic: &str,
+        id: &str,
+        did: u16,
+        payload: Vec<u8>,
+    ) -> IdentificationObservation {
+        IdentificationObservation::new(
+            target("7E0"),
+            responder("7E8"),
+            semantic,
+            id,
+            1,
+            catalog.pin().repository(),
+            catalog.pin().revision(),
+            [0x22, (did >> 8) as u8, did as u8],
+            IdentificationResultStatus::Supported,
+            Vec::new(),
+            None,
+            Some(payload),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     fn target(value: &str) -> RequestTarget {
         RequestTarget::concrete(context(), RequestAddress::new("elm-header", value))
     }
@@ -486,6 +668,271 @@ mod tests {
     }
 
     #[test]
+    fn canonical_ascii_decoder_is_the_only_path_from_observation_to_fact() {
+        let catalog = catalog(
+            "ecu.manufacturer_spare_part_number",
+            "test.f187.part_number",
+            0xf187,
+            "{type: ascii, trim: space_and_nul}",
+        );
+        let observation = observation(
+            &catalog,
+            "ecu.manufacturer_spare_part_number",
+            "test.f187.part_number",
+            0xf187,
+            b"1K0-ABC  \0".to_vec(),
+        );
+
+        let fact = normalize_identification_observation(&observation, &catalog)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fact.field(),
+            FingerprintField::EcuManufacturerSparePartNumber
+        );
+        assert_eq!(fact.value(), "1K0-ABC");
+        assert_eq!(observation.value(), Some(b"1K0-ABC  \0".as_slice()));
+        assert_eq!(fact.provenance().confidence(), Confidence::High);
+        assert_eq!(
+            fact.provenance().source(),
+            format!(
+                "canonical-knowledge:{}@{}:test.f187.part_number@1",
+                catalog.pin().repository(),
+                catalog.pin().revision()
+            )
+        );
+        let projected = project_observed_ecu_facts(
+            &VehicleCacheSnapshot::new([], [], [mapping("7E8", None)]),
+            [fact],
+        )
+        .unwrap();
+        let effective = EffectiveVehicleKnowledge::resolve(
+            &catalog,
+            projected.into_iter().map(ProjectedEcuFacts::into_observed),
+        )
+        .unwrap();
+        assert_eq!(
+            effective
+                .ecus()
+                .next()
+                .unwrap()
+                .semantic("ecu.manufacturer_spare_part_number")
+                .unwrap()
+                .state(),
+            SemanticResolutionState::ResolvedGeneric
+        );
+    }
+
+    #[test]
+    fn canonical_ascii_trim_and_validation_are_exact() {
+        for (trim, payload, expected) in [
+            ("none", b"A B".as_slice(), "A B"),
+            ("space", b" A  ".as_slice(), " A"),
+            ("nul", b"A\0".as_slice(), "A"),
+            ("space_and_nul", b"A \0".as_slice(), "A"),
+        ] {
+            let catalog = catalog(
+                "ecu.system_name",
+                "test.f197.system_name",
+                0xf197,
+                &format!("{{type: ascii, trim: {trim}}}"),
+            );
+            let observation = observation(
+                &catalog,
+                "ecu.system_name",
+                "test.f197.system_name",
+                0xf197,
+                payload.to_vec(),
+            );
+            assert_eq!(
+                normalize_identification_observation(&observation, &catalog)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                expected
+            );
+        }
+
+        let catalog = catalog(
+            "ecu.system_name",
+            "test.f197.system_name",
+            0xf197,
+            "{type: ascii, trim: none}",
+        );
+        for payload in [vec![0x80], b"A\nB".to_vec(), Vec::new()] {
+            let observation = observation(
+                &catalog,
+                "ecu.system_name",
+                "test.f197.system_name",
+                0xf197,
+                payload,
+            );
+            assert!(normalize_identification_observation(&observation, &catalog).is_err());
+        }
+    }
+
+    #[test]
+    fn opaque_and_private_identification_semantics_remain_evidence_only() {
+        for (semantic, id, did, decoder) in [
+            (
+                "ecu.manufacturer_software_version",
+                "test.f189.software_version",
+                0xf189,
+                "{type: opaque_bytes}",
+            ),
+            (
+                "ecu.serial_number",
+                "test.f18c.serial_number",
+                0xf18c,
+                "{type: ascii, trim: none}",
+            ),
+        ] {
+            let catalog = catalog(semantic, id, did, decoder);
+            let observation = observation(&catalog, semantic, id, did, b"PRIVATE".to_vec());
+            assert!(normalize_identification_observation(&observation, &catalog)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn canonical_binding_mismatches_fail_closed() {
+        let catalog = catalog(
+            "ecu.system_name",
+            "test.f197.system_name",
+            0xf197,
+            "{type: ascii, trim: none}",
+        );
+        for (semantic, id, version, repository, revision, request) in [
+            (
+                "ecu.system_name",
+                "missing.definition",
+                1,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xf1, 0x97],
+            ),
+            (
+                "other.semantic",
+                "test.f197.system_name",
+                1,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xf1, 0x97],
+            ),
+            (
+                "ecu.system_name",
+                "test.f197.system_name",
+                2,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xf1, 0x97],
+            ),
+            (
+                "ecu.system_name",
+                "test.f197.system_name",
+                1,
+                "other/repository",
+                catalog.pin().revision(),
+                [0x22, 0xf1, 0x97],
+            ),
+            (
+                "ecu.system_name",
+                "test.f197.system_name",
+                1,
+                catalog.pin().repository(),
+                "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                [0x22, 0xf1, 0x97],
+            ),
+            (
+                "ecu.system_name",
+                "test.f197.system_name",
+                1,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xf1, 0x96],
+            ),
+        ] {
+            let observation = IdentificationObservation::new(
+                target("7E0"),
+                responder("7E8"),
+                semantic,
+                id,
+                version,
+                repository,
+                revision,
+                request,
+                IdentificationResultStatus::Supported,
+                Vec::new(),
+                None,
+                Some(b"name".to_vec()),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(normalize_identification_observation(&observation, &catalog).is_err());
+        }
+    }
+
+    #[test]
+    fn non_supported_identification_statuses_never_project_facts() {
+        let catalog = catalog(
+            "ecu.system_name",
+            "test.f197.system_name",
+            0xf197,
+            "{type: ascii, trim: none}",
+        );
+        for (status, nrc, errors) in [
+            (
+                IdentificationResultStatus::Unsupported,
+                Some(0x31),
+                Vec::new(),
+            ),
+            (
+                IdentificationResultStatus::NegativeResponse,
+                Some(0x22),
+                Vec::new(),
+            ),
+            (
+                IdentificationResultStatus::Unavailable,
+                Some(0x22),
+                Vec::new(),
+            ),
+            (IdentificationResultStatus::Malformed, None, Vec::new()),
+            (
+                IdentificationResultStatus::Timeout,
+                None,
+                vec!["timeout".into()],
+            ),
+            (
+                IdentificationResultStatus::TransportError,
+                None,
+                vec!["transport".into()],
+            ),
+            (IdentificationResultStatus::NotProbed, None, Vec::new()),
+        ] {
+            let observation = IdentificationObservation::new(
+                target("7E0"),
+                responder("7E8"),
+                "ecu.system_name",
+                "test.f197.system_name",
+                1,
+                catalog.pin().repository(),
+                catalog.pin().revision(),
+                [0x22, 0xf1, 0x97],
+                status,
+                Vec::new(),
+                nrc,
+                None,
+                errors,
+            )
+            .unwrap();
+            assert!(normalize_identification_observation(&observation, &catalog)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
     fn projection_is_order_independent_and_feeds_effective_knowledge_directly() {
         let snapshot = VehicleCacheSnapshot::new([], [], [mapping("7E8", Some(EcuRole::Engine))]);
         let field = FingerprintField::EcuManufacturerSoftwareVersion;
@@ -497,7 +944,12 @@ mod tests {
         let second = project_observed_ecu_facts(&snapshot, [b, a]).unwrap();
         assert_eq!(first, second);
 
-        let catalog = KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let catalog = catalog(
+            "ecu.manufacturer_software_version",
+            "test.f189.software_version",
+            0xf189,
+            "{type: opaque_bytes}",
+        );
         let effective = EffectiveVehicleKnowledge::resolve(
             &catalog,
             first.into_iter().map(ProjectedEcuFacts::into_observed),
