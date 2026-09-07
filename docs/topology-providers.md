@@ -147,8 +147,14 @@ The provider domain and cache persistence contain no provider execution trait, a
 
 Future orchestration may execute a reviewed provider and then persist the resulting domain evidence, but transport remains below the typed diagnostic/safety boundary. The provider result itself is evidence only.
 
-## Discovery follow-up
+## Discovery orchestration
 
-With the provider domain and persistence seam established, the remaining #125 integration is discovery orchestration: applicable reviewed providers can later be composed with functional OBD discovery while preserving fallback and structured partial-coverage reporting.
+`vehicle discover` composes functional OBD discovery with the reviewed provider
+states, persists the result through the existing private v5 cache and reports
+structured coverage. The current EA189/PQ35 gateway provider is recorded as
+`blocked` with `unknown` coverage; it sends no gateway traffic and does not
+claim a complete vehicle inventory.
 
-That orchestration remains a separate slice. It must reuse the existing private cache and topology types, and it must not add live VW/PQ35 gateway traffic until new reviewed evidence resolves issue #35.
+Any future provider must continue to reuse the existing private cache and
+topology types. Live VW/PQ35 gateway traffic remains prohibited until new
+reviewed evidence resolves issue #35.

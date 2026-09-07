@@ -381,6 +381,7 @@ mod tests {
         },
         vehicle_cache::TargetMappingSnapshot,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn context() -> ProtocolContext {
         ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical)
@@ -395,14 +396,13 @@ mod tests {
     }
 
     const TEST_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     fn catalog(semantic: &str, id: &str, did: u16, decoder: &str) -> KnowledgeCatalog {
         let root = std::env::temp_dir().join(format!(
-            "obdentic-inventory-facts-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "obdentic-inventory-facts-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
         ));
         let standards = root.join("standards");
         std::fs::create_dir_all(&standards).unwrap();
