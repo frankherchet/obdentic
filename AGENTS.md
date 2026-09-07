@@ -10,7 +10,7 @@ Good delegation targets: repository discovery, mechanical checks, focused search
 
 ## Issue workflow
 
-When work is tracked by a GitHub issue, completing that work includes committing its intended changes on a feature branch, opening a pull request, and merging it into `main` only after CI succeeds. Enable auto-merge for a ready pull request so GitHub merges it once its required CI checks pass. Immediately after that successful merge, close the implemented issue. Keep the milestone open when a separately recorded hardware acceptance remains; close it after all its issues and required acceptance work are complete.
+When work is tracked by a GitHub issue, completing that work includes committing its intended changes on a feature branch, opening a pull request, and merging it into `main`. Until 1 October 2026, CI is unavailable because its budget is exhausted: run the relevant local checks, inspect the PR manually, and merge it manually. Do not enable auto-merge during this period. Immediately after a successful merge, close the implemented issue. Keep the milestone open when a separately recorded hardware acceptance remains; close it after all its issues and required acceptance work are complete.
 
 ## Agent skills
 
