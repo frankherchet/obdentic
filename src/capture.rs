@@ -1,5 +1,6 @@
 use crate::{
     capability::HardwareCapability,
+    effective_knowledge::{EffectiveVehicleKnowledge, SemanticResolution, SemanticResolutionState},
     scheduler::Subscription,
     subscription_policy::{ObservationRequest, PlanStatus, SubscriptionPolicy},
 };
@@ -23,6 +24,71 @@ pub struct CaptureProfile {
 struct ProfileSubscription {
     semantic: String,
     interval: Duration,
+    requirement: ProfileObservationRequirement,
+}
+
+/// Whether a profile can proceed when one requested semantic is unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileObservationRequirement {
+    Required,
+    Optional,
+}
+
+/// The effective-Knowledge outcome for one declarative profile observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProfileObservationResolution {
+    Canonical {
+        definition_id: String,
+        definition_version: u32,
+    },
+    /// A known, closed Mode-01 semantic that has not yet migrated into the
+    /// canonical Knowledge repository.
+    LegacyGenericMode01,
+    OptionalUnavailable {
+        state: SemanticResolutionState,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedProfileObservation {
+    semantic: String,
+    interval: Duration,
+    requirement: ProfileObservationRequirement,
+    resolution: ProfileObservationResolution,
+}
+
+impl ResolvedProfileObservation {
+    pub fn semantic(&self) -> &str {
+        &self.semantic
+    }
+
+    pub const fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub const fn requirement(&self) -> ProfileObservationRequirement {
+        self.requirement
+    }
+
+    pub fn resolution(&self) -> &ProfileObservationResolution {
+        &self.resolution
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedCaptureProfile {
+    name: String,
+    observations: Vec<ResolvedProfileObservation>,
+}
+
+impl ResolvedCaptureProfile {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn observations(&self) -> &[ResolvedProfileObservation] {
+        &self.observations
+    }
 }
 
 impl CaptureProfile {
@@ -75,6 +141,83 @@ impl CaptureProfile {
         }
         Ok(())
     }
+
+    /// Resolve this profile against one observed ECU without performing I/O.
+    ///
+    /// Existing built-in Mode-01 semantics are preserved only while no
+    /// canonical definition exists for that semantic. Once canonical
+    /// Knowledge has candidates, an unavailable or ambiguous result cannot
+    /// silently fall back to the legacy catalog.
+    pub fn resolve_against(
+        &self,
+        effective: &EffectiveVehicleKnowledge,
+        ecu_id: &str,
+    ) -> Result<ResolvedCaptureProfile, String> {
+        let ecu = effective
+            .ecu(ecu_id)
+            .ok_or_else(|| format!("effective knowledge has no observed ECU {ecu_id:?}"))?;
+        let observations = self
+            .subscriptions
+            .iter()
+            .map(|observation| {
+                let resolution = match ecu.semantic(&observation.semantic) {
+                    None => ProfileObservationResolution::LegacyGenericMode01,
+                    Some(semantic) => {
+                        resolve_observation(self.name(), observation, semantic, ecu_id)?
+                    }
+                };
+                Ok(ResolvedProfileObservation {
+                    semantic: observation.semantic.clone(),
+                    interval: observation.interval,
+                    requirement: observation.requirement,
+                    resolution,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(ResolvedCaptureProfile {
+            name: self.name.clone(),
+            observations,
+        })
+    }
+}
+
+fn resolve_observation(
+    profile: &str,
+    observation: &ProfileSubscription,
+    semantic: &SemanticResolution,
+    ecu_id: &str,
+) -> Result<ProfileObservationResolution, String> {
+    match semantic.state() {
+        SemanticResolutionState::ResolvedGeneric | SemanticResolutionState::ResolvedSpecific => {
+            let definition_id = semantic.selected_definition_id().ok_or_else(|| {
+                format!(
+                    "resolved semantic {} has no definition",
+                    semantic.semantic()
+                )
+            })?;
+            let definition = semantic
+                .candidates()
+                .iter()
+                .find(|candidate| candidate.definition_id() == definition_id)
+                .ok_or_else(|| {
+                    format!(
+                        "resolved semantic {} has no selected candidate",
+                        semantic.semantic()
+                    )
+                })?;
+            Ok(ProfileObservationResolution::Canonical {
+                definition_id: definition.definition_id().to_owned(),
+                definition_version: definition.definition_version(),
+            })
+        }
+        state if observation.requirement == ProfileObservationRequirement::Optional => {
+            Ok(ProfileObservationResolution::OptionalUnavailable { state })
+        }
+        state => Err(format!(
+            "capture profile {profile} requires semantic {} but ECU {ecu_id} is {state:?}",
+            observation.semantic
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +235,12 @@ struct ProfileDocument {
 struct ProfileObservationDocument {
     semantic: String,
     interval: String,
+    #[serde(default = "default_required")]
+    required: bool,
+}
+
+const fn default_required() -> bool {
+    true
 }
 
 pub fn profile(spec: &str) -> Result<CaptureProfile, String> {
@@ -173,6 +322,11 @@ fn parse_profile_yaml(input: &str) -> Result<CaptureProfile, String> {
         subscriptions.push(ProfileSubscription {
             semantic: observation.semantic,
             interval,
+            requirement: if observation.required {
+                ProfileObservationRequirement::Required
+            } else {
+                ProfileObservationRequirement::Optional
+            },
         });
     }
 
@@ -223,6 +377,10 @@ fn parse_interval(value: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        effective_knowledge::{EffectiveVehicleKnowledge, ObservedEcuFacts},
+        knowledge_db::{KnowledgeCatalog, KnowledgePin, CANONICAL_KNOWLEDGE_REPOSITORY},
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_PROFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -235,6 +393,59 @@ mod tests {
         ));
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    fn effective_catalog(definitions: &str) -> KnowledgeCatalog {
+        let sequence = TEMP_PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "obdentic-effective-profile-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("standards")).unwrap();
+        std::fs::write(
+            root.join("standards/fixture.yaml"),
+            format!("schema_version: 2\nnamespace: test.profile\ndefinitions:\n{definitions}"),
+        )
+        .unwrap();
+        let catalog = KnowledgeCatalog::load_from_directory(
+            &root,
+            KnowledgePin::new(
+                CANONICAL_KNOWLEDGE_REPOSITORY,
+                "0123456789abcdef0123456789abcdef01234567",
+                2,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        catalog
+    }
+
+    fn definition(id: &str, semantic: &str, applicability: &str) -> String {
+        format!(
+            r#"  - id: {id}
+    semantic: {semantic}
+    version: 1
+    applicability:
+{applicability}
+    operation: {{type: uds.read_data_by_identifier, identifier: "0xF189"}}
+    response: {{positive_service: "0x62", identifier_echo: true}}
+    decoder: {{type: opaque_bytes}}
+    provenance:
+      classification: VERIFIED
+      confidence: high
+      sources: [{{kind: standard, citation: fixture}}]
+    hardware_validation: {{status: not_applicable}}
+"#
+        )
+    }
+
+    fn generic_applicability() -> &'static str {
+        "      kind: generic\n      provenance:\n        classification: VERIFIED\n        confidence: high\n        sources: [{kind: standard, citation: fixture}]"
+    }
+
+    fn specific_applicability() -> &'static str {
+        "      kind: ecu_fingerprint\n      predicates:\n        - field: ecu.manufacturer_software_version\n          equals: S1\n      provenance:\n        classification: VERIFIED\n        confidence: high\n        sources: [{kind: standard, citation: fixture}]"
     }
 
     #[test]
@@ -264,6 +475,93 @@ mod tests {
                 "engine.runtime",
                 "engine.barometric_pressure",
             ]
+        );
+    }
+
+    #[test]
+    fn effective_resolution_keeps_unmigrated_mode01_semantics_explicitly_legacy() {
+        let catalog = effective_catalog(&definition(
+            "uds.fixture.system_name",
+            "ecu.system_name",
+            generic_applicability(),
+        ));
+        let effective = EffectiveVehicleKnowledge::resolve(
+            &catalog,
+            [ObservedEcuFacts::new("engine-local").unwrap()],
+        )
+        .unwrap();
+
+        let resolved = profile("engine-drive")
+            .unwrap()
+            .resolve_against(&effective, "engine-local")
+            .unwrap();
+
+        assert!(resolved.observations().iter().all(|observation| {
+            observation.resolution() == &ProfileObservationResolution::LegacyGenericMode01
+        }));
+    }
+
+    #[test]
+    fn effective_resolution_preserves_selected_canonical_definition_identity() {
+        let catalog = effective_catalog(&definition(
+            "obd2.fixture.engine_rpm",
+            "engine.rpm",
+            generic_applicability(),
+        ));
+        let effective = EffectiveVehicleKnowledge::resolve(
+            &catalog,
+            [ObservedEcuFacts::new("engine-local").unwrap()],
+        )
+        .unwrap();
+        let capture = parse_profile_yaml(
+            "version: 1\nid: canonical-rpm\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n",
+        )
+        .unwrap();
+
+        let resolved = capture.resolve_against(&effective, "engine-local").unwrap();
+        assert_eq!(
+            resolved.observations()[0].resolution(),
+            &ProfileObservationResolution::Canonical {
+                definition_id: "obd2.fixture.engine_rpm".into(),
+                definition_version: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn effective_resolution_rejects_required_and_keeps_optional_unavailable_visible() {
+        let catalog = effective_catalog(&definition(
+            "obd2.fixture.engine_rpm",
+            "engine.rpm",
+            specific_applicability(),
+        ));
+        let effective = EffectiveVehicleKnowledge::resolve(
+            &catalog,
+            [ObservedEcuFacts::new("engine-local").unwrap()],
+        )
+        .unwrap();
+        let required = parse_profile_yaml(
+            "version: 1\nid: required-rpm\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n",
+        )
+        .unwrap();
+        assert!(required
+            .resolve_against(&effective, "engine-local")
+            .unwrap_err()
+            .contains("InsufficientIdentity"));
+
+        let optional = parse_profile_yaml(
+            "version: 1\nid: optional-rpm\nobservations:\n  - semantic: engine.rpm\n    interval: 1s\n    required: false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            optional
+                .resolve_against(&effective, "engine-local")
+                .unwrap()
+                .observations()[0]
+                .resolution(),
+            &ProfileObservationResolution::OptionalUnavailable {
+                state: SemanticResolutionState::InsufficientIdentity,
+            }
         );
     }
 
