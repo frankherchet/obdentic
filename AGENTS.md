@@ -12,6 +12,16 @@ Choose the lowest-cost worker that can reliably handle the task. Give every work
 
 When work is tracked by a GitHub issue, completing that work includes committing its intended changes on a feature branch, opening a pull request, and merging it into `main` only after CI succeeds. Enable auto-merge for a ready pull request so GitHub merges it once its required CI checks pass. Immediately after that successful merge, close the implemented issue. Keep the milestone open when a separately recorded hardware acceptance remains; close it after all its issues and required acceptance work are complete.
 
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for `frankherchet/obdentic`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context layout: `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+
 ## Project constraints
 
 - Treat `docs/project-goals.md` as the long-term product contract. If an implementation decision changes those goals, update that document deliberately rather than allowing architecture to drift implicitly.
