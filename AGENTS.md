@@ -1,12 +1,12 @@
 # OBDentic agent instructions
 
+These instructions apply to any coding agent working in this repository, regardless of harness (Codex CLI, Claude Code, or otherwise). Harness-specific mechanics — which sub-agents exist and how to invoke them — live in that harness's own configuration; see "Harness-specific configuration" at the end of this file.
+
 ## Delegation
 
-Use sub-agents deliberately instead of implementing every non-trivial task in the primary agent. Use `gpt-5.6-luna` exclusively for sub-agents; do not delegate to `gpt-5.6-terra` or `gpt-5.6-sol`. Recreate this worker when useful at the start of a new session:
+Delegate bounded, non-trivial work to sub-agents instead of implementing everything in the primary agent. Give every sub-agent a concrete, bounded assignment and a non-overlapping write scope. Choose the lowest-cost sub-agent that can reliably handle the task. Parallelize independent work only; the primary agent owns integration and final verification. Do not delegate trivial work when coordination would cost more than doing it directly.
 
-- `luna_worker`: `gpt-5.6-luna`, `xhigh` reasoning — repository discovery, mechanical checks, focused searches, bounded implementation, tests and isolated bug fixes.
-
-Choose the lowest-cost worker that can reliably handle the task. Give every worker a concrete, bounded assignment and a non-overlapping write scope. Parallelize independent work only; the primary agent owns integration and final verification. Do not delegate trivial work when coordination would cost more than doing it directly.
+Good delegation targets: repository discovery, mechanical checks, focused searches, bounded implementation, tests, and isolated bug fixes.
 
 ## Issue workflow
 
@@ -37,3 +37,8 @@ Single-context layout: `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`
   `rtk env PATH=/Users/frankherchet/.cargo/bin:/opt/local/bin:/usr/bin:/bin cargo +1.98.0 ...`.
 - Before handoff, run the smallest relevant checks; for the current codebase this includes `cargo test`, `cargo clippy --all-targets -- -D warnings`, and Swift compilation when the BLE probe changes.
 - A meaningful feature or bug-fix task is complete only after its relevant checks pass, its intended changes are committed to a feature branch, its pull request is merged into `main`, and the merge is visible on `origin/main`.
+
+## Harness-specific configuration
+
+- **Codex CLI**: define named sub-agent/model profiles in your own `~/.codex/config.toml` (or `agents/*.toml`). This repository does not pin sub-agent names or models — use whatever profile your environment provides, and apply the Delegation principles above when choosing one.
+- **Claude Code**: sub-agents are defined in `.claude/agents/*.md`; `.claude/agents/worker.md` is the general delegation target for the tasks described above. `CLAUDE.md` at the repository root imports this file (`@AGENTS.md`), so these instructions apply automatically.
