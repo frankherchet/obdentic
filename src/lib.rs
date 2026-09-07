@@ -34,6 +34,7 @@ pub mod inventory_facts;
 pub mod jsonl_capture;
 pub mod knowledge_db;
 pub mod layout_observation;
+pub mod observed_inventory;
 pub mod protocol;
 pub mod runtime_actor;
 pub mod runtime_reducer;
