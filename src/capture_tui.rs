@@ -93,6 +93,7 @@ impl Timeline {
                         ),
                     );
                 }
+                CaptureEvent::KnowledgeContext { .. } => {}
                 CaptureEvent::SessionInitialized => {
                     timeline.push(clock_us, "session", None, "initialized".into());
                 }
@@ -969,6 +970,7 @@ mod tests {
             profile: "obd2-v1".into(),
             decoder: "test".into(),
             provenance: "synthetic".into(),
+            definition: None,
         }
     }
 

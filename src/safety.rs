@@ -8,6 +8,7 @@
 use crate::{
     diagnostic_job::{DiagnosticScope, KnownTarget},
     ea189::{Ea189DpfProbe, Ea189DpfProbeError, Ea189DpfProbeRequest},
+    ecu_identification::IdentificationCandidate,
     prepare_read,
     runtime_state::Activity,
     ReadRequest,
@@ -70,6 +71,7 @@ pub enum OperationKind {
     SignalRead,
     DtcRead,
     Ea189DpfProbe,
+    EcuIdentification,
     DtcClear,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -94,6 +96,7 @@ pub enum OperationRequest {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
     Ea189DpfProbe(Ea189DpfProbeRequest),
+    EcuIdentification(IdentificationCandidate),
     ClearDtcs,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -147,6 +150,7 @@ impl OperationRequest {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
+            Self::EcuIdentification(_) => OperationKind::EcuIdentification,
             Self::ClearDtcs => OperationKind::DtcClear,
             Self::SecurityAccess => OperationKind::SecurityAccess,
             Self::DiagnosticSessionControl => OperationKind::DiagnosticSessionControl,
@@ -170,6 +174,7 @@ pub enum Operation {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
     Ea189DpfProbe(Ea189DpfProbeRequest),
+    EcuIdentification(IdentificationCandidate),
 }
 
 impl Operation {
@@ -178,6 +183,7 @@ impl Operation {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
+            Self::EcuIdentification(_) => OperationKind::EcuIdentification,
         }
     }
 
@@ -195,6 +201,10 @@ impl Operation {
 
     pub fn ea189_dpf_probe(request: Ea189DpfProbeRequest) -> Self {
         Self::Ea189DpfProbe(request)
+    }
+
+    pub fn ecu_identification(candidate: IdentificationCandidate) -> Self {
+        Self::EcuIdentification(candidate)
     }
 }
 
@@ -220,7 +230,10 @@ impl Capability {
         match self {
             Self::ReadOnly => matches!(
                 operation,
-                OperationKind::SignalRead | OperationKind::DtcRead | OperationKind::Ea189DpfProbe
+                OperationKind::SignalRead
+                    | OperationKind::DtcRead
+                    | OperationKind::Ea189DpfProbe
+                    | OperationKind::EcuIdentification
             ),
         }
     }
@@ -300,6 +313,9 @@ impl SafetyPolicy {
             OperationRequest::Ea189DpfProbe(probe) => {
                 self.authorize_operation(Operation::Ea189DpfProbe(probe))
             }
+            OperationRequest::EcuIdentification(candidate) => {
+                self.authorize_operation(Operation::EcuIdentification(candidate))
+            }
             OperationRequest::ClearDtcs => {
                 Err(SafetyError::OperationBlocked(OperationKind::DtcClear))
             }
@@ -363,7 +379,9 @@ impl SafetyPolicy {
             Activity::Diagnose => {
                 matches!(
                     operation,
-                    OperationKind::DtcRead | OperationKind::Ea189DpfProbe
+                    OperationKind::DtcRead
+                        | OperationKind::Ea189DpfProbe
+                        | OperationKind::EcuIdentification
                 )
             }
             Activity::Idle | Activity::Write => false,
@@ -452,6 +470,29 @@ mod tests {
                         }
                     )
         ));
+    }
+
+    #[test]
+    fn bounded_ecu_identification_is_diagnose_only_and_read_only() {
+        let catalog =
+            crate::knowledge_db::KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let plan =
+            crate::ecu_identification::EcuIdentificationPlan::from_catalog(&catalog).unwrap();
+        let candidate = plan.candidates()[0].clone();
+        let request = OperationRequest::EcuIdentification(candidate.clone());
+        assert_eq!(request.kind(), OperationKind::EcuIdentification);
+        assert_eq!(
+            SafetyPolicy::default()
+                .authorize_activity(Activity::Diagnose, request)
+                .unwrap(),
+            Operation::EcuIdentification(candidate)
+        );
+        assert!(SafetyPolicy::default()
+            .authorize_activity(
+                Activity::Read,
+                OperationRequest::EcuIdentification(plan.candidates()[0].clone())
+            )
+            .is_err());
     }
 
     #[test]

@@ -9,7 +9,6 @@ use tokio::sync::{mpsc, oneshot};
 pub use crate::adapter::AdapterCandidate;
 #[cfg(test)]
 use crate::elm::ElmExchange;
-use crate::elm::ElmSession;
 #[cfg(test)]
 pub(crate) use crate::elm::{
     discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
@@ -20,10 +19,12 @@ pub(crate) use crate::elm::{
     PidSupport,
 };
 pub use crate::elm::{
-    DiagnosticResponse, DiagnosticResponseError, DiagnosticResponses, ProtocolNegotiation,
-    ResponderIdentity, SignalSupport, SignalSupportStatus, SupportDiscovery,
-    TargetedDpfProbeRequest, TargetedReadRequest,
+    mode09_support_bitmap, DiagnosticResponse, DiagnosticResponseError, DiagnosticResponses,
+    FunctionalEcuSerialProbe, Mode09Pid, ProtocolNegotiation, ResponderIdentity, SignalSupport,
+    SignalSupportStatus, SupportDiscovery, TargetedEcuIdentificationRequest, TargetedMode09Request,
+    TargetedReadRequest,
 };
+use crate::elm::{ElmSession, TargetedDpfProbeRequest};
 pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
 // Two consecutive transport failures stop a live session; data failures reset the count.
@@ -44,12 +45,29 @@ impl PreparedDiagnosticSession {
         &self.negotiation
     }
 
+    /// Execute one already-typed targeted semantic read while retaining this session.
+    /// The outcome preserves every normalized responder observation as passive evidence.
+    pub async fn read_targeted_with_evidence(
+        &self,
+        request: TargetedReadRequest,
+    ) -> Result<TargetedReadOutcome, String> {
+        self.session
+            .read_targeted_with_evidence(request)
+            .await
+            .map(TargetedReadOutcome::from_internal)
+    }
+
     /// Execute one closed EA189 candidate probe while retaining this session.
     pub async fn read_dpf_probe(
         &self,
-        request: TargetedDpfProbeRequest,
+        probe: crate::ea189::Ea189DpfProbe,
+        mapping: &crate::vehicle_knowledge::EcuTargetMapping,
     ) -> Result<DiagnosticResponses, String> {
-        self.session.read_dpf_probe(request).await
+        self.session
+            .read_dpf_probe(crate::elm::TargetedDpfProbeRequest::from_mapping(
+                probe, mapping,
+            )?)
+            .await
     }
 
     /// Execute the one bounded stored-DTC request and deterministically close
@@ -65,6 +83,74 @@ impl PreparedDiagnosticSession {
 
     pub async fn shutdown(self) -> Result<(), String> {
         self.session.shutdown().await
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedReadObservation {
+    responses: Vec<crate::capture_events::ResponderEvidence>,
+    selected_responder: Option<String>,
+    selection_error: Option<String>,
+}
+
+impl TargetedReadObservation {
+    fn from_internal(observation: ResponseObservation) -> Self {
+        Self {
+            responses: observation.responses,
+            selected_responder: observation.selected_responder,
+            selection_error: observation.selection_error,
+        }
+    }
+
+    pub fn responses(&self) -> &[crate::capture_events::ResponderEvidence] {
+        &self.responses
+    }
+
+    pub fn selected_responder(&self) -> Option<&str> {
+        self.selected_responder.as_deref()
+    }
+
+    pub fn selection_error(&self) -> Option<&str> {
+        self.selection_error.as_deref()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TargetedReadOutcome {
+    Succeeded {
+        transaction: Transaction,
+        observations: Vec<TargetedReadObservation>,
+    },
+    Failed {
+        error: String,
+        observations: Vec<TargetedReadObservation>,
+    },
+}
+
+impl TargetedReadOutcome {
+    fn from_internal(outcome: ReadOutcome) -> Self {
+        match outcome {
+            ReadOutcome::Succeeded {
+                transaction,
+                observations,
+            } => Self::Succeeded {
+                transaction,
+                observations: observations
+                    .into_iter()
+                    .map(TargetedReadObservation::from_internal)
+                    .collect(),
+            },
+            ReadOutcome::Failed {
+                error,
+                observations,
+            } => Self::Failed {
+                error,
+                observations: observations
+                    .into_iter()
+                    .map(TargetedReadObservation::from_internal)
+                    .collect(),
+            },
+        }
     }
 }
 
@@ -102,6 +188,27 @@ pub(crate) enum DpfProbeOutcome {
 }
 
 impl DpfProbeOutcome {
+    fn into_result(self) -> Result<DiagnosticResponses, String> {
+        match self {
+            Self::Succeeded { responses, .. } => Ok(responses),
+            Self::Failed { error, .. } => Err(error),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum EcuIdentificationOutcome {
+    Succeeded {
+        responses: DiagnosticResponses,
+        observations: Vec<ResponseObservation>,
+    },
+    Failed {
+        error: String,
+        observations: Vec<ResponseObservation>,
+    },
+}
+
+impl EcuIdentificationOutcome {
     fn into_result(self) -> Result<DiagnosticResponses, String> {
         match self {
             Self::Succeeded { responses, .. } => Ok(responses),
@@ -223,6 +330,13 @@ pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
     start_session_mode(adapter_id, true).await
 }
 
+/// Start the same closed session while mirroring adapter TX/RX for a bounded
+/// diagnostic probe. No caller-controlled ELM command path is exposed.
+pub async fn start_session_with_adapter_io(adapter_id: &str) -> Result<SessionClient, String> {
+    let session = DiagnosticSession::connect_with_adapter_io_mode(adapter_id, true, true).await?;
+    Ok(start_session_actor(session))
+}
+
 async fn start_session_mode(
     adapter_id: &str,
     discover_support: bool,
@@ -283,10 +397,24 @@ impl SessionClient {
             .into_transaction()
     }
 
+    pub async fn read_mode09(
+        &self,
+        request: TargetedMode09Request,
+    ) -> Result<DiagnosticResponses, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::ReadMode09 { request, reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
     /// Execute the closed EA189 DPF UDS probe and return its raw normalized
     /// responses.  Negative or malformed responses are returned as errors,
     /// while the crate-visible evidence variant retains responder payloads.
-    pub async fn read_dpf_probe(
+    pub(crate) async fn read_dpf_probe(
         &self,
         request: TargetedDpfProbeRequest,
     ) -> Result<DiagnosticResponses, String> {
@@ -302,6 +430,44 @@ impl SessionClient {
         let (reply, result) = oneshot::channel();
         self.sender
             .send(SessionCommand::ReadDpfProbe { request, reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
+    pub async fn read_ecu_identification(
+        &self,
+        request: TargetedEcuIdentificationRequest,
+    ) -> Result<DiagnosticResponses, String> {
+        self.read_ecu_identification_with_evidence(request)
+            .await?
+            .into_result()
+    }
+
+    /// Execute a closed, standards-catalogued functional identification read.
+    pub async fn read_functional_ecu_serials(
+        &self,
+        probe: FunctionalEcuSerialProbe,
+    ) -> Result<DiagnosticResponses, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::ReadFunctionalEcuSerials { probe, reply })
+            .await
+            .map_err(|_| "diagnostic session is closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "diagnostic session stopped before responding".to_string())?
+    }
+
+    pub(crate) async fn read_ecu_identification_with_evidence(
+        &self,
+        request: TargetedEcuIdentificationRequest,
+    ) -> Result<EcuIdentificationOutcome, String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(SessionCommand::ReadEcuIdentification { request, reply })
             .await
             .map_err(|_| "diagnostic session is closed".to_string())?;
         result
@@ -366,9 +532,21 @@ enum SessionCommand {
         request: TargetedReadRequest,
         reply: oneshot::Sender<Result<ReadOutcome, String>>,
     },
+    ReadMode09 {
+        request: TargetedMode09Request,
+        reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
+    },
     ReadDpfProbe {
         request: TargetedDpfProbeRequest,
         reply: oneshot::Sender<Result<DpfProbeOutcome, String>>,
+    },
+    ReadEcuIdentification {
+        request: TargetedEcuIdentificationRequest,
+        reply: oneshot::Sender<Result<EcuIdentificationOutcome, String>>,
+    },
+    ReadFunctionalEcuSerials {
+        probe: FunctionalEcuSerialProbe,
+        reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
     },
     ReadStoredDtcs {
         reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
@@ -468,6 +646,31 @@ async fn session_actor(
                 )
                 .await;
             }
+            SessionCommand::ReadMode09 { request, reply } => {
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
+                }
+                let started = Instant::now();
+                match session.read_mode09(request).await {
+                    Ok(responses) => {
+                        service.observe(started.elapsed());
+                        health.success();
+                        let _ = reply.send(Ok(responses));
+                    }
+                    Err(error) => {
+                        if health.observe(&error) {
+                            let fatal = health.unhealthy().unwrap().to_owned();
+                            session.disconnect_best_effort().await;
+                            disconnect_done = true;
+                            let _ = reply.send(Err(fatal));
+                        } else {
+                            service.observe(started.elapsed());
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
+            }
             SessionCommand::ReadDpfProbe { request, reply } => {
                 if let Some(error) = health.unhealthy() {
                     let _ = reply.send(Err(error.to_owned()));
@@ -485,6 +688,49 @@ async fn session_actor(
                     reply,
                 )
                 .await;
+            }
+            SessionCommand::ReadEcuIdentification { request, reply } => {
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
+                }
+                let started = Instant::now();
+                let outcome = session.read_ecu_identification_with_evidence(request).await;
+                process_ecu_identification_outcome(
+                    &mut session,
+                    &mut health,
+                    &mut service,
+                    &mut disconnect_done,
+                    outcome,
+                    started.elapsed(),
+                    reply,
+                )
+                .await;
+            }
+            SessionCommand::ReadFunctionalEcuSerials { probe, reply } => {
+                if let Some(error) = health.unhealthy() {
+                    let _ = reply.send(Err(error.to_owned()));
+                    continue;
+                }
+                let started = Instant::now();
+                match session.read_functional_ecu_serials(probe).await {
+                    Ok(responses) => {
+                        service.observe(started.elapsed());
+                        health.success();
+                        let _ = reply.send(Ok(responses));
+                    }
+                    Err(error) => {
+                        if health.observe(&error) {
+                            let fatal = health.unhealthy().unwrap().to_owned();
+                            session.disconnect_best_effort().await;
+                            disconnect_done = true;
+                            let _ = reply.send(Err(fatal));
+                        } else {
+                            service.observe(started.elapsed());
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
             }
             SessionCommand::ReadStoredDtcs { reply } => {
                 if let Some(error) = health.unhealthy() {
@@ -619,6 +865,48 @@ async fn process_dpf_probe_outcome(
     }
 }
 
+async fn process_ecu_identification_outcome(
+    session: &mut DiagnosticSession,
+    health: &mut SessionHealth,
+    service: &mut RequestServiceEstimator,
+    disconnect_done: &mut bool,
+    outcome: EcuIdentificationOutcome,
+    service_time: Duration,
+    reply: oneshot::Sender<Result<EcuIdentificationOutcome, String>>,
+) {
+    if let Some(error) = health.unhealthy() {
+        let _ = reply.send(Err(error.to_owned()));
+        return;
+    }
+    match outcome {
+        EcuIdentificationOutcome::Succeeded { .. } => {
+            service.observe(service_time);
+            health.success();
+            let _ = reply.send(Ok(outcome));
+        }
+        EcuIdentificationOutcome::Failed {
+            error,
+            observations,
+        } => {
+            if health.observe(&error) {
+                let fatal = health.unhealthy().unwrap().to_owned();
+                session.disconnect_best_effort().await;
+                *disconnect_done = true;
+                let _ = reply.send(Ok(EcuIdentificationOutcome::Failed {
+                    error: fatal,
+                    observations,
+                }));
+            } else {
+                service.observe(service_time);
+                let _ = reply.send(Ok(EcuIdentificationOutcome::Failed {
+                    error,
+                    observations,
+                }));
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct SessionHealth {
     consecutive_transport_failures: u8,
@@ -724,6 +1012,13 @@ impl DiagnosticSession {
             .into_transaction()
     }
 
+    async fn read_mode09(
+        &mut self,
+        request: TargetedMode09Request,
+    ) -> Result<DiagnosticResponses, String> {
+        self.elm_mut()?.read_mode09(&request).await
+    }
+
     async fn read_dpf_probe_with_evidence(
         &mut self,
         request: TargetedDpfProbeRequest,
@@ -745,6 +1040,40 @@ impl DiagnosticSession {
                 observations: error.observations,
             },
         }
+    }
+
+    async fn read_ecu_identification_with_evidence(
+        &mut self,
+        request: TargetedEcuIdentificationRequest,
+    ) -> EcuIdentificationOutcome {
+        let read = match self.elm_mut() {
+            Ok(session) => {
+                session
+                    .read_ecu_identification_with_evidence(&request)
+                    .await
+            }
+            Err(error) => Err(ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            }),
+        };
+        match read {
+            Ok(read) => EcuIdentificationOutcome::Succeeded {
+                responses: read.responses,
+                observations: read.observations,
+            },
+            Err(error) => EcuIdentificationOutcome::Failed {
+                error: error.error,
+                observations: error.observations,
+            },
+        }
+    }
+
+    async fn read_functional_ecu_serials(
+        &mut self,
+        probe: FunctionalEcuSerialProbe,
+    ) -> Result<DiagnosticResponses, String> {
+        self.elm_mut()?.read_functional_ecu_serials(&probe).await
     }
 
     async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
@@ -989,8 +1318,19 @@ mod tests {
                     SessionCommand::ReadTargeted { reply, .. } => {
                         let _ = reply.send(Err("targeted test request not scripted".into()));
                     }
+                    SessionCommand::ReadMode09 { reply, .. } => {
+                        let _ = reply.send(Err("Mode 09 test request not scripted".into()));
+                    }
                     SessionCommand::ReadDpfProbe { reply, .. } => {
                         let _ = reply.send(Err("DPF probe test request not scripted".into()));
+                    }
+                    SessionCommand::ReadEcuIdentification { reply, .. } => {
+                        let _ =
+                            reply.send(Err("ECU identification test request not scripted".into()));
+                    }
+                    SessionCommand::ReadFunctionalEcuSerials { reply, .. } => {
+                        let _ = reply
+                            .send(Err("functional ECU serial test request not scripted".into()));
                     }
                     SessionCommand::ReadStoredDtcs { reply } => {
                         let _ = reply.send(Err("stored DTC test request not scripted".into()));

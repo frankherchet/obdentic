@@ -1,0 +1,18 @@
+version: 1
+id: obd2-expansion-validation
+description: Bounded validation profile for the expanded generic OBD-II semantic catalog.
+observations:
+  - semantic: engine.throttle_position
+    interval: 2s
+  - semantic: vehicle.distance_with_mil_on
+    interval: 2s
+  - semantic: engine.fuel_rail_gauge_pressure
+    interval: 2s
+  - semantic: vehicle.warmups_since_dtc_clear
+    interval: 2s
+  - semantic: vehicle.distance_since_dtc_clear
+    interval: 2s
+  - semantic: vehicle.ambient_air_temperature
+    interval: 2s
+  - semantic: engine.throttle_actuator.commanded
+    interval: 2s

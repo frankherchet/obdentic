@@ -74,6 +74,176 @@ pub struct CaptureSubscription {
     filter: SubscriptionFilterOutcome,
 }
 
+pub const MAX_CAPTURE_CORE_VERSION_LEN: usize = 64;
+pub const MAX_CAPTURE_COMMIT_LEN: usize = 40;
+pub const MAX_CAPTURE_KNOWLEDGE_REPOSITORY_LEN: usize = 128;
+pub const MAX_CAPTURE_KNOWLEDGE_REVISION_LEN: usize = 40;
+pub const MAX_CAPTURE_DEFINITION_ID_LEN: usize = 128;
+pub const MAX_CAPTURE_CONFIDENCE_LEN: usize = 32;
+pub const MAX_CAPTURE_HARDWARE_VALIDATION_LEN: usize = 64;
+pub const MAX_CAPTURE_LOCAL_ECU_ID_LEN: usize = 64;
+
+/// The exact executable and canonical Knowledge inputs used by a capture.
+///
+/// This contains repository metadata only. It deliberately contains no VIN,
+/// ECU serial number, responder payload or other vehicle-instance identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureKnowledgeContext {
+    core_version: String,
+    core_commit: Option<String>,
+    knowledge_repository: String,
+    knowledge_revision: String,
+    knowledge_schema_version: u32,
+}
+
+impl CaptureKnowledgeContext {
+    /// Loads the compile-time project pin without shelling out to Git or
+    /// reading vehicle-specific inventory data.
+    pub fn current() -> Result<Self, String> {
+        let pin = crate::knowledge_db::KnowledgePin::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("knowledge.lock"),
+        )
+        .map_err(|error| format!("capture knowledge pin unavailable: {error}"))?;
+        Self::new(
+            env!("CARGO_PKG_VERSION"),
+            None,
+            pin.repository(),
+            pin.revision(),
+            pin.schema_version(),
+        )
+    }
+
+    pub fn new(
+        core_version: impl Into<String>,
+        core_commit: Option<String>,
+        knowledge_repository: impl Into<String>,
+        knowledge_revision: impl Into<String>,
+        knowledge_schema_version: u32,
+    ) -> Result<Self, String> {
+        let core_version = core_version.into();
+        let knowledge_repository = knowledge_repository.into();
+        let knowledge_revision = knowledge_revision.into();
+        validate_capture_text("core version", &core_version, MAX_CAPTURE_CORE_VERSION_LEN)?;
+        validate_capture_commit(core_commit.as_deref(), "core commit")?;
+        validate_capture_text(
+            "knowledge repository",
+            &knowledge_repository,
+            MAX_CAPTURE_KNOWLEDGE_REPOSITORY_LEN,
+        )?;
+        validate_capture_revision(&knowledge_revision, "knowledge revision")?;
+        if knowledge_schema_version == 0 {
+            return Err("knowledge schema version must be positive".into());
+        }
+        Ok(Self {
+            core_version,
+            core_commit,
+            knowledge_repository,
+            knowledge_revision,
+            knowledge_schema_version,
+        })
+    }
+
+    pub fn core_version(&self) -> &str {
+        &self.core_version
+    }
+
+    pub fn core_commit(&self) -> Option<&str> {
+        self.core_commit.as_deref()
+    }
+
+    pub fn knowledge_repository(&self) -> &str {
+        &self.knowledge_repository
+    }
+
+    pub fn knowledge_revision(&self) -> &str {
+        &self.knowledge_revision
+    }
+
+    pub const fn knowledge_schema_version(&self) -> u32 {
+        self.knowledge_schema_version
+    }
+}
+
+/// A privacy-safe reference to the Knowledge definition used for one fact.
+///
+/// `local_ecu_id` is an application-owned local identifier, not a VIN or ECU
+/// serial number. Callers must not place vehicle identity values in it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureDefinitionReference {
+    definition_id: Option<String>,
+    definition_version: Option<u32>,
+    confidence: Option<String>,
+    hardware_validation: Option<String>,
+    local_ecu_id: Option<String>,
+}
+
+impl CaptureDefinitionReference {
+    pub fn new(
+        definition_id: Option<String>,
+        definition_version: Option<u32>,
+        confidence: Option<String>,
+        hardware_validation: Option<String>,
+        local_ecu_id: Option<String>,
+    ) -> Result<Self, String> {
+        if definition_id.is_some() != definition_version.is_some() {
+            return Err("definition id and version must be provided together".into());
+        }
+        if definition_id.is_none() {
+            return Err("definition reference requires an id and version".into());
+        }
+        if definition_version == Some(0) {
+            return Err("definition version must be positive".into());
+        }
+        validate_capture_optional_text(
+            "definition id",
+            definition_id.as_deref(),
+            MAX_CAPTURE_DEFINITION_ID_LEN,
+        )?;
+        validate_capture_optional_text(
+            "confidence",
+            confidence.as_deref(),
+            MAX_CAPTURE_CONFIDENCE_LEN,
+        )?;
+        validate_capture_optional_text(
+            "hardware validation",
+            hardware_validation.as_deref(),
+            MAX_CAPTURE_HARDWARE_VALIDATION_LEN,
+        )?;
+        validate_capture_optional_text(
+            "local ECU id",
+            local_ecu_id.as_deref(),
+            MAX_CAPTURE_LOCAL_ECU_ID_LEN,
+        )?;
+        Ok(Self {
+            definition_id,
+            definition_version,
+            confidence,
+            hardware_validation,
+            local_ecu_id,
+        })
+    }
+
+    pub fn definition_id(&self) -> Option<&str> {
+        self.definition_id.as_deref()
+    }
+
+    pub const fn definition_version(&self) -> Option<u32> {
+        self.definition_version
+    }
+
+    pub fn confidence(&self) -> Option<&str> {
+        self.confidence.as_deref()
+    }
+
+    pub fn hardware_validation(&self) -> Option<&str> {
+        self.hardware_validation.as_deref()
+    }
+
+    pub fn local_ecu_id(&self) -> Option<&str> {
+        self.local_ecu_id.as_deref()
+    }
+}
+
 impl CaptureSubscription {
     pub fn new(
         semantic: impl Into<String>,
@@ -178,6 +348,9 @@ pub enum CaptureEvent {
         wallclock_ms: Option<u64>,
         profile: Option<String>,
     },
+    KnowledgeContext {
+        context: CaptureKnowledgeContext,
+    },
     SessionInitialized,
     SubscriptionConfigured {
         semantic: String,
@@ -222,6 +395,7 @@ pub enum CaptureEvent {
         profile: String,
         decoder: String,
         provenance: String,
+        definition: Option<Box<CaptureDefinitionReference>>,
     },
     ReadFailed {
         semantic: String,
@@ -299,6 +473,10 @@ impl CaptureEvent {
             wallclock_ms,
             profile,
         }
+    }
+
+    pub fn knowledge_context(context: CaptureKnowledgeContext) -> Self {
+        Self::KnowledgeContext { context }
     }
 
     pub fn subscription_configured(
@@ -423,6 +601,23 @@ impl CaptureEvent {
         requested_interval_us: CaptureTimeUs,
         timing: ReadTiming,
     ) -> Result<Self, String> {
+        Self::read_succeeded_from_transaction_with_definition(
+            transaction,
+            requested_interval_us,
+            timing,
+            None,
+        )
+    }
+
+    /// Copy a completed read and attach an already validated Knowledge
+    /// definition reference. `None` is intentional for signals that are still
+    /// backed by the legacy built-in catalog rather than canonical Knowledge.
+    pub fn read_succeeded_from_transaction_with_definition(
+        transaction: &Transaction,
+        requested_interval_us: CaptureTimeUs,
+        timing: ReadTiming,
+        definition: Option<CaptureDefinitionReference>,
+    ) -> Result<Self, String> {
         let metadata = crate::supported_signals()
             .iter()
             .find(|signal| signal.metadata().semantic == transaction.semantic())
@@ -443,6 +638,7 @@ impl CaptureEvent {
             profile: transaction.profile().into(),
             decoder: metadata.decoder.into(),
             provenance: metadata.provenance.into(),
+            definition: definition.map(Box::new),
         })
     }
 
@@ -725,6 +921,47 @@ pub(crate) fn validate_diagnostic_text(
     Ok(())
 }
 
+fn validate_capture_text(label: &str, value: &str, max_len: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("capture {label} must not be empty"));
+    }
+    if value.len() > max_len {
+        return Err(format!("capture {label} exceeds {max_len} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "capture {label} must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capture_optional_text(
+    label: &str,
+    value: Option<&str>,
+    max_len: usize,
+) -> Result<(), String> {
+    value.map_or(Ok(()), |value| validate_capture_text(label, value, max_len))
+}
+
+fn validate_capture_commit(value: Option<&str>, label: &str) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_capture_text(label, value, MAX_CAPTURE_COMMIT_LEN)?;
+    if value.len() != MAX_CAPTURE_COMMIT_LEN || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "capture {label} must be a 40-character hexadecimal Git commit"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capture_revision(value: &str, label: &str) -> Result<(), String> {
+    validate_capture_commit(Some(value), label)
+}
+
 pub(crate) fn validate_diagnostic_mode(mode: u8) -> Result<(), String> {
     (1..=MAX_DIAGNOSTIC_MODE)
         .contains(&mode)
@@ -811,8 +1048,119 @@ mod tests {
                 profile: "obd2-v1".into(),
                 decoder: "((A * 256) + B) / 4".into(),
                 provenance: "SAE J1979 Mode 01 PID 0C".into(),
+                definition: None,
             }
         );
+    }
+
+    #[test]
+    fn knowledge_context_validates_and_preserves_exact_pin() {
+        let context = CaptureKnowledgeContext::new(
+            "0.1.0",
+            Some("0123456789abcdef0123456789abcdef01234567".into()),
+            "frankherchet/obdentic-knowledge",
+            "fedcba9876543210fedcba9876543210fedcba98",
+            2,
+        )
+        .unwrap();
+        assert_eq!(context.core_version(), "0.1.0");
+        assert_eq!(
+            context.core_commit(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            context.knowledge_repository(),
+            "frankherchet/obdentic-knowledge"
+        );
+        assert_eq!(
+            context.knowledge_revision(),
+            "fedcba9876543210fedcba9876543210fedcba98"
+        );
+        assert_eq!(context.knowledge_schema_version(), 2);
+        assert!(CaptureKnowledgeContext::new(
+            "0.1.0",
+            None,
+            "repo\nleak",
+            "fedcba9876543210fedcba9876543210fedcba98",
+            2,
+        )
+        .is_err());
+        assert!(CaptureKnowledgeContext::new("0.1.0", None, "repo", "not-a-revision", 2,).is_err());
+    }
+
+    #[test]
+    fn definition_reference_requires_a_paired_identity_and_keeps_local_context_private() {
+        assert!(CaptureDefinitionReference::new(
+            Some("knowledge.signal".into()),
+            None,
+            Some("high".into()),
+            Some("validated".into()),
+            Some("ecu-local-7e8".into()),
+        )
+        .is_err());
+        assert!(
+            CaptureDefinitionReference::new(None, None, Some("high".into()), None, None,).is_err()
+        );
+
+        let reference = CaptureDefinitionReference::new(
+            Some("uds.f189.manufacturer_software_version".into()),
+            Some(1),
+            Some("high".into()),
+            Some("validated".into()),
+            Some("ecu-local-7e8".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            reference.definition_id(),
+            Some("uds.f189.manufacturer_software_version")
+        );
+        assert_eq!(reference.definition_version(), Some(1));
+        assert_eq!(reference.confidence(), Some("high"));
+        assert_eq!(reference.hardware_validation(), Some("validated"));
+        assert_eq!(reference.local_ecu_id(), Some("ecu-local-7e8"));
+    }
+
+    #[test]
+    fn read_constructor_keeps_legacy_builtin_signal_without_definition_reference() {
+        let transaction = prepare_read("engine.rpm")
+            .unwrap()
+            .complete("user", vec![0x41, 0x0c, 0x00, 0x00])
+            .unwrap();
+        let definition = CaptureDefinitionReference::new(
+            Some("obd2.engine.rpm".into()),
+            Some(1),
+            Some("high".into()),
+            Some("validated".into()),
+            Some("local-engine".into()),
+        )
+        .unwrap();
+        let event = CaptureEvent::read_succeeded_from_transaction_with_definition(
+            &transaction,
+            250_000,
+            ReadTiming::new(1, 2, 3),
+            Some(definition.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            CaptureEvent::ReadSucceeded {
+                definition: Some(reference),
+                ..
+            } if *reference == definition
+        ));
+        let legacy = CaptureEvent::read_succeeded_from_transaction(
+            &transaction,
+            250_000,
+            ReadTiming::new(1, 2, 3),
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            CaptureEvent::ReadSucceeded {
+                definition: None,
+                ..
+            }
+        ));
     }
 
     #[test]

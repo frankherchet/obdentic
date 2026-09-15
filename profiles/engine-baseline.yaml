@@ -1,0 +1,30 @@
+version: 1
+id: engine-baseline
+description: Broad conservative engine baseline capture profile.
+observations:
+  - semantic: engine.rpm
+    interval: 1s
+  - semantic: engine.maf
+    interval: 2s
+  - semantic: engine.load
+    interval: 2s
+  - semantic: engine.intake_manifold_pressure
+    interval: 2s
+  - semantic: vehicle.speed
+    interval: 8s
+  - semantic: engine.egr.commanded
+    interval: 8s
+  - semantic: engine.egr.error
+    interval: 8s
+  - semantic: vehicle.accelerator_pedal_e
+    interval: 8s
+  - semantic: engine.relative_throttle
+    interval: 8s
+  - semantic: engine.coolant_temperature
+    interval: 8s
+  - semantic: engine.intake_air_temperature
+    interval: 8s
+  - semantic: engine.runtime
+    interval: 8s
+  - semantic: engine.barometric_pressure
+    interval: 8s

@@ -1,8 +1,10 @@
 use obdentic::knowledge_db::{
-    KnowledgeCatalog, KnowledgeLoadError, KnowledgePin, CANONICAL_KNOWLEDGE_REPOSITORY,
-    STANDARD_UDS_ECU_IDENTIFICATION_SET,
+    KnowledgeApplicability, KnowledgeCatalog, KnowledgeLoadError, KnowledgePin,
+    CANONICAL_KNOWLEDGE_REPOSITORY, STANDARD_UDS_ECU_IDENTIFICATION_SET,
 };
 use std::{fs, path::PathBuf, time::SystemTime};
+
+const PINNED_REVISION: &str = "b356ff5afb850017ec546945f41d739071c74d76";
 
 fn temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -23,8 +25,8 @@ fn pinned_submodule_catalog_loads_without_git_or_network() {
     let catalog = KnowledgeCatalog::load_pinned(&root).unwrap();
 
     assert_eq!(catalog.pin().repository(), CANONICAL_KNOWLEDGE_REPOSITORY);
-    assert_eq!(catalog.pin().schema_version(), 1);
-    assert_eq!(catalog.pin().revision().len(), 40);
+    assert_eq!(catalog.pin().schema_version(), 2);
+    assert_eq!(catalog.pin().revision(), PINNED_REVISION);
 
     let set = catalog
         .set(STANDARD_UDS_ECU_IDENTIFICATION_SET)
@@ -36,7 +38,11 @@ fn pinned_submodule_catalog_loads_without_git_or_network() {
 
     let definition = catalog
         .semantic("ecu.manufacturer_software_version")
-        .expect("F189 semantic must resolve from canonical Knowledge");
+        .expect("F189 semantic must resolve uniquely from canonical Knowledge");
+    assert!(matches!(
+        definition.applicability(),
+        KnowledgeApplicability::Generic { .. }
+    ));
     assert_eq!(definition.operation().request_bytes(), [0x22, 0xF1, 0x89]);
     assert_eq!(
         definition
@@ -46,6 +52,18 @@ fn pinned_submodule_catalog_loads_without_git_or_network() {
     );
 }
 
+fn generic_applicability() -> &'static str {
+    r#"    applicability:
+      kind: generic
+      provenance:
+        classification: VERIFIED
+        confidence: high
+        sources:
+          - kind: standard
+            citation: synthetic standard fixture
+"#
+}
+
 #[test]
 fn f190_in_standard_ecu_identification_set_is_rejected() {
     let root = temp_dir("f190");
@@ -53,7 +71,8 @@ fn f190_in_standard_ecu_identification_set_is_rejected() {
     fs::create_dir_all(&standards).unwrap();
     fs::write(
         standards.join("vin.yaml"),
-        r#"schema_version: 1
+        format!(
+            r#"schema_version: 2
 namespace: test.uds
 sets:
   - id: uds.standard.ecu_identification
@@ -63,7 +82,7 @@ definitions:
   - id: test.f190.vin
     semantic: vehicle.vin
     version: 1
-    operation:
+{}    operation:
       type: uds.read_data_by_identifier
       identifier: "0xF190"
     response:
@@ -80,13 +99,15 @@ definitions:
     hardware_validation:
       status: not_applicable
 "#,
+            generic_applicability()
+        ),
     )
     .unwrap();
 
     let pin = KnowledgePin::new(
         CANONICAL_KNOWLEDGE_REPOSITORY,
         "0123456789abcdef0123456789abcdef01234567",
-        1,
+        2,
     )
     .unwrap();
     let result = KnowledgeCatalog::load_from_directory(&root, pin);
@@ -102,13 +123,14 @@ fn raw_request_field_fails_before_any_runnable_operation_exists() {
     fs::create_dir_all(&standards).unwrap();
     fs::write(
         standards.join("unsafe.yaml"),
-        r#"schema_version: 1
+        format!(
+            r#"schema_version: 2
 namespace: test.unsafe
 definitions:
   - id: test.unsafe
     semantic: test.unsafe
     version: 1
-    operation:
+{}    operation:
       type: uds.read_data_by_identifier
       identifier: "0xF189"
       raw_request: "27 01"
@@ -126,13 +148,15 @@ definitions:
     hardware_validation:
       status: not_validated
 "#,
+            generic_applicability()
+        ),
     )
     .unwrap();
 
     let pin = KnowledgePin::new(
         CANONICAL_KNOWLEDGE_REPOSITORY,
         "0123456789abcdef0123456789abcdef01234567",
-        1,
+        2,
     )
     .unwrap();
     assert!(matches!(

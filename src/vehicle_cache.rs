@@ -8,22 +8,35 @@ use std::{
 };
 
 use crate::{
+    ecu_identification::{
+        IdentificationObservation, IdentificationResponseEvidence, IdentificationResultStatus,
+    },
     functional_discovery::EcuCapability,
     topology::{
-        AddressingContext, Confidence, EcuRole, EcuTopology, ObservationWindow, Protocol,
-        ProtocolContext, Provenance, RequestAddress, RequestTarget, RequestTargetEvidence,
-        ResponderIdentity, RoleAssignment,
+        AddressingContext, Confidence, ConfiguredController, ConfiguredIdentity, EcuRole,
+        EcuTopology, LogicalAddress, ObservationWindow, Protocol, ProtocolContext, Provenance,
+        RequestAddress, RequestTarget, RequestTargetEvidence, ResponderIdentity, RoleAssignment,
+    },
+    topology_provider::{
+        EvidenceReference, InstalledEcuEvidence, TopologyProviderApplicability,
+        TopologyProviderCoverage, TopologyProviderId, TopologyProviderResult,
+        TopologyProviderScope, TopologyProviderStatus,
     },
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-const HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t3";
+const HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t5";
+const V4_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t4";
+const V3_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t3";
 const V2_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t2";
 const LEGACY_HEADER: &str = "OBDENTIC-VEHICLE-CACHE\t1";
 const INDEX_HEADER: &str = "OBDENTIC-VEHICLE-INDEX\t1";
 const INDEX_NAME: &str = ".identity-index";
+const MAX_PROVIDER_EVIDENCE_REFERENCES: usize = 256;
+const MAX_PROVIDER_ENTRIES: usize = 1024;
+const MAX_PROVIDER_ENTRY_EVIDENCE_REFERENCES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VehicleCache {
@@ -109,6 +122,8 @@ pub struct VehicleCacheSnapshot {
     topology: Vec<TopologyObservation>,
     ecu_capabilities: Vec<EcuCapabilitySnapshot>,
     target_mappings: Vec<TargetMappingSnapshot>,
+    ecu_identification: Vec<IdentificationObservation>,
+    topology_provider_results: Vec<TopologyProviderResult>,
 }
 
 impl VehicleCacheSnapshot {
@@ -117,15 +132,37 @@ impl VehicleCacheSnapshot {
         ecu_capabilities: impl IntoIterator<Item = EcuCapabilitySnapshot>,
         target_mappings: impl IntoIterator<Item = TargetMappingSnapshot>,
     ) -> Self {
+        Self::with_ecu_identification(topology, ecu_capabilities, target_mappings, [])
+    }
+
+    pub fn with_ecu_identification(
+        topology: impl IntoIterator<Item = TopologyObservation>,
+        ecu_capabilities: impl IntoIterator<Item = EcuCapabilitySnapshot>,
+        target_mappings: impl IntoIterator<Item = TargetMappingSnapshot>,
+        ecu_identification: impl IntoIterator<Item = IdentificationObservation>,
+    ) -> Self {
         let mut snapshot = Self {
             topology: topology.into_iter().collect(),
             ecu_capabilities: ecu_capabilities.into_iter().collect(),
             target_mappings: target_mappings.into_iter().collect(),
+            ecu_identification: ecu_identification.into_iter().collect(),
+            topology_provider_results: Vec::new(),
         };
         snapshot.topology.sort();
         snapshot.ecu_capabilities.sort();
         snapshot.target_mappings.sort();
+        snapshot.ecu_identification.sort();
         snapshot
+    }
+
+    pub fn with_topology_provider_results(
+        mut self,
+        results: impl IntoIterator<Item = TopologyProviderResult>,
+    ) -> Self {
+        self.topology_provider_results = results.into_iter().collect();
+        self.topology_provider_results.sort();
+        self.topology_provider_results.dedup();
+        self
     }
 
     pub fn from_topology(topology: &EcuTopology) -> Self {
@@ -188,6 +225,14 @@ impl VehicleCacheSnapshot {
 
     pub fn target_mappings(&self) -> &[TargetMappingSnapshot] {
         &self.target_mappings
+    }
+
+    pub fn ecu_identification(&self) -> &[IdentificationObservation] {
+        &self.ecu_identification
+    }
+
+    pub fn topology_provider_results(&self) -> &[TopologyProviderResult] {
+        &self.topology_provider_results
     }
 
     pub fn validation_signature(&self) -> ValidationSignature {
@@ -506,6 +551,14 @@ impl CacheStore {
                 file.write_all(b"\ntarget_mapping\t")?;
                 file.write_all(encode_target_mapping(mapping).as_bytes())?;
             }
+            for observation in &cache.snapshot.ecu_identification {
+                file.write_all(b"\necu_identification\t")?;
+                file.write_all(encode_identification_observation(observation).as_bytes())?;
+            }
+            for result in &cache.snapshot.topology_provider_results {
+                file.write_all(b"\ntopology_provider\t")?;
+                file.write_all(encode_topology_provider_result(result).as_bytes())?;
+            }
             for line in &cache.history {
                 file.write_all(b"\nhistory\t")?;
                 file.write_all(escape(line).as_bytes())?;
@@ -785,6 +838,184 @@ fn encode_target_mapping(mapping: &TargetMappingSnapshot) -> String {
     encode_fields(&fields)
 }
 
+fn encode_identification_observation(observation: &IdentificationObservation) -> String {
+    let mut fields = encode_target(observation.target());
+    fields.extend(encode_responder_fields(observation.expected_responder()));
+    fields.extend([
+        observation.semantic().into(),
+        observation.definition_id().into(),
+        observation.definition_version().to_string(),
+        observation.knowledge_repository().into(),
+        observation.knowledge_revision().into(),
+        hex(&observation.request()),
+        encode_identification_status(observation.status()).into(),
+        if observation.nrc().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    ]);
+    if let Some(nrc) = observation.nrc() {
+        fields.push(nrc.to_string());
+    }
+    fields.push(
+        if observation.value().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(value) = observation.value() {
+        fields.push(hex(value));
+    }
+    fields.push(observation.responses().len().to_string());
+    for response in observation.responses() {
+        fields.push(
+            if response.responder().is_some() {
+                "1"
+            } else {
+                "0"
+            }
+            .into(),
+        );
+        if let Some(responder) = response.responder() {
+            fields.extend(encode_responder_fields(responder));
+        }
+        fields.push(hex(response.payload()));
+    }
+    fields.push(observation.errors().len().to_string());
+    fields.extend(observation.errors().iter().cloned());
+    encode_fields(&fields)
+}
+
+fn encode_topology_provider_result(result: &TopologyProviderResult) -> String {
+    let mut fields = vec![result.id().name().into(), result.id().version().to_string()];
+    fields.extend(encode_topology_provider_scope(
+        result.applicability().scope(),
+    ));
+    fields.extend(encode_provenance(result.applicability().provenance()));
+    fields.push(encode_topology_provider_status(result.status()).into());
+    fields.push(encode_topology_provider_coverage(result.coverage()).into());
+    fields.push(result.evidence_references().len().to_string());
+    fields.extend(
+        result
+            .evidence_references()
+            .iter()
+            .map(|reference| reference.as_str().into()),
+    );
+    fields.push(result.entries().len().to_string());
+    for entry in result.entries() {
+        fields.extend(encode_installed_ecu_evidence(entry));
+    }
+    encode_fields(&fields)
+}
+
+fn encode_topology_provider_scope(scope: &TopologyProviderScope) -> Vec<String> {
+    let mut fields = vec![if scope.manufacturer_name().is_some() {
+        "1"
+    } else {
+        "0"
+    }
+    .into()];
+    if let Some(manufacturer) = scope.manufacturer_name() {
+        fields.push(manufacturer.into());
+    }
+    fields.push(
+        if scope.platform_name().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(platform) = scope.platform_name() {
+        fields.push(platform.into());
+    }
+    fields
+}
+
+fn encode_installed_ecu_evidence(entry: &InstalledEcuEvidence) -> Vec<String> {
+    let mut fields = encode_context(entry.context()).to_vec();
+    let configured = entry.configured_controller();
+    fields.push(
+        if configured.identity().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(identity) = configured.identity() {
+        fields.extend([identity.authority().into(), identity.identifier().into()]);
+    }
+    fields.push(
+        if configured.logical_address().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(logical) = configured.logical_address() {
+        fields.extend([logical.authority().into(), logical.value().into()]);
+    }
+    fields.extend(encode_provenance(configured.provenance()));
+    fields.push(
+        if entry.request_target().is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    );
+    if let Some(target) = entry.request_target() {
+        fields.extend(encode_target(target.target()));
+        fields.extend(encode_provenance(target.provenance()));
+    }
+    fields.push(entry.evidence_references().len().to_string());
+    fields.extend(
+        entry
+            .evidence_references()
+            .iter()
+            .map(|reference| reference.as_str().into()),
+    );
+    fields
+}
+
+fn encode_identification_status(status: IdentificationResultStatus) -> &'static str {
+    match status {
+        IdentificationResultStatus::Supported => "supported",
+        IdentificationResultStatus::Unsupported => "unsupported",
+        IdentificationResultStatus::NegativeResponse => "negative_response",
+        IdentificationResultStatus::Unavailable => "unavailable",
+        IdentificationResultStatus::Malformed => "malformed",
+        IdentificationResultStatus::Timeout => "timeout",
+        IdentificationResultStatus::TransportError => "transport_error",
+        IdentificationResultStatus::NotProbed => "not_probed",
+    }
+}
+
+fn encode_topology_provider_status(status: TopologyProviderStatus) -> &'static str {
+    match status {
+        TopologyProviderStatus::Completed => "completed",
+        TopologyProviderStatus::Unavailable => "unavailable",
+        TopologyProviderStatus::Blocked => "blocked",
+        TopologyProviderStatus::NotApplicable => "not_applicable",
+        TopologyProviderStatus::Failed => "failed",
+    }
+}
+
+fn encode_topology_provider_coverage(coverage: TopologyProviderCoverage) -> &'static str {
+    match coverage {
+        TopologyProviderCoverage::Unknown => "unknown",
+        TopologyProviderCoverage::Partial => "partial",
+        TopologyProviderCoverage::Complete => "complete",
+        TopologyProviderCoverage::NotApplicable => "not_applicable",
+    }
+}
+
 fn encode_role_assignment(role: &RoleAssignment) -> Vec<String> {
     let mut fields = vec![encode_role(role.role())];
     fields.extend(encode_provenance(role.provenance()));
@@ -996,6 +1227,21 @@ fn parse_optional_flag(fields: &[String], index: &mut usize, name: &str) -> Resu
     }
 }
 
+fn parse_count(
+    fields: &[String],
+    index: &mut usize,
+    name: &str,
+    maximum: usize,
+) -> Result<usize, String> {
+    let count = field(fields, index, name)?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {name}: {error}"))?;
+    if count > maximum {
+        return Err(format!("vehicle cache {name} exceeds {maximum}"));
+    }
+    Ok(count)
+}
+
 fn parse_target(fields: &[String], index: &mut usize) -> Result<RequestTarget, String> {
     let context = parse_context(fields, index)?;
     let has_address = parse_optional_flag(fields, index, "target address")?;
@@ -1016,7 +1262,9 @@ fn parse_target(fields: &[String], index: &mut usize) -> Result<RequestTarget, S
 fn parse(contents: &str, requested_key: &str) -> Result<VehicleCache, String> {
     let mut lines = contents.lines();
     match lines.next() {
-        Some(HEADER) => parse_v3(lines, requested_key),
+        Some(HEADER) => parse_v5(lines, requested_key),
+        Some(V4_HEADER) => parse_v4(lines, requested_key),
+        Some(V3_HEADER) => parse_v3(lines, requested_key),
         Some(V2_HEADER) => parse_v2(lines, requested_key),
         Some(LEGACY_HEADER) => parse_v1(lines, requested_key),
         _ => Err("unsupported vehicle cache format".into()),
@@ -1071,20 +1319,36 @@ fn parse_v2<'a>(
     lines: impl Iterator<Item = &'a str>,
     requested_key: &str,
 ) -> Result<VehicleCache, String> {
-    parse_versioned(lines, requested_key, false)
+    parse_versioned(lines, requested_key, false, false, false)
 }
 
 fn parse_v3<'a>(
     lines: impl Iterator<Item = &'a str>,
     requested_key: &str,
 ) -> Result<VehicleCache, String> {
-    parse_versioned(lines, requested_key, true)
+    parse_versioned(lines, requested_key, true, false, false)
+}
+
+fn parse_v4<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    requested_key: &str,
+) -> Result<VehicleCache, String> {
+    parse_versioned(lines, requested_key, true, true, false)
+}
+
+fn parse_v5<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    requested_key: &str,
+) -> Result<VehicleCache, String> {
+    parse_versioned(lines, requested_key, true, true, true)
 }
 
 fn parse_versioned<'a>(
     lines: impl Iterator<Item = &'a str>,
     requested_key: &str,
     has_role: bool,
+    has_identification: bool,
+    has_topology_providers: bool,
 ) -> Result<VehicleCache, String> {
     let mut local_key = None;
     let mut first_seen_ms = None;
@@ -1092,6 +1356,8 @@ fn parse_versioned<'a>(
     let mut topology = Vec::new();
     let mut capabilities = BTreeMap::new();
     let mut target_mappings = Vec::new();
+    let mut ecu_identification = Vec::new();
+    let mut topology_provider_results = Vec::new();
     let mut history = Vec::new();
     for line in lines {
         let (tag, fields) = parse_fields(line)?;
@@ -1151,6 +1417,12 @@ fn parse_versioned<'a>(
             "target_mapping" => {
                 target_mappings.push(parse_target_mapping_with_role(&fields, has_role)?);
             }
+            "ecu_identification" if has_identification => {
+                ecu_identification.push(parse_identification_observation(&fields)?);
+            }
+            "topology_provider" if has_topology_providers => {
+                topology_provider_results.push(parse_topology_provider_result(&fields)?);
+            }
             "history" => history.push(one_field(&fields, "history")?.to_owned()),
             "evidence" => history.push(one_field(&fields, "evidence")?.to_owned()),
             _ => return Err(format!("vehicle cache contains unsupported field {tag}")),
@@ -1163,11 +1435,18 @@ fn parse_versioned<'a>(
         last_seen_ms.ok_or_else(|| "vehicle cache is missing last_seen_ms".to_string())?,
         history,
     );
+    let snapshot = VehicleCacheSnapshot::with_ecu_identification(
+        topology,
+        capabilities.into_values(),
+        target_mappings,
+        ecu_identification,
+    )
+    .with_topology_provider_results(topology_provider_results);
     let cache = VehicleCache::with_snapshot(
         cache.local_key,
         cache.first_seen_ms,
         cache.last_seen_ms,
-        VehicleCacheSnapshot::new(topology, capabilities.into_values(), target_mappings),
+        snapshot,
         cache.history,
     );
     finish_cache(cache, requested_key)
@@ -1272,6 +1551,244 @@ fn parse_target_mapping_with_role(
     ))
 }
 
+fn parse_topology_provider_result(fields: &[String]) -> Result<TopologyProviderResult, String> {
+    let mut index = 0;
+    let id = TopologyProviderId::new(
+        field(fields, &mut index, "topology provider id")?,
+        field(fields, &mut index, "topology provider version")?
+            .parse::<u32>()
+            .map_err(|error| format!("invalid topology provider version: {error}"))?,
+    )
+    .map_err(|error| error.to_string())?;
+    let scope = parse_topology_provider_scope(fields, &mut index)?;
+    let applicability =
+        TopologyProviderApplicability::new(scope, parse_provenance(fields, &mut index)?);
+    let status =
+        parse_topology_provider_status(field(fields, &mut index, "topology provider status")?)?;
+    let coverage =
+        parse_topology_provider_coverage(field(fields, &mut index, "topology provider coverage")?)?;
+    let reference_count = parse_count(
+        fields,
+        &mut index,
+        "topology provider evidence reference count",
+        MAX_PROVIDER_EVIDENCE_REFERENCES,
+    )?;
+    let mut references = Vec::with_capacity(reference_count);
+    for _ in 0..reference_count {
+        references.push(
+            EvidenceReference::new(field(
+                fields,
+                &mut index,
+                "topology provider evidence reference",
+            )?)
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    let entry_count = parse_count(
+        fields,
+        &mut index,
+        "topology provider entry count",
+        MAX_PROVIDER_ENTRIES,
+    )?;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        entries.push(parse_installed_ecu_evidence(fields, &mut index)?);
+    }
+    finish_fields(fields, index)?;
+    TopologyProviderResult::new(id, applicability, status, coverage, entries, references)
+        .map_err(|error| error.to_string())
+}
+
+fn parse_topology_provider_scope(
+    fields: &[String],
+    index: &mut usize,
+) -> Result<TopologyProviderScope, String> {
+    let manufacturer = if parse_optional_flag(fields, index, "topology provider manufacturer")? {
+        Some(field(fields, index, "topology provider manufacturer value")?.to_owned())
+    } else {
+        None
+    };
+    let platform = if parse_optional_flag(fields, index, "topology provider platform")? {
+        Some(field(fields, index, "topology provider platform value")?.to_owned())
+    } else {
+        None
+    };
+    match (manufacturer, platform) {
+        (None, None) => Ok(TopologyProviderScope::generic()),
+        (Some(manufacturer), None) => {
+            TopologyProviderScope::manufacturer(manufacturer).map_err(|error| error.to_string())
+        }
+        (Some(manufacturer), Some(platform)) => {
+            TopologyProviderScope::platform(manufacturer, platform)
+                .map_err(|error| error.to_string())
+        }
+        (None, Some(_)) => {
+            Err("vehicle cache topology provider platform has no manufacturer".into())
+        }
+    }
+}
+
+fn parse_installed_ecu_evidence(
+    fields: &[String],
+    index: &mut usize,
+) -> Result<InstalledEcuEvidence, String> {
+    let context = parse_context(fields, index)?;
+    let identity = if parse_optional_flag(fields, index, "configured identity")? {
+        Some(ConfiguredIdentity::new(
+            field(fields, index, "configured identity authority")?,
+            field(fields, index, "configured identity value")?,
+        ))
+    } else {
+        None
+    };
+    let logical_address = if parse_optional_flag(fields, index, "logical address")? {
+        Some(LogicalAddress::new(
+            field(fields, index, "logical address authority")?,
+            field(fields, index, "logical address value")?,
+        ))
+    } else {
+        None
+    };
+    let configured =
+        ConfiguredController::new(identity, logical_address, parse_provenance(fields, index)?)
+            .map_err(|error| error.to_string())?;
+    let mut entry = InstalledEcuEvidence::new(context, configured);
+    if parse_optional_flag(fields, index, "configured request target")? {
+        entry = entry.with_request_target(RequestTargetEvidence::new(
+            parse_target(fields, index)?,
+            parse_provenance(fields, index)?,
+        ));
+    }
+    let reference_count = parse_count(
+        fields,
+        index,
+        "configured entry evidence reference count",
+        MAX_PROVIDER_ENTRY_EVIDENCE_REFERENCES,
+    )?;
+    for _ in 0..reference_count {
+        entry = entry.with_evidence_reference(
+            EvidenceReference::new(field(fields, index, "configured entry evidence reference")?)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(entry)
+}
+
+fn parse_identification_observation(
+    fields: &[String],
+) -> Result<IdentificationObservation, String> {
+    let mut index = 0;
+    let target = parse_target(fields, &mut index)?;
+    let expected_responder = parse_responder(fields, &mut index)?;
+    let semantic = field(fields, &mut index, "identification semantic")?.to_owned();
+    let definition_id = field(fields, &mut index, "identification definition")?.to_owned();
+    let definition_version = field(fields, &mut index, "identification definition version")?
+        .parse::<u32>()
+        .map_err(|error| format!("invalid identification definition version: {error}"))?;
+    let knowledge_repository =
+        field(fields, &mut index, "identification knowledge repository")?.to_owned();
+    let knowledge_revision =
+        field(fields, &mut index, "identification knowledge revision")?.to_owned();
+    let request_bytes = parse_bytes(field(fields, &mut index, "identification request")?)?;
+    let request: [u8; 3] = request_bytes
+        .try_into()
+        .map_err(|_| "ECU identification request must contain exactly three bytes".to_string())?;
+    let status = parse_identification_status(field(fields, &mut index, "identification status")?)?;
+    let nrc = if parse_optional_flag(fields, &mut index, "identification NRC")? {
+        Some(
+            field(fields, &mut index, "identification NRC value")?
+                .parse::<u8>()
+                .map_err(|error| format!("invalid identification NRC: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let value = if parse_optional_flag(fields, &mut index, "identification value")? {
+        Some(parse_bytes(field(
+            fields,
+            &mut index,
+            "identification value bytes",
+        )?)?)
+    } else {
+        None
+    };
+    let response_count = field(fields, &mut index, "identification response count")?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid identification response count: {error}"))?;
+    let mut responses = Vec::with_capacity(response_count);
+    for _ in 0..response_count {
+        let responder = if parse_optional_flag(fields, &mut index, "identification responder")? {
+            Some(parse_responder(fields, &mut index)?)
+        } else {
+            None
+        };
+        let payload = parse_bytes(field(
+            fields,
+            &mut index,
+            "identification response payload",
+        )?)?;
+        responses.push(IdentificationResponseEvidence::new(responder, payload));
+    }
+    let error_count = field(fields, &mut index, "identification error count")?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid identification error count: {error}"))?;
+    let mut errors = Vec::with_capacity(error_count);
+    for _ in 0..error_count {
+        errors.push(field(fields, &mut index, "identification error")?.to_owned());
+    }
+    finish_fields(fields, index)?;
+    IdentificationObservation::new(
+        target,
+        expected_responder,
+        semantic,
+        definition_id,
+        definition_version,
+        knowledge_repository,
+        knowledge_revision,
+        request,
+        status,
+        responses,
+        nrc,
+        value,
+        errors,
+    )
+}
+
+fn parse_identification_status(value: &str) -> Result<IdentificationResultStatus, String> {
+    match value {
+        "supported" => Ok(IdentificationResultStatus::Supported),
+        "unsupported" => Ok(IdentificationResultStatus::Unsupported),
+        "negative_response" => Ok(IdentificationResultStatus::NegativeResponse),
+        "unavailable" => Ok(IdentificationResultStatus::Unavailable),
+        "malformed" => Ok(IdentificationResultStatus::Malformed),
+        "timeout" => Ok(IdentificationResultStatus::Timeout),
+        "transport_error" => Ok(IdentificationResultStatus::TransportError),
+        "not_probed" => Ok(IdentificationResultStatus::NotProbed),
+        _ => Err("vehicle cache contains an invalid ECU identification status".into()),
+    }
+}
+
+fn parse_topology_provider_status(value: &str) -> Result<TopologyProviderStatus, String> {
+    match value {
+        "completed" => Ok(TopologyProviderStatus::Completed),
+        "unavailable" => Ok(TopologyProviderStatus::Unavailable),
+        "blocked" => Ok(TopologyProviderStatus::Blocked),
+        "not_applicable" => Ok(TopologyProviderStatus::NotApplicable),
+        "failed" => Ok(TopologyProviderStatus::Failed),
+        _ => Err("vehicle cache contains an invalid topology provider status".into()),
+    }
+}
+
+fn parse_topology_provider_coverage(value: &str) -> Result<TopologyProviderCoverage, String> {
+    match value {
+        "unknown" => Ok(TopologyProviderCoverage::Unknown),
+        "partial" => Ok(TopologyProviderCoverage::Partial),
+        "complete" => Ok(TopologyProviderCoverage::Complete),
+        "not_applicable" => Ok(TopologyProviderCoverage::NotApplicable),
+        _ => Err("vehicle cache contains an invalid topology provider coverage".into()),
+    }
+}
+
 fn parse_role_assignment(fields: &[String], index: &mut usize) -> Result<RoleAssignment, String> {
     let role = parse_role(field(fields, index, "mapping role")?)?;
     let provenance = parse_provenance(fields, index)?;
@@ -1323,6 +1840,36 @@ fn validate_snapshot(snapshot: &VehicleCacheSnapshot) -> Result<(), String> {
             }
         }
     }
+    for observation in &snapshot.ecu_identification {
+        observation.validate()?;
+        validate_context(observation.target().context())?;
+        if let Some(address) = observation.target().address() {
+            validate_text("identification target namespace", address.namespace())?;
+            validate_text("identification target value", address.value())?;
+        }
+        validate_responder(observation.expected_responder())?;
+        validate_text("identification semantic", observation.semantic())?;
+        validate_text("identification definition", observation.definition_id())?;
+        validate_text(
+            "identification knowledge repository",
+            observation.knowledge_repository(),
+        )?;
+        validate_knowledge_revision(observation.knowledge_revision())?;
+        if observation.value().is_some_and(|value| value.len() > 4096) {
+            return Err("vehicle cache ECU identification value is too large".into());
+        }
+        for response in observation.responses() {
+            if let Some(responder) = response.responder() {
+                validate_responder(responder)?;
+            }
+            if response.payload().len() > 4096 {
+                return Err("vehicle cache ECU identification response is too large".into());
+            }
+        }
+        for error in observation.errors() {
+            validate_text("identification error", error)?;
+        }
+    }
     for mapping in &snapshot.target_mappings {
         if let Some(role) = mapping.role() {
             validate_role(role)?;
@@ -1336,6 +1883,57 @@ fn validate_snapshot(snapshot: &VehicleCacheSnapshot) -> Result<(), String> {
             validate_text("target value", address.value())?;
         }
         validate_provenance(mapping.provenance())?;
+    }
+    for result in &snapshot.topology_provider_results {
+        validate_topology_provider_result(result)?;
+    }
+    Ok(())
+}
+
+fn validate_topology_provider_result(result: &TopologyProviderResult) -> Result<(), String> {
+    validate_text("topology provider id", result.id().name())?;
+    if result.evidence_references().len() > MAX_PROVIDER_EVIDENCE_REFERENCES {
+        return Err("vehicle cache topology provider has too many evidence references".into());
+    }
+    if result.entries().len() > MAX_PROVIDER_ENTRIES {
+        return Err("vehicle cache topology provider has too many entries".into());
+    }
+    if let Some(manufacturer) = result.applicability().scope().manufacturer_name() {
+        validate_text("topology provider manufacturer", manufacturer)?;
+    }
+    if let Some(platform) = result.applicability().scope().platform_name() {
+        validate_text("topology provider platform", platform)?;
+    }
+    validate_provenance(result.applicability().provenance())?;
+    for reference in result.evidence_references() {
+        validate_text("topology provider evidence reference", reference.as_str())?;
+    }
+    for entry in result.entries() {
+        validate_context(entry.context())?;
+        let configured = entry.configured_controller();
+        if let Some(identity) = configured.identity() {
+            validate_text("configured identity authority", identity.authority())?;
+            validate_text("configured identity", identity.identifier())?;
+        }
+        if let Some(logical) = configured.logical_address() {
+            validate_text("logical address authority", logical.authority())?;
+            validate_text("logical address", logical.value())?;
+        }
+        validate_provenance(configured.provenance())?;
+        if let Some(target) = entry.request_target() {
+            validate_context(target.target().context())?;
+            if let Some(address) = target.target().address() {
+                validate_text("provider target namespace", address.namespace())?;
+                validate_text("provider target value", address.value())?;
+            }
+            validate_provenance(target.provenance())?;
+        }
+        if entry.evidence_references().len() > MAX_PROVIDER_ENTRY_EVIDENCE_REFERENCES {
+            return Err("vehicle cache configured entry has too many evidence references".into());
+        }
+        for reference in entry.evidence_references() {
+            validate_text("configured entry evidence reference", reference.as_str())?;
+        }
     }
     Ok(())
 }
@@ -1367,6 +1965,13 @@ fn validate_responder(responder: &ResponderIdentity) -> Result<(), String> {
 
 fn validate_provenance(provenance: &Provenance) -> Result<(), String> {
     validate_text("provenance", provenance.source())
+}
+
+fn validate_knowledge_revision(value: &str) -> Result<(), String> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("vehicle cache knowledge revision is not a full Git object id".into());
+    }
+    Ok(())
 }
 
 fn validate_text(field: &str, value: &str) -> Result<(), String> {
@@ -1442,6 +2047,45 @@ mod tests {
         std::env::temp_dir().join(format!("obdentic-vehicle-cache-{label}-{nonce}"))
     }
 
+    fn provider_applicability(source: &str) -> TopologyProviderApplicability {
+        TopologyProviderApplicability::new(
+            TopologyProviderScope::platform("Synthetic Motors", "Test Platform").unwrap(),
+            Provenance::new(source, Confidence::High).unwrap(),
+        )
+    }
+
+    fn configured_provider_entry(
+        source: &str,
+        identity: &str,
+        logical: &str,
+    ) -> InstalledEcuEvidence {
+        InstalledEcuEvidence::new(
+            ProtocolContext::new(Protocol::Uds, AddressingContext::Unknown),
+            ConfiguredController::new(
+                Some(ConfiguredIdentity::new("synthetic-list", identity)),
+                Some(LogicalAddress::new("synthetic-logical", logical)),
+                Provenance::new(source, Confidence::High).unwrap(),
+            )
+            .unwrap(),
+        )
+        .with_evidence_reference(EvidenceReference::new("synthetic entry evidence").unwrap())
+    }
+
+    fn completed_provider(
+        name: &str,
+        entries: Vec<InstalledEcuEvidence>,
+    ) -> TopologyProviderResult {
+        TopologyProviderResult::new(
+            TopologyProviderId::new(name, 1).unwrap(),
+            provider_applicability("synthetic applicability"),
+            TopologyProviderStatus::Completed,
+            TopologyProviderCoverage::Partial,
+            entries,
+            [EvidenceReference::new("synthetic provider evidence").unwrap()],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn round_trips_sorted_evidence() {
         let root = root("roundtrip");
@@ -1471,7 +2115,7 @@ mod tests {
         let path = root.join("6c6f63616c2d6b6579.tsv");
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            "OBDENTIC-VEHICLE-CACHE\t3\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t2\nhistory\tevidence\n"
+            "OBDENTIC-VEHICLE-CACHE\t5\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t2\nhistory\tevidence\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1511,7 +2155,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("6c6f63616c2d6b6579.tsv"),
-            "OBDENTIC-VEHICLE-CACHE\t4\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
+            "OBDENTIC-VEHICLE-CACHE\t6\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
         )
         .unwrap();
         assert!(store.load("local-key").is_err());
@@ -1569,6 +2213,196 @@ mod tests {
             .target_mappings()
             .is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn round_trips_topology_provider_results_without_promoting_reachability() {
+        let root = root("provider-roundtrip");
+        let store = CacheStore::new(&root);
+        let target_context = ProtocolContext::new(Protocol::Uds, AddressingContext::Physical);
+        let engine = configured_provider_entry("provider engine", "engine", "01")
+            .with_request_target(RequestTargetEvidence::new(
+                RequestTarget::concrete(
+                    target_context,
+                    RequestAddress::new("reviewed-target-space", "engine-target"),
+                ),
+                Provenance::new("independent target mapping", Confidence::Verified).unwrap(),
+            ));
+        let abs = configured_provider_entry("provider abs", "abs", "03");
+        let provider = completed_provider("synthetic.installation-list", vec![engine, abs]);
+        let snapshot = VehicleCacheSnapshot::new([], [], [])
+            .with_topology_provider_results([provider.clone()]);
+        let signature = snapshot.validation_signature();
+        assert!(signature.topology().is_empty());
+        assert!(signature.ecu_capabilities().is_empty());
+        assert!(signature.target_mappings().is_empty());
+
+        store
+            .save(&VehicleCache::with_snapshot(
+                "local-key",
+                1,
+                2,
+                snapshot.clone(),
+                Vec::new(),
+            ))
+            .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert_eq!(loaded.snapshot(), &snapshot);
+        assert!(loaded.snapshot().topology().is_empty());
+        assert_eq!(loaded.snapshot().topology_provider_results(), &[provider]);
+        let entries = loaded.snapshot().topology_provider_results()[0].entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| { entry.to_topology_node().observed_responders().is_empty() }));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.request_target().is_some())
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blocked_ea189_provider_round_trips_as_unknown_empty_evidence() {
+        let root = root("provider-blocked");
+        let store = CacheStore::new(&root);
+        let blocked = TopologyProviderResult::new(
+            TopologyProviderId::new("vw.pq35.gateway-installation-list", 1).unwrap(),
+            TopologyProviderApplicability::new(
+                TopologyProviderScope::platform("Volkswagen", "PQ35 / EA189").unwrap(),
+                Provenance::new(
+                    "docs/research/vw-gateway-installation-list.md",
+                    Confidence::Verified,
+                )
+                .unwrap(),
+            ),
+            TopologyProviderStatus::Blocked,
+            TopologyProviderCoverage::Unknown,
+            [],
+            [EvidenceReference::new("issue #35 negative safety gate").unwrap()],
+        )
+        .unwrap();
+        let snapshot =
+            VehicleCacheSnapshot::default().with_topology_provider_results([blocked.clone()]);
+        store
+            .save(&VehicleCache::with_snapshot(
+                "local-key",
+                1,
+                1,
+                snapshot,
+                Vec::new(),
+            ))
+            .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert_eq!(loaded.snapshot().topology_provider_results(), &[blocked]);
+        assert!(loaded.snapshot().topology_provider_results()[0]
+            .entries()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_results_are_sorted_deterministically() {
+        let first = completed_provider(
+            "synthetic.first",
+            vec![configured_provider_entry("first", "engine", "01")],
+        );
+        let second = completed_provider(
+            "synthetic.second",
+            vec![configured_provider_entry("second", "abs", "03")],
+        );
+        let left = VehicleCacheSnapshot::default()
+            .with_topology_provider_results([second.clone(), first.clone()]);
+        let right = VehicleCacheSnapshot::default().with_topology_provider_results([first, second]);
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn loads_v4_cache_without_topology_provider_results() {
+        let root = root("v4");
+        let store = CacheStore::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("6c6f63616c2d6b6579.tsv"),
+            "OBDENTIC-VEHICLE-CACHE\t4\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
+        )
+        .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert!(loaded.snapshot().topology_provider_results().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_v5_provider_status_coverage() {
+        let root = root("provider-invalid");
+        let store = CacheStore::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("6c6f63616c2d6b6579.tsv"),
+            "OBDENTIC-VEHICLE-CACHE\t5\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\ntopology_provider\tsynthetic.blocked\t1\t0\t0\tsafety review\thigh\tblocked\tcomplete\t0\t0\n",
+        )
+        .unwrap();
+        assert!(store.load("local-key").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_raw_vin_in_topology_provider_metadata() {
+        let vin = "WVWZZZ1JZXW000001";
+        let provider = TopologyProviderResult::new(
+            TopologyProviderId::new(vin, 1).unwrap(),
+            provider_applicability("synthetic applicability"),
+            TopologyProviderStatus::Completed,
+            TopologyProviderCoverage::Partial,
+            [configured_provider_entry("provider", "engine", "01")],
+            [],
+        )
+        .unwrap();
+        let snapshot = VehicleCacheSnapshot::default().with_topology_provider_results([provider]);
+        let root = root("provider-vin");
+        let store = CacheStore::new(&root);
+        assert!(store
+            .save(&VehicleCache::with_snapshot(
+                "local-key",
+                1,
+                1,
+                snapshot,
+                Vec::new(),
+            ))
+            .is_err());
+        assert!(!root.join("6c6f63616c2d6b6579.tsv").exists());
+    }
+
+    #[test]
+    fn rejects_provider_evidence_counts_that_cannot_round_trip() {
+        let references = (0..=MAX_PROVIDER_EVIDENCE_REFERENCES)
+            .map(|index| EvidenceReference::new(format!("provider-ref-{index}")).unwrap())
+            .collect::<Vec<_>>();
+        let provider = TopologyProviderResult::new(
+            TopologyProviderId::new("synthetic.too-many-refs", 1).unwrap(),
+            provider_applicability("synthetic applicability"),
+            TopologyProviderStatus::Completed,
+            TopologyProviderCoverage::Partial,
+            [configured_provider_entry("provider", "engine", "01")],
+            references,
+        )
+        .unwrap();
+        let snapshot = VehicleCacheSnapshot::default().with_topology_provider_results([provider]);
+        let root = root("provider-count-bound");
+        let store = CacheStore::new(&root);
+        assert!(store
+            .save(&VehicleCache::with_snapshot(
+                "local-key",
+                1,
+                1,
+                snapshot,
+                Vec::new(),
+            ))
+            .is_err());
+        assert!(!root.join("6c6f63616c2d6b6579.tsv").exists());
     }
 
     #[test]
@@ -1658,6 +2492,119 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_per_ecu_identification_without_affecting_validation_signature() {
+        let root = root("ecu-identification");
+        let store = CacheStore::new(&root);
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let target =
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0"));
+        let responder = ResponderIdentity::address(context, "7E8");
+        let supported = IdentificationObservation::new(
+            target.clone(),
+            responder.clone(),
+            "ecu.manufacturer_software_version",
+            "uds.f189.manufacturer_software_version",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "661fba8eed8ddce8fef5bba4c68dfcba85e2dd28",
+            [0x22, 0xF1, 0x89],
+            IdentificationResultStatus::Supported,
+            vec![IdentificationResponseEvidence::new(
+                Some(responder.clone()),
+                vec![0x62, 0xF1, 0x89, 0x31, 0x2E],
+            )],
+            None,
+            Some(vec![0x31, 0x2E]),
+            Vec::new(),
+        )
+        .unwrap();
+        let timeout = IdentificationObservation::new(
+            target,
+            responder,
+            "ecu.boot_software_identification",
+            "uds.f180.boot_software_identification",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "661fba8eed8ddce8fef5bba4c68dfcba85e2dd28",
+            [0x22, 0xF1, 0x80],
+            IdentificationResultStatus::Timeout,
+            Vec::new(),
+            None,
+            None,
+            vec!["Carly command timed out".into()],
+        )
+        .unwrap();
+        let snapshot =
+            VehicleCacheSnapshot::with_ecu_identification([], [], [], [supported, timeout]);
+        let signature = snapshot.validation_signature();
+        assert!(signature.topology().is_empty());
+        assert!(signature.ecu_capabilities().is_empty());
+        assert!(signature.target_mappings().is_empty());
+
+        store
+            .save(&VehicleCache::with_snapshot(
+                "local-key",
+                1,
+                2,
+                snapshot.clone(),
+                Vec::new(),
+            ))
+            .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert_eq!(loaded.snapshot(), &snapshot);
+        assert_eq!(
+            loaded
+                .snapshot()
+                .ecu_identification()
+                .iter()
+                .map(IdentificationObservation::status)
+                .collect::<Vec<_>>(),
+            vec![
+                IdentificationResultStatus::Timeout,
+                IdentificationResultStatus::Supported,
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_v3_cache_without_ecu_identification() {
+        let root = root("v3");
+        let store = CacheStore::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("6c6f63616c2d6b6579.tsv"),
+            "OBDENTIC-VEHICLE-CACHE\t3\nlocal_key\tlocal-key\nfirst_seen_ms\t1\nlast_seen_ms\t1\n",
+        )
+        .unwrap();
+        let loaded = store.load("local-key").unwrap().unwrap();
+        assert!(loaded.snapshot().ecu_identification().is_empty());
+        assert!(loaded.snapshot().topology_provider_results().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_vin_did_in_ecu_identification_cache() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let observation = IdentificationObservation::new(
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0")),
+            ResponderIdentity::address(context, "7E8"),
+            "ecu.vin",
+            "uds.f190.vin",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "revision",
+            [0x22, 0xF1, 0x90],
+            IdentificationResultStatus::NotProbed,
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        );
+        assert!(observation.is_err());
+    }
+
+    #[test]
     fn loads_legacy_textual_evidence_as_history_only() {
         let root = root("legacy");
         let store = CacheStore::new(&root);
@@ -1669,6 +2616,7 @@ mod tests {
         .unwrap();
         let loaded = store.load("local-key").unwrap().unwrap();
         assert!(loaded.snapshot().topology().is_empty());
+        assert!(loaded.snapshot().topology_provider_results().is_empty());
         assert_eq!(loaded.history(), ["old"]);
         fs::remove_dir_all(root).unwrap();
     }
