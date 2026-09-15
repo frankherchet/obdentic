@@ -1,8 +1,9 @@
 use crate::{
     capture_events::{
         validate_diagnostic_error, validate_diagnostic_job_id, validate_diagnostic_mode,
-        validate_diagnostic_source, validate_diagnostic_text, validate_dtc_fact, CaptureEvent,
-        CaptureValue, DiagnosticJobStepStatus, DtcObservationFact, DtcTransportOutcome, ReadTiming,
+        validate_diagnostic_source, validate_diagnostic_text, validate_dtc_fact,
+        CaptureDefinitionReference, CaptureEvent, CaptureKnowledgeContext, CaptureValue,
+        DiagnosticJobStepStatus, DtcObservationFact, DtcTransportOutcome, ReadTiming,
         SubscriptionFilterOutcome, MAX_DTC_DECODER_LEN, MAX_DTC_PROVENANCE_LEN,
     },
     diagnostic_job::JobStatus,
@@ -147,6 +148,20 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             object.push_str(",\"profile\":");
             push_option_string(&mut object, profile.as_deref());
         }
+        CaptureEvent::KnowledgeContext { context } => {
+            object.push_str("\"knowledge_context\",\"sequence\":");
+            object.push_str(&sequence.to_string());
+            object.push_str(",\"core_version\":");
+            push_string(&mut object, context.core_version());
+            object.push_str(",\"core_commit\":");
+            push_option_string(&mut object, context.core_commit());
+            object.push_str(",\"knowledge_repository\":");
+            push_string(&mut object, context.knowledge_repository());
+            object.push_str(",\"knowledge_revision\":");
+            push_string(&mut object, context.knowledge_revision());
+            object.push_str(",\"knowledge_schema_version\":");
+            object.push_str(&context.knowledge_schema_version().to_string());
+        }
         CaptureEvent::SessionInitialized => {
             simple_event(&mut object, "session_initialized", sequence)
         }
@@ -238,6 +253,7 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             profile,
             decoder,
             provenance,
+            definition,
         } => {
             object.push_str("\"read_succeeded\",\"sequence\":");
             object.push_str(&sequence.to_string());
@@ -267,6 +283,7 @@ fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
             push_string(&mut object, decoder);
             object.push_str(",\"provenance\":");
             push_string(&mut object, provenance);
+            push_definition_reference(&mut object, definition.as_deref());
         }
         CaptureEvent::ReadFailed {
             semantic,
@@ -580,6 +597,34 @@ fn push_option_string(object: &mut String, value: Option<&str>) {
     }
 }
 
+fn push_definition_reference(object: &mut String, definition: Option<&CaptureDefinitionReference>) {
+    object.push_str(",\"knowledge_definition_id\":");
+    push_option_string(
+        object,
+        definition.and_then(CaptureDefinitionReference::definition_id),
+    );
+    object.push_str(",\"knowledge_definition_version\":");
+    match definition.and_then(CaptureDefinitionReference::definition_version) {
+        Some(version) => object.push_str(&version.to_string()),
+        None => object.push_str("null"),
+    }
+    object.push_str(",\"knowledge_confidence\":");
+    push_option_string(
+        object,
+        definition.and_then(CaptureDefinitionReference::confidence),
+    );
+    object.push_str(",\"knowledge_hardware_validation\":");
+    push_option_string(
+        object,
+        definition.and_then(CaptureDefinitionReference::hardware_validation),
+    );
+    object.push_str(",\"local_ecu_id\":");
+    push_option_string(
+        object,
+        definition.and_then(CaptureDefinitionReference::local_ecu_id),
+    );
+}
+
 fn push_string(object: &mut String, value: &str) {
     object.push('"');
     for character in value.chars() {
@@ -623,6 +668,7 @@ pub fn read(path: &Path) -> Result<ParsedCapture, String> {
     let mut events = Vec::new();
     let mut expected_sequence = 0_u64;
     let mut last_response_offset_us = None;
+    let mut has_knowledge_context = false;
     let mut stopped = false;
     for (line_number, line) in lines.enumerate() {
         let line_number = line_number + 2;
@@ -641,6 +687,14 @@ pub fn read(path: &Path) -> Result<ParsedCapture, String> {
             .checked_add(1)
             .ok_or_else(|| format!("line {line_number}: sequence exhausted"))?;
         let event = parse_event(&object, line_number)?;
+        if matches!(event, CaptureEvent::KnowledgeContext { .. }) {
+            if has_knowledge_context {
+                return Err(format!(
+                    "line {line_number}: duplicate knowledge_context event"
+                ));
+            }
+            has_knowledge_context = true;
+        }
         if let CaptureEvent::ResponsesObserved {
             offset_us: Some(offset_us),
             ..
@@ -712,6 +766,37 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 wallclock_ms: optional_u64_field(object, "wallclock_ms", line_number)?,
                 profile: optional_string_field(object, "profile", line_number)?,
             })
+        }
+        "knowledge_context" => {
+            fields_exact(
+                object,
+                &[
+                    "schema",
+                    "version",
+                    "type",
+                    "sequence",
+                    "core_version",
+                    "core_commit",
+                    "knowledge_repository",
+                    "knowledge_revision",
+                    "knowledge_schema_version",
+                ],
+                line_number,
+            )?;
+            Ok(CaptureEvent::knowledge_context(
+                CaptureKnowledgeContext::new(
+                    string_field(object, "core_version", line_number)?,
+                    optional_string_field(object, "core_commit", line_number)?,
+                    string_field(object, "knowledge_repository", line_number)?,
+                    string_field(object, "knowledge_revision", line_number)?,
+                    u64_field(object, "knowledge_schema_version", line_number)?
+                        .try_into()
+                        .map_err(|_| {
+                            format!("line {line_number}: knowledge schema version is out of range")
+                        })?,
+                )
+                .map_err(|error| format!("line {line_number}: {error}"))?,
+            ))
         }
         "session_initialized" => {
             fields_exact(
@@ -868,27 +953,55 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
             .map_err(|error| format!("line {line_number}: {error}"))
         }
         "read_succeeded" => {
+            let has_definition = object.contains_key("knowledge_definition_id");
             fields_exact(
                 object,
-                &[
-                    "schema",
-                    "version",
-                    "type",
-                    "sequence",
-                    "semantic",
-                    "requested_interval_us",
-                    "due_us",
-                    "started_us",
-                    "finished_us",
-                    "request_payload",
-                    "response_payload",
-                    "value",
-                    "unit",
-                    "source",
-                    "profile",
-                    "decoder",
-                    "provenance",
-                ],
+                if has_definition {
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "semantic",
+                        "requested_interval_us",
+                        "due_us",
+                        "started_us",
+                        "finished_us",
+                        "request_payload",
+                        "response_payload",
+                        "value",
+                        "unit",
+                        "source",
+                        "profile",
+                        "decoder",
+                        "provenance",
+                        "knowledge_definition_id",
+                        "knowledge_definition_version",
+                        "knowledge_confidence",
+                        "knowledge_hardware_validation",
+                        "local_ecu_id",
+                    ]
+                } else {
+                    &[
+                        "schema",
+                        "version",
+                        "type",
+                        "sequence",
+                        "semantic",
+                        "requested_interval_us",
+                        "due_us",
+                        "started_us",
+                        "finished_us",
+                        "request_payload",
+                        "response_payload",
+                        "value",
+                        "unit",
+                        "source",
+                        "profile",
+                        "decoder",
+                        "provenance",
+                    ]
+                },
                 line_number,
             )?;
             let due_us = u64_field(object, "due_us", line_number)?;
@@ -897,6 +1010,44 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
             if !(due_us <= started_us && started_us <= finished_us) {
                 return Err(format!("line {line_number}: non-monotonic read timing"));
             }
+            let definition = if has_definition {
+                let definition_id =
+                    optional_string_field(object, "knowledge_definition_id", line_number)?;
+                let definition_version =
+                    optional_u64_field(object, "knowledge_definition_version", line_number)?
+                        .map(|version| {
+                            version.try_into().map_err(|_| {
+                        format!("line {line_number}: knowledge definition version is out of range")
+                    })
+                        })
+                        .transpose()?;
+                let confidence =
+                    optional_string_field(object, "knowledge_confidence", line_number)?;
+                let hardware_validation =
+                    optional_string_field(object, "knowledge_hardware_validation", line_number)?;
+                let local_ecu_id = optional_string_field(object, "local_ecu_id", line_number)?;
+                if definition_id.is_none()
+                    && definition_version.is_none()
+                    && confidence.is_none()
+                    && hardware_validation.is_none()
+                    && local_ecu_id.is_none()
+                {
+                    None
+                } else {
+                    Some(Box::new(
+                        CaptureDefinitionReference::new(
+                            definition_id,
+                            definition_version,
+                            confidence,
+                            hardware_validation,
+                            local_ecu_id,
+                        )
+                        .map_err(|error| format!("line {line_number}: {error}"))?,
+                    ))
+                }
+            } else {
+                None
+            };
             Ok(CaptureEvent::ReadSucceeded {
                 semantic: string_field(object, "semantic", line_number)?,
                 requested_interval_us: u64_field(object, "requested_interval_us", line_number)?,
@@ -920,6 +1071,7 @@ fn parse_event(object: &Object, line_number: usize) -> Result<CaptureEvent, Stri
                 profile: string_field(object, "profile", line_number)?,
                 decoder: string_field(object, "decoder", line_number)?,
                 provenance: string_field(object, "provenance", line_number)?,
+                definition,
             })
         }
         "read_failed" => {
@@ -1969,7 +2121,10 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::{
-        capture_events::{CaptureEvent, DiagnosticJobStepStatus, SubscriptionFilterOutcome},
+        capture_events::{
+            CaptureDefinitionReference, CaptureEvent, CaptureKnowledgeContext,
+            DiagnosticJobStepStatus, SubscriptionFilterOutcome,
+        },
         runtime_reducer::RuntimeEvent,
         runtime_state::RuntimeState,
     };
@@ -2002,6 +2157,16 @@ mod tests {
         );
         vec![
             CaptureEvent::capture_started(Some(1_700_000_000_000), Some("engine-baseline".into())),
+            CaptureEvent::knowledge_context(
+                CaptureKnowledgeContext::new(
+                    "0.1.0",
+                    None,
+                    "frankherchet/obdentic-knowledge",
+                    "0123456789abcdef0123456789abcdef01234567",
+                    2,
+                )
+                .unwrap(),
+            ),
             CaptureEvent::SessionInitialized,
             CaptureEvent::runtime_state_changed(from, to, RuntimeEvent::InitializationCompleted),
             CaptureEvent::subscription_configured(
@@ -2047,6 +2212,16 @@ mod tests {
                 profile: "obd2-v1".into(),
                 decoder: "((A * 256) + B) / 4".into(),
                 provenance: "SAE J1979 Mode 01 PID 0C".into(),
+                definition: Some(Box::new(
+                    CaptureDefinitionReference::new(
+                        Some("obd2.engine.rpm".into()),
+                        Some(1),
+                        Some("high".into()),
+                        Some("validated".into()),
+                        Some("local-engine".into()),
+                    )
+                    .unwrap(),
+                )),
             },
             CaptureEvent::ReadFailed {
                 semantic: "engine.rpm".into(),
@@ -2086,6 +2261,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..expected.len() as u64).collect::<Vec<_>>()
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_capture_without_knowledge_context_or_definition_fields_remains_readable() {
+        let path = temp_path("legacy-knowledge");
+        fs::write(
+            &path,
+            concat!(
+                "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n",
+                "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"capture_started\",\"sequence\":0,\"wallclock_ms\":null,\"profile\":null}\n",
+                "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"session_stopped\",\"sequence\":1,\"offset_us\":0}\n"
+            ),
+        )
+        .unwrap();
+        let parsed = read(&path).unwrap();
+        assert!(parsed
+            .events
+            .iter()
+            .all(|event| !matches!(event, CaptureEvent::KnowledgeContext { .. })));
+        assert_eq!(parsed.status, CaptureStatus::Complete);
         fs::remove_file(path).unwrap();
     }
 

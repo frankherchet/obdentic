@@ -6,6 +6,7 @@ use std::time::Duration;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MODE03_COMMAND: &str = "03\r";
+const STALE_MODE01_RESPONSE_PREFIX: &str = "stale unrelated OBD-II Mode 01 response from responder";
 const IGNORED_MODE01_RESPONSE_PREFIX: &str =
     "ignored unrelated OBD-II Mode 01 response from responder";
 
@@ -166,7 +167,7 @@ pub struct TargetedReadRequest {
 /// The closed EA189 DPF UDS probe.  The profile fixes the DID; callers can
 /// provide only independently validated physical routing evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TargetedDpfProbeRequest {
+pub(crate) struct TargetedDpfProbeRequest {
     operation: crate::protocol::ReadOperation,
     target: RequestTarget,
     expected_responder: ResponderIdentity,
@@ -180,9 +181,78 @@ pub struct TargetedEcuIdentificationRequest {
     expected_responder: ResponderIdentity,
 }
 
+/// The one closed functional ECU responder probe. It can be built only from
+/// the catalogued standard ECU serial-number candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionalEcuSerialProbe {
+    candidate: crate::ecu_identification::IdentificationCandidate,
+}
+
+impl FunctionalEcuSerialProbe {
+    pub fn from_candidate(
+        candidate: crate::ecu_identification::IdentificationCandidate,
+    ) -> Result<Self, String> {
+        if candidate.did() != 0xF18C || candidate.semantic() != "ecu.serial_number" {
+            return Err("functional ECU responder probing is limited to standard F18C".into());
+        }
+        Ok(Self { candidate })
+    }
+
+    pub const fn request_bytes(&self) -> [u8; 3] {
+        self.candidate.request_bytes()
+    }
+
+    fn candidate(&self) -> &crate::ecu_identification::IdentificationCandidate {
+        &self.candidate
+    }
+}
+
+/// The closed standard OBD-II Mode 09 PID set used for engine identification.
+/// Callers cannot construct an arbitrary Mode 09 request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode09Pid {
+    SupportedPids,
+    CalibrationId,
+    CalibrationVerificationNumber,
+    EcuName,
+}
+
+impl Mode09Pid {
+    pub const fn pid(self) -> u8 {
+        match self {
+            Self::SupportedPids => 0x00,
+            Self::CalibrationId => 0x04,
+            Self::CalibrationVerificationNumber => 0x06,
+            Self::EcuName => 0x0A,
+        }
+    }
+
+    pub const fn request_bytes(self) -> [u8; 2] {
+        [0x09, self.pid()]
+    }
+
+    pub const fn advertised_by(self, support_bitmap: u32) -> bool {
+        let pid = self.pid();
+        if pid == 0 {
+            return true;
+        }
+        let offset = pid & 0x1f;
+        let shift = if offset == 0 { 0 } else { 32 - offset };
+        support_bitmap & (1 << shift) != 0
+    }
+}
+
+/// A Mode 09 request bound to the confirmed physical engine target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedMode09Request {
+    pid: Mode09Pid,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
 impl TargetedDpfProbeRequest {
     /// Construct a closed EA189 probe from validated engine target evidence.
-    pub fn from_mapping(
+    pub(crate) fn from_mapping(
         probe: crate::ea189::Ea189DpfProbe,
         mapping: &crate::vehicle_knowledge::EcuTargetMapping,
     ) -> Result<Self, String> {
@@ -222,10 +292,6 @@ impl TargetedDpfProbeRequest {
 
     pub fn did(&self) -> u16 {
         self.operation.did()
-    }
-
-    pub fn request_bytes(&self) -> [u8; 3] {
-        self.operation.request_bytes()
     }
 
     pub fn target(&self) -> &RequestTarget {
@@ -287,6 +353,62 @@ impl TargetedEcuIdentificationRequest {
 
     pub fn request_bytes(&self) -> [u8; 3] {
         self.operation.request_bytes()
+    }
+
+    pub fn target(&self) -> &RequestTarget {
+        &self.target
+    }
+
+    pub fn expected_responder(&self) -> &ResponderIdentity {
+        &self.expected_responder
+    }
+}
+
+impl TargetedMode09Request {
+    pub fn from_mapping(
+        pid: Mode09Pid,
+        mapping: &crate::vehicle_knowledge::EcuTargetMapping,
+    ) -> Result<Self, String> {
+        if mapping.role().role() != &crate::topology::EcuRole::Engine {
+            return Err("Mode 09 probes require validated engine target evidence".into());
+        }
+        let target = mapping.target().target().clone();
+        if mapping.expected_responder().context() != target.context() {
+            return Err("Mode 09 target and responder contexts differ".into());
+        }
+        let expected_responder = mapping
+            .expected_responder()
+            .value()
+            .ok_or_else(|| "Mode 09 probes require an expected responder".to_string())?;
+        Self::new(
+            pid,
+            target,
+            ResponderIdentity::ElmHeader(expected_responder.to_owned()),
+        )
+    }
+
+    fn new(
+        pid: Mode09Pid,
+        target: RequestTarget,
+        expected_responder: ResponderIdentity,
+    ) -> Result<Self, String> {
+        validate_request_target(&target)?;
+        validate_elm_header(&expected_responder, "expected responder")?;
+        Ok(Self {
+            pid,
+            target,
+            expected_responder: ResponderIdentity::ElmHeader(
+                expected_responder.as_str().to_ascii_uppercase(),
+            ),
+        })
+    }
+
+    pub const fn pid(&self) -> Mode09Pid {
+        self.pid
+    }
+
+    pub const fn request_bytes(&self) -> [u8; 2] {
+        self.pid.request_bytes()
     }
 
     pub fn target(&self) -> &RequestTarget {
@@ -488,6 +610,9 @@ impl DiagnosticResponses {
             .responses
             .first()
             .ok_or_else(|| format!("01{pid:02X} response not found"))?;
+        if !first.payload.starts_with(&[0x41, pid]) {
+            return Err(format!("01{pid:02X} response not found"));
+        }
         if self
             .responses
             .iter()
@@ -683,6 +808,42 @@ where
         read_elm_targeted_with_evidence(&mut self.exchange, request).await
     }
 
+    pub(crate) async fn read_mode09(
+        &mut self,
+        request: &TargetedMode09Request,
+    ) -> Result<DiagnosticResponses, String> {
+        if let Err(error) = configure_target(
+            &mut self.exchange,
+            request.target(),
+            request.expected_responder(),
+        )
+        .await
+        {
+            let restore = restore_functional(&mut self.exchange).await;
+            return Err(combine_setup_errors(error, restore));
+        }
+
+        let read = read_elm_mode09_responses(&mut self.exchange, request).await;
+        let read = match read {
+            Ok(responses) => match targeted_payload(&responses, request.expected_responder()) {
+                Ok(_) => Ok(responses),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let restore = restore_functional(&mut self.exchange).await;
+        match (read, restore) {
+            (Ok(responses), Ok(())) => Ok(responses),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(format!(
+                "Mode 09 read succeeded; restoring functional addressing failed: {error}"
+            )),
+            (Err(error), Err(restore)) => Err(format!(
+                "{error}; restoring functional addressing failed: {restore}"
+            )),
+        }
+    }
+
     pub(crate) async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
         read_elm_mode03_responses(&mut self.exchange).await
     }
@@ -787,12 +948,37 @@ where
             }
         }
     }
+
+    /// Execute one standards-catalogued functional ECU-identification read.
+    /// The candidate type has no caller-supplied DID constructor.
+    pub(crate) async fn read_functional_ecu_serials(
+        &mut self,
+        probe: &FunctionalEcuSerialProbe,
+    ) -> Result<DiagnosticResponses, String> {
+        read_elm_functional_ecu_serial_responses(&mut self.exchange, probe).await
+    }
 }
 
 fn should_retry_stale_uds_response(responses: &DiagnosticResponses) -> bool {
     responses.responses.is_empty()
         && !responses.errors.is_empty()
         && responses.errors.iter().all(is_ignored_mode01_response)
+}
+
+fn should_retry_stale_mode01_response(responses: &DiagnosticResponses, pid: u8) -> bool {
+    !responses.responses.is_empty()
+        && responses.responses.len() == responses.errors.len()
+        && responses.responses.iter().all(|response| {
+            response.payload.first() == Some(&0x41)
+                && response
+                    .payload
+                    .get(1)
+                    .is_some_and(|observed| *observed != pid)
+        })
+        && responses
+            .errors
+            .iter()
+            .all(|error| error.error.starts_with(STALE_MODE01_RESPONSE_PREFIX))
 }
 
 fn is_ignored_mode01_response(error: &DiagnosticResponseError) -> bool {
@@ -831,6 +1017,41 @@ where
             payload,
             observations: vec![first.observation(None)],
         }),
+        Err(error) if should_retry_stale_mode01_response(&first, request.pid()) => {
+            let mut observations = vec![first.observation(Some(error.clone()))];
+            let retry = match read_elm_responses(exchange, request).await {
+                Ok(retry) => retry,
+                Err(retry_error) => {
+                    return Err(ReadEvidenceError {
+                        error: format!(
+                            "{error}; first ELM response={}; retry failed: {retry_error}",
+                            first.raw_response().escape_default()
+                        ),
+                        observations,
+                    });
+                }
+            };
+            match retry.unambiguous_payload(request.pid()) {
+                Ok(payload) => {
+                    observations.push(retry.observation(None));
+                    Ok(ReadEvidence {
+                        payload,
+                        observations,
+                    })
+                }
+                Err(retry_error) => {
+                    observations.push(retry.observation(Some(retry_error.clone())));
+                    Err(ReadEvidenceError {
+                        error: format!(
+                            "{retry_error}; first ELM response={}; retry ELM response={}",
+                            first.raw_response().escape_default(),
+                            retry.raw_response().escape_default()
+                        ),
+                        observations,
+                    })
+                }
+            }
+        }
         Err(error)
             if error.starts_with(&format!("conflicting 01{:02X} responses", request.pid())) =>
         {
@@ -1009,7 +1230,13 @@ where
 {
     let command = obd_command(request);
     let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
-    normalize_mode01_responses(&response, request.pid(), request.data_len())
+    match normalize_mode01_responses(&response, request.pid(), request.data_len()) {
+        Ok(responses) => Ok(responses),
+        Err(error) => match normalize_stale_mode01_responses(&response, request.pid()) {
+            Ok(responses) => Ok(responses),
+            Err(_) => Err(error),
+        },
+    }
 }
 
 pub(crate) async fn read_elm_mode03_responses<E>(
@@ -1046,6 +1273,49 @@ where
     normalize_uds_responses(&response, request.did())
 }
 
+pub(crate) async fn read_elm_functional_ecu_serial_responses<E>(
+    exchange: &mut E,
+    probe: &FunctionalEcuSerialProbe,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let candidate = probe.candidate();
+    let command = uds_command(candidate.operation());
+    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    let responses = normalize_uds_responses(&response, candidate.did())?;
+    let mut accepted = Vec::new();
+    let mut errors = responses.errors;
+    for response in responses.responses {
+        if response.payload.starts_with(&[0x62, 0xF1, 0x8C]) {
+            accepted.push(response);
+        } else {
+            errors.push(DiagnosticResponseError {
+                responder: response.responder,
+                error: "unexpected response while awaiting UDS 22 F18C".into(),
+            });
+        }
+    }
+    Ok(DiagnosticResponses::with_errors(
+        accepted,
+        &responses.raw_response,
+        errors,
+    ))
+}
+
+pub(crate) async fn read_elm_mode09_responses<E>(
+    exchange: &mut E,
+    request: &TargetedMode09Request,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let [_, pid] = request.request_bytes();
+    let command = format!("09{pid:02X}\r");
+    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    normalize_mode09_responses(&response, pid)
+}
+
 #[cfg(test)]
 pub(crate) fn supports_pid(support: &PidSupport, pid: u8) -> bool {
     support.supports_pid(pid)
@@ -1071,6 +1341,275 @@ pub(crate) fn uds_command(operation: crate::protocol::ReadOperation) -> String {
     format!("{service:02X}{high:02X}{low:02X}\r")
 }
 
+pub fn mode09_support_bitmap(payload: &[u8]) -> Result<u32, String> {
+    if payload.len() != 6 || payload[..2] != [0x49, 0x00] {
+        return Err("malformed Mode 09 PID 00 response".into());
+    }
+    Ok(u32::from_be_bytes(payload[2..].try_into().unwrap()))
+}
+
+/// Normalize one standard OBD-II Mode 09 response while retaining responder
+/// identity.  Only the requested positive `49 <pid>` payloads become reads;
+/// stale Mode 01 frames are recorded as ignored parser errors.
+pub(crate) fn normalize_mode09_responses(
+    response: &str,
+    pid: u8,
+) -> Result<DiagnosticResponses, String> {
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+    let mut assemblies: Vec<(Option<ResponderIdentity>, UdsIsoTpAssembly)> = Vec::new();
+    let request_echo = format!("09{pid:02X}");
+
+    for raw_line in response.split(['\r', '\n']) {
+        let line = raw_line.trim().trim_end_matches('>').trim();
+        if line.is_empty()
+            || line.eq_ignore_ascii_case(&request_echo)
+            || line.to_ascii_uppercase().starts_with("SEARCHING")
+            || (line.to_ascii_uppercase().starts_with("BUS INIT")
+                && !line.to_ascii_uppercase().contains("ERROR"))
+        {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let header = tokens.first().filter(|token| token.len() == 3).copied();
+        let responder =
+            header.map(|value| ResponderIdentity::ElmHeader(value.to_ascii_uppercase()));
+        let data = if header.is_some() {
+            &tokens[1..]
+        } else {
+            tokens.as_slice()
+        };
+        if ["?", "NO DATA", "STOPPED", "UNABLE TO CONNECT", "ERROR"]
+            .iter()
+            .any(|status| upper == *status || upper.contains(status))
+        {
+            errors.push(DiagnosticResponseError {
+                responder,
+                error: format!("ELM327 rejected Mode 09 PID {pid:02X} response: {line}"),
+            });
+            continue;
+        }
+        if header.is_some_and(|value| !value.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+            errors.push(DiagnosticResponseError {
+                responder: None,
+                error: format!("malformed ELM327 Mode 09 responder header: {line:?}"),
+            });
+            continue;
+        }
+        let mut bytes = Vec::new();
+        let mut malformed = None;
+        for token in data {
+            if token.is_empty()
+                || token.len() % 2 != 0
+                || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                malformed = Some(format!("malformed ELM327 Mode 09 response line: {line:?}"));
+                break;
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let pair = std::str::from_utf8(pair).expect("ASCII hex token");
+                match u8::from_str_radix(pair, 16) {
+                    Ok(byte) => bytes.push(byte),
+                    Err(error) => {
+                        malformed = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            if malformed.is_some() {
+                break;
+            }
+        }
+        if let Some(error) = malformed {
+            errors.push(DiagnosticResponseError { responder, error });
+            continue;
+        }
+
+        let is_mode01 = bytes.first() == Some(&0x41)
+            || (bytes.first().is_some_and(|byte| byte >> 4 == 0) && bytes.get(1) == Some(&0x41));
+        if is_mode01 {
+            errors.push(DiagnosticResponseError {
+                responder: None,
+                error: format!(
+                    "ignored unrelated OBD-II Mode 01 response while awaiting 090{pid:X}: {line:?}"
+                ),
+            });
+            continue;
+        }
+
+        match bytes.first().map(|byte| byte >> 4) {
+            Some(0) => {
+                let declared_len = (bytes[0] & 0x0f) as usize;
+                let payload = &bytes[1..];
+                if declared_len == 0 || payload.len() < declared_len {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 09 single frame: {line:?}"),
+                    });
+                    continue;
+                }
+                if payload[declared_len..]
+                    .iter()
+                    .any(|byte| !matches!(byte, 0x00 | 0x55 | 0xaa))
+                {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("unexpected bytes after Mode 09 response: {line:?}"),
+                    });
+                    continue;
+                }
+                push_mode09_payload(
+                    &mut matches,
+                    &mut errors,
+                    responder,
+                    &payload[..declared_len],
+                    pid,
+                    line,
+                );
+            }
+            Some(1) => {
+                if bytes.len() < 3 {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 09 first frame: {line:?}"),
+                    });
+                    continue;
+                }
+                let declared_len = (((bytes[0] & 0x0f) as usize) << 8) | bytes[1] as usize;
+                let payload = &bytes[2..];
+                if declared_len < 3 || payload.len() >= declared_len {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 09 first frame: {line:?}"),
+                    });
+                    continue;
+                }
+                assemblies.push((
+                    responder,
+                    UdsIsoTpAssembly {
+                        declared_len,
+                        payload: payload.to_vec(),
+                        next_sequence: 1,
+                    },
+                ));
+            }
+            Some(2) => {
+                let Some(index) = assemblies
+                    .iter()
+                    .position(|(identity, _)| *identity == responder)
+                else {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("Mode 09 consecutive frame without first frame: {line:?}"),
+                    });
+                    continue;
+                };
+                if bytes.len() < 2 {
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 09 consecutive frame: {line:?}"),
+                    });
+                    continue;
+                }
+                let sequence = bytes[0] & 0x0f;
+                let (declared_len, received_len, expected) = {
+                    let assembly = &assemblies[index].1;
+                    (
+                        assembly.declared_len,
+                        assembly.payload.len(),
+                        assembly.next_sequence,
+                    )
+                };
+                if sequence != expected || received_len >= declared_len {
+                    let (responder, _) = assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("malformed Mode 09 consecutive frame: {line:?}"),
+                    });
+                    continue;
+                }
+                let data = &bytes[1..];
+                let remaining = declared_len - received_len;
+                if data.len() > remaining
+                    && data[remaining..]
+                        .iter()
+                        .any(|byte| !matches!(byte, 0x00 | 0x55 | 0xaa))
+                {
+                    let (responder, _) = assemblies.remove(index);
+                    errors.push(DiagnosticResponseError {
+                        responder,
+                        error: format!("unexpected bytes after Mode 09 response: {line:?}"),
+                    });
+                    continue;
+                }
+                let complete = {
+                    let assembly = &mut assemblies[index].1;
+                    assembly
+                        .payload
+                        .extend_from_slice(&data[..data.len().min(remaining)]);
+                    assembly.next_sequence = (sequence + 1) & 0x0f;
+                    assembly.payload.len() == declared_len
+                };
+                if complete {
+                    let (responder, assembly) = assemblies.remove(index);
+                    push_mode09_payload(
+                        &mut matches,
+                        &mut errors,
+                        responder,
+                        &assembly.payload,
+                        pid,
+                        line,
+                    );
+                }
+            }
+            Some(3) => errors.push(DiagnosticResponseError {
+                responder,
+                error: format!("unexpected Mode 09 flow-control frame: {line:?}"),
+            }),
+            _ => push_mode09_payload(&mut matches, &mut errors, responder, &bytes, pid, line),
+        }
+    }
+    for (responder, assembly) in assemblies {
+        errors.push(DiagnosticResponseError {
+            responder,
+            error: format!(
+                "truncated Mode 09 response: declared {} bytes, received {}",
+                assembly.declared_len,
+                assembly.payload.len()
+            ),
+        });
+    }
+    if matches.is_empty() && errors.is_empty() {
+        errors.push(DiagnosticResponseError {
+            responder: None,
+            error: format!("Mode 09 PID {pid:02X} response not found"),
+        });
+    }
+    Ok(DiagnosticResponses::with_errors(matches, response, errors))
+}
+
+fn push_mode09_payload(
+    matches: &mut Vec<DiagnosticResponse>,
+    errors: &mut Vec<DiagnosticResponseError>,
+    responder: Option<ResponderIdentity>,
+    payload: &[u8],
+    pid: u8,
+    line: &str,
+) {
+    if payload.starts_with(&[0x49, pid]) {
+        matches.push(DiagnosticResponse {
+            responder,
+            payload: payload.to_vec(),
+        });
+    } else {
+        errors.push(DiagnosticResponseError {
+            responder,
+            error: format!("unexpected Mode 09 PID {pid:02X} response: {line:?}"),
+        });
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn normalize_mode01(
     response: &str,
@@ -1089,6 +1628,104 @@ pub(crate) fn normalize_mode01_responses(
         mode01_responses(response, pid, data_len)?,
         response,
     ))
+}
+
+/// Preserve a complete, length-prefixed response to a different Mode 01 PID
+/// so the caller can retry its already-authorized request once. Anything less
+/// definite remains the original normalization error.
+fn normalize_stale_mode01_responses(
+    response: &str,
+    requested_pid: u8,
+) -> Result<DiagnosticResponses, String> {
+    let mut responses = Vec::new();
+    let mut errors = Vec::new();
+
+    for raw_line in response.split(['\r', '\n']) {
+        let line = raw_line.trim().trim_end_matches('>').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        let compact = upper.split_ascii_whitespace().collect::<String>();
+        if compact == format!("01{requested_pid:02X}")
+            || upper.starts_with("SEARCHING")
+            || (upper.starts_with("BUS INIT") && !upper.contains("ERROR"))
+        {
+            continue;
+        }
+        if upper == "?"
+            || ["NO DATA", "STOPPED", "UNABLE TO CONNECT", "ERROR"]
+                .iter()
+                .any(|status| upper.contains(status))
+        {
+            return Err(format!("ELM327 rejected 01{requested_pid:02X}: {line}"));
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let header = tokens.first().filter(|token| token.len() == 3).copied();
+        if header.is_some_and(|value| !value.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+            return Err(format!("malformed ELM327 responder header: {line:?}"));
+        }
+        let data = if header.is_some() {
+            &tokens[1..]
+        } else {
+            tokens.as_slice()
+        };
+        let mut bytes = Vec::new();
+        for token in data {
+            if token.is_empty()
+                || token.len() % 2 != 0
+                || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!("malformed ELM327 response line: {line:?}"));
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+                bytes.push(u8::from_str_radix(pair, 16).map_err(|error| error.to_string())?);
+            }
+        }
+        let Some((&declared_len, payload_and_padding)) = bytes.split_first() else {
+            return Err(format!(
+                "01{requested_pid:02X} response not found in {response:?}"
+            ));
+        };
+        let declared_len = declared_len as usize;
+        if declared_len < 2
+            || payload_and_padding.len() < declared_len
+            || payload_and_padding[0] != 0x41
+            || payload_and_padding[1] == requested_pid
+            || payload_and_padding[declared_len..]
+                .iter()
+                .any(|byte| !matches!(byte, 0x00 | 0x55 | 0xaa))
+        {
+            return Err(format!(
+                "01{requested_pid:02X} response not found in {response:?}"
+            ));
+        }
+        let responder =
+            header.map(|value| ResponderIdentity::ElmHeader(value.to_ascii_uppercase()));
+        let payload = payload_and_padding[..declared_len].to_vec();
+        let observed = responder.as_ref().map_or_else(
+            || "unknown".to_owned(),
+            |responder| responder.as_str().to_owned(),
+        );
+        responses.push(DiagnosticResponse {
+            responder: responder.clone(),
+            payload,
+        });
+        errors.push(DiagnosticResponseError {
+            responder,
+            error: format!(
+                "stale unrelated OBD-II Mode 01 response from responder {observed} while awaiting 01{requested_pid:02X}: {line:?}"
+            ),
+        });
+    }
+
+    (!responses.is_empty())
+        .then_some(DiagnosticResponses::with_errors(
+            responses, response, errors,
+        ))
+        .ok_or_else(|| format!("01{requested_pid:02X} response not found in {response:?}"))
 }
 
 #[derive(Debug)]
@@ -2097,6 +2734,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_mode01_retries_one_stale_different_pid_response() {
+        let mut exchange = ScriptedExchange::new([
+            "7E9 06 41 00 98 18 00 01 AA\r>",
+            "7E9 03 41 0D 00 00 00 00\r>",
+        ]);
+        let request = crate::prepare_read("vehicle.speed").unwrap();
+
+        let read = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap();
+
+        assert_eq!(read.payload, [0x41, 0x0d, 0x00]);
+        assert_eq!(read.observations.len(), 2);
+        assert!(read.observations[0]
+            .selection_error
+            .as_deref()
+            .is_some_and(|error| error == "010D response not found"));
+        assert_eq!(exchange.commands, ["010D\r", "010D\r"]);
+    }
+
+    #[tokio::test]
+    async fn generic_mode01_stops_after_one_stale_different_pid_retry() {
+        let stale = "7E9 06 41 00 98 18 00 01 AA\r>";
+        let mut exchange = ScriptedExchange::new([stale, stale]);
+        let request = crate::prepare_read("vehicle.speed").unwrap();
+
+        let error = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+
+        assert!(error.error.contains("first ELM response"));
+        assert_eq!(error.observations.len(), 2);
+        assert_eq!(exchange.commands, ["010D\r", "010D\r"]);
+    }
+
+    #[tokio::test]
+    async fn generic_mode01_does_not_retry_adapter_rejection() {
+        let mut exchange = ScriptedExchange::new(["NO DATA\r>"]);
+        let request = crate::prepare_read("vehicle.speed").unwrap();
+
+        let error = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+
+        assert!(error.error.contains("ELM327 rejected"));
+        assert_eq!(exchange.commands, ["010D\r"]);
+    }
+
+    #[tokio::test]
     async fn generic_session_executes_closed_mode01_read_without_adapter_backend() {
         let exchange = ScriptedExchange::new(["410000100000\r>", "7E8 04 41 0C 1A F8\r>"]);
         let mut session = ElmSession::new(exchange);
@@ -2166,6 +2852,37 @@ mod tests {
                 "ATCRA\r",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn functional_f18c_keeps_only_positive_responder_identity() {
+        let catalog =
+            crate::knowledge_db::KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let candidate = crate::ecu_identification::EcuIdentificationPlan::from_catalog(&catalog)
+            .unwrap()
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.did() == 0xF18C)
+            .unwrap()
+            .clone();
+        let probe = FunctionalEcuSerialProbe::from_candidate(candidate).unwrap();
+        let exchange =
+            ScriptedExchange::new(["7E8 05 62 F1 8C 01 02 55 55\r7E9 03 7F 22 31 55 55\r>"]);
+        let mut session = ElmSession::new(exchange);
+
+        let responses = session.read_functional_ecu_serials(&probe).await.unwrap();
+
+        assert_eq!(responses.as_slice().len(), 1);
+        assert_eq!(
+            responses.as_slice()[0].responder,
+            Some(ResponderIdentity::ElmHeader("7E8".into()))
+        );
+        assert_eq!(
+            responses.as_slice()[0].payload,
+            [0x62, 0xF1, 0x8C, 0x01, 0x02]
+        );
+        assert_eq!(responses.errors().len(), 1);
+        assert_eq!(session.into_exchange().commands, ["22F18C\r"]);
     }
 
     #[tokio::test]
@@ -2331,5 +3048,34 @@ mod tests {
             .error
             .contains("ignored unrelated OBD-II Mode 01 response"));
         assert!(responses.raw_response().contains("41 00 98 3B A0 13"));
+    }
+
+    #[test]
+    fn mode09_support_bitmap_gates_only_the_closed_pid_set() {
+        let bitmap = mode09_support_bitmap(&[0x49, 0x00, 0x14, 0x40, 0x00, 0x00]).unwrap();
+
+        assert!(Mode09Pid::CalibrationId.advertised_by(bitmap));
+        assert!(Mode09Pid::CalibrationVerificationNumber.advertised_by(bitmap));
+        assert!(Mode09Pid::EcuName.advertised_by(bitmap));
+        assert_eq!(Mode09Pid::EcuName.request_bytes(), [0x09, 0x0A]);
+        assert!(mode09_support_bitmap(&[0x49, 0x00, 0x14]).is_err());
+    }
+
+    #[test]
+    fn mode09_normalizer_keeps_the_target_responder_and_reassembles_frames() {
+        let responses = normalize_mode09_responses(
+            "7E8 10 0C 49 04 01 43 41 4C\r7E8 21 49 44 31 32 33 34 55\r>",
+            0x04,
+        )
+        .unwrap();
+
+        assert_eq!(
+            responses.as_slice(),
+            &[DiagnosticResponse {
+                responder: Some(ResponderIdentity::ElmHeader("7E8".into())),
+                payload: b"I\x04\x01CALID1234".to_vec(),
+            }]
+        );
+        assert!(responses.errors().is_empty());
     }
 }

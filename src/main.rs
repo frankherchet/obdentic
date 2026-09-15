@@ -1,4 +1,11 @@
-use obdentic::vehicle_cache::{TargetMappingSnapshot, VehicleCache};
+#[cfg(test)]
+use obdentic::topology::{
+    AddressingContext, Confidence, Protocol, ProtocolContext, Provenance, RequestAddress,
+    RequestTarget, ResponderIdentity, RoleAssignment,
+};
+#[cfg(test)]
+use obdentic::vehicle_cache::TargetMappingSnapshot;
+use obdentic::vehicle_cache::VehicleCache;
 use obdentic::vehicle_knowledge::{
     EcuTargetMapping, FallbackPolicy, ReadRouting, VehicleKnowledge,
 };
@@ -31,10 +38,7 @@ use obdentic::{
     subscription_policy::{ObservationRequest, PlanStatus, SubscriptionPolicy},
     supported_signals,
     telemetry::TelemetryState,
-    topology::{
-        AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
-        RequestAddress, RequestTarget, ResponderIdentity, RoleAssignment,
-    },
+    topology::EcuRole,
     tui, ReadRequest, Transaction,
 };
 use std::{
@@ -44,7 +48,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture --adapter <CoreBluetooth UUID> --profile <ea189-dpf|ea189-dpf-longitudinal> --record <capture.jsonl> --cycles <1..=1440> --interval-seconds <>=30> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle scan --adapter <CoreBluetooth UUID> | obdentic vehicle mode09 --adapter <CoreBluetooth UUID> | obdentic vehicle ecu-serials --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture --adapter <CoreBluetooth UUID> --profile <ea189-dpf|ea189-dpf-longitudinal> --record <capture.jsonl> --cycles <1..=1440> --interval-seconds <>=30> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 const EA189_DPF_LONGITUDINAL_CONTEXT: [&str; 5] = [
     "engine.rpm",
@@ -110,6 +114,15 @@ enum Command {
         adapter_id: String,
     },
     VehicleRefresh {
+        adapter_id: String,
+    },
+    VehicleScan {
+        adapter_id: String,
+    },
+    VehicleMode09 {
+        adapter_id: String,
+    },
+    VehicleEcuSerials {
         adapter_id: String,
     },
     VehicleShow,
@@ -231,6 +244,15 @@ async fn run() -> Result<(), String> {
             }
             Command::VehicleRefresh { adapter_id } => {
                 run_vehicle_discover(&adapter_id, true, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleScan { adapter_id } => {
+                run_vehicle_scan(&adapter_id, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleMode09 { adapter_id } => {
+                run_vehicle_mode09(&adapter_id, &runtime, &mut runtime_state).await
+            }
+            Command::VehicleEcuSerials { adapter_id } => {
+                run_vehicle_ecu_serials(&adapter_id, &runtime, &mut runtime_state).await
             }
             Command::VehicleShow => run_vehicle_show(),
             Command::Capture {
@@ -365,6 +387,7 @@ async fn run() -> Result<(), String> {
                         Ok(scheduler) => scheduler,
                         Err(error) => {
                             if let Some(sender) = recorder.as_ref() {
+                                record_capture_start_failure(sender, "tui.live", &error).await?;
                                 apply_runtime_event(
                                     &runtime,
                                     &mut runtime_state,
@@ -561,6 +584,269 @@ async fn finish_discovery_failure(
     Ok(())
 }
 
+async fn run_vehicle_scan(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryStarted).await?;
+
+    match run_vehicle_scan_inner(adapter_id).await {
+        Ok(()) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await
+        }
+        Err(error) => {
+            finish_discovery_failure(&error, runtime, state).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_vehicle_scan_inner(adapter_id: &str) -> Result<(), String> {
+    let session = ble::start_session(adapter_id).await?;
+    let scan: Result<(), String> = async {
+        let discovery =
+            obdentic::functional_discovery::discover_functional_responders(&session).await?;
+        print!("{}", render_vehicle_scan(&discovery));
+        Ok(())
+    }
+    .await;
+    let shutdown = session.shutdown().await;
+    scan?;
+    shutdown
+}
+
+async fn run_vehicle_mode09(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryStarted).await?;
+
+    match run_vehicle_mode09_inner(adapter_id).await {
+        Ok(()) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await
+        }
+        Err(error) => {
+            finish_discovery_failure(&error, runtime, state).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_vehicle_mode09_inner(adapter_id: &str) -> Result<(), String> {
+    let mapping = cached_engine_mapping(adapter_id).await?;
+    let session = ble::start_session_with_adapter_io(adapter_id).await?;
+    let expected = mapping
+        .expected_responder()
+        .value()
+        .ok_or_else(|| "engine mapping has no expected responder".to_string())?;
+    let expected = ble::ResponderIdentity::ElmHeader(expected.to_owned());
+    let result: Result<(), String> = async {
+        let support = session
+            .read_mode09(ble::TargetedMode09Request::from_mapping(
+                ble::Mode09Pid::SupportedPids,
+                &mapping,
+            )?)
+            .await?;
+        let support_payload = support.select(&expected)?;
+        let support_bitmap = ble::mode09_support_bitmap(&support_payload)?;
+        println!("vehicle mode09");
+        println!(
+            "target\t{}",
+            mapping
+                .target()
+                .target()
+                .address()
+                .map_or("unknown", |address| address.value())
+        );
+        println!("responder\t{}", expected.as_str());
+        println!("pid\t00\tsupported\t{}", hex(&support_payload[2..]));
+
+        for pid in [
+            ble::Mode09Pid::CalibrationId,
+            ble::Mode09Pid::CalibrationVerificationNumber,
+            ble::Mode09Pid::EcuName,
+        ] {
+            if !pid.advertised_by(support_bitmap) {
+                println!("pid\t{:02X}\tnot-advertised\t", pid.pid());
+                continue;
+            }
+            let request = ble::TargetedMode09Request::from_mapping(pid, &mapping)?;
+            match session.read_mode09(request).await {
+                Ok(responses) => match responses.select(&expected) {
+                    Ok(payload) if payload.len() >= 2 && payload[..2] == [0x49, pid.pid()] => {
+                        println!("pid\t{:02X}\tread\t{}", pid.pid(), hex(&payload[2..]));
+                    }
+                    Ok(_) => println!("pid\t{:02X}\terror\tmalformed-response", pid.pid()),
+                    Err(error) => {
+                        println!("pid\t{:02X}\terror\t{}", pid.pid(), escape_field(&error))
+                    }
+                },
+                Err(error) => println!("pid\t{:02X}\terror\t{}", pid.pid(), escape_field(&error)),
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let shutdown = session.shutdown().await;
+    result?;
+    shutdown
+}
+
+async fn run_vehicle_ecu_serials(
+    adapter_id: &str,
+    runtime: &RuntimeClient,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::source(SourceState::Live),
+    )
+    .await?;
+    apply_runtime_event(
+        runtime,
+        state,
+        None,
+        RuntimeEvent::transport(TransportState::Connecting),
+    )
+    .await?;
+    apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryStarted).await?;
+
+    match run_vehicle_ecu_serials_inner(adapter_id).await {
+        Ok(()) => {
+            apply_runtime_event(runtime, state, None, RuntimeEvent::DiscoveryCompleted).await?;
+            apply_runtime_event(
+                runtime,
+                state,
+                None,
+                RuntimeEvent::transport(TransportState::Disconnected),
+            )
+            .await
+        }
+        Err(error) => {
+            finish_discovery_failure(&error, runtime, state).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_vehicle_ecu_serials_inner(adapter_id: &str) -> Result<(), String> {
+    let catalog = KnowledgeCatalog::load_pinned(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .map_err(|error| error.to_string())?;
+    let candidate = EcuIdentificationPlan::from_catalog(&catalog)?
+        .candidates()
+        .iter()
+        .find(|candidate| candidate.did() == 0xF18C)
+        .cloned()
+        .ok_or_else(|| "canonical knowledge is missing standard F18C".to_string())?;
+    let probe = ble::FunctionalEcuSerialProbe::from_candidate(candidate)?;
+    let session = ble::start_session(adapter_id).await?;
+    let result: Result<(), String> = async {
+        let responses = session.read_functional_ecu_serials(probe).await?;
+        println!("vehicle ecu serial responders");
+        println!("request\t22 F1 8C");
+        println!("responders\t{}", responses.as_slice().len());
+        for response in responses.as_slice() {
+            println!(
+                "responder\t{}\tpositive\tserial_hex={}",
+                response
+                    .responder
+                    .as_ref()
+                    .map_or("unknown", ble::ResponderIdentity::as_str),
+                hex(&response.payload[3..])
+            );
+        }
+        for error in responses.errors() {
+            println!(
+                "responder\t{}\terror\t{}",
+                error
+                    .responder
+                    .as_ref()
+                    .map_or("unknown", ble::ResponderIdentity::as_str),
+                escape_field(&error.error)
+            );
+        }
+        Ok(())
+    }
+    .await;
+    let shutdown = session.shutdown().await;
+    result?;
+    shutdown
+}
+
+fn render_vehicle_scan(
+    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
+) -> String {
+    let capabilities = discovery.capabilities();
+    let mut output = String::from("vehicle obd scan\nscope\tfunctional OBD-II Mode 01 only\n");
+    output.push_str(&format!("responders\t{}\n", capabilities.len()));
+    for capability in capabilities {
+        let responder = capability.responder().value().unwrap_or("unknown");
+        output.push_str(&format!("responder\t{}\n", responder.escape_default()));
+        for signal in supported_signals() {
+            let status = match capability.status(signal.metadata().semantic) {
+                Ok(obdentic::functional_discovery::CapabilityStatus::Supported) => "advertised",
+                Ok(obdentic::functional_discovery::CapabilityStatus::Unsupported) => {
+                    "not-advertised"
+                }
+                Ok(obdentic::functional_discovery::CapabilityStatus::Unknown) | Err(_) => "unknown",
+            };
+            output.push_str(&format!(
+                "signal\t{}\t{}\t{}\n",
+                responder.escape_default(),
+                signal.metadata().semantic,
+                status
+            ));
+        }
+    }
+    output
+}
+
 async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(), String> {
     let catalog = KnowledgeCatalog::load_pinned(Path::new(env!("CARGO_MANIFEST_DIR")))
         .map_err(|error| error.to_string())?;
@@ -607,24 +893,26 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
 
     let session = ble::start_session(adapter_id).await?;
     let discovery = obdentic::functional_discovery::discover_functional_responders(&session).await;
-    let target_mapping = match &discovery {
-        Ok(discovery) => validate_engine_target(&session, discovery).await,
-        Err(_) => Ok(None),
+    let target_mappings = match &discovery {
+        Ok(discovery) => {
+            obdentic::observed_inventory::discover_target_mappings(&session, discovery).await
+        }
+        Err(_) => Ok(Vec::new()),
     };
-    let ecu_identification = match &target_mapping {
-        Ok(Some(mapping)) => {
+    let ecu_identification = match &target_mappings {
+        Ok(mappings) if !mappings.is_empty() => {
             ecu_identification_discovery::discover_known_ecus(
                 &session,
                 &identification_plan,
-                std::slice::from_ref(mapping),
+                mappings,
             )
             .await
         }
-        Ok(None) | Err(_) => Ok(Vec::new()),
+        Ok(_) | Err(_) => Ok(Vec::new()),
     };
     let shutdown = session.shutdown().await;
     let discovery = discovery?;
-    let target_mapping = target_mapping?;
+    let target_mappings = target_mappings?;
     let ecu_identification = ecu_identification?;
     shutdown?;
 
@@ -634,17 +922,27 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         .as_ref()
         .map(VehicleCache::first_seen_ms)
         .unwrap_or(now);
-    let base_snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
+    let provider_results = obdentic::topology_provider::reviewed_topology_provider_results();
+    let inventory = obdentic::topology_provider::merge_topology_provider_results(
         &discovery.topology(),
+        &provider_results,
+    );
+    let base_snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::from_discovery(
+        inventory.topology(),
         &discovery.capabilities(),
     );
     let snapshot = obdentic::vehicle_cache::VehicleCacheSnapshot::with_ecu_identification(
         base_snapshot.topology().to_vec(),
         base_snapshot.ecu_capabilities().to_vec(),
-        target_mapping,
+        target_mappings,
         ecu_identification,
-    );
-    let engine_target_validated = !snapshot.target_mappings().is_empty();
+    )
+    .with_topology_provider_results(provider_results);
+    let engine_target_validated = snapshot.target_mappings().iter().any(|mapping| {
+        mapping
+            .role()
+            .is_some_and(|role| role.role() == &EcuRole::Engine)
+    });
     let mut history = existing
         .as_ref()
         .map(|cache| cache.history().to_vec())
@@ -676,71 +974,16 @@ async fn run_vehicle_discover_inner(adapter_id: &str, refresh: bool) -> Result<(
         );
     }
     println!("evidence\t{}", discovery.observations().len());
+    print!(
+        "{}",
+        render_topology_inventory_coverage(inventory.coverage())
+    );
     if !engine_target_validated {
         println!("target\tengine.rpm\tunavailable");
     } else {
         println!("target\tengine.rpm\t7E0 -> 7E8\tvalidated");
     }
     Ok(())
-}
-
-async fn validate_engine_target(
-    session: &ble::SessionClient,
-    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
-) -> Result<Option<TargetMappingSnapshot>, String> {
-    if !engine_responder_observed(discovery) {
-        return Ok(None);
-    }
-
-    let transaction = session.read_targeted(engine_target_request()?).await?;
-    validate_engine_target_transaction(&transaction)?;
-    Ok(Some(confirmed_engine_target()?))
-}
-
-fn engine_responder_observed(
-    discovery: &obdentic::functional_discovery::FunctionalResponderDiscovery,
-) -> bool {
-    discovery.responders().iter().any(|responder| {
-        responder
-            .value()
-            .is_some_and(|value| value.eq_ignore_ascii_case("7E8"))
-    })
-}
-
-fn validate_engine_target_transaction(transaction: &Transaction) -> Result<(), String> {
-    if transaction.semantic() != "engine.rpm"
-        || transaction.request() != [0x01, 0x0C]
-        || transaction.response().len() != 4
-        || transaction.response().first() != Some(&0x41)
-        || transaction.response().get(1) != Some(&0x0C)
-    {
-        return Err("targeted engine validation returned an invalid 010C response".into());
-    }
-    Ok(())
-}
-
-fn engine_target_request() -> Result<ble::TargetedReadRequest, String> {
-    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
-    ble::TargetedReadRequest::new(
-        prepare_read("engine.rpm")?,
-        RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E0")),
-        ble::ResponderIdentity::ElmHeader("7E8".into()),
-    )
-}
-
-fn confirmed_engine_target() -> Result<TargetMappingSnapshot, String> {
-    let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
-    let provenance = Provenance::new(
-        "targeted engine.rpm Mode 01 validation",
-        Confidence::Verified,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(TargetMappingSnapshot::new(
-        Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
-        Some(ResponderIdentity::address(context.clone(), "7E8")),
-        RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E0")),
-        provenance,
-    ))
 }
 
 async fn run_read(
@@ -863,11 +1106,7 @@ async fn run_diagnose_dtc_scan(
     let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
     let result = async {
         if sender.is_some() {
-            emit_capture_event(
-                sender,
-                CaptureEvent::capture_started(Some(wallclock_ms()?), Some("dtc.scan".into())),
-            )
-            .await?;
+            emit_capture_started(sender, Some("dtc.scan".into())).await?;
             apply_runtime_event(
                 runtime,
                 state,
@@ -1205,11 +1444,7 @@ async fn run_ea189_dpf_capture(
     let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
     let result = async {
         if sender.is_some() {
-            emit_capture_event(
-                sender,
-                CaptureEvent::capture_started(Some(wallclock_ms()?), Some(profile.into())),
-            )
-            .await?;
+            emit_capture_started(sender, Some(profile.into())).await?;
             apply_runtime_event(
                 runtime,
                 state,
@@ -1429,8 +1664,7 @@ async fn run_diagnose_ea189_dpf_probe_inner(
                     }
                     Err(error) => return Err(error.to_string()),
                 }
-                let request = ble::TargetedDpfProbeRequest::from_mapping(probe, &mapping)?;
-                match prepared.read_dpf_probe(request).await {
+                match prepared.read_dpf_probe(probe, &mapping).await {
                     Ok(responses) => {
                         let response = responses.as_slice().first().ok_or_else(|| {
                             format!("{} returned no normalized response", probe.semantic())
@@ -2203,6 +2437,37 @@ fn print_cached_vehicle_discovery(cache: &VehicleCache) {
         );
     }
     println!("evidence\t{}", signature.topology().len());
+    let inventory = obdentic::topology_provider::merge_topology_provider_results(
+        &obdentic::topology::EcuTopology::new(),
+        cache.snapshot().topology_provider_results(),
+    );
+    print!(
+        "{}",
+        render_topology_inventory_coverage(inventory.coverage())
+    );
+}
+
+fn render_topology_inventory_coverage(
+    coverage: &obdentic::topology_provider::TopologyInventoryCoverage,
+) -> String {
+    let mut output = format!(
+        "inventory_coverage\t{}\ntopology_providers\t{}\n",
+        coverage.class().as_str(),
+        coverage.providers().len()
+    );
+    for provider in coverage.providers() {
+        let scope = provider.applicability().scope();
+        output.push_str(&format!(
+            "topology_provider\t{}@{}\tstatus={}\tcoverage={}\tmanufacturer={}\tplatform={}\n",
+            provider.id().name(),
+            provider.id().version(),
+            provider.status().as_str(),
+            provider.coverage().as_str(),
+            scope.manufacturer_name().unwrap_or("-"),
+            scope.platform_name().unwrap_or("-"),
+        ));
+    }
+    output
 }
 
 fn run_vehicle_show() -> Result<(), String> {
@@ -2289,8 +2554,86 @@ fn render_vehicle_summaries(caches: &[obdentic::vehicle_cache::VehicleCache]) ->
         for evidence in cache.history() {
             output.push_str(&format!("  {}\n", evidence.escape_default()));
         }
+        let observations = cache.snapshot().ecu_identification();
+        if !observations.is_empty() {
+            output.push_str(&format!("ecu_identification\t{}\n", observations.len()));
+            for observation in observations {
+                let target = observation
+                    .target()
+                    .address()
+                    .map(|address| {
+                        format!(
+                            "{}:{}",
+                            escape_field(address.namespace()),
+                            escape_field(address.value())
+                        )
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                let responder = observation
+                    .expected_responder()
+                    .value()
+                    .map(escape_field)
+                    .unwrap_or_else(|| "unknown".into());
+                let role = cache
+                    .snapshot()
+                    .target_mappings()
+                    .iter()
+                    .find(|mapping| {
+                        mapping.target() == observation.target()
+                            && mapping
+                                .responder()
+                                .is_some_and(|value| value == observation.expected_responder())
+                    })
+                    .and_then(|mapping| mapping.role())
+                    .map(|role| render_ecu_role(role.role()))
+                    .unwrap_or_else(|| "unassigned".into());
+                let sensitivity = if observation.semantic() == "ecu.serial_number" {
+                    "local-sensitive"
+                } else {
+                    "local"
+                };
+                let value = observation
+                    .value()
+                    .map(|value| format!("\tvalue_hex={}", hex(value)))
+                    .unwrap_or_default();
+                output.push_str(&format!(
+                    "identification\ttarget={target}\tresponder={responder}\trole={role}\tsemantic={}\tstatus={}\tsensitivity={sensitivity}{value}\n",
+                    escape_field(observation.semantic()),
+                    render_identification_status(observation.status()),
+                ));
+            }
+        }
     }
     output
+}
+
+fn render_ecu_role(role: &EcuRole) -> String {
+    match role {
+        EcuRole::Engine => "engine".into(),
+        EcuRole::Transmission => "transmission".into(),
+        EcuRole::Gateway => "gateway".into(),
+        EcuRole::Unknown => "unknown".into(),
+        EcuRole::VendorSpecific(value) => format!("vendor:{}", escape_field(value)),
+    }
+}
+
+fn render_identification_status(
+    status: obdentic::ecu_identification::IdentificationResultStatus,
+) -> &'static str {
+    match status {
+        obdentic::ecu_identification::IdentificationResultStatus::Supported => "supported",
+        obdentic::ecu_identification::IdentificationResultStatus::Unsupported => "unsupported",
+        obdentic::ecu_identification::IdentificationResultStatus::NegativeResponse => {
+            "negative_response"
+        }
+        obdentic::ecu_identification::IdentificationResultStatus::Unavailable => "unavailable",
+        obdentic::ecu_identification::IdentificationResultStatus::Malformed => "malformed",
+        obdentic::ecu_identification::IdentificationResultStatus::Timeout => "timeout",
+        obdentic::ecu_identification::IdentificationResultStatus::TransportError => {
+            "transport_error"
+        }
+        obdentic::ecu_identification::IdentificationResultStatus::NotProbed => "not_probed",
+    }
 }
 
 async fn run_capture(
@@ -2466,6 +2809,22 @@ async fn emit_capture_event(
     Ok(())
 }
 
+async fn emit_capture_started(
+    recorder: Option<&jsonl_capture::Sender>,
+    profile: Option<String>,
+) -> Result<(), String> {
+    let Some(recorder) = recorder else {
+        return Ok(());
+    };
+    let context = obdentic::capture_events::CaptureKnowledgeContext::current()?;
+    emit_capture_event(
+        Some(recorder),
+        CaptureEvent::capture_started(Some(wallclock_ms()?), profile),
+    )
+    .await?;
+    emit_capture_event(Some(recorder), CaptureEvent::knowledge_context(context)).await
+}
+
 async fn record_capture_start_failure(
     sender: &jsonl_capture::Sender,
     profile: &str,
@@ -2477,8 +2836,10 @@ async fn record_capture_start_failure(
         .as_millis()
         .try_into()
         .map_err(|_| "wall clock timestamp exceeds supported range")?;
+    let context = obdentic::capture_events::CaptureKnowledgeContext::current()?;
     for event in [
         CaptureEvent::capture_started(Some(wallclock_ms), Some(profile.into())),
+        CaptureEvent::knowledge_context(context),
         CaptureEvent::session_error(error),
         CaptureEvent::SessionStopped { offset_us: 0 },
     ] {
@@ -2762,6 +3123,30 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 Command::VehicleRefresh {
                     adapter_id: adapter_id.clone(),
                 }
+            })
+        }
+        [command, action, adapter_flag, adapter_id]
+            if command == "vehicle" && action == "scan" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::VehicleScan {
+                adapter_id: adapter_id.clone(),
+            })
+        }
+        [command, action, adapter_flag, adapter_id]
+            if command == "vehicle" && action == "mode09" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::VehicleMode09 {
+                adapter_id: adapter_id.clone(),
+            })
+        }
+        [command, action, adapter_flag, adapter_id]
+            if command == "vehicle" && action == "ecu-serials" && adapter_flag == "--adapter" =>
+        {
+            require_uuid(adapter_id)?;
+            Ok(Command::VehicleEcuSerials {
+                adapter_id: adapter_id.clone(),
             })
         }
         [command, action] if command == "vehicle" && action == "show" => Ok(Command::VehicleShow),
@@ -3083,7 +3468,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_failure_is_preserved_in_the_capture_event_stream() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         record_capture_start_failure(&sender, "engine-baseline", "Carly setup timed out")
             .await
             .unwrap();
@@ -3094,6 +3479,10 @@ mod tests {
                 profile: Some(profile),
                 ..
             }) if profile == "engine-baseline"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(CaptureEvent::KnowledgeContext { .. })
         ));
         assert_eq!(
             receiver.recv().await,
@@ -3195,6 +3584,24 @@ mod tests {
         assert_eq!(
             parse_command(&args(&["vehicle", "refresh", "--adapter", uuid,])),
             Ok(Command::VehicleRefresh {
+                adapter_id: uuid.into(),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "scan", "--adapter", uuid,])),
+            Ok(Command::VehicleScan {
+                adapter_id: uuid.into(),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "mode09", "--adapter", uuid,])),
+            Ok(Command::VehicleMode09 {
+                adapter_id: uuid.into(),
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["vehicle", "ecu-serials", "--adapter", uuid,])),
+            Ok(Command::VehicleEcuSerials {
                 adapter_id: uuid.into(),
             })
         );
@@ -3401,6 +3808,104 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn renders_functional_scan_for_each_responder_without_physical_targets() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Functional);
+        let provenance = Provenance::new("test", Confidence::High).unwrap();
+        let discovery = obdentic::functional_discovery::FunctionalResponderDiscovery::new([
+            obdentic::functional_discovery::FunctionalPageObservation::new(
+                [0x01, 0x00],
+                ResponderIdentity::opaque(context.clone(), "7E8"),
+                vec![0x41, 0x00, 0x00, 0x18, 0x00, 0x00],
+                provenance.clone(),
+            )
+            .unwrap(),
+            obdentic::functional_discovery::FunctionalPageObservation::new(
+                [0x01, 0x00],
+                ResponderIdentity::opaque(context, "7E9"),
+                vec![0x41, 0x00, 0x00, 0x08, 0x00, 0x00],
+                provenance,
+            )
+            .unwrap(),
+        ]);
+
+        let output = render_vehicle_scan(&discovery);
+        assert!(output.contains("scope\tfunctional OBD-II Mode 01 only\n"));
+        assert!(output.contains("responders\t2\n"));
+        assert!(output.contains("signal\t7E8\tengine.rpm\tadvertised\n"));
+        assert!(output.contains("signal\t7E9\tengine.rpm\tnot-advertised\n"));
+        assert!(output.contains("signal\t7E9\tvehicle.speed\tadvertised\n"));
+        assert!(!output.contains("7E0"));
+    }
+
+    #[test]
+    fn renders_blocked_provider_coverage_without_claiming_complete_inventory() {
+        let inventory = obdentic::topology_provider::merge_topology_provider_results(
+            &obdentic::topology::EcuTopology::new(),
+            &obdentic::topology_provider::reviewed_topology_provider_results(),
+        );
+        let output = render_topology_inventory_coverage(inventory.coverage());
+
+        assert!(
+            output.contains("inventory_coverage\tmanufacturer-provider-unavailable-or-blocked\n")
+        );
+        assert!(output.contains(
+            "topology_provider\tvw.pq35.gateway-installation-list@1\tstatus=blocked\tcoverage=unknown\tmanufacturer=Volkswagen\tplatform=PQ35 / EA189\n"
+        ));
+        assert!(!output.contains("complete vehicle"));
+        assert!(!output.contains("all ECUs"));
+    }
+
+    #[test]
+    fn renders_cached_ecu_identification_with_role_and_sensitive_value_marker() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let target =
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0"));
+        let responder = ResponderIdentity::address(context, "7E8");
+        let provenance = Provenance::new("test", Confidence::Verified).unwrap();
+        let mapping = TargetMappingSnapshot::new(
+            Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
+            Some(responder.clone()),
+            target.clone(),
+            provenance,
+        );
+        let observation = obdentic::ecu_identification::IdentificationObservation::new(
+            target,
+            responder,
+            "ecu.serial_number",
+            "uds.f18c.serial_number",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "0123456789abcdef0123456789abcdef01234567",
+            [0x22, 0xF1, 0x8C],
+            obdentic::ecu_identification::IdentificationResultStatus::Supported,
+            Vec::new(),
+            None,
+            Some(vec![0x53, 0x31]),
+            Vec::new(),
+        )
+        .unwrap();
+        let cache = VehicleCache::with_snapshot(
+            "cache",
+            1,
+            2,
+            obdentic::vehicle_cache::VehicleCacheSnapshot::with_ecu_identification(
+                [],
+                [],
+                [mapping],
+                [observation],
+            ),
+            Vec::new(),
+        );
+
+        let output = render_vehicle_summaries(&[cache]);
+        assert!(output.contains("ecu_identification\t1\n"));
+        assert!(output.contains(
+            "identification\ttarget=elm-header:7E0\tresponder=7E8\trole=engine\tsemantic=ecu.serial_number\tstatus=supported\tsensitivity=local-sensitive\tvalue_hex=53 31\n"
+        ));
+        assert!(!output.contains("S1"));
     }
 
     #[test]

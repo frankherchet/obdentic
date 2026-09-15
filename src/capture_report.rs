@@ -2,8 +2,9 @@
 
 use crate::{
     capture_events::{
-        CaptureEvent, CaptureTimeUs, CaptureValue, DiagnosticJobStepStatus, DtcObservationFact,
-        DtcTransportOutcome, SubscriptionFilterOutcome,
+        CaptureEvent, CaptureKnowledgeContext, CaptureTimeUs, CaptureValue,
+        DiagnosticJobStepStatus, DtcObservationFact, DtcTransportOutcome,
+        SubscriptionFilterOutcome,
     },
     jsonl_capture::{CaptureStatus, ParsedCapture},
 };
@@ -37,6 +38,7 @@ struct Summary {
     session_stopped_us: Option<CaptureTimeUs>,
     profile: Option<String>,
     wallclock_ms: Option<u64>,
+    knowledge_context: Option<CaptureKnowledgeContext>,
     session_errors: Vec<String>,
     error_messages: BTreeMap<String, u64>,
     all_reads: Vec<(CaptureTimeUs, CaptureTimeUs, CaptureTimeUs)>,
@@ -65,6 +67,10 @@ fn summary(capture: &ParsedCapture) -> Summary {
                 summary.lifecycle += 1;
                 summary.wallclock_ms = *wallclock_ms;
                 summary.profile = profile.clone();
+            }
+            CaptureEvent::KnowledgeContext { context } => {
+                summary.lifecycle += 1;
+                summary.knowledge_context = Some(context.clone());
             }
             CaptureEvent::SessionInitialized
             | CaptureEvent::SupportDiscovery { .. }
@@ -233,10 +239,11 @@ fn observe_offset(summary: &mut Summary, offset: CaptureTimeUs) {
 pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
     let summary = summary(capture);
     let mut output = format!(
-        "Capture: {path}\nFormat: JSONL {}\nStatus: {}\nProfile: {}\nStarted: {}\nDuration: {}\nEvents: {}\nReads: {} succeeded, {} failed\nSkipped: {} events, {} slots\nDiagnostic jobs: {} started, {} completed, {} failed, {} cancelled\nDiagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\nDTC transport observations: {}\nDTC decoded observations: {}\nLifecycle events: {}\n\nSignals\n",
+        "Capture: {path}\nFormat: JSONL {}\nStatus: {}\nProfile: {}\nKnowledge: {}\nStarted: {}\nDuration: {}\nEvents: {}\nReads: {} succeeded, {} failed\nSkipped: {} events, {} slots\nDiagnostic jobs: {} started, {} completed, {} failed, {} cancelled\nDiagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\nDTC transport observations: {}\nDTC decoded observations: {}\nLifecycle events: {}\n\nSignals\n",
         crate::jsonl_capture::VERSION,
         status(capture.status),
         summary.profile.as_deref().unwrap_or("unavailable"),
+        knowledge_context(summary.knowledge_context.as_ref()),
         summary.wallclock_ms.map_or_else(|| "unavailable".into(), |value| value.to_string()),
         duration(&summary),
         summary.events,
@@ -303,6 +310,19 @@ pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
         }
     }
     output
+}
+
+fn knowledge_context(context: Option<&CaptureKnowledgeContext>) -> String {
+    let Some(context) = context else {
+        return "legacy/unavailable".into();
+    };
+    format!(
+        "{}@{} schema {} (core {})",
+        context.knowledge_repository(),
+        context.knowledge_revision(),
+        context.knowledge_schema_version(),
+        context.core_version(),
+    )
 }
 
 pub fn render_capability(path: &str, capture: &ParsedCapture) -> String {
@@ -511,7 +531,9 @@ fn percentage(part: u64, total: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture_events::{CaptureEvent, CaptureValue, DiagnosticJobStepStatus};
+    use crate::capture_events::{
+        CaptureEvent, CaptureKnowledgeContext, CaptureValue, DiagnosticJobStepStatus,
+    };
     use crate::diagnostic_job::JobStatus;
 
     fn capture(events: Vec<CaptureEvent>) -> ParsedCapture {
@@ -543,6 +565,7 @@ mod tests {
             profile: "generic-obd2".into(),
             decoder: "x".into(),
             provenance: "x".into(),
+            definition: None,
         }
     }
 
@@ -572,6 +595,28 @@ mod tests {
         assert!(rendered.contains("Reads: 2 succeeded, 1 failed"));
         assert!(rendered.contains("numeric range: 800 .. 900"));
         assert!(rendered.contains("ambiguous responders"));
+        assert!(rendered.contains("Knowledge: legacy/unavailable"));
+    }
+
+    #[test]
+    fn inspection_renders_recorded_knowledge_pin_without_vehicle_identity() {
+        let rendered = render_inspection(
+            "sample.jsonl",
+            &capture(vec![CaptureEvent::knowledge_context(
+                CaptureKnowledgeContext::new(
+                    "0.1.0",
+                    None,
+                    "frankherchet/obdentic-knowledge",
+                    "0123456789abcdef0123456789abcdef01234567",
+                    2,
+                )
+                .unwrap(),
+            )]),
+        );
+        assert!(rendered.contains(
+            "Knowledge: frankherchet/obdentic-knowledge@0123456789abcdef0123456789abcdef01234567 schema 2 (core 0.1.0)"
+        ));
+        assert!(!rendered.contains("VIN"));
     }
 
     #[test]

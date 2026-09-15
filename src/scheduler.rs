@@ -3,7 +3,8 @@ use crate::{
     ble::{is_session_unhealthy, start_session, ReadOutcome, ResponseObservation, SessionClient},
     capability::HardwareCapability,
     capture_events::{
-        CaptureEvent, CaptureSubscription, CaptureTimeUs, ReadTiming, SubscriptionFilterOutcome,
+        CaptureEvent, CaptureKnowledgeContext, CaptureSubscription, CaptureTimeUs, ReadTiming,
+        SubscriptionFilterOutcome,
     },
     prepare_read,
     runtime_actor::RuntimeClient,
@@ -212,6 +213,10 @@ impl TelemetryScheduler {
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
+        let knowledge_context = recorder
+            .as_ref()
+            .map(|_| CaptureKnowledgeContext::current())
+            .transpose()?;
         let mut runtime_state = runtime
             .snapshot()
             .await
@@ -334,6 +339,7 @@ impl TelemetryScheduler {
             };
         }
         let mut events = std::iter::once(started)
+            .chain(knowledge_context.map(CaptureEvent::knowledge_context))
             .chain(std::iter::once(CaptureEvent::SessionInitialized))
             .chain(configured.into_iter().map(CaptureSubscription::into_event))
             .chain(discovery.into_iter().map(|page| {

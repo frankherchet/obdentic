@@ -469,9 +469,9 @@ mod tests {
         );
         assert_eq!(
             first.knowledge_revision(),
-            "661fba8eed8ddce8fef5bba4c68dfcba85e2dd28"
+            "b356ff5afb850017ec546945f41d739071c74d76"
         );
-        assert_eq!(first.knowledge_schema_version(), 1);
+        assert_eq!(first.knowledge_schema_version(), 2);
         assert_eq!(first.set_id(), STANDARD_UDS_ECU_IDENTIFICATION_SET);
     }
 }
