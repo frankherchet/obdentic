@@ -823,6 +823,7 @@ fn event_kind(event: &CaptureEvent) -> u64 {
         CaptureEvent::DiagnosticJobCancelled { .. } => 18,
         CaptureEvent::DtcTransportObserved { .. } => 19,
         CaptureEvent::DtcObservation { .. } => 20,
+        CaptureEvent::KnowledgeContext { .. } => 21,
     }
 }
 
@@ -874,6 +875,7 @@ mod tests {
                 profile: "standard".into(),
                 decoder: "sae-j1979".into(),
                 provenance: "SAE J1979".into(),
+                definition: None,
             })
             .await
             .unwrap();
