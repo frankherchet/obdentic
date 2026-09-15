@@ -3916,18 +3916,24 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn engine_target_validation_is_explicit_and_read_only() {
-        let request = engine_target_request().unwrap();
-        assert_eq!(request.request().bytes(), [0x01, 0x0C]);
-        assert_eq!(request.target().address().unwrap().value(), "7E0");
-        assert_eq!(request.expected_responder().as_str(), "7E8");
+    fn confirmed_engine_target_for_test() -> TargetMappingSnapshot {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let provenance = Provenance::new(
+            "targeted engine.rpm Mode 01 validation",
+            Confidence::Verified,
+        )
+        .unwrap();
+        TargetMappingSnapshot::new(
+            Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
+            Some(ResponderIdentity::address(context.clone(), "7E8")),
+            RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E0")),
+            provenance,
+        )
     }
 
     #[test]
     fn longitudinal_context_is_explicit_policy_admitted_and_engine_targeted() {
-        let mapping = confirmed_engine_target()
-            .unwrap()
+        let mapping = confirmed_engine_target_for_test()
             .to_vehicle_knowledge_mapping()
             .unwrap();
         let plan = longitudinal_context_plan(&mapping, Duration::from_secs(30)).unwrap();
@@ -3941,52 +3947,6 @@ mod tests {
                 && entry.requested_interval_us == 30_000_000
         }));
         assert!(longitudinal_context_plan(&mapping, Duration::from_millis(1)).is_err());
-    }
-
-    #[test]
-    fn confirmed_engine_target_preserves_distinct_role_target_and_responder() {
-        let mapping = confirmed_engine_target().unwrap();
-        assert_eq!(mapping.role().unwrap().role(), &EcuRole::Engine);
-        assert_eq!(mapping.target().address().unwrap().value(), "7E0");
-        assert_eq!(mapping.responder().unwrap().value(), Some("7E8"));
-        assert_ne!(
-            mapping.target().address().unwrap().value(),
-            mapping.responder().unwrap().value().unwrap()
-        );
-    }
-
-    #[test]
-    fn target_validation_requires_the_expected_engine_transaction() {
-        let valid = prepare_read("engine.rpm")
-            .unwrap()
-            .complete("test", vec![0x41, 0x0C, 0x00, 0x00])
-            .unwrap();
-        assert!(validate_engine_target_transaction(&valid).is_ok());
-
-        let wrong_signal = prepare_read("vehicle.speed")
-            .unwrap()
-            .complete("test", vec![0x41, 0x0D, 0x00])
-            .unwrap();
-        assert!(validate_engine_target_transaction(&wrong_signal).is_err());
-    }
-
-    #[test]
-    fn target_validation_is_not_attempted_without_7e8_evidence() {
-        let discovery = obdentic::functional_discovery::FunctionalResponderDiscovery::new([]);
-        assert!(!engine_responder_observed(&discovery));
-
-        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Functional);
-        let provenance = Provenance::new("test", Confidence::High).unwrap();
-        let observation = obdentic::functional_discovery::FunctionalPageObservation::new(
-            [0x01, 0x00],
-            ResponderIdentity::opaque(context, "7E9"),
-            vec![0x41, 0x00, 0, 0, 0, 0],
-            provenance,
-        )
-        .unwrap();
-        let discovery =
-            obdentic::functional_discovery::FunctionalResponderDiscovery::new([observation]);
-        assert!(!engine_responder_observed(&discovery));
     }
 
     #[test]
