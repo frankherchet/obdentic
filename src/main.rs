@@ -18,12 +18,13 @@ use obdentic::{
         CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, DtcObservationFact,
         DtcTransportOutcome, ReadTiming, SubscriptionFilterOutcome,
     },
+    capture_format::{self, CaptureSender, CaptureSink},
     capture_replay::CaptureReplay,
     capture_report, capture_tui,
     diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus, KnownTarget},
     dtc,
     ecu_identification::EcuIdentificationPlan,
-    ecu_identification_discovery, hex, jsonl_capture,
+    ecu_identification_discovery, hex,
     knowledge_db::KnowledgeCatalog,
     layout_observation::{self, LayoutFreshnessPolicy},
     prepare_read, record, replay,
@@ -270,12 +271,12 @@ async fn run() -> Result<(), String> {
                 .await
             }
             Command::CaptureInspect(path) => {
-                let capture = jsonl_capture::read(Path::new(&path))?;
+                let capture = capture_format::read(Path::new(&path))?;
                 print!("{}", capture_report::render_inspection(&path, &capture));
                 Ok(())
             }
             Command::CaptureCapability(path) => {
-                let capture = jsonl_capture::read(Path::new(&path))?;
+                let capture = capture_format::read(Path::new(&path))?;
                 print!("{}", capture_report::render_capability(&path, &capture));
                 Ok(())
             }
@@ -355,18 +356,16 @@ async fn run() -> Result<(), String> {
                     tui::run_live(&layout, telemetry, audit, policy_state)
                 } else {
                     let plans = routed_observation_plans(&adapter_id, subscriptions).await?;
-                    let (recorder, writer) = match recording.as_deref() {
-                        Some(path) => {
-                            let (sender, writer) = jsonl_capture::start(Path::new(path))?;
-                            (Some(sender), Some(writer))
-                        }
-                        None => (None, None),
-                    };
-                    if let Some(sender) = recorder.as_ref() {
+                    let recorder = recording
+                        .as_deref()
+                        .map(|path| CaptureSink::open(Path::new(path)))
+                        .transpose()?;
+                    let sender = recorder.as_ref().map(CaptureSink::sender);
+                    if sender.is_some() {
                         apply_runtime_event(
                             &runtime,
                             &mut runtime_state,
-                            Some(sender),
+                            sender,
                             RuntimeEvent::recording(RecordingState::Active),
                         )
                         .await?;
@@ -376,7 +375,7 @@ async fn run() -> Result<(), String> {
                         plans,
                         telemetry.clone(),
                         audit.clone(),
-                        recorder.clone(),
+                        sender.cloned(),
                         None,
                         None,
                         runtime.clone(),
@@ -386,7 +385,7 @@ async fn run() -> Result<(), String> {
                     {
                         Ok(scheduler) => scheduler,
                         Err(error) => {
-                            if let Some(sender) = recorder.as_ref() {
+                            if let Some(sender) = sender {
                                 record_capture_start_failure(sender, "tui.live", &error).await?;
                                 apply_runtime_event(
                                     &runtime,
@@ -397,9 +396,8 @@ async fn run() -> Result<(), String> {
                                 .await?;
                             }
                             let shutdown =
-                                finish_runtime(&runtime, &mut runtime_state, recorder.as_ref())
-                                    .await;
-                            let recorded = finish_capture(recorder, writer).await;
+                                finish_runtime(&runtime, &mut runtime_state, sender).await;
+                            let recorded = finish_capture(recorder).await;
                             shutdown?;
                             recorded?;
                             return Err(error);
@@ -407,7 +405,7 @@ async fn run() -> Result<(), String> {
                     };
                     let result = tui::run_live(&layout, telemetry, audit, policy_state);
                     let stopped = scheduler.stop().await;
-                    let inactive = if let Some(sender) = recorder.as_ref() {
+                    let inactive = if let Some(sender) = sender {
                         apply_runtime_event(
                             &runtime,
                             &mut runtime_state,
@@ -418,9 +416,8 @@ async fn run() -> Result<(), String> {
                     } else {
                         Ok(())
                     };
-                    let shutdown =
-                        finish_runtime(&runtime, &mut runtime_state, recorder.as_ref()).await;
-                    let recorded = finish_capture(recorder, writer).await;
+                    let shutdown = finish_runtime(&runtime, &mut runtime_state, sender).await;
+                    let recorded = finish_capture(recorder).await;
                     result?;
                     stopped?;
                     inactive?;
@@ -1101,9 +1098,9 @@ async fn run_diagnose_dtc_scan(
 ) -> Result<(), String> {
     let started = Instant::now();
     let recorder = recording
-        .map(jsonl_capture::JsonlRecorder::start)
+        .map(CaptureSink::open)
         .transpose()?;
-    let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
+    let sender = recorder.as_ref().map(CaptureSink::sender);
     let result = async {
         if sender.is_some() {
             emit_capture_started(sender, Some("dtc.scan".into())).await?;
@@ -1154,7 +1151,7 @@ async fn run_diagnose_dtc_scan_inner(
     adapter_id: &str,
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
 ) -> Result<(), String> {
     let job = DiagnosticJob::dtc_scan(DiagnosticScope::VehicleWide);
     let plan = job.plan();
@@ -1439,9 +1436,9 @@ async fn run_ea189_dpf_capture(
     let profile = config.profile;
     let started = Instant::now();
     let recorder = recording
-        .map(jsonl_capture::JsonlRecorder::start)
+        .map(CaptureSink::open)
         .transpose()?;
-    let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
+    let sender = recorder.as_ref().map(CaptureSink::sender);
     let result = async {
         if sender.is_some() {
             emit_capture_started(sender, Some(profile.into())).await?;
@@ -1495,7 +1492,7 @@ async fn run_diagnose_ea189_dpf_probe_inner(
     adapter_id: &str,
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     started: Instant,
     config: Ea189DpfCaptureConfig<'_>,
 ) -> Result<(), String> {
@@ -1955,7 +1952,7 @@ fn longitudinal_context_plan(
 }
 
 struct LongitudinalCycleContext<'a> {
-    recorder: Option<&'a jsonl_capture::Sender>,
+    recorder: Option<&'a CaptureSender>,
     started: Instant,
     due_us: u64,
     reads: &'a [LongitudinalContextRead],
@@ -2118,7 +2115,7 @@ async fn capture_longitudinal_context_cycle(
 }
 
 async fn emit_longitudinal_response_observations(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     context_read: &LongitudinalContextRead,
     observations: &[ble::TargetedReadObservation],
     offset_us: u64,
@@ -2172,7 +2169,7 @@ async fn cached_engine_mapping(adapter_id: &str) -> Result<EcuTargetMapping, Str
 async fn finish_diagnostic(
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
 ) -> Result<(), String> {
     apply_runtime_event(
         runtime,
@@ -2212,7 +2209,7 @@ fn dtc_evidence(
 }
 
 async fn record_protocol_negotiation(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     negotiation: &ble::ProtocolNegotiation,
 ) -> Result<(), String> {
     for observation in negotiation.observations() {
@@ -2233,7 +2230,7 @@ async fn record_protocol_negotiation(
 }
 
 async fn record_dtc_transport_evidence(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     job: &DiagnosticJob,
     responses: &ble::DiagnosticResponses,
 ) -> Result<(), String> {
@@ -2271,7 +2268,7 @@ async fn record_dtc_transport_evidence(
 }
 
 async fn record_dtc_facts(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     job: &DiagnosticJob,
     result: &dtc::DtcScanResult,
 ) -> Result<(), String> {
@@ -2658,11 +2655,11 @@ async fn run_capture(
     }
     let plans = routed_observation_plans(adapter_id, subscriptions.clone()).await?;
 
-    let (sender, writer) = jsonl_capture::start(path)?;
+    let sink = CaptureSink::open(path)?;
     apply_runtime_event(
         runtime,
         runtime_state,
-        Some(&sender),
+        Some(sink.sender()),
         RuntimeEvent::recording(RecordingState::Active),
     )
     .await?;
@@ -2696,7 +2693,7 @@ async fn run_capture(
         plans,
         Arc::new(Mutex::new(TelemetryState::new(600)?)),
         Arc::new(Mutex::new(AuditState::new(600)?)),
-        Some(sender.clone()),
+        Some(sink.sender().clone()),
         Some(profile.name().into()),
         Some(capture_subscriptions),
         runtime.clone(),
@@ -2706,16 +2703,16 @@ async fn run_capture(
     {
         Ok(scheduler) => scheduler,
         Err(error) => {
-            record_capture_start_failure(&sender, profile.name(), &error).await?;
+            record_capture_start_failure(sink.sender(), profile.name(), &error).await?;
             let inactive = apply_runtime_event(
                 runtime,
                 runtime_state,
-                Some(&sender),
+                Some(sink.sender()),
                 RuntimeEvent::recording(RecordingState::Inactive),
             )
             .await;
-            let shutdown = finish_runtime(runtime, runtime_state, Some(&sender)).await;
-            let recorded = finish_capture(Some(sender), Some(writer)).await;
+            let shutdown = finish_runtime(runtime, runtime_state, Some(sink.sender())).await;
+            let recorded = finish_capture(Some(sink)).await;
             inactive?;
             shutdown?;
             recorded?;
@@ -2735,12 +2732,12 @@ async fn run_capture(
     let inactive = apply_runtime_event(
         runtime,
         runtime_state,
-        Some(&sender),
+        Some(sink.sender()),
         RuntimeEvent::recording(RecordingState::Inactive),
     )
     .await;
-    let shutdown = finish_runtime(runtime, runtime_state, Some(&sender)).await;
-    let recorded = finish_capture(Some(sender), Some(writer)).await;
+    let shutdown = finish_runtime(runtime, runtime_state, Some(sink.sender())).await;
+    let recorded = finish_capture(Some(sink)).await;
     stopped?;
     wait_result?;
     inactive?;
@@ -2785,19 +2782,15 @@ async fn wait_for_scheduler(scheduler: &TelemetryScheduler) {
     }
 }
 
-async fn finish_capture(
-    sender: Option<jsonl_capture::Sender>,
-    writer: Option<jsonl_capture::Writer>,
-) -> Result<(), String> {
-    match (sender, writer) {
-        (Some(sender), Some(writer)) => jsonl_capture::close(sender, writer).await,
-        (None, None) => Ok(()),
-        _ => Err("JSONL recorder has incomplete ownership".into()),
+async fn finish_capture(sink: Option<CaptureSink>) -> Result<(), String> {
+    match sink {
+        Some(sink) => sink.close().await,
+        None => Ok(()),
     }
 }
 
 async fn emit_capture_event(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     event: CaptureEvent,
 ) -> Result<(), String> {
     if let Some(recorder) = recorder {
@@ -2810,7 +2803,7 @@ async fn emit_capture_event(
 }
 
 async fn emit_capture_started(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     profile: Option<String>,
 ) -> Result<(), String> {
     let Some(recorder) = recorder else {
@@ -2826,7 +2819,7 @@ async fn emit_capture_started(
 }
 
 async fn record_capture_start_failure(
-    sender: &jsonl_capture::Sender,
+    sender: &CaptureSender,
     profile: &str,
     error: &str,
 ) -> Result<(), String> {
@@ -2971,7 +2964,7 @@ fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
 fn run_capture_dpf_report(paths: &[String]) -> Result<(), String> {
     let mut replays = Vec::with_capacity(paths.len());
     for path in paths {
-        replays.push(CaptureReplay::from_capture(&jsonl_capture::read(
+        replays.push(CaptureReplay::from_capture(&capture_format::read(
             Path::new(path),
         )?));
     }

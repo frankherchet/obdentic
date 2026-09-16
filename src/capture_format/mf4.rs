@@ -1,3 +1,4 @@
+use super::{CaptureSender as Sender, Writer};
 use crate::capture_events::{CaptureEvent, CaptureValue};
 use mdf4_rs::{writer::FileWriter, DataType, DecodedValue, FlushPolicy, MdfWriter};
 use std::path::Path;
@@ -23,9 +24,6 @@ const FIELD_DECODER_UTF8: u64 = 10;
 const FIELD_PROVENANCE_UTF8: u64 = 11;
 const FIELD_ERROR_UTF8: u64 = 12;
 
-pub type Sender = mpsc::Sender<CaptureEvent>;
-pub type Writer = task::JoinHandle<Result<(), String>>;
-
 type NativeWriter = MdfWriter<FileWriter>;
 
 struct Layout {
@@ -33,8 +31,9 @@ struct Layout {
 }
 
 /// Starts the passive MF4 sink. The sink only receives already-normalized
-/// capture events and has no adapter/session capability.
-pub fn start(path: &Path) -> Result<(Sender, Writer), String> {
+/// capture events and has no adapter/session capability. Called only
+/// through [`CaptureSink::open`](super::CaptureSink::open).
+pub(super) fn start(path: &Path) -> Result<(Sender, Writer), String> {
     let path_text = path
         .to_str()
         .ok_or_else(|| "MF4 capture path must be valid UTF-8".to_string())?;
@@ -317,7 +316,7 @@ fn write_event(
         },
     )?;
 
-    let audit = crate::jsonl_capture::event_line(sequence, event)?;
+    let audit = super::jsonl::event_line(sequence, event)?;
     let audit = audit.trim_end_matches('\n');
     write_chunks(
         writer,

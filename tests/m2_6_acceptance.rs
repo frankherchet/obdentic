@@ -2,9 +2,9 @@ use obdentic::{
     capture_events::{
         CaptureEvent, DiagnosticJobStepStatus, DtcObservationFact, ResponderEvidence,
     },
+    capture_format::{self, CaptureSink, CaptureStatus},
     diagnostic_job::{DiagnosticJob, DiagnosticScope},
     dtc::{decode_mode03, DtcResponse, ResponderIdentity, ResponseEvidence},
-    jsonl_capture::{self, CaptureStatus, JsonlRecorder},
     runtime_actor,
     runtime_reducer::{self, RuntimeEvent, TransitionError},
     runtime_state::{Activity, Phase, RuntimeState},
@@ -161,7 +161,7 @@ async fn jsonl_round_trip_keeps_runtime_and_diagnostic_events_ordered() {
         "obdentic-m2-6-acceptance-{}.jsonl",
         std::process::id()
     ));
-    let recorder = JsonlRecorder::start(&path).unwrap();
+    let recorder = CaptureSink::open(&path).unwrap();
     let (client, actor) = runtime_actor::start();
     let initialized = client
         .send(RuntimeEvent::InitializationCompleted)
@@ -252,7 +252,7 @@ async fn jsonl_round_trip_keeps_runtime_and_diagnostic_events_ordered() {
     }
     recorder.close().await.unwrap();
 
-    let parsed = jsonl_capture::read(&path).unwrap();
+    let parsed = capture_format::read(&path).unwrap();
     assert_eq!(parsed.status, CaptureStatus::Partial);
     assert_eq!(parsed.events, events);
     assert!(matches!(

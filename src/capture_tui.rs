@@ -1,7 +1,7 @@
 use crate::{
     capture_events::{CaptureEvent, CaptureValue, SubscriptionFilterOutcome},
     hex,
-    jsonl_capture::{self, CaptureStatus, ParsedCapture},
+    capture_format::{self, CaptureStatus, ParsedCapture},
     tui::{self, DashboardLayout, Panel, View},
 };
 use ratatui::{
@@ -916,7 +916,7 @@ fn render(frame: &mut Frame, layout: &DashboardLayout, timeline: &Timeline, nav:
 }
 
 fn run_tui(path: &Path, layout: &DashboardLayout) -> Result<(), String> {
-    let capture = jsonl_capture::read(path)?;
+    let capture = capture_format::read(path)?;
     let timeline = Timeline::from_capture(&capture);
     enable_raw_mode().map_err(|error| error.to_string())?;
     let mut stdout = io::stdout();

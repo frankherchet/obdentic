@@ -1,3 +1,4 @@
+use super::{CaptureSender as Sender, Writer};
 use crate::{
     capture_events::{
         validate_diagnostic_error, validate_diagnostic_job_id, validate_diagnostic_mode,
@@ -7,6 +8,7 @@ use crate::{
         SubscriptionFilterOutcome, MAX_DTC_DECODER_LEN, MAX_DTC_PROVENANCE_LEN,
     },
     diagnostic_job::JobStatus,
+    hex,
     runtime_reducer::{ContextUpdate, RuntimeEvent},
     runtime_state::{
         RecordingState, RuntimeState, SafetyCapability, SourceState, TopologyState, TransportState,
@@ -19,18 +21,12 @@ use std::{
     io::{self, Write},
     path::Path,
 };
-use tokio::{
-    sync::mpsc,
-    task::{self, JoinHandle},
-};
+use tokio::{sync::mpsc, task};
 
-pub const SCHEMA: &str = "OBDENTIC-CAPTURE";
-pub const VERSION: u64 = 1;
+pub(super) const SCHEMA: &str = "OBDENTIC-CAPTURE";
+pub(crate) const VERSION: u64 = 1;
 const CHANNEL_CAPACITY: usize = 64;
 const FLUSH_EVERY: u64 = 16;
-
-pub type Sender = mpsc::Sender<CaptureEvent>;
-pub type Writer = JoinHandle<Result<(), String>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureStatus {
@@ -44,13 +40,10 @@ pub struct ParsedCapture {
     pub status: CaptureStatus,
 }
 
-/// Starts a private recorder, replacing an earlier capture at the same path.
-pub fn start(path: &Path) -> Result<(Sender, Writer), String> {
-    crate::capture_writer::start(path)
-}
-
-/// JSONL plugin entry point used by the capture-writer registry.
-pub(crate) fn start_jsonl(path: &Path) -> Result<(Sender, Writer), String> {
+/// Starts the JSONL sink at `path`. Called only through
+/// [`CaptureSink::open`](super::CaptureSink::open), which picks this by
+/// file extension and wraps a failure with the format name and path.
+pub(super) fn start(path: &Path) -> Result<(Sender, Writer), String> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -68,43 +61,6 @@ pub(crate) fn start_jsonl(path: &Path) -> Result<(Sender, Writer), String> {
     let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let task = task::spawn_blocking(move || write_events(file, receiver));
     Ok((sender, task))
-}
-
-/// Convenience owner for callers that do not need to keep the task separate.
-pub struct JsonlRecorder {
-    sender: Option<Sender>,
-    task: Option<Writer>,
-}
-
-impl JsonlRecorder {
-    pub fn start(path: &Path) -> Result<Self, String> {
-        let (sender, task) = start(path)?;
-        Ok(Self {
-            sender: Some(sender),
-            task: Some(task),
-        })
-    }
-
-    pub fn sender(&self) -> &Sender {
-        self.sender
-            .as_ref()
-            .expect("recorder sender already closed")
-    }
-
-    pub async fn close(mut self) -> Result<(), String> {
-        self.sender.take();
-        self.task
-            .take()
-            .expect("recorder task already closed")
-            .await
-            .map_err(|error| format!("capture recorder stopped unexpectedly: {error}"))?
-    }
-}
-
-pub async fn close(sender: Sender, task: Writer) -> Result<(), String> {
-    drop(sender);
-    task.await
-        .map_err(|error| format!("capture recorder stopped unexpectedly: {error}"))?
 }
 
 fn write_events(mut file: File, mut receiver: mpsc::Receiver<CaptureEvent>) -> Result<(), String> {
@@ -139,7 +95,7 @@ fn header() -> String {
     format!("{{\"schema\":\"{SCHEMA}\",\"version\":{VERSION},\"type\":\"header\"}}\n")
 }
 
-pub(crate) fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
+pub(super) fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
     let mut object = format!("{{\"schema\":\"{SCHEMA}\",\"version\":{VERSION},\"type\":",);
     match event {
         CaptureEvent::CaptureStarted {
@@ -650,15 +606,7 @@ fn push_string(object: &mut String, value: &str) {
     object.push('"');
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn read(path: &Path) -> Result<ParsedCapture, String> {
+pub(super) fn read(path: &Path) -> Result<ParsedCapture, String> {
     let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let mut lines = contents.lines();
     let header_line = lines
@@ -2146,7 +2094,11 @@ mod tests {
     }
 
     async fn finish(sender: Sender, writer: Writer) {
-        close(sender, writer).await.unwrap();
+        drop(sender);
+        writer
+            .await
+            .unwrap()
+            .expect("capture recorder stopped unexpectedly");
     }
 
     fn events() -> Vec<CaptureEvent> {
