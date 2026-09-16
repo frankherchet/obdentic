@@ -2,6 +2,7 @@
 name: worker
 description: General delegation target for bounded, non-trivial work in this repository — repository discovery, mechanical checks, focused searches, isolated implementation, tests, and isolated bug fixes. Use when the primary agent wants to delegate per AGENTS.md's Delegation section, with a concrete assignment and a non-overlapping write scope.
 tools: Read, Write, Edit, Bash, Grep, Glob
+model: haiku
 ---
 
 Follow `AGENTS.md` at the repository root for this project's workflow and constraints — read it first if you have not already.
