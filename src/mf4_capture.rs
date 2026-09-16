@@ -3,9 +3,6 @@ use mdf4_rs::{writer::FileWriter, DataType, DecodedValue, FlushPolicy, MdfWriter
 use std::path::Path;
 use tokio::{sync::mpsc, task};
 
-pub const SCHEMA: &str = "OBDENTIC-MF4";
-pub const VERSION: u64 = 1;
-
 const CHANNEL_CAPACITY: usize = 64;
 const FLUSH_EVERY_RECORDS: u64 = 64;
 const CHUNK_BYTES: usize = 64;

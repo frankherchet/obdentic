@@ -733,10 +733,6 @@ pub fn read(path: &Path) -> Result<ParsedCapture, String> {
     })
 }
 
-pub fn read_events(path: &Path) -> Result<Vec<CaptureEvent>, String> {
-    Ok(read(path)?.events)
-}
-
 fn expect_schema(object: &Object, line_number: usize) -> Result<(), String> {
     if string_field(object, "schema", line_number)? != SCHEMA {
         return Err(format!(
@@ -2338,7 +2334,7 @@ mod tests {
         assert!(contents.contains("\"source\":\"7E8\""));
         assert!(!contents.contains("VIN"));
         assert!(!contents.contains("raw_command"));
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         fs::remove_file(path).unwrap();
     }
 
@@ -2368,7 +2364,7 @@ mod tests {
         }
         finish(sender, writer).await;
 
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"filter_outcome\":\"scheduled\""));
         assert!(contents.contains("\"filter_outcome\":\"unsupported\""));
@@ -2423,7 +2419,7 @@ mod tests {
         assert!(contents.contains("\"type\":\"protocol_negotiation_observed\""));
         assert!(contents.contains("\"request_payload\":\"01 00\""));
         assert!(!contents.contains("dtc_observation"));
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         fs::remove_file(path).unwrap();
     }
 
@@ -2464,7 +2460,7 @@ mod tests {
         assert!(contents.contains("\"code\":\"P010C\""));
         assert!(contents.contains("\"type\":\"decode_error\""));
         assert!(!contents.contains("raw_command"));
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         fs::remove_file(path).unwrap();
     }
 
@@ -2503,7 +2499,7 @@ mod tests {
         assert!(contents.contains("phase/ready"));
         assert!(!contents.contains("VIN"));
         assert_eq!(
-            read_events(&path).unwrap(),
+            read(&path).unwrap().events,
             vec![CaptureEvent::RuntimeStateChanged {
                 transition_sequence: 0,
                 from,
@@ -2580,7 +2576,7 @@ mod tests {
         }
         finish(sender, writer).await;
 
-        let parsed = read_events(&path).unwrap();
+        let parsed = read(&path).unwrap().events;
         assert_eq!(
             parsed,
             runtime_events
@@ -2604,7 +2600,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            read_events(&path).unwrap(),
+            read(&path).unwrap().events,
             vec![CaptureEvent::SupportDiscovery {
                 request_payload: vec![0x01, 0x00],
                 responder: None,
@@ -2635,7 +2631,7 @@ mod tests {
         finish(sender, writer).await;
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"offset_us\":12345678"));
-        assert_eq!(read_events(&path).unwrap(), vec![expected]);
+        assert_eq!(read(&path).unwrap().events, vec![expected]);
         fs::remove_file(path).unwrap();
 
         let path = temp_path("legacy-response-offset");
@@ -2644,7 +2640,7 @@ mod tests {
             "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"responses_observed\",\"sequence\":0,\"semantic\":\"dpf.soot_mass_calculated\",\"request_payload\":\"22 11 4F\",\"responses\":[{\"responder\":\"7E8\",\"payload\":\"62 11 4F 04 F8\"}],\"selected_responder\":\"7E8\",\"selection_error\":null}\n",
         )
         .unwrap();
-        let events = read_events(&path).unwrap();
+        let events = read(&path).unwrap().events;
         assert!(matches!(
             events.as_slice(),
             [CaptureEvent::ResponsesObserved {
@@ -2678,7 +2674,7 @@ mod tests {
         }
         finish(sender, writer).await;
         assert_eq!(read(&path).unwrap().status, CaptureStatus::Partial);
-        assert_eq!(read_events(&path).unwrap().len(), 3);
+        assert_eq!(read(&path).unwrap().events.len(), 3);
         fs::remove_file(path).unwrap();
     }
 

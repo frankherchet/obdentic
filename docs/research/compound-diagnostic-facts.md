@@ -3,6 +3,11 @@
 Status: domain-shape decision (2026-08-28). No compound PID decoder is enabled by
 this note.
 
+The `CompoundObservation`/`SemanticFact` prototype that once implemented the
+shape below (`src/compound_fact.rs`) had no caller and was removed as dead
+code in 2026-09. The domain shape recorded here is unaffected and still
+applies to any future compound-PID decoder.
+
 The existing `Transaction` and `TelemetryState` intentionally remain a
 one-request-to-one-scalar path. They are not a safe place to force a bitfield or
 a multi-value response into an arbitrary number.
