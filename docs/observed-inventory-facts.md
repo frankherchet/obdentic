@@ -11,6 +11,16 @@ private observed inventory / evidence
 
 The local vehicle cache is evidence about one concrete vehicle and its observed ECUs. It is not the canonical Knowledge database and it does not become one by decoding values opportunistically.
 
+## Vehicle and ECU instances
+
+`VehicleCache` is one `VehicleInstance`: a private local key (never the raw VIN), `first_seen_ms`/`last_seen_ms`, and a `VehicleCacheSnapshot` holding this vehicle's current typed evidence.
+
+The snapshot stores topology observations, Mode 01 capabilities, target/role mappings, and standard UDS identification results as independent vectors, each keyed by the same typed `ResponderIdentity`. `VehicleCacheSnapshot::ecu_instances()` groups them by that identity into a read-only `EcuInstance` view — `Vehicle -> n EcuInstances` is therefore directly queryable rather than left implicit in four separately enumerated vectors. This is a projection, not a second persistence format: the on-disk TSV layout and its version header are unchanged, and grouping is deterministic (sorted by `ResponderIdentity`) regardless of insertion order.
+
+An `EcuInstance` never fabricates a field it has no evidence for: a responder observed only through a target mapping (for example a validated engine target before its standard identification set has run) still yields an instance, with `capabilities()`/`identification()` legitimately absent rather than borrowed from another ECU.
+
+History is currently the vehicle-level `history: Vec<String>` evidence log plus each stored evidence value's own provenance; there is no per-ECU multi-version timeline yet distinguishing an old fingerprint from a newer one on the same responder. A fresh discovery run replaces this vehicle's entire snapshot rather than merging into the previous one, so a software-version change on an existing ECU is not currently distinguishable from its prior evidence. Representing an explicit per-field history remains a follow-up slice.
+
 ## Raw ECU-identification evidence is not automatically a fingerprint fact
 
 The bounded standard UDS ECU-identification path persists normalized response payload bytes together with target/responder identity, status, Knowledge definition identity and errors/NRCs.

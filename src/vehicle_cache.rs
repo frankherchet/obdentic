@@ -266,6 +266,109 @@ impl VehicleCacheSnapshot {
             target_mappings: Vec::new(),
         }
     }
+
+    /// Group this vehicle's independently observed evidence into per-ECU
+    /// instances, keyed by responder identity.
+    ///
+    /// This is a read-only projection over the existing evidence vectors, not
+    /// a new persistence format: `VehicleCacheSnapshot` remains the private
+    /// observed-inventory contract, and canonical `obdentic-knowledge`
+    /// definitions are never folded into it. A responder identity present in
+    /// only one evidence vector (for example a target mapping with no
+    /// identification evidence yet) still yields an `EcuInstance`, with the
+    /// other fields absent rather than fabricated. Order is deterministic
+    /// (sorted by `ResponderIdentity`) regardless of the enumeration order of
+    /// the underlying vectors.
+    pub fn ecu_instances(&self) -> Vec<EcuInstance<'_>> {
+        let mut responders: BTreeSet<&ResponderIdentity> = BTreeSet::new();
+        responders.extend(self.topology.iter().map(TopologyObservation::responder));
+        responders.extend(
+            self.ecu_capabilities
+                .iter()
+                .map(EcuCapabilitySnapshot::responder),
+        );
+        responders.extend(
+            self.target_mappings
+                .iter()
+                .filter_map(TargetMappingSnapshot::responder),
+        );
+        responders.extend(
+            self.ecu_identification
+                .iter()
+                .map(IdentificationObservation::expected_responder),
+        );
+
+        responders
+            .into_iter()
+            .map(|responder| EcuInstance {
+                responder,
+                topology: self
+                    .topology
+                    .iter()
+                    .filter(|observation| observation.responder() == responder)
+                    .collect(),
+                capabilities: self
+                    .ecu_capabilities
+                    .iter()
+                    .find(|capability| capability.responder() == responder),
+                target_mapping: self
+                    .target_mappings
+                    .iter()
+                    .find(|mapping| mapping.responder() == Some(responder)),
+                identification: self
+                    .ecu_identification
+                    .iter()
+                    .filter(|observation| observation.expected_responder() == responder)
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+/// A read-only per-ECU view of one vehicle's observed inventory, grouping the
+/// otherwise independently stored evidence vectors in `VehicleCacheSnapshot`
+/// by responder identity. See [`VehicleCacheSnapshot::ecu_instances`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcuInstance<'a> {
+    responder: &'a ResponderIdentity,
+    topology: Vec<&'a TopologyObservation>,
+    capabilities: Option<&'a EcuCapabilitySnapshot>,
+    target_mapping: Option<&'a TargetMappingSnapshot>,
+    identification: Vec<&'a IdentificationObservation>,
+}
+
+impl<'a> EcuInstance<'a> {
+    /// Stable local identity of this ECU within the vehicle's inventory.
+    pub const fn responder(&self) -> &'a ResponderIdentity {
+        self.responder
+    }
+
+    /// Observed/reachable evidence: raw responder observations for this ECU.
+    pub fn topology(&self) -> &[&'a TopologyObservation] {
+        &self.topology
+    }
+
+    /// This ECU's observed Mode 01 support capability, if probed.
+    pub const fn capabilities(&self) -> Option<&'a EcuCapabilitySnapshot> {
+        self.capabilities
+    }
+
+    /// Logical role/request-target mapping evidence, if this ECU has been
+    /// validated as a physical targeting address.
+    pub const fn target_mapping(&self) -> Option<&'a TargetMappingSnapshot> {
+        self.target_mapping
+    }
+
+    /// Logical role, if a target mapping assigned one with provenance.
+    pub fn role(&self) -> Option<&'a RoleAssignment> {
+        self.target_mapping.and_then(TargetMappingSnapshot::role)
+    }
+
+    /// Per-ECU standard UDS identification results for every semantic probed
+    /// on this ECU, independent of any other ECU's identification support.
+    pub fn identification(&self) -> &[&'a IdentificationObservation] {
+        &self.identification
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2565,6 +2668,129 @@ mod tests {
             ]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ecu_instances_group_independent_evidence_by_responder_deterministically() {
+        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
+        let engine_responder = ResponderIdentity::address(context.clone(), "7E8");
+        let secondary_responder = ResponderIdentity::address(context.clone(), "7E9");
+        let engine_target =
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0"));
+        let secondary_target =
+            RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E1"));
+        let provenance = Provenance::new("test", Confidence::High).unwrap();
+
+        let engine_topology = TopologyObservation::new(
+            context.clone(),
+            engine_responder.clone(),
+            Some(vec![0x41, 0x00]),
+            None,
+            provenance.clone(),
+        );
+        let engine_capabilities = EcuCapabilitySnapshot::new(
+            engine_responder.clone(),
+            [CapabilityPageSnapshot::new(
+                [0x01, 0x00],
+                vec![0, 0, 0, 1],
+                provenance.clone(),
+            )],
+        );
+        let engine_mapping = TargetMappingSnapshot::new(
+            Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
+            Some(engine_responder.clone()),
+            engine_target.clone(),
+            provenance.clone(),
+        );
+        let engine_software_version = IdentificationObservation::new(
+            engine_target.clone(),
+            engine_responder.clone(),
+            "ecu.manufacturer_software_version",
+            "uds.f189.manufacturer_software_version",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "661fba8eed8ddce8fef5bba4c68dfcba85e2dd28",
+            [0x22, 0xF1, 0x89],
+            IdentificationResultStatus::Supported,
+            vec![IdentificationResponseEvidence::new(
+                Some(engine_responder.clone()),
+                vec![0x62, 0xF1, 0x89, 0x31, 0x2E],
+            )],
+            None,
+            Some(vec![0x31, 0x2E]),
+            Vec::new(),
+        )
+        .unwrap();
+        let engine_boot_software = IdentificationObservation::new(
+            engine_target.clone(),
+            engine_responder.clone(),
+            "ecu.boot_software_identification",
+            "uds.f180.boot_software_identification",
+            1,
+            "frankherchet/obdentic-knowledge",
+            "661fba8eed8ddce8fef5bba4c68dfcba85e2dd28",
+            [0x22, 0xF1, 0x80],
+            IdentificationResultStatus::Timeout,
+            Vec::new(),
+            None,
+            None,
+            vec!["Carly command timed out".into()],
+        )
+        .unwrap();
+
+        // The secondary ECU has a validated target mapping but no capability
+        // or identification evidence yet: its EcuInstance must still exist,
+        // with those fields absent rather than fabricated or borrowed from
+        // the engine ECU.
+        let secondary_mapping = TargetMappingSnapshot::new(
+            None,
+            Some(secondary_responder.clone()),
+            secondary_target,
+            provenance,
+        );
+
+        let snapshot = VehicleCacheSnapshot::with_ecu_identification(
+            [engine_topology],
+            [engine_capabilities],
+            [engine_mapping, secondary_mapping],
+            [engine_boot_software, engine_software_version],
+        );
+
+        let instances = snapshot.ecu_instances();
+        assert_eq!(instances.len(), 2);
+
+        // Deterministic order: sorted by ResponderIdentity, independent of
+        // insertion order above (identification observations were passed
+        // boot-before-software, mappings engine-before-secondary).
+        assert_eq!(instances[0].responder(), &engine_responder);
+        assert_eq!(instances[1].responder(), &secondary_responder);
+
+        let engine = &instances[0];
+        assert_eq!(engine.topology().len(), 1);
+        assert!(engine.capabilities().is_some());
+        assert_eq!(
+            engine.role(),
+            Some(&RoleAssignment::new(
+                EcuRole::Engine,
+                Provenance::new("test", Confidence::High).unwrap()
+            ))
+        );
+        assert_eq!(engine.identification().len(), 2);
+        assert!(engine
+            .identification()
+            .iter()
+            .any(|observation| observation.status() == IdentificationResultStatus::Supported));
+        assert!(engine
+            .identification()
+            .iter()
+            .any(|observation| observation.status() == IdentificationResultStatus::Timeout));
+
+        let secondary = &instances[1];
+        assert!(secondary.topology().is_empty());
+        assert!(secondary.capabilities().is_none());
+        assert!(secondary.identification().is_empty());
+        assert!(secondary.target_mapping().is_some());
+        assert_eq!(secondary.role(), None);
     }
 
     #[test]
