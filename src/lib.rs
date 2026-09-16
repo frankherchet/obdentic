@@ -35,6 +35,8 @@ pub mod safety;
 pub mod scheduler;
 pub mod subscription_policy;
 pub mod telemetry;
+#[cfg(test)]
+mod test_support;
 pub mod topology;
 pub mod topology_provider;
 pub mod tui;

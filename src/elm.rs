@@ -2,7 +2,7 @@ use crate::{
     topology::{AddressingContext, Protocol, RequestTarget},
     ReadRequest,
 };
-use std::time::Duration;
+use std::{fmt, future::Future, time::Duration};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MODE03_COMMAND: &str = "03\r";
@@ -10,15 +10,79 @@ const STALE_MODE01_RESPONSE_PREFIX: &str = "stale unrelated OBD-II Mode 01 respo
 const IGNORED_MODE01_RESPONSE_PREFIX: &str =
     "ignored unrelated OBD-II Mode 01 response from responder";
 
+/// A byte-transport failure at the adapter seam, as opposed to a well-formed
+/// but unusable response. Its `Display` text is the exact wording every
+/// caller and fixture already depends on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TransportFailure {
+    WriteTimedOut(String),
+    WriteFailed(String),
+    CommandTimedOut(String),
+    NotificationStreamEnded,
+}
+
+impl fmt::Display for TransportFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriteTimedOut(command) => write!(formatter, "Carly write timed out: {command}"),
+            Self::WriteFailed(error) => write!(formatter, "Carly write failed: {error}"),
+            Self::CommandTimedOut(command) => {
+                write!(formatter, "Carly command timed out: {command}")
+            }
+            Self::NotificationStreamEnded => {
+                formatter.write_str("Carly notification stream ended")
+            }
+        }
+    }
+}
+
+/// The result of one adapter exchange: either a [`TransportFailure`] at the
+/// byte transport, or a well-formed exchange that the ELM dialect layer
+/// still could not use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExchangeError {
+    Transport(TransportFailure),
+    Response(String),
+}
+
+impl fmt::Display for ExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(failure) => write!(formatter, "{failure}"),
+            Self::Response(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<TransportFailure> for ExchangeError {
+    fn from(failure: TransportFailure) -> Self {
+        Self::Transport(failure)
+    }
+}
+
+impl From<ExchangeError> for String {
+    fn from(error: ExchangeError) -> Self {
+        error.to_string()
+    }
+}
+
 /// The small protocol seam shared by ELM dialect users and transport
 /// backends.  The backend owns the actual byte exchange; this module owns
 /// only ELM command sequencing and response validation.
-pub(crate) trait ElmExchange {
-    async fn exchange(
+pub(crate) trait ElmExchange: Send {
+    fn exchange(
         &mut self,
         command: &str,
         command_timeout: Duration,
-    ) -> Result<String, String>;
+    ) -> impl Future<Output = Result<String, ExchangeError>> + Send;
+}
+
+/// An [`ElmExchange`] that also owns a connection lifecycle. Two adapters
+/// satisfy it: the production Carly backend, and a scripted fake used in
+/// tests, so this is a real seam rather than a hypothetical one.
+pub(crate) trait AdapterLink: ElmExchange {
+    fn disconnect(&mut self) -> impl Future<Output = Result<(), String>> + Send;
+    fn disconnect_best_effort(&mut self) -> impl Future<Output = ()> + Send;
 }
 
 /// Verify the generic ELM327 identity before any dialect-specific setup.
@@ -764,6 +828,10 @@ where
 
     pub(crate) fn into_exchange(self) -> E {
         self.exchange
+    }
+
+    pub(crate) fn exchange_mut(&mut self) -> &mut E {
+        &mut self.exchange
     }
 
     pub(crate) async fn discover_support(&mut self, highest_page: u8) -> Result<(), String> {
@@ -2644,34 +2712,7 @@ pub(crate) fn normalize_uds_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-
-    struct ScriptedExchange {
-        responses: VecDeque<String>,
-        commands: Vec<String>,
-    }
-
-    impl ScriptedExchange {
-        fn new(responses: impl IntoIterator<Item = &'static str>) -> Self {
-            Self {
-                responses: responses.into_iter().map(str::to_owned).collect(),
-                commands: Vec::new(),
-            }
-        }
-    }
-
-    impl ElmExchange for ScriptedExchange {
-        async fn exchange(
-            &mut self,
-            command: &str,
-            _command_timeout: Duration,
-        ) -> Result<String, String> {
-            self.commands.push(command.to_owned());
-            self.responses
-                .pop_front()
-                .ok_or_else(|| "script ended before adapter response".to_string())
-        }
-    }
+    use crate::test_support::ScriptedExchange;
 
     fn canonical_ecu_identification_request() -> TargetedEcuIdentificationRequest {
         let catalog =
@@ -2715,7 +2756,7 @@ mod tests {
         initialize_elm(&mut exchange).await.unwrap();
 
         assert_eq!(
-            exchange.commands,
+            exchange.commands(),
             ["ATI\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r"]
         );
     }
@@ -2725,7 +2766,7 @@ mod tests {
         let mut exchange = ScriptedExchange::new(["7E8 04 41 0C 1A F8\r>"]);
         let request = crate::prepare_read("engine.rpm").unwrap();
         let responses = read_elm_responses(&mut exchange, request).await.unwrap();
-        assert_eq!(exchange.commands, ["010C\r"]);
+        assert_eq!(exchange.commands(), ["010C\r"]);
         assert_eq!(responses.as_slice()[0].payload, [0x41, 0x0c, 0x1a, 0xf8]);
         assert_eq!(
             responses.as_slice()[0].responder.as_ref().unwrap().as_str(),
@@ -2751,7 +2792,7 @@ mod tests {
             .selection_error
             .as_deref()
             .is_some_and(|error| error == "010D response not found"));
-        assert_eq!(exchange.commands, ["010D\r", "010D\r"]);
+        assert_eq!(exchange.commands(), ["010D\r", "010D\r"]);
     }
 
     #[tokio::test]
@@ -2766,7 +2807,7 @@ mod tests {
 
         assert!(error.error.contains("first ELM response"));
         assert_eq!(error.observations.len(), 2);
-        assert_eq!(exchange.commands, ["010D\r", "010D\r"]);
+        assert_eq!(exchange.commands(), ["010D\r", "010D\r"]);
     }
 
     #[tokio::test]
@@ -2779,7 +2820,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.error.contains("ELM327 rejected"));
-        assert_eq!(exchange.commands, ["010D\r"]);
+        assert_eq!(exchange.commands(), ["010D\r"]);
     }
 
     #[tokio::test]
@@ -2792,7 +2833,7 @@ mod tests {
         let read = session.read_with_evidence(request).await.unwrap();
 
         assert_eq!(read.payload, [0x41, 0x0c, 0x1a, 0xf8]);
-        assert_eq!(session.into_exchange().commands, ["0100\r", "010C\r"]);
+        assert_eq!(session.into_exchange().commands(), ["0100\r", "010C\r"]);
     }
 
     #[tokio::test]
@@ -2842,7 +2883,7 @@ mod tests {
             [0x62, 0xf1, 0x89, 0x31, 0x2e]
         );
         assert_eq!(
-            session.into_exchange().commands,
+            session.into_exchange().commands(),
             [
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
@@ -2882,7 +2923,7 @@ mod tests {
             [0x62, 0xF1, 0x8C, 0x01, 0x02]
         );
         assert_eq!(responses.errors().len(), 1);
-        assert_eq!(session.into_exchange().commands, ["22F18C\r"]);
+        assert_eq!(session.into_exchange().commands(), ["22F18C\r"]);
     }
 
     #[tokio::test]
@@ -2930,7 +2971,7 @@ mod tests {
         assert_eq!(read.responses.as_slice()[0].payload, [0x7f, 0x22, 0x31]);
         assert!(read.responses.errors().is_empty());
         assert_eq!(
-            session.into_exchange().commands,
+            session.into_exchange().commands(),
             [
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
@@ -2969,7 +3010,7 @@ mod tests {
         assert!(read.responses.raw_response().contains("41 00 98 3B A0 13"));
         assert!(read.responses.raw_response().contains("62 F1 89 31 2E"));
         assert_eq!(
-            session.into_exchange().commands,
+            session.into_exchange().commands(),
             [
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
@@ -3002,7 +3043,7 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("did not answer")));
         assert_eq!(
-            session.into_exchange().commands,
+            session.into_exchange().commands(),
             [
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
