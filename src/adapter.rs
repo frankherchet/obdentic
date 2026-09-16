@@ -1,4 +1,7 @@
-use crate::elm::{initialize_elm, require_response, verify_elm327, ElmExchange};
+use crate::elm::{
+    initialize_elm, require_response, verify_elm327, AdapterLink, ElmExchange, ExchangeError,
+    TransportFailure,
+};
 use btleplug::{
     api::{
         bleuuid::uuid_from_u16, Central, CharPropFlags, Characteristic, Manager as _,
@@ -111,19 +114,21 @@ impl CarlyCuaV200 {
         result
     }
 
-    pub(crate) async fn disconnect(&mut self) -> Result<(), String> {
+    async fn initialize(&mut self) -> Result<(), String> {
+        initialize_carly(self).await
+    }
+}
+
+impl AdapterLink for CarlyCuaV200 {
+    async fn disconnect(&mut self) -> Result<(), String> {
         timeout(CONNECT_TIMEOUT, self.peripheral.disconnect())
             .await
             .map_err(|_| "Bluetooth disconnect timed out".to_string())?
             .map_err(|error| format!("Bluetooth disconnect failed: {error}"))
     }
 
-    pub(crate) async fn disconnect_best_effort(&mut self) {
+    async fn disconnect_best_effort(&mut self) {
         let _ = timeout(SHUTDOWN_DISCONNECT_TIMEOUT, self.peripheral.disconnect()).await;
-    }
-
-    async fn initialize(&mut self) -> Result<(), String> {
-        initialize_carly(self).await
     }
 }
 
@@ -149,7 +154,7 @@ impl ElmExchange for CarlyCuaV200 {
         &mut self,
         command: &str,
         command_timeout: Duration,
-    ) -> Result<String, String> {
+    ) -> Result<String, ExchangeError> {
         elm_exchange(
             &self.peripheral,
             &self.channel,
@@ -237,7 +242,7 @@ async fn elm_exchange<S>(
     command: &str,
     command_timeout: Duration,
     show_adapter_io: bool,
-) -> Result<String, String>
+) -> Result<String, ExchangeError>
 where
     S: Stream<Item = ValueNotification> + Unpin,
 {
@@ -255,15 +260,15 @@ where
         peripheral.write(channel, command.as_bytes(), write_type),
     )
     .await
-    .map_err(|_| format!("Carly write timed out: {}", command.trim()))?
-    .map_err(|error| format!("Carly write failed: {error}"))?;
+    .map_err(|_| TransportFailure::WriteTimedOut(command.trim().to_string()))?
+    .map_err(|error| TransportFailure::WriteFailed(error.to_string()))?;
     if let Some(line) = adapter_io_line(show_adapter_io, "tx", command.trim()) {
         println!("{line}");
     }
 
     let response = timeout(command_timeout, wait_for_prompt(notifications, channel))
         .await
-        .map_err(|_| format!("Carly command timed out: {}", command.trim()))??;
+        .map_err(|_| TransportFailure::CommandTimedOut(command.trim().to_string()))??;
     if let Some(line) = adapter_io_line(show_adapter_io, "rx", response.escape_default()) {
         println!("{line}");
     }
@@ -291,7 +296,7 @@ fn adapter_io_line(
 async fn wait_for_prompt<S>(
     notifications: &mut S,
     channel: &Characteristic,
-) -> Result<String, String>
+) -> Result<String, ExchangeError>
 where
     S: Stream<Item = ValueNotification> + Unpin,
 {
@@ -300,7 +305,7 @@ where
         let notification = notifications
             .next()
             .await
-            .ok_or_else(|| "Carly notification stream ended".to_string())?;
+            .ok_or(TransportFailure::NotificationStreamEnded)?;
         if notification.uuid != channel.uuid {
             continue;
         }
@@ -310,10 +315,12 @@ where
     }
 }
 
-fn append_notification(response: &mut Vec<u8>, fragment: &[u8]) -> Result<bool, String> {
+fn append_notification(response: &mut Vec<u8>, fragment: &[u8]) -> Result<bool, ExchangeError> {
     response.extend_from_slice(fragment);
     if response.len() > MAX_RESPONSE {
-        return Err("Carly response exceeded 8 KiB".into());
+        return Err(ExchangeError::Response(
+            "Carly response exceeded 8 KiB".into(),
+        ));
     }
     Ok(response.contains(&b'>'))
 }
@@ -321,52 +328,17 @@ fn append_notification(response: &mut Vec<u8>, fragment: &[u8]) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeSet, VecDeque};
-
-    struct ScriptedExchange {
-        responses: VecDeque<String>,
-        commands: Vec<String>,
-    }
-
-    impl ScriptedExchange {
-        fn new(responses: impl IntoIterator<Item = &'static str>) -> Self {
-            Self {
-                responses: responses.into_iter().map(str::to_owned).collect(),
-                commands: Vec::new(),
-            }
-        }
-    }
-
-    impl ElmExchange for ScriptedExchange {
-        async fn exchange(
-            &mut self,
-            command: &str,
-            _command_timeout: Duration,
-        ) -> Result<String, String> {
-            self.commands.push(command.to_owned());
-            self.responses
-                .pop_front()
-                .ok_or_else(|| "script ended before adapter response".to_string())
-        }
-    }
+    use crate::test_support::ScriptedExchange;
+    use std::collections::BTreeSet;
 
     #[tokio::test]
     async fn carly_initialization_checks_identity_before_generic_elm_setup() {
-        let mut exchange = ScriptedExchange::new([
-            "ELM327 v1.4 v100\r>",
-            "carly-universal v200\r>",
-            "ELM327 v1.4 v100\r>",
-            "OK\r>",
-            "OK\r>",
-            "OK\r>",
-            "OK\r>",
-            "OK\r>",
-        ]);
+        let mut exchange = ScriptedExchange::new(ScriptedExchange::carly_init_responses());
 
         initialize_carly(&mut exchange).await.unwrap();
 
         assert_eq!(
-            exchange.commands,
+            exchange.commands(),
             ["ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r"]
         );
     }

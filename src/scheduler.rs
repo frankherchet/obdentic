@@ -149,18 +149,7 @@ pub async fn apply_runtime_event(
 
 /// Errors with a session/transport boundary are fatal to a live operation;
 /// semantic/data errors remain recoverable for bounded reads.
-pub fn is_fatal_runtime_error(error: &str) -> bool {
-    error.starts_with("diagnostic session became unresponsive")
-        || [
-            "Bluetooth ",
-            "BLE ",
-            "Carly ",
-            "diagnostic session is ",
-            "diagnostic session stopped ",
-        ]
-        .iter()
-        .any(|prefix| error.starts_with(prefix))
-}
+pub use crate::ble::is_fatal_session_error as is_fatal_runtime_error;
 
 impl TelemetryScheduler {
     #[allow(clippy::too_many_arguments)]
