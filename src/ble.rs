@@ -273,15 +273,6 @@ pub async fn prepare_diagnostic_session(
     })
 }
 
-/// Compatibility helper for callers that do not need the explicit protocol
-/// evidence. The semantic DTC request remains exactly one Mode 03 command.
-pub async fn read_stored_dtcs(adapter_id: &str) -> Result<DiagnosticResponses, String> {
-    prepare_diagnostic_session(adapter_id)
-        .await?
-        .read_stored_dtcs()
-        .await
-}
-
 pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
     let mut session =
         DiagnosticSession::connect_without_support_discovery(adapter_id, true).await?;

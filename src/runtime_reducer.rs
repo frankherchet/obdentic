@@ -20,9 +20,6 @@ pub enum ContextUpdate {
     Safety(SafetyCapability),
 }
 
-/// Alias for callers that describe context changes as facts.
-pub type ContextFact = ContextUpdate;
-
 /// Explicit lifecycle, activity, and context events understood by the reducer.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RuntimeEvent {
