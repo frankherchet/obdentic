@@ -25,6 +25,7 @@ use obdentic::{
     dtc,
     ecu_identification::EcuIdentificationPlan,
     ecu_identification_discovery, hex,
+    jobs::{self, plan_capture, CaptureSession, JobRuntime},
     knowledge_db::KnowledgeCatalog,
     layout_observation::{self, LayoutFreshnessPolicy},
     prepare_read, record, replay,
@@ -386,7 +387,8 @@ async fn run() -> Result<(), String> {
                         Ok(scheduler) => scheduler,
                         Err(error) => {
                             if let Some(sender) = sender {
-                                record_capture_start_failure(sender, "tui.live", &error).await?;
+                                jobs::record_capture_start_failure(sender, "tui.live", &error)
+                                    .await?;
                                 apply_runtime_event(
                                     &runtime,
                                     &mut runtime_state,
@@ -2645,35 +2647,22 @@ async fn run_capture(
     profile.admit(capability)?;
     let configured = profile.subscriptions()?;
     let advertised = ble::supported_signals(adapter_id).await?;
-    let total = configured.len();
-    let (subscriptions, capture_subscriptions) =
-        filter_capture_subscriptions(configured, &advertised);
-    if subscriptions.is_empty() {
-        return Err(format!(
-            "capture profile {profile_name} has no signals supported by the adapter"
-        ));
-    }
-    let plans = routed_observation_plans(adapter_id, subscriptions.clone()).await?;
+    let plan = plan_capture(profile_name, configured, &advertised)?;
+    let plans = routed_observation_plans(adapter_id, plan.scheduled().to_vec()).await?;
 
     let sink = CaptureSink::open(path)?;
-    apply_runtime_event(
-        runtime,
-        runtime_state,
-        Some(sink.sender()),
-        RuntimeEvent::recording(RecordingState::Active),
-    )
-    .await?;
+    let mut rt = JobRuntime::new(runtime, runtime_state, Some(sink.sender().clone()));
     println!("capture profile  {profile_name}");
     println!(
         "capture signals  {}/{} supported",
-        subscriptions.len(),
-        total
+        plan.scheduled().len(),
+        plan.total_configured()
     );
     println!(
         "capture budget   {} reads/s conservative",
         capability.request_budget_per_second()
     );
-    for subscription in &capture_subscriptions {
+    for subscription in plan.subscriptions() {
         println!(
             "capture signal   {}  {} ms  {}",
             subscription.semantic(),
@@ -2688,98 +2677,31 @@ async fn run_capture(
     println!("capture record   {}", path.display());
     println!("capture connecting...  wait for session initialization");
 
-    let scheduler = match TelemetryScheduler::start_with_runtime(
-        ble::start_session(adapter_id),
+    let session = CaptureSession::start(
+        profile_name,
+        &plan,
         plans,
+        ble::start_session(adapter_id),
         Arc::new(Mutex::new(TelemetryState::new(600)?)),
         Arc::new(Mutex::new(AuditState::new(600)?)),
-        Some(sink.sender().clone()),
-        Some(profile.name().into()),
-        Some(capture_subscriptions),
-        runtime.clone(),
-        None,
+        &mut rt,
+        sink,
     )
-    .await
-    {
-        Ok(scheduler) => scheduler,
-        Err(error) => {
-            record_capture_start_failure(sink.sender(), profile.name(), &error).await?;
-            let inactive = apply_runtime_event(
-                runtime,
-                runtime_state,
-                Some(sink.sender()),
-                RuntimeEvent::recording(RecordingState::Inactive),
-            )
-            .await;
-            let shutdown = finish_runtime(runtime, runtime_state, Some(sink.sender())).await;
-            let recorded = finish_capture(Some(sink)).await;
-            inactive?;
-            shutdown?;
-            recorded?;
-            return Err(error);
-        }
-    };
+    .await?;
     println!("capture running  press Ctrl-C to stop");
 
-    let wait_result = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            println!("capture stopping...");
-            signal.map_err(|error| format!("Ctrl-C listener failed: {error}"))
-        },
-        _ = wait_for_scheduler(&scheduler) => Err("capture session stopped unexpectedly".into()),
-    };
-    let stopped = scheduler.stop().await;
-    let inactive = apply_runtime_event(
-        runtime,
-        runtime_state,
-        Some(sink.sender()),
-        RuntimeEvent::recording(RecordingState::Inactive),
-    )
-    .await;
-    let shutdown = finish_runtime(runtime, runtime_state, Some(sink.sender())).await;
-    let recorded = finish_capture(Some(sink)).await;
-    stopped?;
-    wait_result?;
-    inactive?;
-    shutdown?;
-    recorded?;
+    session
+        .run_until(
+            async {
+                let signal = tokio::signal::ctrl_c().await;
+                println!("capture stopping...");
+                signal.map_err(|error| format!("Ctrl-C listener failed: {error}"))
+            },
+            &mut rt,
+        )
+        .await?;
     println!("capture stopped");
     Ok(())
-}
-
-fn filter_capture_subscriptions(
-    configured: Vec<Subscription>,
-    advertised: &[ble::SignalSupport],
-) -> (Vec<Subscription>, Vec<CaptureSubscription>) {
-    let mut scheduled = Vec::new();
-    let mut decisions = Vec::new();
-    for subscription in configured {
-        let filter = match advertised
-            .iter()
-            .find(|signal| signal.semantic == subscription.semantic())
-            .map(|signal| signal.status)
-            .unwrap_or(ble::SignalSupportStatus::Unknown)
-        {
-            ble::SignalSupportStatus::Supported => SubscriptionFilterOutcome::Scheduled,
-            ble::SignalSupportStatus::Unsupported => SubscriptionFilterOutcome::Unsupported,
-            ble::SignalSupportStatus::Unknown => SubscriptionFilterOutcome::Unknown,
-        };
-        decisions.push(CaptureSubscription::new(
-            subscription.semantic(),
-            subscription.interval_us(),
-            filter,
-        ));
-        if filter == SubscriptionFilterOutcome::Scheduled {
-            scheduled.push(subscription);
-        }
-    }
-    (scheduled, decisions)
-}
-
-async fn wait_for_scheduler(scheduler: &TelemetryScheduler) {
-    while !scheduler.is_finished() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 async fn finish_capture(sink: Option<CaptureSink>) -> Result<(), String> {
@@ -2816,32 +2738,6 @@ async fn emit_capture_started(
     )
     .await?;
     emit_capture_event(Some(recorder), CaptureEvent::knowledge_context(context)).await
-}
-
-async fn record_capture_start_failure(
-    sender: &CaptureSender,
-    profile: &str,
-    error: &str,
-) -> Result<(), String> {
-    let wallclock_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_millis()
-        .try_into()
-        .map_err(|_| "wall clock timestamp exceeds supported range")?;
-    let context = obdentic::capture_events::CaptureKnowledgeContext::current()?;
-    for event in [
-        CaptureEvent::capture_started(Some(wallclock_ms), Some(profile.into())),
-        CaptureEvent::knowledge_context(context),
-        CaptureEvent::session_error(error),
-        CaptureEvent::SessionStopped { offset_us: 0 },
-    ] {
-        sender
-            .send(event)
-            .await
-            .map_err(|_| "capture recorder is closed".to_string())?;
-    }
-    Ok(())
 }
 
 fn planned_layout_subscriptions(
@@ -3460,34 +3356,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_failure_is_preserved_in_the_capture_event_stream() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        record_capture_start_failure(&sender, "engine-baseline", "Carly setup timed out")
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            receiver.recv().await,
-            Some(CaptureEvent::CaptureStarted {
-                profile: Some(profile),
-                ..
-            }) if profile == "engine-baseline"
-        ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(CaptureEvent::KnowledgeContext { .. })
-        ));
-        assert_eq!(
-            receiver.recv().await,
-            Some(CaptureEvent::session_error("Carly setup timed out"))
-        );
-        assert_eq!(
-            receiver.recv().await,
-            Some(CaptureEvent::SessionStopped { offset_us: 0 })
-        );
-    }
-
-    #[tokio::test]
     async fn runtime_shutdown_documents_observation_idle_then_stopped() {
         let (runtime, task) = obdentic::runtime_actor::start();
         let mut state = RuntimeState::default();
@@ -4099,38 +3967,6 @@ mod tests {
             .lines()
             .any(|line| line.starts_with("engine.load\tunknown\t")));
         assert_eq!(output.lines().count(), supported_signals().len() + 1);
-    }
-
-    #[test]
-    fn capture_filter_schedules_only_advertised_signals_and_records_all_decisions() {
-        let configured = capture::profile("engine-baseline")
-            .unwrap()
-            .subscriptions()
-            .unwrap();
-        let (scheduled, decisions) = filter_capture_subscriptions(
-            configured,
-            &[
-                ble::SignalSupport {
-                    semantic: "engine.rpm",
-                    status: ble::SignalSupportStatus::Supported,
-                },
-                ble::SignalSupport {
-                    semantic: "engine.maf",
-                    status: ble::SignalSupportStatus::Unsupported,
-                },
-            ],
-        );
-
-        assert_eq!(scheduled.len(), 1);
-        assert_eq!(scheduled[0].semantic(), "engine.rpm");
-        assert_eq!(scheduled[0].interval(), Duration::from_secs(1));
-        assert_eq!(decisions.len(), 13);
-        assert_eq!(decisions[0].filter(), SubscriptionFilterOutcome::Scheduled);
-        assert_eq!(
-            decisions[1].filter(),
-            SubscriptionFilterOutcome::Unsupported
-        );
-        assert_eq!(decisions[2].filter(), SubscriptionFilterOutcome::Unknown);
     }
 
     #[test]

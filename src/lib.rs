@@ -20,6 +20,7 @@ pub(crate) mod elm;
 pub mod functional_discovery;
 pub mod identity;
 pub mod inventory_facts;
+pub mod jobs;
 pub mod knowledge_db;
 pub mod layout_observation;
 mod legacy_recording;
