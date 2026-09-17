@@ -371,7 +371,7 @@ async fn run() -> Result<(), String> {
                         .await?;
                     }
                     let scheduler = match TelemetryScheduler::start_with_runtime(
-                        &adapter_id,
+                        ble::start_session(&adapter_id),
                         plans,
                         telemetry.clone(),
                         audit.clone(),
@@ -2689,7 +2689,7 @@ async fn run_capture(
     println!("capture connecting...  wait for session initialization");
 
     let scheduler = match TelemetryScheduler::start_with_runtime(
-        adapter_id,
+        ble::start_session(adapter_id),
         plans,
         Arc::new(Mutex::new(TelemetryState::new(600)?)),
         Arc::new(Mutex::new(AuditState::new(600)?)),

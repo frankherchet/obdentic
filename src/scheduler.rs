@@ -16,6 +16,7 @@ use crate::{
     ReadRequest,
 };
 use std::{
+    future::Future,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -169,7 +170,7 @@ impl TelemetryScheduler {
             .await
             .map_err(|error| error.to_string())?;
         Self::start_with_runtime(
-            adapter_id,
+            start_session(adapter_id),
             subscriptions,
             telemetry,
             audit,
@@ -183,9 +184,15 @@ impl TelemetryScheduler {
     }
 
     /// Start observation using the caller-owned runtime actor clone.
+    ///
+    /// `connect` is a lazy connect future rather than an adapter id, so
+    /// tests can start the scheduler against a scripted session instead of
+    /// a real adapter. The Connecting transition is recorded before it is
+    /// awaited, so a slow or failing connect still shows up in the runtime
+    /// history at the right point.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_runtime<Plan: Into<ObservationPlan>>(
-        adapter_id: &str,
+        connect: impl Future<Output = Result<SessionClient, String>> + Send,
         subscriptions: Vec<Plan>,
         telemetry: Arc<Mutex<TelemetryState>>,
         audit: Arc<Mutex<AuditState>>,
@@ -225,7 +232,7 @@ impl TelemetryScheduler {
             RuntimeEvent::transport(crate::runtime_state::TransportState::Connecting),
         )
         .await?;
-        let session = match start_session(adapter_id).await {
+        let session = match connect.await {
             Ok(session) => session,
             Err(error) => {
                 let _ = apply_runtime_event(
@@ -884,7 +891,7 @@ mod tests {
     };
     use crate::{
         runtime_reducer::ContextUpdate,
-        runtime_state::{Activity, Phase, RuntimeContext, SourceState},
+        runtime_state::{Activity, Phase, RuntimeContext, SourceState, TransportState},
     };
 
     fn targeted_decision() -> RoutingDecision {
@@ -1211,5 +1218,94 @@ mod tests {
             "Bluetooth connection failed: unavailable"
         ));
         assert!(!is_fatal_runtime_error("conflicting 010C responses"));
+    }
+
+    fn transport_transitions(receiver: &mut mpsc::Receiver<CaptureEvent>) -> Vec<TransportState> {
+        let mut transitions = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let CaptureEvent::RuntimeStateChanged {
+                event: RuntimeEvent::ContextUpdated(ContextUpdate::Transport(state)),
+                ..
+            } = event
+            {
+                transitions.push(state);
+            }
+        }
+        transitions
+    }
+
+    #[tokio::test]
+    async fn scripted_session_start_and_stop_transitions_connecting_then_connected() {
+        let (runtime, runtime_task) = crate::runtime_actor::start();
+        runtime
+            .send(RuntimeEvent::InitializationCompleted)
+            .await
+            .unwrap();
+        let (recorder, mut receiver) = mpsc::channel(32);
+        let exchange = crate::test_support::ScriptedExchange::new(Vec::<String>::new());
+        let connect = crate::ble::start_scripted_session(exchange, false);
+
+        let scheduler = TelemetryScheduler::start_with_runtime(
+            connect,
+            vec![Subscription::new("engine.rpm", Duration::from_millis(200)).unwrap()],
+            Arc::new(Mutex::new(TelemetryState::new(4).unwrap())),
+            Arc::new(Mutex::new(AuditState::new(4).unwrap())),
+            Some(recorder),
+            None,
+            None,
+            runtime.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        scheduler.stop().await.unwrap();
+
+        assert_eq!(
+            transport_transitions(&mut receiver),
+            vec![
+                TransportState::Connecting,
+                TransportState::Connected,
+                TransportState::Disconnected,
+            ]
+        );
+        drop(runtime);
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_transitions_unhealthy_then_fatal() {
+        let (runtime, runtime_task) = crate::runtime_actor::start();
+        runtime
+            .send(RuntimeEvent::InitializationCompleted)
+            .await
+            .unwrap();
+        let (recorder, mut receiver) = mpsc::channel(32);
+        let connect = std::future::ready(Err("adapter unavailable".to_string()));
+
+        let result = TelemetryScheduler::start_with_runtime(
+            connect,
+            vec![Subscription::new("engine.rpm", Duration::from_millis(200)).unwrap()],
+            Arc::new(Mutex::new(TelemetryState::new(4).unwrap())),
+            Arc::new(Mutex::new(AuditState::new(4).unwrap())),
+            Some(recorder),
+            None,
+            None,
+            runtime.clone(),
+            None,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected the failed connect future to prevent scheduler start"),
+        };
+
+        assert_eq!(error, "adapter unavailable");
+        assert_eq!(
+            transport_transitions(&mut receiver),
+            vec![TransportState::Connecting, TransportState::Unhealthy]
+        );
+        drop(runtime);
+        runtime_task.abort();
     }
 }
