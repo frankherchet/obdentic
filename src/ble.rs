@@ -220,33 +220,39 @@ pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
     crate::adapter::scan().await
 }
 
+/// Merges a one-shot operation's result with its own disconnect outcome:
+/// the operation's error wins over a clean disconnect, and a disconnect
+/// failure is appended to whatever error (if any) the operation produced.
+async fn finish_after_disconnect<T>(
+    result: Result<T, String>,
+    mut session: DiagnosticSession,
+) -> Result<T, String> {
+    match (result, session.disconnect().await) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
 pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction, String> {
-    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
+    let mut session = DiagnosticSession::connect(adapter_id, ConnectMode::new(true, true)).await?;
     let result = tokio::select! {
         outcome = session.read_with_evidence(request) => outcome.into_transaction(),
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(transaction), Ok(())) => Ok(transaction),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 pub async fn read_targeted(
     adapter_id: &str,
     request: TargetedReadRequest,
 ) -> Result<Transaction, String> {
-    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
+    let mut session = DiagnosticSession::connect(adapter_id, ConnectMode::new(true, true)).await?;
     let result = tokio::select! {
         outcome = session.read_targeted(request) => outcome,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(transaction), Ok(())) => Ok(transaction),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 /// Connect and initialize an ELM327 session, then establish the automatic
@@ -256,7 +262,7 @@ pub async fn prepare_diagnostic_session(
     adapter_id: &str,
 ) -> Result<PreparedDiagnosticSession, String> {
     let mut session =
-        DiagnosticSession::connect_with_adapter_io_mode(adapter_id, false, false).await?;
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, false)).await?;
     let negotiation = match session.establish_protocol().await {
         Ok(negotiation) => negotiation,
         Err(error) => {
@@ -274,16 +280,12 @@ pub async fn prepare_diagnostic_session(
 
 pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
     let mut session =
-        DiagnosticSession::connect_without_support_discovery(adapter_id, true).await?;
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(true, false)).await?;
     let result = tokio::select! {
         identity = session.identify() => identity,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(identity), Ok(())) => Ok(identity),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 /// Connect, initialize the adapter, and validate functional support with one
@@ -293,27 +295,18 @@ pub async fn validate_functional_support(
     adapter_id: &str,
 ) -> Result<Vec<SupportDiscovery>, String> {
     let mut session =
-        DiagnosticSession::connect_without_support_discovery(adapter_id, false).await?;
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, false)).await?;
     let result = tokio::select! {
         support = session.validate_functional_support() => support,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(support), Ok(())) => Ok(support),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 pub async fn supported_signals(adapter_id: &str) -> Result<Vec<SignalSupport>, String> {
-    let mut session = DiagnosticSession::connect(adapter_id).await?;
-    let result = Ok(session.signal_support());
-    match (result, session.disconnect().await) {
-        (Ok(support), Ok(())) => Ok(support),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    let session = DiagnosticSession::connect(adapter_id, ConnectMode::new(false, true)).await?;
+    let support = session.signal_support();
+    finish_after_disconnect(Ok(support), session).await
 }
 
 pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
@@ -323,7 +316,7 @@ pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
 /// Start the same closed session while mirroring adapter TX/RX for a bounded
 /// diagnostic probe. No caller-controlled ELM command path is exposed.
 pub async fn start_session_with_adapter_io(adapter_id: &str) -> Result<SessionClient, String> {
-    let session = DiagnosticSession::connect_with_adapter_io_mode(adapter_id, true, true).await?;
+    let session = DiagnosticSession::connect(adapter_id, ConnectMode::new(true, true)).await?;
     Ok(start_session_actor(session))
 }
 
@@ -332,7 +325,7 @@ async fn start_session_mode(
     discover_support: bool,
 ) -> Result<SessionClient, String> {
     let session =
-        DiagnosticSession::connect_with_adapter_io_mode(adapter_id, false, discover_support)
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, discover_support))
             .await?;
     Ok(start_session_actor(session))
 }
@@ -341,6 +334,19 @@ fn start_session_actor<E: AdapterLink + 'static>(session: DiagnosticSession<E>) 
     let (sender, receiver) = mpsc::channel(16);
     tokio::spawn(session_actor(session, receiver));
     SessionClient { sender }
+}
+
+/// A [`SessionClient`] backed by a scripted exchange rather than real
+/// hardware. Shared across this module's tests and other modules'
+/// (e.g. the scheduler's), so every crate test that needs a session can
+/// use the same fake adapter seam.
+#[cfg(test)]
+pub(crate) async fn start_scripted_session(
+    exchange: crate::test_support::ScriptedExchange,
+    discover_support: bool,
+) -> Result<SessionClient, String> {
+    let session = DiagnosticSession::from_exchange(exchange, discover_support).await?;
+    Ok(start_session_actor(session))
 }
 
 #[derive(Clone)]
@@ -1009,31 +1015,27 @@ pub(crate) struct DiagnosticSession<E: AdapterLink = CarlyCuaV200> {
 }
 
 impl DiagnosticSession<CarlyCuaV200> {
-    pub async fn connect(adapter_id: &str) -> Result<Self, String> {
-        Self::connect_with_adapter_io(adapter_id, false).await
+    async fn connect(adapter_id: &str, mode: ConnectMode) -> Result<Self, String> {
+        let backend = CarlyCuaV200::connect(adapter_id, mode.show_adapter_io).await?;
+        Self::from_exchange(backend, mode.discover_support).await
     }
+}
 
-    async fn connect_without_support_discovery(
-        adapter_id: &str,
-        show_adapter_io: bool,
-    ) -> Result<Self, String> {
-        Self::connect_with_adapter_io_mode(adapter_id, show_adapter_io, false).await
-    }
+/// Which of the two connect-time options a one-shot session needs: whether
+/// to mirror adapter TX/RX, and whether to run the Mode 01 PID-support
+/// discovery pages before returning.
+#[derive(Clone, Copy)]
+struct ConnectMode {
+    show_adapter_io: bool,
+    discover_support: bool,
+}
 
-    async fn connect_with_adapter_io(
-        adapter_id: &str,
-        show_adapter_io: bool,
-    ) -> Result<Self, String> {
-        Self::connect_with_adapter_io_mode(adapter_id, show_adapter_io, true).await
-    }
-
-    async fn connect_with_adapter_io_mode(
-        adapter_id: &str,
-        show_adapter_io: bool,
-        discover_support: bool,
-    ) -> Result<Self, String> {
-        let backend = CarlyCuaV200::connect(adapter_id, show_adapter_io).await?;
-        Self::from_exchange(backend, discover_support).await
+impl ConnectMode {
+    const fn new(show_adapter_io: bool, discover_support: bool) -> Self {
+        Self {
+            show_adapter_io,
+            discover_support,
+        }
     }
 }
 
@@ -1548,14 +1550,6 @@ mod tests {
 
         assert_eq!(dispatched, 2);
         assert!(health.unhealthy().is_some());
-    }
-
-    async fn start_scripted_session(
-        exchange: ScriptedExchange,
-        discover_support: bool,
-    ) -> Result<SessionClient, String> {
-        let session = DiagnosticSession::from_exchange(exchange, discover_support).await?;
-        Ok(start_session_actor(session))
     }
 
     fn scripted_command_timeouts() -> impl Iterator<Item = Result<String, ExchangeError>> {
