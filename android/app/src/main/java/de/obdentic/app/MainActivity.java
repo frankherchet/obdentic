@@ -268,7 +268,7 @@ public class MainActivity extends Activity {
     private void showVehicle(JSONObject row){
         new AlertDialog.Builder(this).setTitle(row.optString("name")).setMessage(vehicleDetails(row)).setPositiveButton("Schließen",null).show();
     }
-    static String vehicleDetails(JSONObject row){
+    public static String vehicleDetails(JSONObject row){
         StringBuilder m=new StringBuilder("FIN: "+row.optString("vin")+"\nHerstellerhinweis: "+row.optString("manufacturer_hint","keiner"));
         JSONArray responders=row.optJSONArray("responders");StringBuilder ids=new StringBuilder();for(int i=0;responders!=null&&i<responders.length();i++){if(i>0)ids.append(", ");ids.append(responders.optString(i));}
         m.append("\nResponder: ").append(ids.length()==0?"keine":ids);
