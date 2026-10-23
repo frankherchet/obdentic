@@ -22,6 +22,12 @@ The UI never accepts raw commands, addresses or mutation capabilities.
   conservatively; unavailable optional values are not assumed supported.
 - Private recording, foreground connected-device service, screen-off operation,
   explicit export, offline replay and timestamped raw TX/RX.
+- A finite EA189 ash learning sequence under **Aufnahmeprofil / Testsequenz**, with
+  operator-reported operating context, visible progress and automatic recording stop.
+- Confirmed deletion of completed internal recordings; active recordings and loaded
+  replays are protected. Exported copies remain separate.
+- The display stays awake while the app is visible; background operation and manual
+  locking remain available.
 - Demo responses pass through the real Rust parser; the mode is always visible.
 
 DPF interpretations remain experimental. Pending/permanent DTCs, freeze frames,
@@ -48,9 +54,12 @@ extracted Car Scanner 2.1.50 EA189 profile and remain experimental with source
 metadata; their original upstream source is unknown. No executable vendor database,
 arbitrary formula, address or preparation sequence is imported.
 
-In particular, the `178C` ash-mass candidate is omitted: the source includes
-`10 03` preparation (UDS extended diagnostic session). No session-start traffic
-is added. The existing seven-value DPF job and its replay remain separate.
+The `178C` ash-mass candidate is omitted from the 15-value extended job: the source
+includes `10 03` preparation (UDS extended diagnostic session). A separate closed
+`ea189.ash.probe` learning job reads only `1153` and `178C`, once each, without that
+preparation or any fallback. It requires validated engine targeting and retains
+uninterpreted responses/NRCs rather than manufacturing ash telemetry. No session-start
+traffic is added. The existing seven-value DPF job and its replay remain separate.
 Support discovery follows advertised continuation bits only, bounded through
 page `0x60` for the newly catalogued torque PIDs.
 
@@ -83,6 +92,22 @@ recreating the Activity or locking the screen. Reopening after process death
 requires a new connection; existing files remain available as partial recordings.
 
 ## Recording, privacy and desktop inspection
+
+Under **Aufnahmeprofil / Testsequenz**, select **Testlauf: EA189 Asche (ohne
+Sitzungswechsel)**. Choose either ignition on/engine off or idle and keep that state
+throughout the run. This is an operator report, not ECU-confirmed context. The fixed
+sequence records validated engine inventory, both ash candidate reads, the seven-value
+DPF comparison and a final normal RPM read. It then closes the recording automatically.
+Generic polling and manual jobs cannot interleave. Negative candidate replies are
+valid learning evidence, not proof that a session change is necessary. Manual stop,
+disconnect and errors remain distinct from completed execution; completion does not
+mean that the candidates or their units have been validated. Export and replay retain
+the context, progress and raw candidate evidence. The live learning gate remains
+[#182](https://github.com/frankherchet/obdentic/issues/182).
+
+Each saved recording has **Aufnahme löschen …**. Confirmation permanently deletes
+only the phone's internal file; exported copies remain. Stop an active recording
+first, or leave a loaded replay before deleting its file.
 
 Recordings live in the application's private `recordings/` directory. Cloud
 backup and device transfer are disabled. Export opens Android's system file

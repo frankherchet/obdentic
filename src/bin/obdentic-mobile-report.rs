@@ -30,6 +30,8 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
     let mut session = None;
     let mut complete = false;
     let mut outcome = Value::Null;
+    let mut test_sequence_context = Value::Null;
+    let mut test_sequence_progress = Value::Null;
     let mut events = 0;
     let mut tx = 0;
     let mut rx = 0;
@@ -64,6 +66,7 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
             {
                 return Err("unsupported mobile recording header".into());
             }
+            test_sequence_context = event["test_sequence"].clone();
             session = Some(event);
             continue;
         }
@@ -72,6 +75,9 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
             Some("session_end") => {
                 complete = true;
                 outcome = json!({"reason":event["reason"],"detail":event["detail"]});
+            }
+            Some("test_sequence") => {
+                test_sequence_progress = event["progress"].clone();
             }
             Some("wire") => match event["direction"].as_str() {
                 Some("TX") => tx += 1,
@@ -90,6 +96,7 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                     "dtc.scan" => "replay.dtc.scan",
                     "ea189.dpf.probe" => "replay.ea189.dpf.probe",
                     "ea189.extended.probe" => "replay.ea189.extended.probe",
+                    "ea189.ash.probe" => "replay.ea189.ash.probe",
                     _ => continue,
                 };
                 let decoded: Value = serde_json::from_str(
@@ -115,9 +122,24 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
     if !complete {
         issues.push("interrupted recording: no session_end marker".into());
     }
+    if test_sequence_context.is_object() {
+        if !test_sequence_progress.is_object() {
+            test_sequence_progress = test_sequence_context.clone();
+        }
+        if !complete {
+            test_sequence_progress["status"] = json!("incomplete");
+        } else if test_sequence_progress["status"] == "running" {
+            test_sequence_progress["status"] = if outcome["reason"] == "completed" {
+                json!("completed")
+            } else {
+                json!("aborted")
+            };
+        }
+    }
     Ok(json!({"schema":"OBDENTIC-MOBILE-REPORT","version":1,
         "mode":session["mode"],"profile":session["profile"],
         "complete":complete,"outcome":outcome,"event_count":events,"tx_count":tx,"rx_count":rx,
+        "test_sequence":{"context":test_sequence_context,"progress":test_sequence_progress},
         "last_values":values,"diagnostic_jobs":jobs,"issues":issues,
         "note":"Values and diagnostic facts are recomputed from recorded responses. Original evidence remains in the source file."}))
 }
@@ -140,6 +162,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incomplete_sequence_cannot_report_running_or_complete_progress() {
+        let recording = concat!(
+            "{\"type\":\"session\",\"schema\":\"OBDENTIC-MOBILE\",\"version\":1,\"test_sequence\":{\"operator_context\":\"idle\",\"status\":\"running\"}}\n",
+            "{\"type\":\"test_sequence\",\"progress\":{\"status\":\"completed\"}}\n"
+        );
+        let value = inspect(recording.as_bytes()).unwrap();
+        assert_eq!(value["complete"], false);
+        assert_eq!(value["test_sequence"]["progress"]["status"], "incomplete");
+    }
     #[test]
     fn recomputes_read_and_reports_interrupted_recording() {
         let recording = concat!(
@@ -221,5 +253,38 @@ mod tests {
         assert_eq!(ash["semantic"], "dpf.oil_ash_volume");
         assert_eq!(ash["value"], 0.0);
         assert_eq!(ash["replay"], true);
+    }
+
+    #[test]
+    fn preserves_both_ash_candidate_responses_offline_without_promoting_values() {
+        let recording = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            json!({"type":"session","schema":"OBDENTIC-MOBILE","version":1,"mode":"demo","profile":"ea189-ash-test","test_sequence":{"operator_context":"engine_off"}}),
+            json!({"type":"test_sequence","progress":{"profile":"ea189-ash-test","status":"running","step":1,"total":2,"label":"Ignition on, engine off"}}),
+            json!({"type":"action","action":"ea189.ash.probe","at":1234,"result":{"ok":true,"data":{"experimental":true,"readings":[
+                {"candidate":"ash_volume_1153","request":"22 11 53","raw_response":"7E8 05 62 11 53 00 64\r>","timestamp_ms":1000},
+                {"candidate":"ash_mass_178c","request":"22 17 8C","raw_response":"7E8 03 7F 22 31\r>","timestamp_ms":1100}
+            ]}}}),
+            json!({"type":"test_sequence","progress":{"profile":"ea189-ash-test","status":"complete","step":2,"total":2,"label":"Idle"}}),
+            json!({"type":"session_end","reason":"stopped"})
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert_eq!(report["complete"], true);
+        assert!(report["issues"].as_array().unwrap().is_empty());
+        let readings = report["diagnostic_jobs"][0]["data"]["readings"]
+            .as_array()
+            .unwrap();
+        assert_eq!(readings[0]["response_data"], json!([0, 100]));
+        assert_eq!(readings[0]["timestamp_ms"], 1000);
+        assert!(!readings[0].as_object().unwrap().contains_key("value"));
+        assert_eq!(readings[1]["nrc"], "0x31");
+        assert_eq!(readings[1]["timestamp_ms"], 1100);
+        assert!(!readings[1].as_object().unwrap().contains_key("value"));
+        assert_eq!(
+            report["test_sequence"]["context"]["operator_context"],
+            "engine_off"
+        );
+        assert_eq!(report["test_sequence"]["progress"]["step"], 2);
+        assert_eq!(report["test_sequence"]["progress"]["status"], "complete");
     }
 }

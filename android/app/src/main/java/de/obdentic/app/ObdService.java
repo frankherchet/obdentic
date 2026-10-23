@@ -29,11 +29,13 @@ public final class ObdService extends Service {
     private BluetoothLeScanner scanner;
     private ScanCallback scanCallback;
     private volatile String mode = "live";
+    private volatile String replayFilename = "";
     private BufferedWriter writer;
     private long lastPoll, lastWakeRefresh, recordingOriginNanos;
     private int scanGeneration;
     private android.os.PowerManager.WakeLock wakeLock;
     private volatile String recordingProfile = "";
+    private volatile int sequenceIndex = -1;
     private final Map<String, Long> due = new HashMap<>(), intervals = new HashMap<>();
     private final Map<String, JSONObject> values = new LinkedHashMap<>();
     public void onCreate() {
@@ -61,7 +63,7 @@ public final class ObdService extends Service {
     private String phase() { synchronized(stateLock) { return state.optString("phase"); } }
     private void message(String value) { set("message",value); }
     public JSONObject snapshot() {
-        synchronized(stateLock) { put(state,"busy",busy); put(state,"records",listRecords());
+        synchronized(stateLock) { put(state,"busy",busy || sequenceIndex>=0); put(state,"records",listRecords());
             try { return new JSONObject(state.toString()); } catch(JSONException e) { return new JSONObject(); } }
     }
     private boolean permitted() {
@@ -138,8 +140,11 @@ public final class ObdService extends Service {
             catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
     }
     private void resetSessionData() {
+        replayFilename="";
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
+            put(state,"replayFile","");
             put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"replayPartial",false);
+            put(state,"testSequence",new JSONObject()); put(state,"ashEvidence",new JSONObject());
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
         synchronized(due) { due.clear(); }
@@ -209,11 +214,12 @@ public final class ObdService extends Service {
         } set("selected",checked);
     }
     public void runJob(String action) {
-        if(busy || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
+        if(busy || sequenceIndex>=0 || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
         if(!action.equals("inventory") && !action.equals("dtc.scan") && !isEa189Job(action) && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
         busy=true; changed(); int token=generation;
         worker.execute(() -> { try {
             if(token!=generation) return;
+            if(sequenceIndex>=0) { message("Während des Testlaufs sind andere Aufträge gesperrt"); return; }
             String argument=action.startsWith("read:") ? action.substring(5) : "";
             if(isEa189Job(action)) { JSONObject inventory=execute("inventory",""); if(token!=generation) return; set("vehicle",inventory.opt("data")); }
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
@@ -243,6 +249,7 @@ public final class ObdService extends Service {
         }
         if(busy || !phase().equals("ready") || core==0) return;
         BleTransport active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
+        if(sequenceIndex>=0) { pollSequence(); return; }
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
         String probeAction=recordingProfile.equals("ea189-dpf")?"ea189.dpf.probe":recordingProfile.equals("ea189-extended")?"ea189.extended.probe":"";
         boolean dpf=!probeAction.isEmpty();
@@ -288,9 +295,13 @@ public final class ObdService extends Service {
             values.put(semantic,row); put(state,"values",new JSONArray(values.values()));
         } changed();
     }
-    public void startRecording(String profileId) { worker.execute(() -> startRecordingNow(profileId)); }
-    private void startRecordingNow(String profileId) {
+    public void startRecording(String profileId) { startRecording(profileId,""); }
+    public void startRecording(String profileId,String context) { worker.execute(() -> startRecordingNow(profileId,context)); }
+    private void startRecordingNow(String profileId,String context) {
         if(!phase().equals("ready")) { message("Zum Aufzeichnen zuerst verbinden"); return; }
+        if(busy || sequenceIndex>=0) { message("Zuerst laufenden Auftrag oder Testlauf beenden"); return; }
+        boolean test=profileId.equals(TestSequence.PROFILE);
+        if(test && !TestSequence.validContext(context)) { message("Für den Testlauf zuerst den Betriebszustand auswählen"); return; }
         JSONArray signals=null, periods=null; synchronized(stateLock) { JSONArray profiles=state.optJSONArray("profiles");
             for(int i=0;i<profiles.length();i++) if(profileId.equals(profiles.optJSONObject(i).optString("id"))) { signals=profiles.optJSONObject(i).optJSONArray("signals"); periods=profiles.optJSONObject(i).optJSONArray("intervals_ms"); } }
         if(signals==null) { message("Unbekanntes Aufnahmeprofil"); return; }
@@ -303,19 +314,28 @@ public final class ObdService extends Service {
                 writer=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory,name)),StandardCharsets.UTF_8));
                 set("recording",name);
                 JSONObject header=new JSONObject(); put(header,"type","session"); put(header,"schema","OBDENTIC-MOBILE"); put(header,"version",1); put(header,"mode",mode); put(header,"profile",profileId); put(header,"selected",profileId.equals("ea189-dpf")||profileId.equals("ea189-extended")?new JSONArray():signals);
+                if(test) {
+                    set("ashEvidence",new JSONObject());
+                    JSONObject sequence=new JSONObject(); put(sequence,"profile",profileId); put(sequence,"operator_context",context); put(sequence,"context_label",TestSequence.contextLabel(context));
+                    put(sequence,"context_source","operator_report"); put(sequence,"status","running"); put(sequence,"step",0); put(sequence,"total",TestSequence.Step.values().length); put(sequence,"file",name);
+                    put(header,"test_sequence",sequence); set("testSequence",sequence);
+                } else set("testSequence",new JSONObject());
                 synchronized(stateLock) { put(header,"vehicle",state.opt("vehicle")); put(header,"diagnostics",state.opt("diagnostics")); put(header,"catalog",state.opt("signals")); put(header,"profiles",state.opt("profiles")); }
                 // Notifications must not precede the header in the new evidence stream.
                 record(header);
-                if(writer==null) return;
+                if(writer==null) { if(test)sequenceProgress("aborted","Aufnahme konnte nicht geschrieben werden"); return; }
             }
             recordingProfile=profileId;
+            sequenceIndex=test?0:-1;
             synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?1200L:periods.optLong(i,1200L)); }
-            if(profileId.equals("ea189-dpf")||profileId.equals("ea189-extended"))set("selected",new JSONArray());else selectSignals(signals); message("Aufnahme läuft: " + profileId);
+            if(test||profileId.equals("ea189-dpf")||profileId.equals("ea189-extended"))set("selected",new JSONArray());else selectSignals(signals); message("Aufnahme läuft: " + profileId);
         } catch(IOException e) { message(e.getMessage()); }
     }
     public void stopRecording() { if(!worker.isShutdown()) worker.execute(this::stopRecordingNow); }
     private void stopRecordingNow() { closeRecording("stopped",""); }
     private void closeRecording(String reason,String detail) {
+        if(sequenceIndex>=0) sequenceProgress(reason.equals("completed")?"completed":"aborted",detail);
+        sequenceIndex=-1;
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
         boolean completed=false;
         synchronized(recordLock) {
@@ -323,12 +343,44 @@ public final class ObdService extends Service {
             if(writer!=null) { try { writer.close(); completed=true; } catch(IOException e) { message("Aufnahme konnte nicht abgeschlossen werden: "+e.getMessage()); } writer=null; }
         }
         set("recording","");
-        if(completed) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
+        if(completed) message(reason.equals("completed")?"Testlauf aufgezeichnet · Antworten auswerten":reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
+    }
+    private void sequenceProgress(String status,String label) {
+        JSONObject progress;
+        synchronized(stateLock) {
+            try { progress=new JSONObject(state.getJSONObject("testSequence").toString()); }
+            catch(JSONException e) { throw new IllegalStateException(e); }
+        }
+        put(progress,"status",status); put(progress,"step",Math.min(sequenceIndex+1,TestSequence.Step.values().length)); put(progress,"label",label);
+        set("testSequence",progress);
+        JSONObject event=new JSONObject(); put(event,"type","test_sequence"); put(event,"progress",progress); record(event);
+    }
+    private void pollSequence() {
+        int token=generation;
+        TestSequence.Step step=TestSequence.Step.values()[sequenceIndex];
+        sequenceProgress("running",step.label);
+        try {
+            synchronized(recordLock) { if(writer==null || sequenceIndex<0)return; }
+            JSONObject result=execute(step.action,step.argument);
+            if(token!=generation) return;
+            synchronized(recordLock) { if(writer==null) { sequenceIndex=-1; return; } }
+            set("jobResult",result);
+            if(!result.optBoolean("ok")) { closeRecording("error",result.optString("error","Testschritt fehlgeschlagen")); return; }
+            JSONObject data=result.optJSONObject("data");
+            if(step==TestSequence.Step.INVENTORY) {
+                set("vehicle",data); if(data!=null)applySupport(data);
+                if(data==null || !data.optBoolean("engine_target_validated")) { closeRecording("error","Motorsteuergerät nicht gezielt bestätigt"); return; }
+            } else if(step==TestSequence.Step.ASH) set("ashEvidence",data);
+            else if(step==TestSequence.Step.DPF) applyDpf(result);
+            else updateValue(step.argument,result);
+            if(sequenceIndex+1==TestSequence.Step.values().length)closeRecording("completed","");
+            else sequenceIndex++;
+        } catch(Throwable e) { fail(token,e); }
     }
     private void record(JSONObject event) {
         put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
             try { writer.write(event.toString()); writer.newLine(); writer.flush(); }
-            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); } set("recording",""); message("Aufnahmefehler: "+e.getMessage()); }
+            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; if(sequenceIndex>=0){sequenceIndex=-1;synchronized(stateLock){put(state.optJSONObject("testSequence"),"status","aborted");}} synchronized(due) { due.clear(); intervals.clear(); } set("recording",""); message("Aufnahmefehler: "+e.getMessage()); }
         }
     }
     private void debug(String direction,String text) {
@@ -341,13 +393,40 @@ public final class ObdService extends Service {
         for(File file:files) if(file.isFile() && file.getName().endsWith(".jsonl")) { JSONObject row=new JSONObject(); put(row,"name",file.getName()); put(row,"bytes",file.length()); put(row,"modified",file.lastModified()); records.put(row); }
         return records;
     }
+    public void deleteRecording(String filename) {
+        if(!worker.isShutdown()) worker.execute(() -> deleteRecordingNow(filename));
+    }
+    private File recordingFile(String filename) throws IOException {
+        if(filename==null || !filename.matches("[A-Za-z0-9_.-]+\\.jsonl")) throw new IOException("Ungültiger Aufnahmepfad");
+        File filesDirectory=getFilesDir().getCanonicalFile();
+        File directory=new File(filesDirectory,"recordings").getCanonicalFile();
+        if(!filesDirectory.equals(directory.getParentFile())) throw new IOException("Ungültiger Aufnahmepfad");
+        File file=new File(directory,filename).getCanonicalFile();
+        if(!directory.equals(file.getParentFile()) || !filename.equals(file.getName())) throw new IOException("Ungültiger Aufnahmepfad");
+        return file;
+    }
+    private void deleteRecordingNow(String filename) {
+        File file;
+        try { file=recordingFile(filename); }
+        catch(IOException e) { message(e.getMessage()); return; }
+        synchronized(recordLock) {
+            String active;
+            synchronized(stateLock) { active=state.optString("recording"); }
+            if(filename.equals(active) && writer!=null) { message("Aufzeichnung vor dem Löschen stoppen"); return; }
+            if(filename.equals(replayFilename)) { message("Im Replay geöffnete Aufzeichnung kann nicht gelöscht werden"); return; }
+            if(!file.isFile()) { message("Aufnahme nicht gefunden"); return; }
+            if(!file.delete()) { message("Aufnahme konnte nicht gelöscht werden"); return; }
+        }
+        message("Aufnahme endgültig gelöscht: " + filename);
+    }
     public void openRecording(String filename) {
         if(filename==null || !filename.matches("[A-Za-z0-9_.-]+\\.jsonl")) { message("Ungültiger Aufnahmepfad"); return; }
-        disconnect(); int token=++generation; busy=true; mode="replay"; set("mode",mode); set("phase","replay");
-        worker.execute(() -> { try {
-            synchronized(stateLock) { values.clear(); } resetSessionData();
+        disconnect(); replayFilename=filename; set("replayFile",filename); int token=++generation; busy=true; mode="replay"; set("mode",mode); set("phase","replay");
+        worker.execute(() -> { boolean headerAccepted=false; try {
+            if(token!=generation)return;
+            synchronized(stateLock) { values.clear(); } resetSessionData(); replayFilename=filename; set("replayFile",filename);
             destroyCore(); core=NativeCore.create((command,timeout) -> { throw new IOException("Offline replay cannot access an adapter"); });
-            File file=new File(new File(getFilesDir(),"recordings"),filename);
+            File file=recordingFile(filename);
             if(file.length()>64L*1024*1024) throw new IOException("Aufnahme größer als 64 MiB");
             try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(file),StandardCharsets.UTF_8))) {
                 String line; int count=0; boolean headerFound=false, endFound=false; String outcome="", outcomeDetail=""; while((line=input.readLine())!=null && token==generation) {
@@ -357,6 +436,7 @@ public final class ObdService extends Service {
                     if(!headerFound) {
                         if(!event.optString("type").equals("session") || !event.optString("schema").equals("OBDENTIC-MOBILE") || event.optInt("version")!=1) throw new IOException("Unbekanntes Aufnahmeformat oder Version");
                         headerFound=true;
+                        headerAccepted=true;
                     }
                     if(event.optString("type").equals("session_end")) { endFound=true; outcome=event.optString("reason"); outcomeDetail=event.optString("detail"); }
                     if(event.optString("type").equals("action")) { String action=event.optString("action"); JSONObject result=event.optJSONObject("result"); if(result==null) continue;
@@ -365,25 +445,35 @@ public final class ObdService extends Service {
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
                         else if(action.equals("inventory")) restoreVehicle(result.optJSONObject("data"));
-                        else if(action.equals("dtc.scan") || isEa189Job(action)) {
+                        else if(action.equals("dtc.scan") || action.equals("ea189.ash.probe") || isEa189Job(action)) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));
-                            if(action.equals("dtc.scan")) set("diagnostics",decoded.opt("data")); else applyDpf(decoded);
+                            if(action.equals("dtc.scan")) set("diagnostics",decoded.opt("data")); else if(action.equals("ea189.ash.probe"))set("ashEvidence",decoded.opt("data")); else applyDpf(decoded);
                             result=decoded;
                         }
                         set("jobResult",result);
                     } else if(event.optString("type").equals("session")) {
                         String savedProfile=event.optString("profile");if(savedProfile.equals("ea189-dpf")||savedProfile.equals("ea189-extended"))set("selected",new JSONArray());else selectSignals(event.optJSONArray("selected")==null?new JSONArray():event.optJSONArray("selected"));
                         if(event.optJSONObject("vehicle")!=null) restoreVehicle(event.optJSONObject("vehicle"));
+                        if(event.optJSONObject("test_sequence")!=null)set("testSequence",event.optJSONObject("test_sequence"));
                         if(event.optJSONObject("diagnostics")!=null && event.optJSONObject("diagnostics").has("raw_response")) { JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay.dtc.scan",event.optJSONObject("diagnostics").toString())); set("diagnostics",decoded.opt("data")); }
                         set("replaySourceMode",event.optString("mode","unknown"));
+                    } else if(event.optString("type").equals("test_sequence")) { if(event.optJSONObject("progress")!=null)set("testSequence",event.optJSONObject("progress"));
                     } else if(event.optString("type").equals("wire")) { synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } }
                 }
                 if(!headerFound) throw new IOException("Leere Aufnahme");
-                if(token==generation) { set("replayPartial",!endFound); set("replayOutcome",outcome); message(!endFound?"Teilaufnahme ohne Abschlussmarker: "+filename:outcome.equals("error")?"Aufnahme mit Fehler beendet: "+outcomeDetail:"Offline geöffnet ("+outcome+"): "+filename); }
+                if(token==generation) { restoreSequenceOutcome(endFound,outcome); set("replayPartial",!endFound); set("replayOutcome",outcome); message(!endFound?"Teilaufnahme ohne Abschlussmarker: "+filename:outcome.equals("error")?"Aufnahme mit Fehler beendet: "+outcomeDetail:"Offline geöffnet ("+outcome+"): "+filename); }
             }
-        } catch(Exception e) { if(token==generation) { set("replayPartial",true); message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
+        } catch(Exception e) { if(token==generation) { if(!headerAccepted){replayFilename="";set("replayFile","");} restoreSequenceOutcome(false,""); set("replayPartial",true); message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
         finally { if(token==generation) { busy=false; changed(); } } });
+    }
+    private void restoreSequenceOutcome(boolean complete,String outcome) {
+        synchronized(stateLock) {
+            JSONObject sequence=state.optJSONObject("testSequence");
+            if(sequence==null || sequence.length()==0)return;
+            if(!complete)put(sequence,"status","incomplete");
+            else if(sequence.optString("status").equals("running"))put(sequence,"status",outcome.equals("completed")?"completed":"aborted");
+        }
     }
     private void restoreVehicle(JSONObject vehicle) throws Exception {
         if(vehicle==null)return;
@@ -427,6 +517,7 @@ public final class ObdService extends Service {
             else if(c.equals("2211B2")) response="7E8 05 62 11 B2 16 A8\r>";
             else if(c.equals("2210F9")) response="7E8 05 62 10 F9 14 B4\r>";
             else if(c.equals("2214F5")) response="7E8 05 62 14 F5 00 0A\r>";
+            else if(c.equals("22178C")) response="7E8 03 7F 22 31\r>";
             else if(c.equals("010C")) response="7E8 04 41 0C 0C 80\r>";
             else if(c.equals("010D")) response="7E8 03 41 0D 00\r>";
             else if(c.equals("0105")) response="7E8 03 41 05 7B\r>";
