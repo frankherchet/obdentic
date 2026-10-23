@@ -85,6 +85,24 @@ details, as is a value lower than the stored one (the new value is stored, neith
 corrected). Without a stored value the page shows "km-Stand nicht verfügbar". Covered
 by `VehicleRecordsAcceptance` (REQ-013, REQ-014, REQ-015) and the demo read in `AcceptanceRunner`.
 
+The Diagnose tab has an experimental, user-started card "EXPERIMENTELL · VW KOMBIINSTRUMENT"
+(REQ-016, [ADR 0001](adr/0001-manufacturer-odometer-source.md) amendment, #198). One job
+action, `vw.cluster.odometer` (no argument), sends a single `22 2203` to request header
+`714` and accepts only a positive answer from `77E`, then restores functional
+addressing; there is no session change, SecurityAccess, RoutineControl, retry or other
+target, and it is never part of automatic connection traffic. It needs a live ready
+session, a stored vehicle selected for the current VIN and a VW Group manufacturer hint;
+otherwise the button is disabled with the reason and the core refuses without sending
+anything. A 2-byte answer is stored as `cluster_odometer` ((A·256+B)·10 km, with date,
+source "VW Kombiinstrument DID 2203 (experimentell)", classification COMMUNITY and
+hardware validation "pending"), separate from the PID `A6` value and never merged with it.
+The list shows the `A6` value when stored, otherwise the cluster value marked
+"Kombiinstrument · experimentell". Failures (no response, other responder, negative
+response with its NRC) are stored as `cluster_odometer_error` and keep stored values;
+other payload lengths stay raw and are shown as "nicht auswertbar". Recordings re-decode
+the action offline through `replay.vw.cluster.odometer`. The scaling and the default-session
+behaviour are unconfirmed until the vehicle check bundled into #178.
+
 A changed live signal selection is stored in the selected record (`selection`) and restored
 when that record is selected again (and after a process restart), without adapter traffic;
 demo and replay sessions never read or write it, and a new record gets the default

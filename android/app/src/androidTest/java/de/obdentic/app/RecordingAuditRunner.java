@@ -35,7 +35,7 @@ public final class RecordingAuditRunner extends Instrumentation {
                         if(type.equals("action")) {
                             String action=event.optString("action");JSONObject envelope=event.optJSONObject("result");if(envelope==null) {invalid=true;continue;}
                             if(!envelope.optBoolean("ok")) {failures++;continue;}
-                            if(action.equals("read")||action.equals("dtc.scan")||action.equals("ea189.dpf.probe")||action.equals("ea189.extended.probe")||action.equals("ea189.ash.probe")) {
+                            if(action.equals("read")||action.equals("dtc.scan")||action.equals("ea189.dpf.probe")||action.equals("ea189.extended.probe")||action.equals("ea189.ash.probe")||action.equals("vw.cluster.odometer")) {
                                 JSONObject data=envelope.optJSONObject("data");JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay."+action,data==null?"{}":data.toString()));
                                 if(!decoded.optBoolean("ok"))decodeErrors++;
                                 else if(action.equals("read")) {reads++;if(data==null||!Double.isFinite(data.optDouble("value",Double.NaN))||Math.abs(data.optDouble("value")-decoded.getJSONObject("data").optDouble("value"))>1e-9)mismatches++;}

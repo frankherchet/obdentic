@@ -72,6 +72,7 @@ pub enum OperationKind {
     DtcRead,
     Ea189DpfProbe,
     EcuIdentification,
+    VwClusterOdometer,
     DtcClear,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -97,6 +98,8 @@ pub enum OperationRequest {
     ReadDtcs(DtcReadKind),
     Ea189DpfProbe(Ea189DpfProbeRequest),
     EcuIdentification(IdentificationCandidate),
+    /// The closed experimental VW cluster odometer read (ADR 0001); it carries no input.
+    VwClusterOdometer,
     ClearDtcs,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -151,6 +154,7 @@ impl OperationRequest {
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
+            Self::VwClusterOdometer => OperationKind::VwClusterOdometer,
             Self::ClearDtcs => OperationKind::DtcClear,
             Self::SecurityAccess => OperationKind::SecurityAccess,
             Self::DiagnosticSessionControl => OperationKind::DiagnosticSessionControl,
@@ -175,6 +179,7 @@ pub enum Operation {
     ReadDtcs(DtcReadKind),
     Ea189DpfProbe(Ea189DpfProbeRequest),
     EcuIdentification(IdentificationCandidate),
+    VwClusterOdometer,
 }
 
 impl Operation {
@@ -184,6 +189,7 @@ impl Operation {
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
+            Self::VwClusterOdometer => OperationKind::VwClusterOdometer,
         }
     }
 
@@ -234,6 +240,7 @@ impl Capability {
                     | OperationKind::DtcRead
                     | OperationKind::Ea189DpfProbe
                     | OperationKind::EcuIdentification
+                    | OperationKind::VwClusterOdometer
             ),
         }
     }
@@ -316,6 +323,9 @@ impl SafetyPolicy {
             OperationRequest::EcuIdentification(candidate) => {
                 self.authorize_operation(Operation::EcuIdentification(candidate))
             }
+            OperationRequest::VwClusterOdometer => {
+                self.authorize_operation(Operation::VwClusterOdometer)
+            }
             OperationRequest::ClearDtcs => {
                 Err(SafetyError::OperationBlocked(OperationKind::DtcClear))
             }
@@ -382,6 +392,7 @@ impl SafetyPolicy {
                     OperationKind::DtcRead
                         | OperationKind::Ea189DpfProbe
                         | OperationKind::EcuIdentification
+                        | OperationKind::VwClusterOdometer
                 )
             }
             Activity::Idle | Activity::Write => false,
@@ -493,6 +504,27 @@ mod tests {
                 OperationRequest::EcuIdentification(plan.candidates()[0].clone())
             )
             .is_err());
+    }
+
+    #[test]
+    fn vw_cluster_odometer_is_allowed_only_as_a_diagnose_activity() {
+        let policy = SafetyPolicy::default();
+        assert_eq!(
+            policy
+                .authorize_activity(Activity::Diagnose, OperationRequest::VwClusterOdometer)
+                .unwrap(),
+            Operation::VwClusterOdometer
+        );
+        for activity in [
+            Activity::Read,
+            Activity::Observe,
+            Activity::Idle,
+            Activity::Write,
+        ] {
+            assert!(policy
+                .authorize_activity(activity, OperationRequest::VwClusterOdometer)
+                .is_err());
+        }
     }
 
     #[test]

@@ -5,10 +5,12 @@ use serde_json::{json, Value};
 
 use crate::{
     elm::{
-        ElmExchange, ElmSession, ExchangeError, TargetedDpfProbeRequest,
-        TargetedEa189AshProbeRequest, TargetedEa189ExtendedProbeRequest, TargetedReadRequest,
-        TransportFailure,
+        ElmExchange, ElmSession, ExchangeError, TargetedClusterOdometerRequest,
+        TargetedDpfProbeRequest, TargetedEa189AshProbeRequest, TargetedEa189ExtendedProbeRequest,
+        TargetedReadRequest, TransportFailure,
     },
+    runtime_state::Activity,
+    safety::{OperationRequest, SafetyPolicy},
     topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
         RequestAddress, RequestTarget, RequestTargetEvidence, ResponderIdentity, RoleAssignment,
@@ -40,6 +42,8 @@ pub struct MobileCore<E> {
     session: Option<ElmSession<PlatformExchange<E>>>,
     initialized: bool,
     engine: Option<EcuTargetMapping>,
+    /// VIN read by the latest inventory of this session; gates the cluster job.
+    inventory_vin: Option<String>,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -52,6 +56,7 @@ impl<E: Exchange> MobileCore<E> {
             session: Some(ElmSession::new(PlatformExchange(exchange))),
             initialized: false,
             engine: None,
+            inventory_vin: None,
         })
     }
 
@@ -84,6 +89,9 @@ impl<E: Exchange> MobileCore<E> {
         if action == "replay.ea189.ash.probe" {
             return replay_ea189_ash_probe(argument);
         }
+        if action == "replay.vw.cluster.odometer" {
+            return replay_vw_cluster_odometer(argument);
+        }
         if action == "replay.read" {
             let mut recorded: Value = serde_json::from_str(argument).map_err(|e| e.to_string())?;
             let semantic = recorded
@@ -113,6 +121,7 @@ impl<E: Exchange> MobileCore<E> {
                 | "ea189.dpf.probe"
                 | "ea189.extended.probe"
                 | "ea189.ash.probe"
+                | "vw.cluster.odometer"
         ) {
             return Err(format!("read-only mobile core rejected action: {action}"));
         }
@@ -122,6 +131,7 @@ impl<E: Exchange> MobileCore<E> {
         if action == "initialize" {
             self.initialized = false;
             self.engine = None;
+            self.inventory_vin = None;
             let mut exchange = self
                 .session
                 .take()
@@ -209,6 +219,7 @@ impl<E: Exchange> MobileCore<E> {
             "ea189.dpf.probe" => self.dpf(),
             "ea189.extended.probe" => self.ea189_extended(),
             "ea189.ash.probe" => self.ea189_ash_probe(),
+            "vw.cluster.odometer" => self.vw_cluster_odometer(),
             _ => unreachable!(),
         }
     }
@@ -225,12 +236,14 @@ impl<E: Exchange> MobileCore<E> {
         // Do not retain target evidence from an earlier inventory if this
         // discovery no longer observes the expected engine responder.
         self.engine = None;
+        self.inventory_vin = None;
         let identity = self
             .runtime
             .block_on(self.session.as_mut().unwrap().identify());
         let mut data = self.support();
         match identity {
             Ok(identity) => {
+                self.inventory_vin = Some(identity.vin().as_str().to_owned());
                 data["vin"] = json!(identity.vin().as_str());
                 data["vin_identity"] = crate::vin_identity::describe(identity.vin().as_str());
             }
@@ -520,6 +533,36 @@ impl<E: Exchange> MobileCore<E> {
         }
         Ok(json!({"experimental":true,"readings":readings}))
     }
+
+    /// REQ-016: one user-started `22 2203` to `714`; no argument, retry or fallback.
+    fn vw_cluster_odometer(&mut self) -> Result<Value, String> {
+        let vin = self.inventory_vin.as_deref().ok_or(
+            "Kombiinstrument-km-Stand: zuerst ein Inventar mit VIN erfassen (nichts gesendet)",
+        )?;
+        if !crate::vin_identity::is_vw_group_vin(vin) {
+            return Err(
+                "Kombiinstrument-km-Stand: nur für Fahrzeuge der VW-Gruppe (nichts gesendet)"
+                    .into(),
+            );
+        }
+        SafetyPolicy::read_only()
+            .authorize_activity(Activity::Diagnose, OperationRequest::VwClusterOdometer)
+            .map_err(|error| error.to_string())?;
+        let request = TargetedClusterOdometerRequest::vw_cluster();
+        let read = self.runtime.block_on(
+            self.session
+                .as_mut()
+                .unwrap()
+                .read_cluster_odometer_with_evidence(&request),
+        );
+        let mut result = cluster_result(read.responses.as_ref(), read.error.as_deref());
+        result["timestamp_ms"] = json!(wallclock_timestamp_ms());
+        if let Some(error) = read.restore_error {
+            self.initialized = false;
+            result["restore_error"] = json!(error);
+        }
+        Ok(result)
+    }
 }
 
 fn wallclock_timestamp_ms() -> u128 {
@@ -634,6 +677,101 @@ fn ash_candidate_result(
         }
     }
     result
+}
+
+/// Shared by the live job and its offline replay, so both decode identically.
+fn cluster_result(
+    responses: Option<&crate::elm::DiagnosticResponses>,
+    error: Option<&str>,
+) -> Value {
+    use crate::vw_cluster as cluster;
+    let mut result = json!({
+        "semantic":cluster::SEMANTIC,
+        "experimental":true,
+        "target":cluster::TARGET,
+        "responder":cluster::RESPONDER,
+        "did":format!("{:04X}", cluster::DID),
+        "request":"22 22 03",
+        "source":cluster::SOURCE,
+        "source_provenance":cluster::PROVENANCE,
+        "classification":cluster::CLASSIFICATION,
+        "hardware_validation":cluster::HARDWARE_VALIDATION,
+    });
+    let Some(responses) = responses else {
+        result["outcome"] = json!(cluster::Outcome::NoResponse.as_str());
+        result["error"] = json!(error.unwrap_or("no response"));
+        result["raw_response"] = Value::Null;
+        result["responses"] = json!([]);
+        result["response_errors"] = json!([]);
+        result["observations"] = json!([]);
+        return result;
+    };
+    let reading = cluster::interpret(responses);
+    result["outcome"] = json!(reading.outcome.as_str());
+    result["raw_response"] = json!(responses.raw_response());
+    result["responses"] = diagnostic_evidence(responses);
+    result["response_errors"] = diagnostic_errors(responses);
+    let selection_error = match reading.outcome {
+        cluster::Outcome::NoResponse
+        | cluster::Outcome::OtherResponder
+        | cluster::Outcome::Malformed => reading.error.clone(),
+        _ => None,
+    };
+    let expected = crate::elm::ResponderIdentity::ElmHeader(cluster::RESPONDER.into());
+    result["observations"] = json!(response_observations_json(&[
+        responses.observation_for_target(&expected, selection_error)
+    ]));
+    if let Some(km) = reading.value_km {
+        result["value_km"] = json!(km);
+    }
+    if let Some(nrc) = reading.nrc {
+        result["nrc"] = json!(format!("0x{nrc:02X}"));
+    }
+    if let Some(data) = reading.data {
+        result["response_data"] = json!(data);
+    }
+    if let Some(error) = reading.error {
+        result["error"] = json!(error);
+    }
+    result
+}
+
+fn replay_vw_cluster_odometer(argument: &str) -> Result<Value, String> {
+    let recorded: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
+    if recorded
+        .get("semantic")
+        .and_then(Value::as_str)
+        .is_some_and(|semantic| semantic != crate::vw_cluster::SEMANTIC)
+    {
+        return Err("recording is not a VW cluster odometer read".into());
+    }
+    let raw_response = recorded
+        .get("raw_response")
+        .and_then(Value::as_str)
+        .filter(|raw| !raw.trim().is_empty());
+    let mut result = match raw_response {
+        None => cluster_result(
+            None,
+            Some(
+                recorded
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("recording raw_response missing"),
+            ),
+        ),
+        Some(raw) => cluster_result(
+            Some(&crate::elm::normalize_uds_responses(
+                raw,
+                crate::vw_cluster::DID,
+            )?),
+            None,
+        ),
+    };
+    result["replay"] = json!(true);
+    if let Some(timestamp) = recorded.get("timestamp_ms") {
+        result["timestamp_ms"] = timestamp.clone();
+    }
+    Ok(result)
 }
 
 fn extended_signal_metadata(signal: crate::ea189::Ea189ExtendedSignal) -> Value {
@@ -1143,6 +1281,257 @@ mod tests {
                 unexpected => panic!("unexpected command {unexpected}"),
             })
         }
+    }
+
+    const VW_VIN_RESPONSE: &str =
+        "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4A 5A 58\r7E8 22 57 30 30 30 30 30 31\r>";
+    const BMW_VIN_RESPONSE: &str =
+        "7E8 10 14 49 02 01 57 42 41\r7E8 21 5A 5A 5A 31 4A 5A 58\r7E8 22 57 30 30 30 30 30 31\r>";
+
+    struct ClusterExchange {
+        commands: Vec<String>,
+        vin_response: &'static str,
+        cluster_response: Result<&'static str, &'static str>,
+    }
+
+    impl ClusterExchange {
+        fn new(vin_response: &'static str, cluster_response: &'static str) -> Self {
+            Self {
+                commands: Vec::new(),
+                vin_response,
+                cluster_response: Ok(cluster_response),
+            }
+        }
+    }
+
+    impl Exchange for ClusterExchange {
+        fn exchange(&mut self, command: &str, _: Duration) -> Result<String, String> {
+            self.commands.push(command.to_owned());
+            match command.trim() {
+                "ATI" | "ATZ" => Ok("ELM327\r>".into()),
+                "AT@1" => Ok("CARLY-UNIVERSAL\r>".into()),
+                "ATE0" | "ATL0" | "ATS1" | "ATH1" | "ATSP0" | "ATSH 7DF" | "ATCRA" | "ATSH 714"
+                | "ATCRA 77E" | "ATSH 7E0" | "ATCRA 7E8" => Ok("OK\r>".into()),
+                "0100" => Ok("7E8 06 41 00 00 00 00 00\r>".into()),
+                "010C" => Ok("7E8 04 41 0C 1F 40\r>".into()),
+                "0902" => Ok(self.vin_response.into()),
+                "222203" => self.cluster_response.map(Into::into).map_err(Into::into),
+                unexpected => panic!("unexpected command {unexpected}"),
+            }
+        }
+    }
+
+    /// Initialize and run an inventory so the VIN gate has evidence.
+    fn cluster_core(
+        vin_response: &'static str,
+        cluster_response: &'static str,
+    ) -> MobileCore<ClusterExchange> {
+        let mut core =
+            MobileCore::new(ClusterExchange::new(vin_response, cluster_response)).unwrap();
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        assert_eq!(run(&mut core, "inventory", "")["ok"], true);
+        core
+    }
+
+    fn sent<E>(core: &mut MobileCore<E>, extract: impl FnOnce(E) -> Vec<String>) -> Vec<String>
+    where
+        E: Exchange,
+    {
+        extract(core.session.take().unwrap().into_exchange().0)
+    }
+
+    fn cluster_commands(core: &mut MobileCore<ClusterExchange>) -> Vec<String> {
+        sent(core, |exchange| exchange.commands)
+    }
+
+    /// Commands after the inventory's engine validation (last `010C` plus its
+    /// three-command restore), i.e. only the cluster job's traffic.
+    fn job_traffic(commands: &[String]) -> Vec<String> {
+        let start = commands.iter().rposition(|c| c.trim() == "010C").unwrap() + 4;
+        commands[start..]
+            .iter()
+            .map(|c| c.trim().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn req_016_1_vw_vin_sends_exactly_one_targeted_read_and_decodes_the_value() {
+        let mut core = cluster_core(VW_VIN_RESPONSE, "77E 05 62 22 03 30 39\r>");
+        let result = run(&mut core, "vw.cluster.odometer", "");
+        assert_eq!(result["ok"], true, "{result}");
+        let data = &result["data"];
+        assert_eq!(data["outcome"], "value");
+        assert_eq!(data["value_km"], 123450);
+        assert_eq!(data["target"], "714");
+        assert_eq!(data["responder"], "77E");
+        assert_eq!(data["did"], "2203");
+        assert_eq!(
+            data["source"],
+            "VW Kombiinstrument DID 2203 (experimentell)"
+        );
+        assert_eq!(data["classification"], "COMMUNITY");
+        assert_eq!(data["hardware_validation"], "pending");
+        assert_eq!(data["responses"][0]["responder"], "77E");
+        assert!(data["timestamp_ms"].is_number());
+        let commands = cluster_commands(&mut core);
+        assert_eq!(
+            job_traffic(&commands),
+            [
+                "ATSH 714",
+                "ATCRA 77E",
+                "222203",
+                "ATSP0",
+                "ATSH 7DF",
+                "ATCRA"
+            ]
+        );
+    }
+
+    #[test]
+    fn req_016_2_non_vw_vin_or_missing_inventory_sends_nothing() {
+        let mut bmw = cluster_core(BMW_VIN_RESPONSE, "77E 05 62 22 03 30 39\r>");
+        let refused = run(&mut bmw, "vw.cluster.odometer", "");
+        assert_eq!(refused["ok"], false);
+        assert!(refused["error"].as_str().unwrap().contains("VW-Gruppe"));
+
+        let mut no_inventory =
+            MobileCore::new(ClusterExchange::new(VW_VIN_RESPONSE, "unused")).unwrap();
+        assert_eq!(run(&mut no_inventory, "initialize", "")["ok"], true);
+        assert_eq!(
+            run(&mut no_inventory, "vw.cluster.odometer", "")["ok"],
+            false
+        );
+        // Dropping the inventory evidence closes the gate again.
+        let mut stale = cluster_core(VW_VIN_RESPONSE, "unused");
+        stale.inventory_vin = None;
+        assert_eq!(run(&mut stale, "vw.cluster.odometer", "")["ok"], false);
+
+        for core in [&mut bmw, &mut no_inventory, &mut stale] {
+            let commands = cluster_commands(core);
+            assert!(!commands
+                .iter()
+                .any(|c| c.contains("222203") || c.contains("ATSH 714")));
+        }
+    }
+
+    #[test]
+    fn req_016_2_the_action_accepts_no_argument() {
+        let mut core = cluster_core(VW_VIN_RESPONSE, "77E 05 62 22 03 30 39\r>");
+        for argument in ["2203", "714", "22 22 03"] {
+            let result = run(&mut core, "vw.cluster.odometer", argument);
+            assert_eq!(result["ok"], false);
+            assert!(result["error"].as_str().unwrap().contains("no argument"));
+        }
+        assert!(!cluster_commands(&mut core)
+            .iter()
+            .any(|c| c.contains("222203")));
+    }
+
+    #[test]
+    fn req_016_3_only_one_22_2203_and_no_session_security_or_routine_service() {
+        let mut core = cluster_core(VW_VIN_RESPONSE, "77E 05 62 22 03 30 39\r>");
+        assert_eq!(run(&mut core, "vw.cluster.odometer", "")["ok"], true);
+        let commands = cluster_commands(&mut core);
+        assert_eq!(commands.iter().filter(|c| c.trim() == "222203").count(), 1);
+        for command in &commands {
+            let command = command.trim();
+            assert!(
+                !(command.starts_with("10")
+                    || command.starts_with("27")
+                    || command.starts_with("31")),
+                "forbidden service sent: {command}"
+            );
+        }
+        // Functional addressing is restored last.
+        assert_eq!(commands.last().unwrap().trim(), "ATCRA");
+    }
+
+    #[test]
+    fn req_016_4_negative_missing_and_foreign_responses_never_yield_a_value() {
+        for (response, outcome) in [
+            ("77E 03 7F 22 31\r>", "negative_response"),
+            ("NO DATA\r>", "no_response"),
+            ("7E8 05 62 22 03 30 39\r>", "other_responder"),
+        ] {
+            let mut core = cluster_core(VW_VIN_RESPONSE, response);
+            let result = run(&mut core, "vw.cluster.odometer", "");
+            assert_eq!(result["ok"], true, "{result}");
+            let data = &result["data"];
+            assert_eq!(data["outcome"], outcome, "{response}");
+            assert!(!data.as_object().unwrap().contains_key("value_km"));
+            assert!(data["raw_response"].as_str().unwrap().len() > 2);
+            if outcome == "negative_response" {
+                assert_eq!(data["nrc"], "0x31");
+                assert!(data["error"].as_str().unwrap().contains("0x31"));
+            }
+            let commands = cluster_commands(&mut core);
+            assert_eq!(commands.iter().filter(|c| c.trim() == "222203").count(), 1);
+            assert_eq!(commands.last().unwrap().trim(), "ATCRA");
+        }
+    }
+
+    #[test]
+    fn req_016_4_a_transport_failure_ends_without_value_and_restores_addressing() {
+        let mut core = cluster_core(VW_VIN_RESPONSE, "unused");
+        let mut exchange = core.session.take().unwrap().into_exchange().0;
+        exchange.cluster_response = Err("Carly command timed out: 222203");
+        core.session = Some(ElmSession::new(PlatformExchange(exchange)));
+        let result = run(&mut core, "vw.cluster.odometer", "");
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["outcome"], "no_response");
+        assert!(result["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"));
+        assert_eq!(result["data"]["raw_response"], Value::Null);
+        assert_eq!(cluster_commands(&mut core).last().unwrap().trim(), "ATCRA");
+    }
+
+    #[test]
+    fn req_016_5_other_payload_lengths_are_kept_raw_without_a_value() {
+        for (response, width) in [
+            ("77E 06 62 22 03 00 12 D6\r>", 3),
+            ("77E 04 62 22 03 12\r>", 1),
+            ("77E 03 62 22 03\r>", 0),
+        ] {
+            let mut core = cluster_core(VW_VIN_RESPONSE, response);
+            let result = run(&mut core, "vw.cluster.odometer", "");
+            let data = &result["data"];
+            assert_eq!(data["outcome"], "unparseable_length", "{result}");
+            assert_eq!(data["response_data"].as_array().unwrap().len(), width);
+            assert!(!data.as_object().unwrap().contains_key("value_km"));
+            assert!(data["error"].as_str().unwrap().contains("nicht auswertbar"));
+        }
+    }
+
+    #[test]
+    fn req_016_7_replay_redecodes_the_recorded_raw_response_without_transport() {
+        let mut core = cluster_core(VW_VIN_RESPONSE, "77E 05 62 22 03 30 39\r>");
+        let live = run(&mut core, "vw.cluster.odometer", "");
+        let recorded = live["data"].to_string();
+        struct Panics;
+        impl Exchange for Panics {
+            fn exchange(&mut self, _: &str, _: Duration) -> Result<String, String> {
+                panic!("replay must not use the transport")
+            }
+        }
+        let mut offline = MobileCore::new(Panics).unwrap();
+        let replay = run(&mut offline, "replay.vw.cluster.odometer", &recorded);
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["data"]["value_km"], 123450);
+        assert_eq!(replay["data"]["outcome"], "value");
+        assert_eq!(replay["data"]["replay"], true);
+        assert_eq!(replay["data"]["timestamp_ms"], live["data"]["timestamp_ms"]);
+
+        let negative = json!({"raw_response":"77E 03 7F 22 31\r>"}).to_string();
+        let replay = run(&mut offline, "replay.vw.cluster.odometer", &negative);
+        assert_eq!(replay["data"]["outcome"], "negative_response");
+        assert!(!replay["data"].as_object().unwrap().contains_key("value_km"));
+        let other = json!({"semantic":"engine.rpm","raw_response":"x"}).to_string();
+        assert_eq!(
+            run(&mut offline, "replay.vw.cluster.odometer", &other)["ok"],
+            false
+        );
     }
 
     fn run<E: Exchange>(core: &mut MobileCore<E>, action: &str, argument: &str) -> Value {

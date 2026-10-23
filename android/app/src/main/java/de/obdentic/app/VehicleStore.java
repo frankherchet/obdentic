@@ -151,6 +151,34 @@ public final class VehicleStore {
             put(find(next, vin), "odometer_error", failure);
         });
     }
+    /** True for a manufacturer hint of the VW Group (REQ-016.2); matches the core's gate. */
+    public static boolean isVwGroup(String hint) {
+        String h = hint == null ? "" : hint.toLowerCase(java.util.Locale.ROOT);
+        return h.contains("volkswagen") || h.contains("audi") || h.contains("skoda") || h.contains("škoda") || h.contains("seat") || h.contains("cupra");
+    }
+    /** REQ-016.1/.8: stores the experimental cluster odometer as its own field; the PID A6 fields are never touched. A success clears the cluster failure. */
+    public synchronized String clusterOdometer(String vin, long km, long now, String source, String classification, String hardwareValidation) {
+        return mutate(vin, next -> {
+            JSONObject row = find(next, vin), value = new JSONObject();
+            row.remove("cluster_odometer_error");
+            put(value, "km", km);
+            put(value, "read_at", now);
+            put(value, "source", source);
+            put(value, "classification", classification);
+            put(value, "hardware_validation", hardwareValidation);
+            put(row, "cluster_odometer", value);
+        });
+    }
+    /** REQ-016.4/.5: records a failed or unreadable cluster read (raw may be null); a stored cluster value stays untouched. */
+    public synchronized String clusterOdometerFailure(String vin, String error, String raw, long now) {
+        return mutate(vin, next -> {
+            JSONObject failure = new JSONObject();
+            put(failure, "error", error);
+            if (raw != null) put(failure, "raw", raw);
+            put(failure, "at", now);
+            put(find(next, vin), "cluster_odometer_error", failure);
+        });
+    }
     /** REQ-014.1: the live signal selection of one record (semantics, caller-checked); replaces the previous one. */
     public synchronized String setSelection(String vin, JSONArray semantics) {
         return mutate(vin, next -> put(find(next, vin), "selection", copyArray(semantics)));
