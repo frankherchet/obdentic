@@ -180,7 +180,7 @@ public final class ObdService extends Service {
             if(selected.length()==0) defaults=defaultSelection(state.optJSONArray("signals"));
         } return defaults;
     }
-    static JSONArray defaultSelection(JSONArray signals) {
+    public static JSONArray defaultSelection(JSONArray signals) {
         JSONArray defaults=new JSONArray();
         for(String semantic:new String[]{"engine.rpm","vehicle.speed","engine.coolant_temperature","engine.maf"})
             for(int i=0;i<signals.length();i++) if(semantic.equals(signals.optJSONObject(i).optString("semantic")) && signals.optJSONObject(i).optString("status").equals("supported")) defaults.put(semantic);
