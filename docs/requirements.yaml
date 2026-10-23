@@ -219,3 +219,79 @@ requirements:
         text: Physical diagnostic commands are sequential unless a reviewed protocol or backend establishes safe concurrent operation.
       - id: REQ-012.3
         text: Adapter identity, command dialect, protocol knowledge, Vehicle Knowledge, diagnostic reasoning, and presentation retain separate responsibilities.
+
+  - id: REQ-013
+    title: Remember vehicles connected through the Android app
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-23: Android vehicle selection refinement"
+    description: >
+      The Android app keeps a private, VIN-keyed record of every real vehicle it
+      has connected to, refreshes it on each live connection, and lets the user
+      select, rename and delete these records without adapter traffic.
+    acceptance:
+      - id: REQ-013.1
+        text: When the inventory of a live adapter session reads a format-valid VIN that is not stored, the app creates a vehicle record keyed by that VIN with the offline manufacturer hint, observed responders, signal support, engine-target validation state, and first and last connection timestamps.
+      - id: REQ-013.2
+        text: When a live session reads the VIN of a stored vehicle, the app replaces its responders, signal support, engine-target validation state and last connection timestamp, keeps its name and first connection timestamp, and keeps no history of replaced values.
+      - id: REQ-013.3
+        text: When the VIN is unreadable or not format-valid, no vehicle record is created, updated or selected, the session continues, and the app shows that the vehicle was not saved because the VIN could not be read.
+      - id: REQ-013.4
+        text: Demo and replay sessions never create, update or select a vehicle record.
+      - id: REQ-013.5
+        text: Every tab shows the selected vehicle's name in the header; tapping it opens a vehicle list that shows per record the name, the VIN masked to its first 3 and last 4 characters, the latest odometer value or "nicht verfügbar", and the last connection date, and a record's details show the full VIN.
+      - id: REQ-013.6
+        text: Selecting a record in the vehicle list sends no adapter traffic, and the selection is restored after the app process restarts.
+      - id: REQ-013.7
+        text: When a live session reads a VIN other than the selected vehicle's, the app selects the record for the read VIN, creating it if needed, shows "Anderes Fahrzeug erkannt" with that record's name, and leaves the previously selected record unchanged.
+      - id: REQ-013.8
+        text: A new record is named after its manufacturer hint, or "Fahrzeug" when there is none, followed by the last 4 VIN characters; the user can rename it to 1 to 40 characters after trimming, and an empty name is rejected while the previous name stays.
+      - id: REQ-013.9
+        text: Deleting a record requires confirmation, permanently removes it from internal storage, clears the selection when it was selected, and leaves recordings unchanged.
+      - id: REQ-013.10
+        text: Vehicle records live only in app-private storage that is excluded from cloud backup and device transfer, and no app action sends or exports them.
+      - id: REQ-013.11
+        text: When stored vehicle records cannot be read, live sessions still work, the app shows that the vehicle store is unreadable, never overwrites it implicitly, and replaces it only after an explicitly confirmed reset.
+      - id: REQ-013.12
+        text: When writing vehicle records fails, the session continues, the app shows that the vehicle could not be saved, and the previously stored records remain intact.
+
+  - id: REQ-014
+    title: Reuse a stored vehicle's live selection and last observed support
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-23: Android vehicle selection refinement"
+    description: >
+      A selected vehicle record restores its live signal selection and shows its
+      last observed signal support before connecting. Stored support is display
+      context only and never replaces discovery on a live connection.
+    acceptance:
+      - id: REQ-014.1
+        text: While a vehicle record is selected, a changed live signal selection is stored for that record and is restored, without adapter traffic, whenever that record is selected again.
+      - id: REQ-014.2
+        text: While no adapter session is active, the signal chooser marks signal support from the selected record's last observation together with its observation date, distinguishable from support observed in a current session.
+      - id: REQ-014.3
+        text: A live connection always performs full support discovery and inventory; stored support never skips discovery or decides whether a read is sent, and the current observation replaces the stored support.
+      - id: REQ-014.4
+        text: A newly created record without a stored selection receives the existing default selection of supported signals.
+
+  - id: REQ-015
+    title: Read the odometer through the standard OBD PID
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-23: Android vehicle selection refinement"
+    description: >
+      On each live connection the odometer is read through standard Mode 01 PID
+      0xA6 when the vehicle advertises it and stored with its date and source.
+      Manufacturer-specific odometer reads are out of scope until a spike decides them.
+    acceptance:
+      - id: REQ-015.1
+        text: When a live session for a stored vehicle advertises PID 0xA6, the app reads it once after inventory, decodes bytes A to D as (A·2^24 + B·2^16 + C·2^8 + D) / 10 km, and stores the value with its read timestamp and the source "OBD PID A6".
+      - id: REQ-015.2
+        text: When PID 0xA6 is not advertised, no odometer request is sent, and the record shows its last stored value with that value's date, or "km-Stand nicht verfügbar" when none exists.
+      - id: REQ-015.3
+        text: When the odometer read fails with NO DATA, a negative response, a timeout or a malformed payload, the stored value and date remain unchanged, the record's details show the failure, and the raw TX/RX remains visible under Debug.
+      - id: REQ-015.4
+        text: When a newly read odometer value is lower than the stored one, the new value is stored and the record's details show that it is lower than the previous value, naming that value and its date, without correcting either value.
