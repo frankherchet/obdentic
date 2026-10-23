@@ -42,6 +42,7 @@ public class MainActivity extends Activity {
     private LinearLayout body, nav;
     private ScrollView scroll;
     private TextView badge, status;
+    private Button chip;
     private TextView debugLog;
     private int tab=0;
     private String structure="", profile="";
@@ -62,6 +63,8 @@ public class MainActivity extends Activity {
         LinearLayout heading=row();heading.setPadding(dp(20),dp(12),dp(20),dp(6));
         TextView name=text("OBDentic",27,TEXT);name.setTypeface(null,Typeface.BOLD);heading.addView(name,new LinearLayout.LayoutParams(0,-2,1));
         badge=text("STARTET",12,ACCENT);badge.setTypeface(null,Typeface.BOLD);badge.setGravity(Gravity.CENTER);badge.setMaxLines(2);badge.setMaxWidth(dp(220));badge.setPadding(dp(12),dp(8),dp(12),dp(8));badge.setBackground(surface(0xff203f3a,10));heading.addView(badge);root.addView(heading);
+        chip=button("Kein Fahrzeug gewählt",()->{tab=5;structure="";scroll.scrollTo(0,0);buildNav();refresh();});chip.setSingleLine(true);chip.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams chipParams=new LinearLayout.LayoutParams(-1,-2);chipParams.setMargins(dp(20),0,dp(20),dp(2));root.addView(chip,chipParams);
         status=text("Diagnose wird vorbereitet …",14,MUTED);status.setMaxLines(3);status.setEllipsize(android.text.TextUtils.TruncateAt.END);status.setPadding(dp(20),dp(2),dp(20),dp(12));root.addView(status);
         scroll=new ScrollView(this);scroll.setFillViewport(true);body=new LinearLayout(this);body.setOrientation(LinearLayout.VERTICAL);body.setPadding(dp(16),dp(4),dp(16),dp(20));scroll.addView(body);root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
         nav=row();nav.setPadding(dp(4),dp(6),dp(4),dp(6));root.addView(nav);buildNav();
@@ -80,6 +83,8 @@ public class MainActivity extends Activity {
         if(service()==null)return;
         if(launchDemo){launchDemo=false;service().setDemo();}
         state=service().snapshot();
+        JSONObject chosen=selectedVehicle();String chipName=chosen==null?"Kein Fahrzeug gewählt":chosen.optString("name");
+        chip.setText(chipName);chip.setContentDescription("Gewähltes Fahrzeug: "+(chosen==null?"keines":chipName));
         String mode=state.optString("mode","live"), phase=state.optString("phase","idle");
         String replayBadge="REPLAY · "+(state.optString("replaySourceMode").equals("demo")?"DEMO":"DATEI");
         if(mode.equals("replay")&&state.optBoolean("replayPartial"))replayBadge+="\nTEILAUFNAHME";
@@ -90,7 +95,7 @@ public class MainActivity extends Activity {
         status.setTextColor(phase.equals("error")?0xffffa79c:MUTED);
         if(!historyMode.equals(mode)){historyMode=mode;histories.clear();lastSamples.clear();}
         collectHistory();
-        String key=tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString();
+        String key=tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles");
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle");
         if(tab==2)key+="|"+array("records")+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile")+"|"+state.opt("testSequence")+"|"+state.opt("ashEvidence");
@@ -102,7 +107,7 @@ public class MainActivity extends Activity {
     }
     private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
     private void buildNav(){nav.removeAllViews();nav.setWeightSum(5);String[] titles={"Live","Diagnose","Aufnahmen","Debug","Adapter"};for(int i=0;i<titles.length;i++){final int next=i;Button b=button(titles[i],()->{tab=next;structure="";scroll.scrollTo(0,0);buildNav();refresh();});b.setTextSize(12);b.setMinWidth(0);b.setMinimumWidth(0);b.setPadding(dp(2),dp(4),dp(2),dp(4));b.setTextColor(tab==i?BG:MUTED);b.setBackground(surface(tab==i?ACCENT:CARD,12));b.setBackgroundTintList(null);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(48),1);p.setMargins(dp(2),0,dp(2),0);nav.addView(b,p);}}
-    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();debugLog=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;default:connection();}}
+    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();debugLog=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;default:connection();}}
     private void live(){
         title("Live-Messwerte","Werte und Verlauf auf einen Blick");
         addButton(body,"Messwerte auswählen",this::chooseSignals).setEnabled(state.optString("recording").isEmpty());
@@ -215,6 +220,40 @@ public class MainActivity extends Activity {
             new AlertDialog.Builder(this).setTitle("Asche-Testlauf starten?").setMessage(labels[which]+"\n\nBitte diesen Zustand während des gesamten Testlaufs beibehalten. Deine Angabe wird zusammen mit den Messantworten gespeichert. Der Test endet automatisch; nicht verfügbare Werte bleiben als Ergebnis erhalten.").setPositiveButton("Testlauf starten",(d,w)->act(()->service().startRecording(selectedProfile,contexts[which]))).setNegativeButton("Abbrechen",null).show();
         }).setNegativeButton("Abbrechen",null).show();
     }
+    private JSONObject vehicleStore(){JSONObject v=state.optJSONObject("vehicles");return v==null?new JSONObject():v;}
+    private JSONObject selectedVehicle(){JSONObject store=vehicleStore();JSONArray rows=store.optJSONArray("vehicles");String selected=store.optString("selected");if(rows!=null)for(int i=0;i<rows.length();i++)if(selected.equals(rows.optJSONObject(i).optString("vin")))return rows.optJSONObject(i);return null;}
+    private String date(long millis){return new java.text.SimpleDateFormat("dd.MM.yyyy",java.util.Locale.GERMANY).format(new java.util.Date(millis));}
+    private void vehicles(){
+        title("Fahrzeuge","Lokal gespeichert · nur auf diesem Handy");
+        JSONObject store=vehicleStore();
+        if(store.optBoolean("unreadable")){LinearLayout e=card();note(e,"FAHRZEUGSPEICHER NICHT LESBAR",0xffffa79c);note(e,"Die gespeicherten Fahrzeuge konnten nicht gelesen werden. Verbindungen funktionieren weiter. Die Datei wird nicht überschrieben, solange du den Speicher nicht selbst zurücksetzt.",MUTED);addButton(e,"Fahrzeugspeicher zurücksetzen …",this::confirmResetVehicles);return;}
+        JSONArray rows=store.optJSONArray("vehicles");
+        if(rows==null||rows.length()==0){empty("Noch keine Fahrzeuge","Verbinde den Adapter mit einem Fahrzeug. Die FIN wird beim ersten Verbinden gelesen und das Fahrzeug hier gespeichert.");return;}
+        for(int i=0;i<rows.length();i++){
+            JSONObject row=rows.optJSONObject(i);if(row==null)continue;String vin=row.optString("vin"),name=row.optString("name");boolean selected=vin.equals(store.optString("selected"));
+            LinearLayout c=card();note(c,name+(selected?" · gewählt":""),TEXT);
+            note(c,(vin.length()>=7?vin.substring(0,3)+"…"+vin.substring(vin.length()-4):vin)+" · km-Stand nicht verfügbar",MUTED);
+            note(c,"Zuletzt verbunden: "+date(row.optLong("last_connected")),MUTED);
+            addButton(c,"Auswählen",()->act(()->service().selectVehicle(vin))).setEnabled(!selected);
+            addButton(c,"Details",()->showVehicle(row));addButton(c,"Umbenennen …",()->renameVehicle(vin,name));addButton(c,"Löschen …",()->confirmDeleteVehicle(vin,name));
+        }
+    }
+    private void showVehicle(JSONObject row){
+        StringBuilder m=new StringBuilder("FIN: "+row.optString("vin")+"\nHerstellerhinweis: "+row.optString("manufacturer_hint","keiner"));
+        JSONArray responders=row.optJSONArray("responders");StringBuilder ids=new StringBuilder();for(int i=0;responders!=null&&i<responders.length();i++){if(i>0)ids.append(", ");ids.append(responders.optString(i));}
+        m.append("\nResponder: ").append(ids.length()==0?"keine":ids);
+        JSONArray signals=row.optJSONArray("signals");int supported=0;for(int i=0;signals!=null&&i<signals.length();i++)if("supported".equals(signals.optJSONObject(i).optString("status")))supported++;
+        m.append("\nMesswerte unterstützt: ").append(supported).append(" von ").append(signals==null?0:signals.length());
+        m.append("\nMotorsteuergerät gezielt geprüft: ").append(row.optBoolean("engine_target_validated")?"ja":"nein");
+        m.append("\nErste Verbindung: ").append(date(row.optLong("first_connected"))).append("\nLetzte Verbindung: ").append(date(row.optLong("last_connected")));
+        new AlertDialog.Builder(this).setTitle(row.optString("name")).setMessage(m).setPositiveButton("Schließen",null).show();
+    }
+    private void renameVehicle(String vin,String name){
+        android.widget.EditText input=new android.widget.EditText(this);input.setSingleLine(true);input.setText(name);input.selectAll();
+        new AlertDialog.Builder(this).setTitle("Fahrzeug umbenennen").setMessage("1 bis 40 Zeichen").setView(input).setPositiveButton("Speichern",(d,w)->act(()->service().renameVehicle(vin,input.getText().toString()))).setNegativeButton("Abbrechen",null).show();
+    }
+    private void confirmDeleteVehicle(String vin,String name){new AlertDialog.Builder(this).setTitle("Fahrzeug endgültig löschen?").setMessage(name+"\n\nDer Eintrag wird dauerhaft aus dem internen Speicher gelöscht. Aufnahmen bleiben erhalten.").setPositiveButton("Endgültig löschen",(d,w)->act(()->service().deleteVehicle(vin))).setNegativeButton("Abbrechen",null).show();}
+    private void confirmResetVehicles(){new AlertDialog.Builder(this).setTitle("Fahrzeugspeicher zurücksetzen?").setMessage("Alle gespeicherten Fahrzeuge werden dauerhaft gelöscht und der Speicher wird neu angelegt. Aufnahmen bleiben erhalten.").setPositiveButton("Zurücksetzen",(d,w)->act(()->service().resetVehicleStore())).setNegativeButton("Abbrechen",null).show();}
     private void confirmDeleteRecording(String name){new AlertDialog.Builder(this).setTitle("Aufnahme endgültig löschen?").setMessage("Diese Datei wird dauerhaft aus dem internen Speicher gelöscht. Exportierte Kopien bleiben bestehen.\n\n"+name).setPositiveButton("Endgültig löschen",(dialog,which)->act(()->service().deleteRecording(name))).setNegativeButton("Abbrechen",null).show();}
     private void debug(){
         title("Debug-Daten","Zeitgestempelte TX/RX-Daten dieser Sitzung");

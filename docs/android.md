@@ -63,6 +63,23 @@ traffic is added. The existing seven-value DPF job and its replay remain separat
 Support discovery follows advertised continuation bits only, bounded through
 page `0x60` for the newly catalogued torque PIDs.
 
+## Known vehicles
+
+Each live inventory with a format-valid VIN creates or refreshes a record in
+`vehicles.json` (app-private files directory, written atomically; excluded from
+backup and device transfer, never exported). A record keeps the VIN, a
+manufacturer-based default name (renamable, 1-40 characters), responders, signal
+support, engine-target validation and first/last connection time; the last
+observation replaces the previous one, no history is kept. The selected vehicle
+persists in the same file and is shown as a header chip on every tab; the chip
+opens the "Fahrzeuge" page (masked VIN, details, rename, delete with
+confirmation). Demo and replay sessions never touch the store, an unreadable VIN
+saves nothing, and selecting a record sends no adapter traffic. A corrupt file is
+reported and never overwritten implicitly; only a confirmed reset replaces it. A
+failed write leaves the previous file and the in-memory state unchanged. The
+odometer is not read yet, so the page shows "km-Stand nicht verfügbar". Covered by
+`VehicleRecordsAcceptance` (REQ-013).
+
 ## Build and install
 
 Prerequisites: JDK 17+, Rust 1.98.0, `rtk`, Android SDK platform 36, build tools
@@ -152,9 +169,12 @@ rtk proxy adb shell am instrument -w de.obdentic.app.test/de.obdentic.app.Accept
 ```
 
 Grant Bluetooth and notification permissions before running acceptance. The
-runner exercises the real JNI/core with a simulated adapter, profile recording,
-screen off, export provider, offline re-decoding, reconnect and Activity
-recreation. It emits synthetic screenshots and a demo recording as instrumentation
+runner exercises the real JNI/core with a simulated adapter, profile recording
+(including background operation after pressing Home), export provider, offline
+re-decoding, reconnect and Activity recreation. The default run does not turn
+the screen off or lock the phone. The real screen-off check is opt-in: add
+`-e screenOff true` to the `am instrument` command (the phone is left locked
+afterwards). It emits synthetic screenshots and a demo recording as instrumentation
 artifacts (also stored in the app-specific acceptance directory). Passing this test
 does **not** establish live BLE or vehicle acceptance.
 
