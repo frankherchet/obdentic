@@ -11,7 +11,7 @@ import java.util.Arrays;
 /** REQ-013 checks: store semantics on temp files, the service's own store, and (via {@link Screen}) the header chip. */
 final class VehicleRecordsAcceptance {
     interface Screen { void show(String vehicleName, String listText) throws Exception; }
-    private static final String VIN_A = "WVW00000000000000", VIN_B = "WVW00000000001111", VIN_C = "XXX00000000002222", VIN_UI = "WVW00000000009999";
+    private static final String VIN_A = "WVW00000000000000", VIN_B = "WVW00000000001111", VIN_C = "XXX00000000002222", VIN_UI = "WVW00000000009999", VIN_SEL_A = "WVW00000000008888", VIN_SEL_B = "WVW00000000007777";
 
     static void run(ObdService service, Screen screen) throws Exception {
         File dir = service.getCacheDir();
@@ -39,6 +39,11 @@ final class VehicleRecordsAcceptance {
         require(own.snapshot().toString().equals(ownBefore), "REQ-013.4 replay never creates, updates or selects a record");
         service.setDemo();
         waitFor(() -> service.snapshot().optString("phase").equals("ready") && !service.snapshot().optBoolean("busy"), "return to demo");
+        // REQ-013.4 / REQ-014.1: a signal selection change in a demo session never touches a record.
+        JSONArray demoSelection = new JSONArray(service.snapshot().getJSONArray("selected").toString());
+        service.setSignals(new JSONArray().put("engine.rpm"));
+        require(service.snapshot().getJSONArray("selected").toString().equals("[\"engine.rpm\"]") && own.snapshot().toString().equals(ownBefore), "REQ-013.4 REQ-014.1 demo signal selection changes no record");
+        service.setSignals(demoSelection);
         service.deleteRecording(replay.getName());
         waitFor(() -> !replay.exists(), "replay file deleted");
 
@@ -88,6 +93,16 @@ final class VehicleRecordsAcceptance {
         require(store.select(VIN_A) == null && store.select("WVW00000000007777") != null, "REQ-013.6 select known VIN, reject unknown");
         require(new VehicleStore(file).snapshot().getString("selected").equals(VIN_A), "REQ-013.6 selection restored by a new store instance on the same file");
 
+        // REQ-014.1/.4: a stored selection persists per record; a new record has none.
+        JSONArray picked = new JSONArray().put("engine.rpm").put("vehicle.speed");
+        require(store.selection(VIN_A) == null && store.selection(VIN_B) == null && !record(store, VIN_A).has("selection"), "REQ-014.4 a record without a stored selection has none");
+        require(store.setSelection(VIN_A, picked) == null && store.selection(VIN_A).toString().equals(picked.toString()) && store.selection(VIN_B) == null, "REQ-014.1 selection is stored for that record only");
+        require(new VehicleStore(file).selection(VIN_A).toString().equals(picked.toString()), "REQ-014.1 stored selection survives a restart");
+        require(store.setSelection("WVW00000000007777", picked) != null, "REQ-014.1 unknown record is refused");
+        require(store.observe(again, 6000).equals("updated") && store.selection(VIN_A).toString().equals(picked.toString()), "REQ-014.1 a later inventory keeps the stored selection");
+        require(store.setSelection(VIN_A, new JSONArray()) == null && store.selection(VIN_A).length() == 0, "REQ-014.1 an emptied selection is stored as empty, not as none");
+        store.setSelection(VIN_A, picked);
+
         // REQ-013.8: names.
         JSONObject plain = inventory(demo, VIN_C).put("vin_identity", new JSONObject().put("status", "unidentified"));
         require(store.observe(plain, 5000).equals("switched") && store.name(VIN_C).equals("Fahrzeug ·2222"), "REQ-013.8 default name without hint is Fahrzeug + last 4: " + store.name(VIN_C));
@@ -112,6 +127,7 @@ final class VehicleRecordsAcceptance {
         require(bad.snapshot().getBoolean("unreadable"), "REQ-013.11 garbage file is reported unreadable");
         require(bad.observe(demo, 1).equals("store_unreadable"), "REQ-013.11 live inventory reports the unreadable store");
         require(bad.select(VIN_A) != null && bad.rename(VIN_A, "x") != null && bad.delete(VIN_A) != null, "REQ-013.11 every mutation refuses");
+        require(bad.setSelection(VIN_A, new JSONArray().put("engine.rpm")) != null && bad.selection(VIN_A) == null, "REQ-014.1 an unreadable store refuses selection writes");
         require(Arrays.equals(Files.readAllBytes(broken.toPath()), garbage), "REQ-013.11 unreadable file is byte-identical, never overwritten implicitly");
         Files.write(broken.toPath(), "{\"version\":2,\"selected\":\"\",\"vehicles\":[]}".getBytes(StandardCharsets.UTF_8));
         require(new VehicleStore(broken).snapshot().getBoolean("unreadable"), "REQ-013.11 unknown version is unreadable");
@@ -136,6 +152,7 @@ final class VehicleRecordsAcceptance {
         try {
             require(readOnly.observe(inventory(demo, VIN_B), 2).equals("write_failed"), "REQ-013.12 observe reports the write failure");
             require(readOnly.rename(VIN_A, "Neu").equals(VehicleStore.WRITE_FAILED) && readOnly.delete(VIN_A).equals(VehicleStore.WRITE_FAILED) && readOnly.select(VIN_A).equals(VehicleStore.WRITE_FAILED), "REQ-013.12 rename, delete and select report the write failure");
+            require(readOnly.setSelection(VIN_A, picked).equals(VehicleStore.WRITE_FAILED) && readOnly.selection(VIN_A) == null, "REQ-014.1 selection write failure is reported and not applied to the stored record");
             require(readOnly.snapshot().toString().equals(persistedState), "REQ-013.12 in-memory state equals the last persisted state");
             require(Arrays.equals(Files.readAllBytes(lockedFile.toPath()), persisted), "REQ-013.12 previous file is intact");
         } finally { locked.setWritable(true); lockedFile.setWritable(true); }
@@ -193,6 +210,69 @@ final class VehicleRecordsAcceptance {
         for (File f : new File[]{file, broken, new File(blocker, "x"), untouched}) { f.delete(); new File(f.getPath() + ".new").delete(); new File(f.getPath() + ".bak").delete(); }
         blocker.delete();
         lockedFile.delete(); new File(lockedFile.getPath() + ".new").delete(); new File(lockedFile.getPath() + ".bak").delete(); locked.delete();
+    }
+
+    /** REQ-014 on the service in live mode without a connection (idle): selection restore, stored support labels, discovery untouched. */
+    static void selection(ObdService service) throws Exception {
+        require(service.snapshot().optString("mode").equals("live") && !service.snapshot().optString("phase").equals("ready"), "live mode without a session expected");
+        VehicleStore own = service.vehicles;
+        for (String vin : new String[]{VIN_SEL_A, VIN_SEL_B}) own.delete(vin); // leftovers of an aborted run
+        String before = own.snapshot().toString(), previous = own.snapshot().optString("selected");
+        JSONArray selectedBefore = new JSONArray(service.snapshot().getJSONArray("selected").toString());
+        String signalsBefore = service.snapshot().getJSONArray("signals").toString();
+        int traffic = service.snapshot().getJSONArray("debug").length();
+        long seen = System.currentTimeMillis();
+        for (String vin : new String[]{VIN_SEL_B, VIN_SEL_A}) { // A last, so A is selected
+            JSONObject inventory = new JSONObject().put("vin", vin).put("vin_identity", new JSONObject().put("status", "unidentified")).put("responders", new JSONArray().put("7E0"))
+                .put("signals", new JSONArray().put(new JSONObject().put("semantic", "engine.rpm").put("status", "supported")).put(new JSONObject().put("semantic", "vehicle.speed").put("status", "unsupported")))
+                .put("engine_target_validated", true);
+            require(!own.observe(inventory, seen).equals("write_failed"), "synthetic record " + vin);
+        }
+        try {
+            JSONArray rpmSpeed = new JSONArray().put("engine.rpm").put("vehicle.speed"), coolant = new JSONArray().put("engine.coolant_temperature");
+            selectVehicle(service, VIN_SEL_A);
+            service.setSignals(rpmSpeed);
+            require(own.selection(VIN_SEL_A).toString().equals(rpmSpeed.toString()), "REQ-014.1 a changed selection is stored for the selected record");
+            selectVehicle(service, VIN_SEL_B);
+            require(own.selection(VIN_SEL_B) == null && service.snapshot().getJSONArray("selected").toString().equals(rpmSpeed.toString()), "REQ-014.1 a record without a stored selection keeps the current selection");
+            service.setSignals(coolant);
+            require(own.selection(VIN_SEL_A).toString().equals(rpmSpeed.toString()) && own.selection(VIN_SEL_B).toString().equals(coolant.toString()), "REQ-014.1 each record keeps its own selection");
+            selectVehicle(service, VIN_SEL_A);
+            require(service.snapshot().getJSONArray("selected").toString().equals(rpmSpeed.toString()), "REQ-014.1 selecting a record restores its selection");
+            selectVehicle(service, VIN_SEL_B);
+            require(service.snapshot().getJSONArray("selected").toString().equals(coolant.toString()), "REQ-014.1 selecting the other record restores its selection");
+            service.setSignals(new JSONArray().put("no.such.signal"));
+            require(own.selection(VIN_SEL_B).length() == 0, "REQ-014.1 unknown semantics are filtered before storing");
+            require(service.snapshot().getJSONArray("debug").length() == traffic, "REQ-014.1 selecting and restoring sends no adapter traffic");
+            require(service.snapshot().getJSONArray("signals").toString().equals(signalsBefore), "REQ-014.3 stored support is never copied into the current session's signal status");
+            require(new VehicleStore(new File(service.getFilesDir(), "vehicles.json")).selection(VIN_SEL_A).toString().equals(rpmSpeed.toString()), "REQ-014.1 the service's selection is on disk");
+
+            // REQ-014.2: labels.
+            String date = new java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.GERMANY).format(new java.util.Date(seen));
+            require(MainActivity.supportLabel("", "supported", seen).equals(" · unterstützt (zuletzt gesehen " + date + ")"), "REQ-014.2 stored support is marked with the observation date: " + MainActivity.supportLabel("", "supported", seen));
+            require(MainActivity.supportLabel("", "unsupported", seen).equals(" · nicht unterstützt (zuletzt gesehen " + date + ")"), "REQ-014.2 stored non-support is marked with the observation date");
+            require(MainActivity.supportLabel("", "", seen).equals(" · ungeprüft") && MainActivity.supportLabel("", "unknown", seen).equals(" · ungeprüft"), "REQ-014.2 unknown signals stay unchecked");
+            require(MainActivity.supportLabel("supported", "unsupported", seen).equals("") && MainActivity.supportLabel("unsupported", "supported", seen).equals(" · nicht unterstützt"), "REQ-014.2 current-session support wins and carries no date");
+            require(!MainActivity.supportLabel("", "supported", seen).equals(MainActivity.supportLabel("supported", "supported", seen)), "REQ-014.2 stored support is distinguishable from current support");
+
+            // REQ-014.4: default selection decision (the live initialize path applies it for a created record).
+            JSONArray catalog = new JSONArray();
+            for (String[] row : new String[][]{{"engine.maf", "supported"}, {"vehicle.speed", "supported"}, {"engine.rpm", "supported"}, {"engine.coolant_temperature", "unsupported"}, {"engine.load", "supported"}})
+                catalog.put(new JSONObject().put("semantic", row[0]).put("status", row[1]));
+            catalog.put(new JSONObject().put("semantic", "engine.coolant_temperature_x"));
+            require(ObdService.defaultSelection(catalog).toString().equals("[\"engine.rpm\",\"vehicle.speed\",\"engine.maf\"]"), "REQ-014.4 default selection is the supported ones of rpm, speed, coolant, MAF: " + ObdService.defaultSelection(catalog));
+        } finally {
+            service.setSignals(selectedBefore); // while a synthetic record is selected, so no real record is written
+            for (String vin : new String[]{VIN_SEL_A, VIN_SEL_B}) own.delete(vin);
+            if (!previous.isEmpty()) own.select(previous);
+        }
+        require(own.snapshot().toString().equals(before), "synthetic selection records removed, service store restored");
+    }
+    private static void selectVehicle(ObdService service, String vin) throws Exception {
+        String expected = "Fahrzeug gewählt: " + service.vehicles.name(vin);
+        service.selectVehicle(vin);
+        waitFor(() -> service.snapshot().optString("message").equals(expected) && service.vehicles.snapshot().optString("selected").equals(vin), "select " + vin);
+        SystemClock.sleep(100);
     }
 
     private static JSONObject inventory(JSONObject base, String vin) throws JSONException {

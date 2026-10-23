@@ -151,6 +151,15 @@ public final class VehicleStore {
             put(find(next, vin), "odometer_error", failure);
         });
     }
+    /** REQ-014.1: the live signal selection of one record (semantics, caller-checked); replaces the previous one. */
+    public synchronized String setSelection(String vin, JSONArray semantics) {
+        return mutate(vin, next -> put(find(next, vin), "selection", copyArray(semantics)));
+    }
+    /** The stored signal selection of a record, or null when it has none. */
+    public synchronized JSONArray selection(String vin) {
+        JSONObject row = find(data, vin);
+        return row == null || row.optJSONArray("selection") == null ? null : copyArray(row.optJSONArray("selection"));
+    }
     public synchronized String select(String vin) { return mutate(vin, next -> put(next, "selected", vin)); }
     public synchronized String rename(String vin, String name) {
         String trimmed = name == null ? "" : name.trim();

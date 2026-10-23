@@ -83,7 +83,15 @@ it, and stored with read date and source "OBD PID A6"; when it is not advertised
 request is sent. A failed read keeps the stored value and date and is shown in the
 details, as is a value lower than the stored one (the new value is stored, neither is
 corrected). Without a stored value the page shows "km-Stand nicht verfügbar". Covered
-by `VehicleRecordsAcceptance` (REQ-013, REQ-015) and the demo read in `AcceptanceRunner`.
+by `VehicleRecordsAcceptance` (REQ-013, REQ-014, REQ-015) and the demo read in `AcceptanceRunner`.
+
+A changed live signal selection is stored in the selected record (`selection`) and restored
+when that record is selected again (and after a process restart), without adapter traffic;
+demo and replay sessions never read or write it, and a new record gets the default
+selection of supported signals. Without an active session the signal chooser marks each
+signal from the record's last observation with its date ("unterstützt (zuletzt gesehen
+22.10.2026)"); stored support never skips discovery or decides whether a read is sent, every
+live connection still discovers support and the current observation replaces the stored one.
 
 ## Build and install
 

@@ -206,6 +206,8 @@ public final class AcceptanceRunner extends Instrumentation {
             waitFor(() -> !"scanning".equals(service.snapshot().optString("phase")),"real Android BLE scan completion");
             require("idle".equals(service.snapshot().optString("phase")),"BLE scan terminates without an Android error");
             passed("Actual Android BLE scan lifecycle (adapter connection remains a separate vehicle test)");
+            VehicleRecordsAcceptance.selection(service);
+            passed("Known vehicles: per-record signal selection restored without adapter traffic, stored support labelled with its date and never used for discovery, default selection");
             runOnMainSync(service::setDemo);
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"),"restore demo for UI review");
             for(String name:new String[]{"acceptance-live.png","acceptance-diagnose.png","acceptance-debug.png","acceptance-connection.png","acceptance-recordings.png","acceptance-vehicles.png","demo-recording.jsonl"}) emitArtifact(name);
