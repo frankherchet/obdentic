@@ -31,6 +31,8 @@ public final class AcceptanceRunner extends Instrumentation {
             Intent launch = new Intent(getTargetContext(), MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             Activity activity = startActivitySync(launch);
+            waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0,"Visible Activity keeps the screen awake");
+            passed("The visible app keeps the display awake");
             waitFor(() -> ObdService.current != null, "service creation");
             service = ObdService.current;
             runOnMainSync(service::setDemo);
@@ -83,6 +85,13 @@ public final class AcceptanceRunner extends Instrumentation {
             String filename = service.snapshot().getString("recording");
             File file = new File(new File(getTargetContext().getFilesDir(), "recordings"), filename);
             waitFor(() -> file.length() > 500, "recording evidence");
+            deleteRecording(filename,"Aufzeichnung vor dem Löschen stoppen");
+            require(file.isFile()&&filename.equals(service.snapshot().optString("recording")),"Active recording cannot be deleted");
+            deleteRecording("../outside.jsonl","Ungültiger Aufnahmepfad");
+            deleteRecording("bad/name.jsonl","Ungültiger Aufnahmepfad");
+            deleteRecording("missing-"+System.nanoTime()+".jsonl","Aufnahme nicht gefunden");
+            require(file.isFile(),"Rejected active, malformed and missing deletions preserve recording evidence");
+            passed("Recording deletion rejects active files, malformed paths and missing files with clear errors");
             long initial = file.length();
             job("ea189.extended.probe");
             JSONArray extended=service.snapshot().getJSONObject("jobResult").getJSONObject("data").getJSONArray("readings");
@@ -90,6 +99,7 @@ public final class AcceptanceRunner extends Instrumentation {
             for(int i=0;i<extended.length();i++)require(extended.getJSONObject(i).has("value")&&extended.getJSONObject(i).optBoolean("experimental"),"Additional EA189 decoder succeeds and stays experimental");
             capture(activity,"Diagnose","acceptance-diagnose.png");
             getUiAutomation().executeShellCommand("input keyevent 3").close();
+            waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) == 0,"Activity clears keep-screen-on when paused");
             getUiAutomation().executeShellCommand("input keyevent 223").close();
             SystemClock.sleep(4000);
             require(filename.equals(service.snapshot().optString("recording")), "Screen-off recording remains active");
@@ -134,6 +144,8 @@ public final class AcceptanceRunner extends Instrumentation {
             require(service.snapshot().getJSONArray("values").length()>0,"Replay restores readings");
             require(findValue(service.snapshot().getJSONArray("values"),"dpf.oil_ash_volume")!=null,"Replay restores new EA189 values");
             require("Volkswagen".equals(service.snapshot().getJSONObject("vehicle").getJSONObject("vin_identity").optString("make_hint")),"Offline replay derives manufacturer locally");
+            deleteRecording(filename,"Im Replay geöffnete Aufzeichnung kann nicht gelöscht werden");
+            require(file.isFile()&&filename.equals(service.snapshot().optString("replayFile")),"Loaded replay cannot be deleted");
             passed("Disconnect and offline replay without a live connection");
 
             long core=NativeCore.create((command,timeout)->{throw new AssertionError("Rejected/offline actions must never send traffic");});
@@ -171,6 +183,15 @@ public final class AcceptanceRunner extends Instrumentation {
                 require(catalogued,"Returning from OEM replay must retain only catalogued generic semantics");
             }
             passed("Explicit EA189 additional recording profile schedules a bounded job and stops cleanly");
+            File exportedCopy=new File(getTargetContext().getExternalFilesDir("acceptance"),"demo-recording.jsonl");
+            service.deleteRecording(filename);
+            waitFor(() -> ("Aufnahme endgültig gelöscht: "+filename).equals(service.snapshot().optString("message")),"completed recording deletion");
+            require(!file.exists(),"Completed internal recording is deleted");
+            require(exportedCopy.isFile()&&exportedCopy.length()>0,"Deleting an internal recording leaves its exported copy intact");
+            require(!containsRecord(filename),"Deleted recording disappears from the listed recordings");
+            passed("Completed recording is permanently deleted while its exported copy remains");
+            TestSequenceAcceptance.run(service,getTargetContext().getFilesDir());
+            passed("Finite ash sequence, operator context, raw candidate evidence, automatic completion, replay and manual stop");
             runOnMainSync(activity::recreate);
             SystemClock.sleep(1500);
             require("ready".equals(service.snapshot().optString("phase")),"Activity recreation preserves session");
@@ -198,6 +219,16 @@ public final class AcceptanceRunner extends Instrumentation {
         if(values==null)return null;
         for(int i=0;i<values.length();i++){JSONObject value=values.optJSONObject(i);if(value!=null&&semantic.equals(value.optString("semantic")))return value;}
         return null;
+    }
+    private void deleteRecording(String filename,String expectedMessage) throws Exception {
+        service.deleteRecording(filename);
+        waitFor(() -> expectedMessage.equals(service.snapshot().optString("message")),"recording deletion result: "+expectedMessage);
+    }
+    private boolean containsRecord(String filename) {
+        JSONArray records=service.snapshot().optJSONArray("records");
+        if(records==null)return false;
+        for(int i=0;i<records.length();i++)if(filename.equals(records.optJSONObject(i).optString("name")))return true;
+        return false;
     }
     private Button findButton(View view,String text) {
         if(view instanceof Button && text.contentEquals(((Button)view).getText())) return (Button)view;

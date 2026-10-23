@@ -344,6 +344,98 @@ impl std::fmt::Display for Ea189DpfProbeError {
 
 impl std::error::Error for Ea189DpfProbeError {}
 
+/// The ash-candidate experiment is deliberately limited to these two reads.
+pub const EA189_ASH_CANDIDATE_PROBE_COUNT: usize = 2;
+pub const EA189_ASH_SOURCE_VERSION: &str = "Car Scanner 2.1.50";
+pub const EA189_ASH_SOURCE_PROFILE: &str =
+    "PQ35, PQ46: Diesel DPF var.10: EA189 1.6, 2.0L (UDS + VWTP2.0 AT/DSG)";
+pub const EA189_ASH_HARDWARE_VALIDATION: &str = "unverified; source hypotheses only";
+
+/// One source hypothesis in the finite ash-candidate learning run.
+/// These definitions are metadata only; this type has no decoder.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Ea189AshCandidate {
+    OilAshVolume1153,
+    AshMass178c,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ea189AshCandidateDefinition {
+    candidate: &'static str,
+    did: u16,
+    name: &'static str,
+    data_len: usize,
+    signed: bool,
+    multiplier: f64,
+    unit: &'static str,
+}
+
+impl Ea189AshCandidateDefinition {
+    pub const fn candidate(self) -> &'static str {
+        self.candidate
+    }
+    pub const fn did(self) -> u16 {
+        self.did
+    }
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+    pub const fn data_len(self) -> usize {
+        self.data_len
+    }
+    pub const fn signed(self) -> bool {
+        self.signed
+    }
+    pub const fn multiplier(self) -> f64 {
+        self.multiplier
+    }
+    pub const fn unit(self) -> &'static str {
+        self.unit
+    }
+    pub const fn request_bytes(self) -> [u8; 3] {
+        let [high, low] = self.did.to_be_bytes();
+        [0x22, high, low]
+    }
+}
+
+impl Ea189AshCandidate {
+    pub const ALL: [Self; EA189_ASH_CANDIDATE_PROBE_COUNT] =
+        [Self::OilAshVolume1153, Self::AshMass178c];
+
+    pub const fn definition(self) -> Ea189AshCandidateDefinition {
+        match self {
+            Self::OilAshVolume1153 => Ea189AshCandidateDefinition {
+                candidate: "ash_volume_1153",
+                did: 0x1153,
+                name: "Oil ash volume candidate",
+                data_len: 2,
+                signed: true,
+                multiplier: 0.01,
+                unit: "liters",
+            },
+            Self::AshMass178c => Ea189AshCandidateDefinition {
+                candidate: "ash_mass_178c",
+                did: 0x178c,
+                name: "Ash mass candidate",
+                data_len: 2,
+                signed: false,
+                multiplier: 0.1,
+                unit: "grams",
+            },
+        }
+    }
+
+    pub const fn candidate(self) -> &'static str {
+        self.definition().candidate()
+    }
+    pub const fn id(self) -> u16 {
+        self.definition().did()
+    }
+    pub const fn request_bytes(self) -> [u8; 3] {
+        self.definition().request_bytes()
+    }
+}
+
 /// Count of reads in the separately selected extended experiment.
 pub const EA189_EXTENDED_PROBE_COUNT: usize = 15;
 pub const EA189_EXTENDED_SOURCE_VERSION: &str = "Car Scanner 2.1.50";

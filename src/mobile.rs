@@ -1,12 +1,13 @@
 //! Closed mobile facade. Platform code supplies transport, never diagnostic commands.
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
 use crate::{
     elm::{
         ElmExchange, ElmSession, ExchangeError, TargetedDpfProbeRequest,
-        TargetedEa189ExtendedProbeRequest, TargetedReadRequest, TransportFailure,
+        TargetedEa189AshProbeRequest, TargetedEa189ExtendedProbeRequest, TargetedReadRequest,
+        TransportFailure,
     },
     topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
@@ -80,6 +81,9 @@ impl<E: Exchange> MobileCore<E> {
         if action == "replay.ea189.extended.probe" {
             return replay_ea189_extended_probe(argument);
         }
+        if action == "replay.ea189.ash.probe" {
+            return replay_ea189_ash_probe(argument);
+        }
         if action == "replay.read" {
             let mut recorded: Value = serde_json::from_str(argument).map_err(|e| e.to_string())?;
             let semantic = recorded
@@ -108,6 +112,7 @@ impl<E: Exchange> MobileCore<E> {
                 | "dtc.scan"
                 | "ea189.dpf.probe"
                 | "ea189.extended.probe"
+                | "ea189.ash.probe"
         ) {
             return Err(format!("read-only mobile core rejected action: {action}"));
         }
@@ -199,6 +204,7 @@ impl<E: Exchange> MobileCore<E> {
             }
             "ea189.dpf.probe" => self.dpf(),
             "ea189.extended.probe" => self.ea189_extended(),
+            "ea189.ash.probe" => self.ea189_ash_probe(),
             _ => unreachable!(),
         }
     }
@@ -451,6 +457,173 @@ impl<E: Exchange> MobileCore<E> {
         }
         Ok(json!({"experimental":true,"readings":readings}))
     }
+
+    fn ea189_ash_probe(&mut self) -> Result<Value, String> {
+        let mapping = self
+            .engine
+            .as_ref()
+            .ok_or("EA189 ash probes require an inventory with validated engine target evidence")?;
+        let mut readings = Vec::with_capacity(crate::ea189::EA189_ASH_CANDIDATE_PROBE_COUNT);
+        for candidate in crate::ea189::Ea189AshCandidate::ALL {
+            let request = TargetedEa189AshProbeRequest::from_mapping(candidate, mapping)?;
+            let outcome = self.runtime.block_on(
+                self.session
+                    .as_mut()
+                    .unwrap()
+                    .read_ea189_ash_probe_with_evidence(&request),
+            );
+            let mut reading = match outcome {
+                Ok(read) => ash_candidate_result(candidate, &read.responses),
+                Err(error) => {
+                    let mut result = ash_candidate_metadata(candidate);
+                    result["error"] = json!(error.error);
+                    result["raw_response"] = Value::Null;
+                    result["responses"] = json!(error.observations.iter()
+                        .flat_map(|observation| observation.responses.iter())
+                        .map(|response| json!({"responder":response.responder,"payload":response.payload}))
+                        .collect::<Vec<_>>());
+                    result["response_errors"] = json!([]);
+                    result["observations"] = json!(response_observations_json(&error.observations));
+                    result
+                }
+            };
+            reading["timestamp_ms"] = json!(wallclock_timestamp_ms());
+            readings.push(reading);
+        }
+
+        // Restore Carly's normal functional setup after the bounded physical reads.
+        let mut exchange = self.session.take().unwrap().into_exchange();
+        let restore = self
+            .runtime
+            .block_on(crate::adapter::initialize_carly(&mut exchange));
+        self.session = Some(ElmSession::new(exchange));
+        if let Err(error) = restore {
+            self.initialized = false;
+            return Err(format!("EA189 ash probe restoration failed: {error}"));
+        }
+        if let Err(error) = self
+            .runtime
+            .block_on(self.session.as_mut().unwrap().discover_support(0x60))
+        {
+            self.initialized = false;
+            return Err(error);
+        }
+        Ok(json!({"experimental":true,"readings":readings}))
+    }
+}
+
+fn wallclock_timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn ash_candidate_metadata(candidate: crate::ea189::Ea189AshCandidate) -> Value {
+    let definition = candidate.definition();
+    json!({
+        "candidate":definition.candidate(),
+        "did":format!("{:04X}", definition.did()),
+        "request":crate::hex(&definition.request_bytes()),
+        "name":definition.name(),
+        "experimental":true,
+        "target":"7E0",
+        "expected_responder":"7E8",
+        "source_version":crate::ea189::EA189_ASH_SOURCE_VERSION,
+        "source_profile":crate::ea189::EA189_ASH_SOURCE_PROFILE,
+        "hardware_validation":crate::ea189::EA189_ASH_HARDWARE_VALIDATION,
+        "source_hypothesis":{
+            "data_length":definition.data_len(),
+            "endianness":"big",
+            "signed":definition.signed(),
+            "multiplier":definition.multiplier(),
+            "offset":0.0,
+            "unit":definition.unit()
+        }
+    })
+}
+
+fn ash_candidate_result(
+    candidate: crate::ea189::Ea189AshCandidate,
+    responses: &crate::elm::DiagnosticResponses,
+) -> Value {
+    let mut result = ash_candidate_metadata(candidate);
+    result["raw_response"] = json!(responses.raw_response());
+    result["responses"] = diagnostic_evidence(responses);
+    result["response_errors"] = diagnostic_errors(responses);
+    let matching: Vec<_> = responses
+        .as_slice()
+        .iter()
+        .filter(|response| {
+            response
+                .responder
+                .as_ref()
+                .is_some_and(|responder| responder.as_str().eq_ignore_ascii_case("7E8"))
+        })
+        .collect();
+    let payload = match matching.first() {
+        None => Err("expected responder 7E8 absent".to_string()),
+        Some(first)
+            if matching
+                .iter()
+                .any(|response| response.payload != first.payload) =>
+        {
+            Err("conflicting ash-candidate responses from expected responder".into())
+        }
+        Some(_) if !responses.errors().is_empty() => Err(format!(
+            "incomplete UDS response: {}",
+            responses.errors()[0].error
+        )),
+        Some(first) => Ok(first.payload.as_slice()),
+    };
+    let selection_error = payload.as_ref().err().cloned();
+    let target = crate::elm::ResponderIdentity::ElmHeader("7E8".into());
+    result["observations"] = json!(response_observations_json(&[
+        responses.observation_for_target(&target, selection_error),
+    ]));
+
+    match payload {
+        Err(error) => result["error"] = json!(error),
+        Ok(payload) if payload.starts_with(&[0x7f, 0x22]) && payload.len() == 3 => {
+            result["outcome"] = json!("negative_response");
+            result["nrc"] = json!(format!("0x{:02X}", payload[2]));
+            result["error"] = json!(format!("negative UDS response (NRC 0x{:02X})", payload[2]));
+        }
+        Ok(payload) if payload.len() < 3 => {
+            result["error"] = json!("UDS response is shorter than service and DID")
+        }
+        Ok(payload) if payload[0] != 0x62 => {
+            result["error"] = json!(format!(
+                "unexpected UDS response service 0x{:02X}",
+                payload[0]
+            ))
+        }
+        Ok(payload) => {
+            let actual_did = u16::from_be_bytes([payload[1], payload[2]]);
+            if actual_did != candidate.id() {
+                result["actual_did"] = json!(format!("{:04X}", actual_did));
+                result["error"] = json!(format!(
+                    "UDS response DID {actual_did:04X} does not match requested DID {:04X}",
+                    candidate.id()
+                ));
+            } else {
+                let data = &payload[3..];
+                result["response_data"] = json!(data);
+                result["response_width_bytes"] = json!(data.len());
+                let expected_width = candidate.definition().data_len();
+                if data.len() != expected_width {
+                    result["error"] = json!(format!(
+                        "positive response width {} differs from the {}-byte source hypothesis",
+                        data.len(),
+                        expected_width
+                    ));
+                } else {
+                    result["outcome"] = json!("positive_candidate");
+                }
+            }
+        }
+    }
+    result
 }
 
 fn extended_signal_metadata(signal: crate::ea189::Ea189ExtendedSignal) -> Value {
@@ -744,6 +917,80 @@ fn replay_ea189_extended_reading(recorded: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
+fn replay_ea189_ash_probe(argument: &str) -> Result<Value, String> {
+    let recorded: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
+    let readings = recorded
+        .get("readings")
+        .and_then(Value::as_array)
+        .ok_or("recording EA189 ash-candidate readings missing")?;
+    if readings.len() != crate::ea189::EA189_ASH_CANDIDATE_PROBE_COUNT {
+        return Err("recording does not contain the fixed EA189 ash-candidate read set".into());
+    }
+    for (index, reading) in readings.iter().enumerate() {
+        let candidate = reading
+            .get("candidate")
+            .and_then(Value::as_str)
+            .ok_or("recorded EA189 ash-candidate identifier missing")?;
+        let expected = crate::ea189::Ea189AshCandidate::ALL[index];
+        if candidate != expected.candidate() {
+            return Err(format!(
+                "recording does not match the fixed EA189 ash-candidate read order: {candidate}"
+            ));
+        }
+    }
+    let replayed = readings
+        .iter()
+        .map(replay_ea189_ash_reading)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({"experimental":true,"replay":true,"readings":replayed}))
+}
+
+fn replay_ea189_ash_reading(recorded: &Value) -> Result<Value, String> {
+    let candidate_name = recorded
+        .get("candidate")
+        .and_then(Value::as_str)
+        .ok_or("recorded EA189 ash-candidate identifier missing")?;
+    let candidate = crate::ea189::Ea189AshCandidate::ALL
+        .into_iter()
+        .find(|candidate| candidate.candidate() == candidate_name)
+        .ok_or_else(|| format!("unsupported EA189 ash candidate: {candidate_name}"))?;
+    let request = recorded
+        .get("request")
+        .and_then(Value::as_str)
+        .ok_or("recorded EA189 ash-candidate request missing")?;
+    let expected_request = crate::hex(&candidate.request_bytes());
+    if request != expected_request {
+        return Err(format!(
+            "recorded EA189 ash candidate {candidate_name} request does not match its fixed read"
+        ));
+    }
+    let raw_response = recorded
+        .get("raw_response")
+        .and_then(Value::as_str)
+        .filter(|raw| !raw.trim().is_empty());
+    let Some(raw_response) = raw_response else {
+        let mut result = ash_candidate_metadata(candidate);
+        result["error"] = json!("recording raw_response missing");
+        result["raw_response"] = Value::Null;
+        result["responses"] = json!([]);
+        result["response_errors"] = json!([]);
+        result["observations"] = json!([]);
+        result["replay"] = json!(true);
+        if let Some(timestamp) = recorded.get("timestamp_ms") {
+            result["timestamp_ms"] = timestamp.clone();
+        }
+        return Ok(result);
+    };
+
+    let responses = crate::elm::normalize_uds_responses(raw_response, candidate.id())?;
+    let mut result = ash_candidate_result(candidate, &responses);
+    result["replay"] = json!(true);
+    if let Some(timestamp) = recorded.get("timestamp_ms") {
+        result["timestamp_ms"] = timestamp.clone();
+    }
+    Ok(result)
+}
+
 fn catalog() -> Value {
     let mut profiles: Vec<_> = ["engine-baseline", "engine-drive", "obd2-expansion-validation", "obd2-extended-validation"]
         .into_iter().map(|id| {
@@ -767,6 +1014,15 @@ fn catalog() -> Value {
         "source_version":crate::ea189::EA189_EXTENDED_SOURCE_VERSION,
         "source_profile":crate::ea189::EA189_EXTENDED_SOURCE_PROFILE,
         "hardware_validation":crate::ea189::EA189_EXTENDED_HARDWARE_VALIDATION
+    }));
+    profiles.push(json!({
+        "id":"ea189-ash-test",
+        "title":"Testlauf: EA189 Asche (ohne Sitzungswechsel)",
+        "description":"Zwei feste Aschekandidaten im aktuellen Diagnosekontext erfassen; keine Werteinterpretation.",
+        "type":"test_sequence",
+        "experimental":true,
+        "default":false,
+        "signals":[]
     }));
     json!({"signals":crate::supported_signals().iter().map(|s| {let m=s.metadata();json!({
         "semantic":m.semantic,"title":m.description,"unit":m.unit,"description":m.description,
@@ -839,8 +1095,48 @@ mod tests {
         }
     }
 
-    fn run(core: &mut MobileCore<Script>, action: &str, argument: &str) -> Value {
+    struct AshExchange {
+        commands: Vec<String>,
+        response_1153: &'static str,
+        response_178c: &'static str,
+    }
+
+    impl AshExchange {
+        fn new(response_1153: &'static str, response_178c: &'static str) -> Self {
+            Self {
+                commands: Vec::new(),
+                response_1153,
+                response_178c,
+            }
+        }
+    }
+
+    impl Exchange for AshExchange {
+        fn exchange(&mut self, command: &str, _: Duration) -> Result<String, String> {
+            self.commands.push(command.to_owned());
+            Ok(match command.trim() {
+                "ATI" | "ATZ" => "ELM327\r>".into(),
+                "AT@1" => "CARLY-UNIVERSAL\r>".into(),
+                "ATE0" | "ATL0" | "ATS1" | "ATH1" | "ATSP0" | "ATSH 7E0" | "ATCRA 7E8"
+                | "ATSH 7DF" | "ATCRA" => "OK\r>".into(),
+                "0100" => "7E8 06 41 00 00 00 00 00\r>".into(),
+                "0902" => "NO DATA\r>".into(),
+                "010C" => "7E8 04 41 0C 1F 40\r>".into(),
+                "221153" => self.response_1153.into(),
+                "22178C" => self.response_178c.into(),
+                unexpected => panic!("unexpected command {unexpected}"),
+            })
+        }
+    }
+
+    fn run<E: Exchange>(core: &mut MobileCore<E>, action: &str, argument: &str) -> Value {
         serde_json::from_str(&core.execute(action, argument)).unwrap()
+    }
+    fn ash_recording(raw_1153: &str, raw_178c: &str) -> Value {
+        json!({"readings":[
+            {"candidate":"ash_volume_1153","request":"22 11 53","raw_response":raw_1153,"timestamp_ms":1000},
+            {"candidate":"ash_mass_178c","request":"22 17 8C","raw_response":raw_178c,"timestamp_ms":2000}
+        ]})
     }
     #[test]
     fn closed_actions_reject_writes_raw_commands_and_uninitialized_reads() {
@@ -871,6 +1167,15 @@ mod tests {
             profile["expected_reading_count"],
             crate::ea189::EA189_EXTENDED_PROBE_COUNT
         );
+        let ash = extended
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["id"] == "ea189-ash-test")
+            .unwrap();
+        assert_eq!(ash["type"], "test_sequence");
+        assert_eq!(ash["signals"], json!([]));
+        assert!(!ash.as_object().unwrap().contains_key("action"));
     }
 
     #[test]
@@ -922,6 +1227,124 @@ mod tests {
             .commands
             .iter()
             .any(|command| command.trim() == "1003"));
+    }
+
+    #[test]
+    fn ash_probe_requires_validated_engine_and_sends_only_two_fixed_reads() {
+        let mut without_target = core(&[]);
+        assert_eq!(run(&mut without_target, "initialize", "")["ok"], true);
+        assert_eq!(run(&mut without_target, "ea189.ash.probe", "")["ok"], false);
+
+        let mut core = MobileCore::new(AshExchange::new(
+            "7E8 05 62 11 53 00 0C\r>",
+            "7E8 05 62 17 8C 00 0C\r>",
+        ))
+        .unwrap();
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let inventory = run(&mut core, "inventory", "");
+        assert_eq!(inventory["data"]["engine_target_validated"], true);
+        let result = run(&mut core, "ea189.ash.probe", "");
+        assert_eq!(result["ok"], true, "{result}");
+        let readings = result["data"]["readings"].as_array().unwrap();
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0]["candidate"], "ash_volume_1153");
+        assert_eq!(readings[0]["request"], "22 11 53");
+        assert_eq!(readings[0]["outcome"], "positive_candidate");
+        assert_eq!(readings[0]["response_width_bytes"], 2);
+        assert_eq!(readings[0]["response_data"], json!([0, 12]));
+        assert_eq!(readings[0]["target"], "7E0");
+        assert_eq!(readings[0]["expected_responder"], "7E8");
+        assert_eq!(readings[0]["source_hypothesis"]["signed"], true);
+        assert_eq!(readings[1]["candidate"], "ash_mass_178c");
+        assert_eq!(readings[1]["request"], "22 17 8C");
+        assert_eq!(readings[1]["outcome"], "positive_candidate");
+        assert_eq!(readings[1]["source_hypothesis"]["signed"], false);
+        for reading in readings {
+            assert_eq!(reading["experimental"], true);
+            assert!(!reading.as_object().unwrap().contains_key("value"));
+            assert!(reading["timestamp_ms"].is_number());
+        }
+
+        let exchange = core.session.take().unwrap().into_exchange().0;
+        let diagnostic_commands: Vec<_> = exchange
+            .commands
+            .iter()
+            .map(|command| command.trim())
+            .filter(|command| !command.starts_with("AT"))
+            .collect();
+        assert_eq!(
+            diagnostic_commands,
+            ["0100", "0100", "0902", "010C", "221153", "22178C", "0100"]
+        );
+        assert!(!exchange
+            .commands
+            .iter()
+            .any(|command| command.trim() == "1003"));
+    }
+
+    #[test]
+    fn ash_probe_keeps_negative_and_unexpected_responder_evidence_without_values() {
+        let mut core = MobileCore::new(AshExchange::new(
+            "7E8 03 7F 22 31\r>",
+            "7E9 05 62 17 8C 00 0C\r>",
+        ))
+        .unwrap();
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        assert_eq!(
+            run(&mut core, "inventory", "")["data"]["engine_target_validated"],
+            true
+        );
+        let result = run(&mut core, "ea189.ash.probe", "");
+        let readings = result["data"]["readings"].as_array().unwrap();
+        assert_eq!(readings[0]["nrc"], "0x31");
+        assert_eq!(readings[0]["outcome"], "negative_response");
+        assert_eq!(
+            readings[0]["responses"][0]["payload"],
+            json!([0x7f, 0x22, 0x31])
+        );
+        assert!(!readings[0].as_object().unwrap().contains_key("value"));
+        assert!(readings[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("expected responder 7E8 absent"));
+        assert_eq!(readings[1]["responses"][0]["responder"], "7E9");
+        assert_eq!(
+            readings[1]["observations"][0]["selection_error"],
+            "expected responder 7E8 absent"
+        );
+        assert!(!readings[1].as_object().unwrap().contains_key("value"));
+    }
+
+    #[test]
+    fn ash_probe_preserves_truncated_and_wrong_width_responses() {
+        let mut core = MobileCore::new(AshExchange::new(
+            "7E8 06 62 11 53 00 0C\r>",
+            "7E8 06 62 17 8C 00 0C 01\r>",
+        ))
+        .unwrap();
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        assert_eq!(
+            run(&mut core, "inventory", "")["data"]["engine_target_validated"],
+            true
+        );
+        let result = run(&mut core, "ea189.ash.probe", "");
+        let readings = result["data"]["readings"].as_array().unwrap();
+        assert!(readings[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("truncated UDS"));
+        assert!(readings[0]["raw_response"]
+            .as_str()
+            .unwrap()
+            .contains("62 11 53"));
+        assert!(!readings[0]["response_errors"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(readings[1]["error"].as_str().unwrap().contains("width 3"));
+        assert_eq!(readings[1]["response_width_bytes"], 3);
+        assert_eq!(readings[1]["response_data"], json!([0, 12, 1]));
+        assert!(!readings[1].as_object().unwrap().contains_key("value"));
     }
     #[test]
     fn initialized_reads_reuse_session_and_preserve_responder() {
@@ -1284,6 +1707,80 @@ mod tests {
                 "replay.ea189.extended.probe",
                 &negative.to_string()
             )["ok"],
+            false
+        );
+    }
+
+    #[test]
+    fn replay_ash_probe_preserves_raw_positive_and_negative_results_without_decoding() {
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let recorded = ash_recording("7E8 05 62 11 53 00 64\r>", "7E8 03 7F 22 31\r>");
+        let replay = run(&mut core, "replay.ea189.ash.probe", &recorded.to_string());
+        assert_eq!(replay["ok"], true, "{replay}");
+        let readings = replay["data"]["readings"].as_array().unwrap();
+        assert_eq!(readings[0]["outcome"], "positive_candidate");
+        assert_eq!(readings[0]["response_data"], json!([0, 100]));
+        assert_eq!(readings[0]["response_width_bytes"], 2);
+        assert_eq!(readings[0]["timestamp_ms"], 1000);
+        assert_eq!(readings[0]["replay"], true);
+        assert!(!readings[0].as_object().unwrap().contains_key("value"));
+        assert_eq!(readings[1]["nrc"], "0x31");
+        assert_eq!(readings[1]["raw_response"], "7E8 03 7F 22 31\r>");
+        assert_eq!(readings[1]["timestamp_ms"], 2000);
+        assert_eq!(readings[1]["replay"], true);
+        assert!(!readings[1].as_object().unwrap().contains_key("value"));
+
+        let wrong_responder = ash_recording("7E9 05 62 11 53 00 64\r>", "7E8 05 62 17 8C 00 64\r>");
+        let replay = run(
+            &mut core,
+            "replay.ea189.ash.probe",
+            &wrong_responder.to_string(),
+        );
+        assert_eq!(
+            replay["data"]["readings"][0]["error"],
+            "expected responder 7E8 absent"
+        );
+        assert_eq!(
+            replay["data"]["readings"][0]["responses"][0]["responder"],
+            "7E9"
+        );
+
+        let truncated = ash_recording("7E8 06 62 11 53 00 64\r>", "7E8 05 62 17 8C 00 64\r>");
+        let replay = run(&mut core, "replay.ea189.ash.probe", &truncated.to_string());
+        assert!(replay["data"]["readings"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("truncated UDS"));
+        assert!(!replay["data"]["readings"][0]["response_errors"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let wrong_width = ash_recording("7E8 06 62 11 53 00 64 01\r>", "7E8 05 62 17 8C 00 64\r>");
+        let replay = run(
+            &mut core,
+            "replay.ea189.ash.probe",
+            &wrong_width.to_string(),
+        );
+        assert!(replay["data"]["readings"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("width 3"));
+        assert!(!replay["data"]["readings"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("value"));
+
+        let mut spoofed = ash_recording("7E8 05 62 11 53 00 64\r>", "7E8 05 62 17 8C 00 64\r>");
+        spoofed["readings"][0]["request"] = json!("22 F1 90");
+        assert_eq!(
+            run(&mut core, "replay.ea189.ash.probe", &spoofed.to_string())["ok"],
+            false
+        );
+        spoofed = ash_recording("7E8 05 62 11 53 00 64\r>", "7E8 05 62 17 8C 00 64\r>");
+        spoofed["readings"].as_array_mut().unwrap().swap(0, 1);
+        assert_eq!(
+            run(&mut core, "replay.ea189.ash.probe", &spoofed.to_string())["ok"],
             false
         );
     }

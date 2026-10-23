@@ -69,6 +69,8 @@ public class MainActivity extends Activity {
         // once a real Bluetooth connection has the required runtime permissions.
         startService(new Intent(this,ObdService.class));
     }
+    @Override protected void onStart(){super.onStart();getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}
+    @Override protected void onStop(){getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);super.onStop();}
     @Override protected void onResume(){super.onResume();handler.post(poll);}
     @Override protected void onPause(){handler.removeCallbacks(poll);super.onPause();}
     @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("profile",profile);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
@@ -91,7 +93,7 @@ public class MainActivity extends Activity {
         String key=tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString();
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle");
-        if(tab==2)key+="|"+array("records")+"|"+array("profiles")+"|"+profile;
+        if(tab==2)key+="|"+array("records")+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile")+"|"+state.opt("testSequence")+"|"+state.opt("ashEvidence");
         if(tab==3)key+="|"+(array("debug").length()==0);
         if(tab==4)key+="|"+array("devices").toString();
         if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->scroll.scrollTo(0,y));}
@@ -184,13 +186,36 @@ public class MainActivity extends Activity {
     private void recordings(){
         title("Aufnahmen","Lokal sichern · später ohne Auto untersuchen");
         JSONArray profiles=array("profiles");if(profile.isEmpty()&&profiles.length()>0)profile=profiles.optJSONObject(0).optString("id");
-        LinearLayout c=card();note(c,"AUFNAHMEPROFIL",ACCENT);addButton(c,profile.isEmpty()?"Profil auswählen":profile,this::chooseProfile);
+        JSONObject chosen=new JSONObject();for(int i=0;i<profiles.length();i++)if(profile.equals(profiles.optJSONObject(i).optString("id")))chosen=profiles.optJSONObject(i);
+        LinearLayout c=card();note(c,"AUFNAHMEPROFIL / TESTSEQUENZ",ACCENT);addButton(c,profile.isEmpty()?"Profil auswählen":chosen.optString("title",profile),this::chooseProfile);
+        if(profile.equals(TestSequence.PROFILE))note(c,"Einmaliger Test: Motorsteuergerät prüfen → beide Asche-Kandidaten lesen → DPF-Vergleich → Drehzahl prüfen. Stoppt automatisch. Antworten bleiben experimentelle Rohdaten; es erfolgt kein Sitzungswechsel.",MUTED);
         boolean running=!state.optString("recording").isEmpty();
-        Button start=addButton(c,running?"Aufzeichnung stoppen":"Aufzeichnung starten",()->act(()->{if(running)service().stopRecording();else service().startRecording(profile);}));start.setEnabled(running||canRun());
+        Button start=addButton(c,running?"Aufzeichnung stoppen":profile.equals(TestSequence.PROFILE)?"Testlauf vorbereiten …":"Aufzeichnung starten",()->act(()->{if(running)service().stopRecording();else if(profile.equals(TestSequence.PROFILE))prepareTestSequence();else service().startRecording(profile);}));start.setEnabled(running||canRun());
         note(c,running?"● "+state.optString("recording"):"Aufzeichnungen enthalten möglicherweise Fahrzeugkennungen. Export erfolgt nur auf deine ausdrückliche Auswahl.",running?ACCENT:MUTED);
+        JSONObject sequence=state.optJSONObject("testSequence");
+        if(sequence!=null&&sequence.length()>0){note(c,sequence.optString("context_label")+" · selbst angegeben",MUTED);String outcome=sequence.optString("status");note(c,outcome.equals("running")?"Schritt "+sequence.optInt("step")+" / "+sequence.optInt("total")+" · "+sequence.optString("label"):outcome.equals("completed")?"Testlauf aufgezeichnet · Auswertung offen":outcome.equals("incomplete")?"Unvollständige Aufnahme · Testlauf nicht abgeschlossen":"Testlauf abgebrochen · Teilaufnahme gesichert",outcome.equals("aborted")||outcome.equals("incomplete")?0xffffa79c:ACCENT);}
+        JSONObject ash=state.optJSONObject("ashEvidence");if(ash!=null&&ash.optJSONArray("readings")!=null)showAshEvidence(ash.optJSONArray("readings"));
         JSONArray records=array("records");if(records.length()==0)empty("Noch keine Aufnahmen","Starte eine Aufzeichnung im Live- oder Demomodus. Die Dateien bleiben auf diesem Handy.");
-        for(int i=0;i<records.length();i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");LinearLayout item=card();note(item,name,TEXT);note(item,record.optLong("bytes")+" Bytes",MUTED);addButton(item,"Als Replay öffnen",()->act(()->{service().openRecording(name);tab=0;buildNav();structure="";}));addButton(item,"Datei exportieren …",()->export(name));}
+        for(int i=0;i<records.length();i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");LinearLayout item=card();note(item,name,TEXT);note(item,record.optLong("bytes")+" Bytes",MUTED);addButton(item,"Als Replay öffnen",()->act(()->{service().openRecording(name);tab=0;buildNav();structure="";}));addButton(item,"Datei exportieren …",()->export(name));Button delete=addButton(item,"Aufnahme löschen …",()->confirmDeleteRecording(name));delete.setEnabled(!name.equals(state.optString("recording"))&&!name.equals(state.optString("replayFile")));}
     }
+    private void showAshEvidence(JSONArray readings){
+        LinearLayout evidence=card();note(evidence,"ASCHE-KANDIDATEN · AUSWERTUNG OFFEN",ACCENT);
+        for(int i=0;i<readings.length();i++){
+            JSONObject reading=readings.optJSONObject(i);if(reading==null)continue;
+            note(evidence,reading.optString("candidate").equals("ash_volume_1153")?"Aschevolumen-Kandidat · 1153":"Aschemassen-Kandidat · 178C",TEXT);
+            String outcome=reading.optString("outcome");
+            note(evidence,outcome.equals("positive_candidate")?"Antwort empfangen · Einheit und Skalierung noch zu prüfen":outcome.equals("negative_response")?"Vom Steuergerät abgelehnt · "+reading.optString("nrc"):"Nicht verfügbar · "+reading.optString("error","Keine auswertbare Antwort"),outcome.equals("positive_candidate")?MUTED:0xffffca75);
+        }
+        smallNote(evidence,"Originalantworten bleiben in der Aufnahme und unter Debug erhalten. Die Kandidaten werden nicht als bestätigte Aschewerte angezeigt.",MUTED);
+    }
+    private void prepareTestSequence(){
+        String[] labels={"Zündung an · Motor aus","Motor im Leerlauf"};String[] contexts={"engine_off","idle"};
+        new AlertDialog.Builder(this).setTitle("Betriebszustand für diesen Testlauf").setItems(labels,(dialog,which)->{
+            String selectedProfile=profile;
+            new AlertDialog.Builder(this).setTitle("Asche-Testlauf starten?").setMessage(labels[which]+"\n\nBitte diesen Zustand während des gesamten Testlaufs beibehalten. Deine Angabe wird zusammen mit den Messantworten gespeichert. Der Test endet automatisch; nicht verfügbare Werte bleiben als Ergebnis erhalten.").setPositiveButton("Testlauf starten",(d,w)->act(()->service().startRecording(selectedProfile,contexts[which]))).setNegativeButton("Abbrechen",null).show();
+        }).setNegativeButton("Abbrechen",null).show();
+    }
+    private void confirmDeleteRecording(String name){new AlertDialog.Builder(this).setTitle("Aufnahme endgültig löschen?").setMessage("Diese Datei wird dauerhaft aus dem internen Speicher gelöscht. Exportierte Kopien bleiben bestehen.\n\n"+name).setPositiveButton("Endgültig löschen",(dialog,which)->act(()->service().deleteRecording(name))).setNegativeButton("Abbrechen",null).show();}
     private void debug(){
         title("Debug-Daten","Zeitgestempelte TX/RX-Daten dieser Sitzung");
         addButton(body,"Debug-Daten lokal kopieren",()->{ClipboardManager cm=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);cm.setPrimaryClip(ClipData.newPlainText("OBDentic Debug",debugText()));toast("In die lokale Zwischenablage kopiert");});
@@ -209,7 +234,7 @@ public class MainActivity extends Activity {
     private void requestScan(){ArrayList<String> missing=new ArrayList<>();if(Build.VERSION.SDK_INT>=31){missing.add(Manifest.permission.BLUETOOTH_SCAN);missing.add(Manifest.permission.BLUETOOTH_CONNECT);}else missing.add(Manifest.permission.ACCESS_FINE_LOCATION);if(Build.VERSION.SDK_INT>=33)missing.add(Manifest.permission.POST_NOTIFICATIONS);missing.removeIf(p->checkSelfPermission(p)==PackageManager.PERMISSION_GRANTED);if(!missing.isEmpty()){scanAfterPermission=true;requestPermissions(missing.toArray(new String[0]),7);}else act(()->service().scan());}
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==7&&scanAfterPermission){scanAfterPermission=false;boolean allowed=true;for(int i=0;i<permissions.length;i++)if(!permissions[i].equals(Manifest.permission.POST_NOTIFICATIONS)&&results[i]!=PackageManager.PERMISSION_GRANTED)allowed=false;if(allowed)act(()->service().scan());else new AlertDialog.Builder(this).setTitle("Bluetooth-Berechtigung fehlt").setMessage("Erlaube Geräte in der Nähe in den Android-App-Einstellungen, um den Adapter zu suchen und zu verbinden.").setPositiveButton("Einstellungen",(d,w)->startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())))).setNegativeButton("Schließen",null).show();}}
     private void chooseSignals(){JSONArray signals=array("signals");String[] labels=new String[signals.length()];boolean[] checked=new boolean[signals.length()];for(int i=0;i<signals.length();i++){JSONObject s=signals.optJSONObject(i);String semantic=s.optString("semantic");labels[i]=signalLabel(semantic,s)+"  ·  "+s.optString("unit")+(s.optString("status").equals("unsupported")?" · nicht unterstützt":s.optString("status").equals("supported")?"":" · ungeprüft");checked[i]=contains(array("selected"),semantic);}new AlertDialog.Builder(this).setTitle("Live-Messwerte · maximal 32").setMultiChoiceItems(labels,checked,(d,which,on)->checked[which]=on).setPositiveButton("Übernehmen",(d,w)->{JSONArray selected=new JSONArray();for(int i=0;i<checked.length;i++)if(checked[i])selected.put(signals.optJSONObject(i).optString("semantic"));act(()->service().setSignals(selected));}).setNegativeButton("Abbrechen",null).show();}
-    private void chooseProfile(){JSONArray p=array("profiles");String[] names=new String[p.length()];int chosen=0;for(int i=0;i<p.length();i++){JSONObject item=p.optJSONObject(i);names[i]=item.optString("id");if(names[i].equals(profile))chosen=i;}new AlertDialog.Builder(this).setTitle("Aufnahmeprofil").setSingleChoiceItems(names,chosen,(dialog,which)->{profile=names[which];structure="";dialog.dismiss();refresh();}).setNegativeButton("Schließen",null).show();}
+    private void chooseProfile(){JSONArray p=array("profiles");String[] names=new String[p.length()];int chosen=0;for(int i=0;i<p.length();i++){JSONObject item=p.optJSONObject(i);names[i]=item.optString("title",item.optString("id"));if(item.optString("id").equals(profile))chosen=i;}new AlertDialog.Builder(this).setTitle("Aufnahmeprofil / Testsequenz").setSingleChoiceItems(names,chosen,(dialog,which)->{profile=p.optJSONObject(which).optString("id");structure="";dialog.dismiss();refresh();}).setNegativeButton("Schließen",null).show();}
     private void export(String name) {
         if(name.equals(state.optString("recording"))) {toast("Aufzeichnung vor dem Export stoppen");return;}
         pendingExport=name;

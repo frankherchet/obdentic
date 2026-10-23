@@ -243,6 +243,14 @@ pub(crate) struct TargetedEa189ExtendedProbeRequest {
     expected_responder: ResponderIdentity,
 }
 
+/// The two-DID EA189 ash-candidate experiment, bound to validated engine routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TargetedEa189AshProbeRequest {
+    operation: crate::protocol::ReadOperation,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetedEcuIdentificationRequest {
     candidate: crate::ecu_identification::IdentificationCandidate,
@@ -402,6 +410,53 @@ impl TargetedEa189ExtendedProbeRequest {
         validate_elm_header(&expected_responder, "expected responder")?;
         Ok(Self {
             operation: crate::protocol::ReadOperation::uds_read_data_by_identifier(signal.id()),
+            target,
+            expected_responder: ResponderIdentity::ElmHeader(
+                expected_responder.as_str().to_ascii_uppercase(),
+            ),
+        })
+    }
+
+    pub fn did(&self) -> u16 {
+        self.operation.did()
+    }
+    pub fn target(&self) -> &RequestTarget {
+        &self.target
+    }
+    pub fn expected_responder(&self) -> &ResponderIdentity {
+        &self.expected_responder
+    }
+}
+
+impl TargetedEa189AshProbeRequest {
+    pub(crate) fn from_mapping(
+        candidate: crate::ea189::Ea189AshCandidate,
+        mapping: &crate::vehicle_knowledge::EcuTargetMapping,
+    ) -> Result<Self, String> {
+        if mapping.role().role() != &crate::topology::EcuRole::Engine {
+            return Err("EA189 ash probes require validated engine target evidence".into());
+        }
+        let target = mapping.target().target().clone();
+        if mapping.expected_responder().context() != target.context() {
+            return Err("EA189 ash probe target and responder contexts differ".into());
+        }
+        if !target.address().is_some_and(|address| {
+            address.namespace() == "elm-header" && address.value().eq_ignore_ascii_case("7E0")
+        }) {
+            return Err("EA189 ash probes are fixed to engine request header 7E0".into());
+        }
+        let expected_responder = mapping
+            .expected_responder()
+            .value()
+            .ok_or_else(|| "EA189 ash probes require an expected responder".to_string())?;
+        if !expected_responder.eq_ignore_ascii_case("7E8") {
+            return Err("EA189 ash probes are fixed to engine responder 7E8".into());
+        }
+        let expected_responder = ResponderIdentity::ElmHeader(expected_responder.to_owned());
+        validate_request_target(&target)?;
+        validate_elm_header(&expected_responder, "expected responder")?;
+        Ok(Self {
+            operation: crate::protocol::ReadOperation::uds_read_data_by_identifier(candidate.id()),
             target,
             expected_responder: ResponderIdentity::ElmHeader(
                 expected_responder.as_str().to_ascii_uppercase(),
@@ -1013,6 +1068,34 @@ where
     pub(crate) async fn read_ea189_extended_probe_with_evidence(
         &mut self,
         request: &TargetedEa189ExtendedProbeRequest,
+    ) -> Result<DpfProbeReadEvidence, ReadEvidenceError> {
+        configure_target(
+            &mut self.exchange,
+            request.target(),
+            request.expected_responder(),
+        )
+        .await
+        .map_err(|error| ReadEvidenceError {
+            error,
+            observations: Vec::new(),
+        })?;
+
+        let responses =
+            read_elm_targeted_uds_responses(&mut self.exchange, request.operation, request.did())
+                .await
+                .map_err(|error| ReadEvidenceError {
+                    error,
+                    observations: Vec::new(),
+                })?;
+        Ok(DpfProbeReadEvidence {
+            observations: vec![responses.observation(None)],
+            responses,
+        })
+    }
+
+    pub(crate) async fn read_ea189_ash_probe_with_evidence(
+        &mut self,
+        request: &TargetedEa189AshProbeRequest,
     ) -> Result<DpfProbeReadEvidence, ReadEvidenceError> {
         configure_target(
             &mut self.exchange,
