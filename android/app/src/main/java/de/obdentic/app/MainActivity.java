@@ -223,6 +223,7 @@ public class MainActivity extends Activity {
     private JSONObject vehicleStore(){JSONObject v=state.optJSONObject("vehicles");return v==null?new JSONObject():v;}
     private JSONObject selectedVehicle(){JSONObject store=vehicleStore();JSONArray rows=store.optJSONArray("vehicles");String selected=store.optString("selected");if(rows!=null)for(int i=0;i<rows.length();i++)if(selected.equals(rows.optJSONObject(i).optString("vin")))return rows.optJSONObject(i);return null;}
     private String date(long millis){return new java.text.SimpleDateFormat("dd.MM.yyyy",java.util.Locale.GERMANY).format(new java.util.Date(millis));}
+    private String km(double value){java.text.NumberFormat f=java.text.NumberFormat.getNumberInstance(java.util.Locale.GERMANY);f.setMaximumFractionDigits(1);return f.format(value)+" km";}
     private void vehicles(){
         title("Fahrzeuge","Lokal gespeichert · nur auf diesem Handy");
         JSONObject store=vehicleStore();
@@ -232,7 +233,7 @@ public class MainActivity extends Activity {
         for(int i=0;i<rows.length();i++){
             JSONObject row=rows.optJSONObject(i);if(row==null)continue;String vin=row.optString("vin"),name=row.optString("name");boolean selected=vin.equals(store.optString("selected"));
             LinearLayout c=card();note(c,name+(selected?" · gewählt":""),TEXT);
-            note(c,(vin.length()>=7?vin.substring(0,3)+"…"+vin.substring(vin.length()-4):vin)+" · km-Stand nicht verfügbar",MUTED);
+            note(c,(vin.length()>=7?vin.substring(0,3)+"…"+vin.substring(vin.length()-4):vin)+" · "+(row.optJSONObject("odometer")==null?"km-Stand nicht verfügbar":km(row.optJSONObject("odometer").optDouble("km"))+" · "+date(row.optJSONObject("odometer").optLong("read_at"))),MUTED);
             note(c,"Zuletzt verbunden: "+date(row.optLong("last_connected")),MUTED);
             addButton(c,"Auswählen",()->act(()->service().selectVehicle(vin))).setEnabled(!selected);
             addButton(c,"Details",()->showVehicle(row));addButton(c,"Umbenennen …",()->renameVehicle(vin,name));addButton(c,"Löschen …",()->confirmDeleteVehicle(vin,name));
@@ -245,6 +246,10 @@ public class MainActivity extends Activity {
         JSONArray signals=row.optJSONArray("signals");int supported=0;for(int i=0;signals!=null&&i<signals.length();i++)if("supported".equals(signals.optJSONObject(i).optString("status")))supported++;
         m.append("\nMesswerte unterstützt: ").append(supported).append(" von ").append(signals==null?0:signals.length());
         m.append("\nMotorsteuergerät gezielt geprüft: ").append(row.optBoolean("engine_target_validated")?"ja":"nein");
+        JSONObject odometer=row.optJSONObject("odometer"),failure=row.optJSONObject("odometer_error"),decrease=row.optJSONObject("odometer_decrease");
+        m.append("\nkm-Stand: ").append(odometer==null?"nicht verfügbar":km(odometer.optDouble("km"))+" (Quelle: "+odometer.optString("source")+", gelesen "+date(odometer.optLong("read_at"))+")");
+        if(failure!=null)m.append("\nLetzter Leseversuch fehlgeschlagen: ").append(failure.optString("error")).append(" (").append(date(failure.optLong("at"))).append(")");
+        if(decrease!=null)m.append("\nNiedriger als zuvor gelesen: ").append(km(decrease.optDouble("previous_km"))).append(" am ").append(date(decrease.optLong("previous_at")));
         m.append("\nErste Verbindung: ").append(date(row.optLong("first_connected"))).append("\nLetzte Verbindung: ").append(date(row.optLong("last_connected")));
         new AlertDialog.Builder(this).setTitle(row.optString("name")).setMessage(m).setPositiveButton("Schließen",null).show();
     }

@@ -606,6 +606,14 @@ mod tests {
                 65535.0,
                 "powertrain",
             ),
+            (
+                "vehicle.odometer",
+                [0x01, 0xa6],
+                "km",
+                0.0,
+                429496729.5,
+                "diagnostics",
+            ),
         ];
         assert_eq!(supported_signals().len(), expected.len());
 

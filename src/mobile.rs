@@ -132,8 +132,12 @@ impl<E: Exchange> MobileCore<E> {
                 .block_on(crate::adapter::initialize_carly(&mut exchange));
             self.session = Some(ElmSession::new(exchange));
             setup?;
-            self.runtime
-                .block_on(self.session.as_mut().unwrap().discover_support(0x60))?;
+            self.runtime.block_on(
+                self.session
+                    .as_mut()
+                    .unwrap()
+                    .discover_support(crate::vehicle::highest_catalog_page()),
+            )?;
             self.initialized = true;
             return Ok(self.support());
         }
@@ -367,10 +371,12 @@ impl<E: Exchange> MobileCore<E> {
             self.initialized = false;
             return Err(format!("DPF restoration failed: {error}"));
         }
-        if let Err(error) = self
-            .runtime
-            .block_on(self.session.as_mut().unwrap().discover_support(0x60))
-        {
+        if let Err(error) = self.runtime.block_on(
+            self.session
+                .as_mut()
+                .unwrap()
+                .discover_support(crate::vehicle::highest_catalog_page()),
+        ) {
             self.initialized = false;
             return Err(error);
         }
@@ -448,10 +454,12 @@ impl<E: Exchange> MobileCore<E> {
             self.initialized = false;
             return Err(format!("EA189 extended restoration failed: {error}"));
         }
-        if let Err(error) = self
-            .runtime
-            .block_on(self.session.as_mut().unwrap().discover_support(0x60))
-        {
+        if let Err(error) = self.runtime.block_on(
+            self.session
+                .as_mut()
+                .unwrap()
+                .discover_support(crate::vehicle::highest_catalog_page()),
+        ) {
             self.initialized = false;
             return Err(error);
         }
@@ -501,10 +509,12 @@ impl<E: Exchange> MobileCore<E> {
             self.initialized = false;
             return Err(format!("EA189 ash probe restoration failed: {error}"));
         }
-        if let Err(error) = self
-            .runtime
-            .block_on(self.session.as_mut().unwrap().discover_support(0x60))
-        {
+        if let Err(error) = self.runtime.block_on(
+            self.session
+                .as_mut()
+                .unwrap()
+                .discover_support(crate::vehicle::highest_catalog_page()),
+        ) {
             self.initialized = false;
             return Err(error);
         }
@@ -1045,6 +1055,12 @@ mod tests {
         }
     }
     fn core(extra: &[(&'static str, &'static str)]) -> MobileCore<Script> {
+        core_with_pages(&[("0100\r", "7E8 06 41 00 00 10 00 00\r>")], extra)
+    }
+    fn core_with_pages(
+        pages: &[(&'static str, &'static str)],
+        extra: &[(&'static str, &'static str)],
+    ) -> MobileCore<Script> {
         let mut script = VecDeque::from([
             ("ATI\r", "ELM327\r>"),
             ("AT@1\r", "CARLY-UNIVERSAL\r>"),
@@ -1054,8 +1070,8 @@ mod tests {
             ("ATS1\r", "OK\r>"),
             ("ATH1\r", "OK\r>"),
             ("ATSP0\r", "OK\r>"),
-            ("0100\r", "7E8 06 41 00 00 10 00 00\r>"),
         ]);
+        script.extend(pages.iter().copied());
         script.extend(extra.iter().copied());
         MobileCore::new(Script(script)).unwrap()
     }
@@ -1138,6 +1154,65 @@ mod tests {
             {"candidate":"ash_mass_178c","request":"22 17 8C","raw_response":raw_178c,"timestamp_ms":2000}
         ]})
     }
+    /// Pages 0100..01A0 chained by continuation bits; PID A6 advertised.
+    const A6_PAGES: [(&str, &str); 6] = [
+        ("0100\r", "7E8 06 41 00 00 00 00 01\r>"),
+        ("0120\r", "7E8 06 41 20 00 00 00 01\r>"),
+        ("0140\r", "7E8 06 41 40 00 00 00 01\r>"),
+        ("0160\r", "7E8 06 41 60 00 00 00 01\r>"),
+        ("0180\r", "7E8 06 41 80 00 00 00 01\r>"),
+        ("01A0\r", "7E8 06 41 A0 04 00 00 00\r>"),
+    ];
+
+    #[test]
+    fn req_015_1_odometer_is_discovered_through_page_a0_and_decoded() {
+        let mut core = core_with_pages(&A6_PAGES, &[("01A6\r", "7E8 06 41 A6 00 12 D6 87\r>")]);
+        let support = run(&mut core, "initialize", "");
+        assert_eq!(support["ok"], true);
+        let odometer = support["data"]["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["semantic"] == "vehicle.odometer")
+            .unwrap();
+        assert_eq!(odometer["status"], "supported");
+        let read = run(&mut core, "read", "vehicle.odometer");
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["data"]["value"], 123456.7);
+        assert_eq!(read["data"]["unit"], "km");
+    }
+
+    #[test]
+    fn req_015_2_unadvertised_odometer_sends_no_request() {
+        // Page 00 has no continuation bit; the script has no 01A6 entry and
+        // would panic on any unexpected transport call.
+        let mut core = core(&[]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let read = run(&mut core, "read", "vehicle.odometer");
+        assert_eq!(read["ok"], false);
+        assert!(read["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not advertise"));
+    }
+
+    #[test]
+    fn req_015_3_failed_odometer_reads_are_errors() {
+        for response in [
+            "NO DATA\r>",
+            "7E8 03 7F 01 12\r>",
+            "7E8 05 41 A6 00 12 D6\r>",
+        ] {
+            let mut core = core_with_pages(&A6_PAGES, &[("01A6\r", response)]);
+            assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+            assert_eq!(
+                run(&mut core, "read", "vehicle.odometer")["ok"],
+                false,
+                "{response}"
+            );
+        }
+    }
+
     #[test]
     fn closed_actions_reject_writes_raw_commands_and_uninitialized_reads() {
         let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();

@@ -10,7 +10,7 @@ import java.util.Arrays;
 
 /** REQ-013 checks: store semantics on temp files, the service's own store, and (via {@link Screen}) the header chip. */
 final class VehicleRecordsAcceptance {
-    interface Screen { void show(String vehicleName) throws Exception; }
+    interface Screen { void show(String vehicleName, String listText) throws Exception; }
     private static final String VIN_A = "WVW00000000000000", VIN_B = "WVW00000000001111", VIN_C = "XXX00000000002222", VIN_UI = "WVW00000000009999";
 
     static void run(ObdService service, Screen screen) throws Exception {
@@ -140,6 +140,34 @@ final class VehicleRecordsAcceptance {
             require(Arrays.equals(Files.readAllBytes(lockedFile.toPath()), persisted), "REQ-013.12 previous file is intact");
         } finally { locked.setWritable(true); lockedFile.setWritable(true); }
 
+        // REQ-015: odometer value, failure and decrease on the record.
+        File odoFile = new File(dir, "vehicles-odometer-" + System.nanoTime() + ".json");
+        VehicleStore odo = new VehicleStore(odoFile);
+        require(odo.observe(demo, 1000).equals("created"), "odometer test record");
+        require(!record(odo, VIN_A).has("odometer") && !record(odo, VIN_A).has("odometer_error") && !record(odo, VIN_A).has("odometer_decrease"), "REQ-015.2 a new record has no odometer");
+        require(odo.odometer(VIN_A, 123456.7, 5000) == null, "REQ-015.1 store odometer");
+        JSONObject stored = record(odo, VIN_A).getJSONObject("odometer");
+        require(stored.getDouble("km") == 123456.7 && stored.getLong("read_at") == 5000 && stored.getString("source").equals("OBD PID A6"), "REQ-015.1 value, read timestamp and source are stored: " + stored);
+        require(new VehicleStore(odoFile).snapshot().getJSONArray("vehicles").getJSONObject(0).getJSONObject("odometer").toString().equals(stored.toString()), "REQ-015.1 odometer survives a restart");
+        require(odo.observe(again, 5500).equals("updated") && record(odo, VIN_A).getJSONObject("odometer").toString().equals(stored.toString()), "REQ-015.1 a later inventory keeps the stored odometer");
+        require(odo.odometerFailure(VIN_A, "NO DATA", 6000) == null, "REQ-015.3 store failure");
+        require(record(odo, VIN_A).getJSONObject("odometer").toString().equals(stored.toString()), "REQ-015.3 failure keeps stored value and date");
+        JSONObject failure = record(odo, VIN_A).getJSONObject("odometer_error");
+        require(failure.getString("error").equals("NO DATA") && failure.getLong("at") == 6000, "REQ-015.3 failure and its date are recorded: " + failure);
+        require(odo.odometer(VIN_A, 100000.0, 7000) == null, "REQ-015.4 lower value stored");
+        JSONObject lower = record(odo, VIN_A);
+        require(lower.getJSONObject("odometer").getDouble("km") == 100000.0 && lower.getJSONObject("odometer").getLong("read_at") == 7000, "REQ-015.4 lower value replaces the stored one");
+        require(lower.getJSONObject("odometer_decrease").getDouble("previous_km") == 123456.7 && lower.getJSONObject("odometer_decrease").getLong("previous_at") == 5000, "REQ-015.4 decrease names the previous value and date");
+        require(!lower.has("odometer_error"), "REQ-015.1 a successful read clears the failure");
+        require(odo.odometer(VIN_A, 100000.0, 8000) == null && !record(odo, VIN_A).has("odometer_decrease"), "REQ-015.4 an equal value is not a decrease");
+        require(odo.odometer(VIN_A, 100000.5, 9000) == null && record(odo, VIN_A).getJSONObject("odometer").getDouble("km") == 100000.5 && !record(odo, VIN_A).has("odometer_decrease"), "REQ-015.4 a higher value clears the decrease note");
+        require(odo.odometer(VIN_B, 1, 1) != null && odo.odometerFailure(VIN_B, "x", 1) != null, "REQ-015 unknown vehicle is refused");
+        File garbageFile = new File(dir, "vehicles-odometer-bad-" + System.nanoTime() + ".json");
+        Files.write(garbageFile.toPath(), garbage);
+        VehicleStore garbled = new VehicleStore(garbageFile);
+        require(garbled.odometer(VIN_A, 1, 1) != null && garbled.odometerFailure(VIN_A, "x", 1) != null && Arrays.equals(Files.readAllBytes(garbageFile.toPath()), garbage), "REQ-015 an unreadable store refuses odometer writes and stays untouched");
+        garbageFile.delete(); new File(odoFile.getPath() + ".new").delete(); new File(odoFile.getPath() + ".bak").delete(); odoFile.delete();
+
         // REQ-013.10: private storage excluded from backup; nothing exports records.
         require((service.getApplicationInfo().flags & ApplicationInfo.FLAG_ALLOW_BACKUP) == 0, "REQ-013.10 backup is disabled for the app");
 
@@ -150,7 +178,10 @@ final class VehicleRecordsAcceptance {
         require(new File(service.getFilesDir(), "vehicles.json").isFile(), "REQ-013.10 service store lives in the app-private files directory");
         service.renameVehicle(VIN_UI, "  Testwagen ");
         waitFor(() -> service.snapshot().optString("message").equals("Fahrzeug umbenannt: Testwagen"), "service rename");
-        screen.show("Testwagen");
+        screen.show("Testwagen", "WVW…9999 · km-Stand nicht verfügbar"); // REQ-015.2: no value stored
+        long readAt = System.currentTimeMillis();
+        require(own.odometer(VIN_UI, 123456.7, readAt) == null, "odometer stored on the service store");
+        screen.show("Testwagen", "WVW…9999 · 123.456,7 km · " + new java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.GERMANY).format(new java.util.Date(readAt))); // REQ-015.2: value and date
         service.deleteVehicle(VIN_UI);
         waitFor(() -> service.snapshot().optString("message").equals("Fahrzeug gelöscht: Testwagen"), "service delete");
         if (!ownSelection.isEmpty()) {

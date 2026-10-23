@@ -41,16 +41,18 @@ public final class AcceptanceRunner extends Instrumentation {
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"), "demo initialization");
             JSONObject state = service.snapshot();
             require("demo".equals(state.optString("mode")), "Demo must be visibly separate from live");
-            require(state.getJSONArray("signals").length() == 49, "Expanded semantic catalog");
+            require(state.getJSONArray("signals").length() == 50, "Expanded semantic catalog");
             require(state.getJSONArray("profiles").length() >= 6, "Capture profiles and explicit EA189 profiles");
             passed("Rust JNI library, real initialization/parser, signal and profile catalogs");
 
             service.setSignals(new JSONArray());waitIdle();
             JSONArray catalog=state.getJSONArray("signals");
             for(int i=0;i<catalog.length();i++)job("read:"+catalog.getJSONObject(i).getString("semantic"));
-            require(service.snapshot().getJSONArray("values").length()==49,"Every catalog scalar decoded in Android demo");
+            require(service.snapshot().getJSONArray("values").length()==50,"Every catalog scalar decoded in Android demo");
+            JSONObject odometer=findValue(service.snapshot().getJSONArray("values"),"vehicle.odometer");
+            require(odometer!=null&&odometer.optDouble("value")==123456.7&&"km".equals(odometer.optString("unit")),"REQ-015.1 demo odometer (PID A6, bytes 00 12 D6 87) decodes to 123456.7 km through the real JNI: "+odometer);
             service.setDemo();waitFor(() -> "ready".equals(service.snapshot().optString("phase"))&&!service.snapshot().optBoolean("busy"),"reset demo values");
-            passed("All 49 standard scalars decode through the actual Android/JNI transport seam");
+            passed("All 50 standard scalars, including the A6 odometer via support pages up to 01A0, decode through the actual Android/JNI transport seam");
 
             service.setSignals(new JSONArray().put("engine.rpm").put("engine.coolant_temperature"));
             waitFor(() -> service.snapshot().optJSONArray("values").length() >= 2, "live scalar reads");
@@ -193,8 +195,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Completed recording is permanently deleted while its exported copy remains");
             TestSequenceAcceptance.run(service,getTargetContext().getFilesDir());
             passed("Finite ash sequence, operator context, raw candidate evidence, automatic completion, replay and manual stop");
-            VehicleRecordsAcceptance.run(service,name -> showVehicles(activity,name));
-            passed("Known vehicles: VIN-keyed records, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
+            VehicleRecordsAcceptance.run(service,(name,listText) -> showVehicles(activity,name,listText));
+            passed("Known vehicles: VIN-keyed records, stored odometer, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
             runOnMainSync(activity::recreate);
             SystemClock.sleep(1500);
             require("ready".equals(service.snapshot().optString("phase")),"Activity recreation preserves session");
@@ -242,14 +244,14 @@ public final class AcceptanceRunner extends Instrumentation {
         return null;
     }
     /** REQ-013.5: the selected vehicle's name is visible on every tab; the chip opens the vehicle list with a masked VIN. */
-    private void showVehicles(Activity activity,String name) throws Exception {
+    private void showVehicles(Activity activity,String name,String listText) throws Exception {
         for(String tab:new String[]{"Live","Diagnose","Aufnahmen","Debug","Adapter"}) {
             runOnMainSync(() -> { Button button=findButton(activity.getWindow().getDecorView(),tab); require(button!=null,"Navigation tab "+tab); button.performClick(); });
             require(onMain(() -> hasText(activity.getWindow().getDecorView(),name,true)),"REQ-013.5 header shows the vehicle name on tab "+tab);
         }
         runOnMainSync(() -> { View chip=findDescribed(activity.getWindow().getDecorView(),"Gewähltes Fahrzeug: "+name); require(chip!=null,"REQ-013.5 header chip content description"); chip.performClick(); });
         require(onMain(() -> hasText(activity.getWindow().getDecorView(),"Fahrzeuge",true)),"REQ-013.5 chip opens the vehicle list");
-        require(onMain(() -> hasText(activity.getWindow().getDecorView(),"WVW…9999 · km-Stand nicht verfügbar",false)),"REQ-013.5 list shows masked VIN and unavailable odometer");
+        require(onMain(() -> hasText(activity.getWindow().getDecorView(),listText,false)),"REQ-013.5/REQ-015.2 list shows masked VIN and odometer state: "+listText);
         require(!onMain(() -> hasText(activity.getWindow().getDecorView(),"WVW00000000009999",false)),"REQ-013.5 list never shows the full VIN");
         shoot(activity,"acceptance-vehicles.png");
         runOnMainSync(() -> findButton(activity.getWindow().getDecorView(),"Live").performClick());
