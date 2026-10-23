@@ -24,7 +24,9 @@ import java.nio.charset.StandardCharsets;
 public final class AcceptanceRunner extends Instrumentation {
     private ObdService service;
     private final StringBuilder report = new StringBuilder();
-    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); start(); }
+    private boolean screenOff;
+    /** Default runs never lock the phone; pass `-e screenOff true` to also exercise a real screen-off period. */
+    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); screenOff = arguments != null && "true".equals(arguments.getString("screenOff")); start(); }
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
@@ -92,7 +94,6 @@ public final class AcceptanceRunner extends Instrumentation {
             deleteRecording("missing-"+System.nanoTime()+".jsonl","Aufnahme nicht gefunden");
             require(file.isFile(),"Rejected active, malformed and missing deletions preserve recording evidence");
             passed("Recording deletion rejects active files, malformed paths and missing files with clear errors");
-            long initial = file.length();
             job("ea189.extended.probe");
             JSONArray extended=service.snapshot().getJSONObject("jobResult").getJSONObject("data").getJSONArray("readings");
             require(extended.length()==15,"All closed EA189 additional readings retained");
@@ -100,11 +101,11 @@ public final class AcceptanceRunner extends Instrumentation {
             capture(activity,"Diagnose","acceptance-diagnose.png");
             getUiAutomation().executeShellCommand("input keyevent 3").close();
             waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) == 0,"Activity clears keep-screen-on when paused");
-            getUiAutomation().executeShellCommand("input keyevent 223").close();
-            SystemClock.sleep(4000);
-            require(filename.equals(service.snapshot().optString("recording")), "Screen-off recording remains active");
-            require(file.length() > initial, "Background recording appends actual evidence");
-            getUiAutomation().executeShellCommand("input keyevent 224").close();
+            long backgrounded=file.length();
+            if(screenOff) { getUiAutomation().executeShellCommand("input keyevent 223").close(); SystemClock.sleep(4000); }
+            waitFor(() -> file.length() > backgrounded, "Background recording appends actual evidence");
+            require(filename.equals(service.snapshot().optString("recording")), "Background recording remains active");
+            if(screenOff) getUiAutomation().executeShellCommand("input keyevent 224").close();
             service.stopRecording();
             waitFor(() -> service.snapshot().optString("recording").isEmpty(),"recording stop at transaction boundary");
             service.setSignals(new JSONArray());
@@ -124,7 +125,7 @@ public final class AcceptanceRunner extends Instrumentation {
             }
             require(tx && rx && read, "Recording preserves requests, responses and decoded operations");
             java.nio.file.Files.copy(file.toPath(),new File(getTargetContext().getExternalFilesDir("acceptance"),"demo-recording.jsonl").toPath(),java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            passed("Profile recording, actual screen-off/background operation, explicit stop and flushed TX/RX evidence");
+            passed("Profile recording, background operation"+(screenOff?" with screen off":" (screen stays on; opt in with -e screenOff true)")+", explicit stop and flushed TX/RX evidence");
 
             Uri uri = Uri.parse("content://de.obdentic.app.files/recordings/" + filename);
             try(ParcelFileDescriptor fd=getTargetContext().getContentResolver().openFileDescriptor(uri,"r")) {
@@ -192,6 +193,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Completed recording is permanently deleted while its exported copy remains");
             TestSequenceAcceptance.run(service,getTargetContext().getFilesDir());
             passed("Finite ash sequence, operator context, raw candidate evidence, automatic completion, replay and manual stop");
+            VehicleRecordsAcceptance.run(service,name -> showVehicles(activity,name));
+            passed("Known vehicles: VIN-keyed records, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
             runOnMainSync(activity::recreate);
             SystemClock.sleep(1500);
             require("ready".equals(service.snapshot().optString("phase")),"Activity recreation preserves session");
@@ -203,7 +206,7 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Actual Android BLE scan lifecycle (adapter connection remains a separate vehicle test)");
             runOnMainSync(service::setDemo);
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"),"restore demo for UI review");
-            for(String name:new String[]{"acceptance-live.png","acceptance-diagnose.png","acceptance-debug.png","acceptance-connection.png","acceptance-recordings.png","demo-recording.jsonl"}) emitArtifact(name);
+            for(String name:new String[]{"acceptance-live.png","acceptance-diagnose.png","acceptance-debug.png","acceptance-connection.png","acceptance-recordings.png","acceptance-vehicles.png","demo-recording.jsonl"}) emitArtifact(name);
             result.putString("stream", report + "\nDESK ACCEPTANCE PASSED\nReal Carly/vehicle acceptance remains separate.\n");
             finish(Activity.RESULT_OK,result);
         } catch(Throwable error) {
@@ -238,12 +241,47 @@ public final class AcceptanceRunner extends Instrumentation {
         }
         return null;
     }
+    /** REQ-013.5: the selected vehicle's name is visible on every tab; the chip opens the vehicle list with a masked VIN. */
+    private void showVehicles(Activity activity,String name) throws Exception {
+        for(String tab:new String[]{"Live","Diagnose","Aufnahmen","Debug","Adapter"}) {
+            runOnMainSync(() -> { Button button=findButton(activity.getWindow().getDecorView(),tab); require(button!=null,"Navigation tab "+tab); button.performClick(); });
+            require(onMain(() -> hasText(activity.getWindow().getDecorView(),name,true)),"REQ-013.5 header shows the vehicle name on tab "+tab);
+        }
+        runOnMainSync(() -> { View chip=findDescribed(activity.getWindow().getDecorView(),"Gewähltes Fahrzeug: "+name); require(chip!=null,"REQ-013.5 header chip content description"); chip.performClick(); });
+        require(onMain(() -> hasText(activity.getWindow().getDecorView(),"Fahrzeuge",true)),"REQ-013.5 chip opens the vehicle list");
+        require(onMain(() -> hasText(activity.getWindow().getDecorView(),"WVW…9999 · km-Stand nicht verfügbar",false)),"REQ-013.5 list shows masked VIN and unavailable odometer");
+        require(!onMain(() -> hasText(activity.getWindow().getDecorView(),"WVW00000000009999",false)),"REQ-013.5 list never shows the full VIN");
+        shoot(activity,"acceptance-vehicles.png");
+        runOnMainSync(() -> findButton(activity.getWindow().getDecorView(),"Live").performClick());
+    }
+    private boolean onMain(java.util.concurrent.Callable<Boolean> check) throws Exception {
+        java.util.concurrent.FutureTask<Boolean> task=new java.util.concurrent.FutureTask<>(check);
+        runOnMainSync(task); return task.get();
+    }
+    /** Own visibility up to the content root: isShown() is false for a stopped (backgrounded) Activity's window. */
+    private boolean visible(View view) {
+        for(View v=view;v!=null && v.getId()!=android.R.id.content;) { if(v.getVisibility()!=View.VISIBLE) return false; v=v.getParent() instanceof View?(View)v.getParent():null; }
+        return true;
+    }
+    private boolean hasText(View view,String text,boolean exact) {
+        if(view instanceof android.widget.TextView && visible(view)) { CharSequence value=((android.widget.TextView)view).getText(); if(exact?text.contentEquals(value):value.toString().contains(text)) return true; }
+        if(view instanceof ViewGroup) { ViewGroup group=(ViewGroup)view; for(int i=0;i<group.getChildCount();i++) if(hasText(group.getChildAt(i),text,exact)) return true; }
+        return false;
+    }
+    private View findDescribed(View view,String description) {
+        if(view.getContentDescription()!=null && description.contentEquals(view.getContentDescription())) return view;
+        if(view instanceof ViewGroup) { ViewGroup group=(ViewGroup)view; for(int i=0;i<group.getChildCount();i++) { View found=findDescribed(group.getChildAt(i),description); if(found!=null) return found; } }
+        return null;
+    }
     private void capture(Activity activity,String tab,String name) {
         runOnMainSync(() -> {
             View root=activity.getWindow().getDecorView(); Button button=findButton(root,tab);
             require(button!=null,"Navigation tab "+tab); button.performClick();
         });
         waitForIdleSync();
+        shoot(activity,name);
+    }
+    private void shoot(Activity activity,String name) {
         runOnMainSync(() -> {
             View root=activity.getWindow().getDecorView();
             require(root.getWidth()>0 && root.getHeight()>0,"Laid out Activity");

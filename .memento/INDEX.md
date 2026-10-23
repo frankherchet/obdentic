@@ -1,5 +1,6 @@
 # Memento index
 
+- [Never lock the test phone](phone-must-stay-unlocked.md) — preference — no adb sleep/power keys; screen-off acceptance only on request
 - [Cost-efficient model delegation](worker-model-preference.md) — preference — Haiku/Sonnet (Codex: GPT-6 Luna xhigh) for fitting tasks; Opus integrates and reviews
 - [Bundle vehicle acceptance](bundle-vehicle-acceptance.md) — preference — minimize separate trips to the vehicle
 - [Local extracted profile archive](local-profile-archive.md) — reference — complete Car Scanner source archive stays local

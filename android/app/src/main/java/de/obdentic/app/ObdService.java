@@ -38,8 +38,10 @@ public final class ObdService extends Service {
     private volatile int sequenceIndex = -1;
     private final Map<String, Long> due = new HashMap<>(), intervals = new HashMap<>();
     private final Map<String, JSONObject> values = new LinkedHashMap<>();
+    public volatile VehicleStore vehicles;
     public void onCreate() {
         super.onCreate(); current = this;
+        vehicles = new VehicleStore(new File(getFilesDir(), "vehicles.json"));
         synchronized (stateLock) {
             put(state,"phase","idle"); put(state,"mode","live"); put(state,"busy",false);
             put(state,"message","Carly verbinden oder Demo starten");
@@ -63,7 +65,7 @@ public final class ObdService extends Service {
     private String phase() { synchronized(stateLock) { return state.optString("phase"); } }
     private void message(String value) { set("message",value); }
     public JSONObject snapshot() {
-        synchronized(stateLock) { put(state,"busy",busy || sequenceIndex>=0); put(state,"records",listRecords());
+        synchronized(stateLock) { put(state,"busy",busy || sequenceIndex>=0); put(state,"records",listRecords()); put(state,"vehicles",vehicles.snapshot());
             try { return new JSONObject(state.toString()); } catch(JSONException e) { return new JSONObject(); } }
     }
     private boolean permitted() {
@@ -158,6 +160,7 @@ public final class ObdService extends Service {
         JSONObject support=result.optJSONObject("data"); if(support != null) { set("vehicle",support); applySupport(support); }
         JSONObject inventory=execute("inventory","");
         if(token!=generation) return;
+        String notice=observeVehicle(inventory.optJSONObject("data"));
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
         JSONArray defaults=new JSONArray(); synchronized(stateLock) { JSONArray selected=state.optJSONArray("selected");
@@ -165,8 +168,25 @@ public final class ObdService extends Service {
                 for(int i=0;i<signals.length();i++) if(semantic.equals(signals.optJSONObject(i).optString("semantic")) && signals.optJSONObject(i).optString("status").equals("supported")) defaults.put(semantic);
             }
         } if(defaults.length()>0) setSignals(defaults);
-        message(mode.equals("demo") ? "Demo · synthetische Fahrzeugdaten" : "Carly bereit");
+        message((mode.equals("demo") ? "Demo · synthetische Fahrzeugdaten" : "Carly bereit") + notice);
     }
+    /** Live sessions only: records the VIN-keyed vehicle and returns " · notice" (or "") for the status line. Never touches the adapter. */
+    private String observeVehicle(JSONObject inventory) {
+        if(!mode.equals("live") || inventory==null) return "";
+        String outcome=vehicles.observe(inventory,System.currentTimeMillis());
+        switch(outcome) {
+            case "unreadable_vin": return " · Fahrzeug nicht gespeichert · FIN nicht lesbar";
+            case "store_unreadable": return " · "+VehicleStore.UNREADABLE;
+            case "write_failed": return " · "+VehicleStore.WRITE_FAILED;
+            case "switched": return " · Anderes Fahrzeug erkannt: "+vehicles.name(inventory.optString("vin"));
+            default: return "";
+        }
+    }
+    public void selectVehicle(String vin) { vehicleAction(() -> { String error=vehicles.select(vin); return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
+    public void renameVehicle(String vin,String name) { vehicleAction(() -> { String error=vehicles.rename(vin,name); return error==null?"Fahrzeug umbenannt: "+vehicles.name(vin):error; }); }
+    public void deleteVehicle(String vin) { vehicleAction(() -> { String name=vehicles.name(vin), error=vehicles.delete(vin); return error==null?"Fahrzeug gelöscht: "+name:error; }); }
+    public void resetVehicleStore() { vehicleAction(() -> { String error=vehicles.reset(); return error==null?"Fahrzeugspeicher zurückgesetzt":error; }); }
+    private void vehicleAction(java.util.function.Supplier<String> action) { if(!worker.isShutdown()) worker.execute(() -> message(action.get())); }
     private void applySupport(JSONObject support) {
         JSONArray statuses = support.optJSONArray("signals"); if(statuses == null) return;
         synchronized(stateLock) { JSONArray catalog = state.optJSONArray("signals");
@@ -229,7 +249,8 @@ public final class ObdService extends Service {
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
             if(!argument.isEmpty()) updateValue(argument,result);
             if(isEa189Job(action)) applyDpf(result);
-            message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action : result.optString("error"));
+            String notice=action.equals("inventory") ? observeVehicle(result.optJSONObject("data")) : "";
+            message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
         } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
     }
     private static boolean isEa189Job(String action) {
