@@ -30,6 +30,8 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
     private int checks;
     private int dpfReadable;
     private int dpfErrors;
+    private int extendedReadable;
+    private int extendedErrors;
     private boolean screenOff;
 
     @Override public void onCreate(Bundle arguments) {
@@ -88,8 +90,11 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
             requireLiveValidatedTarget();
             runJob("dtc.scan");
             runDpfProbe();
+            runExtendedProbe();
             passed("Inventory and stored-DTC jobs completed; experimental DPF results="
-                + (dpfReadable + dpfErrors) + ", readable=" + dpfReadable + ", errors=" + dpfErrors);
+                + (dpfReadable + dpfErrors) + ", readable=" + dpfReadable + ", errors=" + dpfErrors
+                + "; extended results=" + (extendedReadable + extendedErrors) + ", readable="
+                + extendedReadable + ", errors=" + extendedErrors);
 
             stage = "screen_off_recording";
             keepRecordingScreenOff(recording, filename);
@@ -101,13 +106,13 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
 
             stage = "capture_validation";
             CaptureFacts capture = inspectCapture(recording);
-            require(capture.hasInventory && capture.hasDtc && capture.hasDpf,
+            require(capture.hasInventory && capture.hasDtc && capture.hasDpf && capture.hasExtended,
                 "capture is missing a requested vehicle job");
             require(capture.engineRpmPresent, "capture has no decodable engine RPM sample");
             File exportedCapture = copyCapture(recording);
             verifyReadOnlyExport(filename, recording.length());
             passed("Capture validated: header/end markers, TX=" + capture.tx + ", RX=" + capture.rx
-                + ", reads=" + capture.reads + ", inventory/DTC/DPF evidence; read-only export opened");
+                + ", reads=" + capture.reads + ", inventory/DTC/DPF/EA189 extended evidence; read-only export opened");
 
             stage = "offline_replay";
             service.openRecording(filename);
@@ -121,9 +126,12 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
             require(replay.optJSONArray("values") != null && replay.getJSONArray("values").length() > 0,
                 "replay did not restore decoded values");
             requireReplayedRpm(capture.recordedRpm, replay);
-            int replayedDpf = countExperimentalValues(replay.optJSONArray("values"));
+            int replayedDpf = countOriginalDpfValues(replay.optJSONArray("values"));
             require(replayedDpf == 7, "replay did not restore all seven experimental DPF results");
-            passed("Offline replay recomputed engine RPM and restored seven experimental DPF results");
+            int replayedExtended = countExtendedValues(replay.optJSONArray("values"));
+            require(replayedExtended == 15, "replay did not restore all 15 experimental EA189 extended results");
+            requireExtendedValueLabels(replay.optJSONArray("values"));
+            passed("Offline replay recomputed engine RPM and restored seven DPF plus 15 EA189 extended results");
 
             stage = "live_reconnect";
             runOnMainSync(service::disconnect);
@@ -156,7 +164,9 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
                 "final service state is not safely disconnected");
             report.append("LIVE VEHICLE ACCEPTANCE PASSED\n")
                 .append("Checks: ").append(checks).append("; DPF readable: ").append(dpfReadable)
-                .append("; DPF errors: ").append(dpfErrors).append("; screen-off seconds: ")
+                .append("; DPF errors: ").append(dpfErrors).append("; EA189 extended readable: ")
+                .append(extendedReadable).append("; EA189 extended errors: ").append(extendedErrors)
+                .append("; screen-off seconds: ")
                 .append(SCREEN_OFF_SECONDS).append("\n")
                 .append("Final state: mode=live, phase=disconnected; engine target validated, RPM available\n");
             result.putString("stream", report.toString());
@@ -271,6 +281,44 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
         checks++;
     }
 
+    private void runExtendedProbe() throws Exception {
+        require(!service.snapshot().optString("recording").isEmpty(),
+            "EA189 extended probe must run while the capture is active");
+        waitFor(() -> !service.snapshot().optBoolean("busy"), 30_000, "idle before EA189 extended probe");
+        service.runJob("ea189.extended.probe");
+        waitFor(() -> !service.snapshot().optBoolean("busy"), 120_000, "EA189 extended probe completion");
+        JSONObject state = service.snapshot();
+        require("ready".equals(state.optString("phase")) && "live".equals(state.optString("mode")),
+            "EA189 extended probe interrupted the live session");
+        require(!state.optString("recording").isEmpty(),
+            "EA189 extended probe stopped the active capture");
+        JSONObject job = state.optJSONObject("jobResult");
+        require(job != null && job.optBoolean("ok"), "closed EA189 extended probe did not complete");
+        JSONObject data = job.optJSONObject("data");
+        JSONArray readings = data == null ? null : data.optJSONArray("readings");
+        require(readings != null && readings.length() == 15,
+            "expected all 15 closed experimental EA189 extended results");
+        for (int i = 0; i < readings.length(); i++) {
+            JSONObject reading = readings.optJSONObject(i);
+            require(reading != null && reading.optBoolean("experimental"),
+                "EA189 extended result lost its experimental label");
+            boolean hasError = !reading.optString("error", "").isEmpty();
+            boolean hasValue = reading.has("value") && !reading.isNull("value")
+                && Double.isFinite(reading.optDouble("value", Double.NaN));
+            require(hasError || hasValue, "EA189 extended result has neither a value nor an explicit error");
+            require("Car Scanner 2.1.50".equals(reading.optString("source_version")),
+                "EA189 extended result lost its source version");
+            require(!reading.optString("source_profile", "").isEmpty(),
+                "EA189 extended result lost its source profile label");
+            require(reading.optString("hardware_validation", "").contains("unverified"),
+                "EA189 extended result lost its unverified hardware label");
+            if (hasError) extendedErrors++;
+            else extendedReadable++;
+        }
+        require(extendedReadable + extendedErrors == 15, "EA189 extended result accounting is incomplete");
+        checks++;
+    }
+
     private void keepRecordingScreenOff(File file, String filename) throws Exception {
         long initialLength = file.length();
         long previousLength = initialLength;
@@ -324,6 +372,11 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
                     facts.hasDpf |= "ea189.dpf.probe".equals(action);
                     JSONObject result = event.optJSONObject("result");
                     JSONObject data = result == null ? null : result.optJSONObject("data");
+                    if ("ea189.extended.probe".equals(action)) {
+                        JSONArray readings = data == null ? null : data.optJSONArray("readings");
+                        facts.hasExtended = result != null && result.optBoolean("ok")
+                            && readings != null && readings.length() == 15;
+                    }
                     if ("read".equals(action) && "engine.rpm".equals(event.optString("argument"))
                             && result != null && result.optBoolean("ok") && data != null
                             && data.has("value") && !data.isNull("value")
@@ -377,16 +430,85 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
             "replay did not recompute engine RPM from its recorded response");
     }
 
-    private int countExperimentalValues(JSONArray values) {
+    private int countOriginalDpfValues(JSONArray values) {
         if (values == null) return 0;
         int count = 0;
         for (int i = 0; i < values.length(); i++) {
             JSONObject value = values.optJSONObject(i);
             if (value != null && value.optBoolean("experimental")
-                    && (value.optString("semantic").startsWith("dpf.")
-                        || value.optString("semantic").startsWith("exhaust.temperature."))) count++;
+                    && isOriginalDpfSemantic(value.optString("semantic"))) count++;
         }
         return count;
+    }
+
+    private int countExtendedValues(JSONArray values) {
+        if (values == null) return 0;
+        int count = 0;
+        for (int i = 0; i < values.length(); i++) {
+            JSONObject value = values.optJSONObject(i);
+            if (value != null && value.optBoolean("experimental")
+                    && isExtendedSemantic(value.optString("semantic"))) count++;
+        }
+        return count;
+    }
+
+    private void requireExtendedValueLabels(JSONArray values) {
+        for (String semantic : new String[]{
+                "engine.boost_pressure_actual",
+                "engine.injector_deviation.cylinder_1",
+                "engine.injector_deviation.cylinder_3",
+                "engine.injector_deviation.cylinder_4",
+                "engine.injector_deviation.cylinder_2",
+                "engine.boost_pressure_commanded",
+                "dpf.oil_ash_volume",
+                "dpf.fuel_consumption_since_regeneration",
+                "dpf.field_regeneration_request_status",
+                "dpf.service_regeneration_status",
+                "engine.rail_pressure_actual",
+                "engine.rail_pressure_commanded",
+                "engine.oil_temperature",
+                "dpf.field_regeneration_lock_status",
+                "engine.fuel_temperature"}) {
+            JSONObject value = findValue(values, semantic);
+            require(value != null && value.optBoolean("experimental"),
+                "replay lost experimental EA189 label for " + semantic);
+            require("Car Scanner 2.1.50".equals(value.optString("source_version"))
+                    && !value.optString("source_profile", "").isEmpty()
+                    && value.optString("hardware_validation", "").contains("unverified"),
+                "replay lost EA189 source labels for " + semantic);
+            boolean hasError = !value.optString("error", "").isEmpty();
+            boolean hasValue = value.has("value") && !value.isNull("value")
+                && Double.isFinite(value.optDouble("value", Double.NaN));
+            require(hasError || hasValue, "replay has neither a value nor an explicit error for " + semantic);
+        }
+    }
+
+    private boolean isOriginalDpfSemantic(String semantic) {
+        return "dpf.soot_mass_calculated".equals(semantic)
+            || "dpf.soot_mass_measured".equals(semantic)
+            || "dpf.distance_since_regeneration".equals(semantic)
+            || "dpf.time_since_regeneration".equals(semantic)
+            || "exhaust.temperature.pre_dpf".equals(semantic)
+            || "exhaust.temperature.post_dpf".equals(semantic)
+            || "dpf.differential_pressure".equals(semantic);
+    }
+
+    private boolean isExtendedSemantic(String semantic) {
+        return "engine.boost_pressure_actual".equals(semantic)
+            || "engine.injector_deviation.cylinder_1".equals(semantic)
+            || "engine.injector_deviation.cylinder_3".equals(semantic)
+            || "engine.injector_deviation.cylinder_4".equals(semantic)
+            || "engine.injector_deviation.cylinder_2".equals(semantic)
+            || "engine.boost_pressure_commanded".equals(semantic)
+            || "dpf.oil_ash_volume".equals(semantic)
+            || "dpf.fuel_consumption_since_regeneration".equals(semantic)
+            || "dpf.field_regeneration_request_status".equals(semantic)
+            || "dpf.service_regeneration_status".equals(semantic)
+            || "engine.rail_pressure_actual".equals(semantic)
+            || "engine.rail_pressure_commanded".equals(semantic)
+            || "engine.oil_temperature".equals(semantic)
+            || "dpf.field_regeneration_lock_status".equals(semantic)
+            || "engine.fuel_temperature".equals(semantic);
     }
 
     private JSONObject findValue(JSONArray values, String semantic) {
@@ -439,6 +561,7 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
         boolean hasInventory;
         boolean hasDtc;
         boolean hasDpf;
+        boolean hasExtended;
         boolean engineRpmPresent;
         double recordedRpm;
     }
