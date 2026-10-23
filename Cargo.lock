@@ -723,6 +723,7 @@ dependencies = [
  "mdf4-rs",
  "ratatui",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "tokio",
 ]

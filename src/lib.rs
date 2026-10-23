@@ -36,6 +36,7 @@ pub mod jsonl_capture;
 pub mod knowledge_db;
 pub mod layout_observation;
 pub mod mf4_capture;
+pub mod mobile;
 pub mod observed_inventory;
 pub mod protocol;
 pub mod runtime_actor;

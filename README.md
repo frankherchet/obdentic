@@ -98,6 +98,9 @@ Manufacturer-specific vehicle knowledge is intentionally added only when a read-
 
 ## Quick start
 
+For the native Android app, phone installation and its separate hardware
+acceptance checklist, see [Android workbench](docs/android.md).
+
 `rust-toolchain.toml` selects Rust 1.98.0. If another Cargo installation appears earlier in `PATH`, activate rustup first:
 
 ```sh

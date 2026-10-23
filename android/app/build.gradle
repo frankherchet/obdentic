@@ -1,0 +1,27 @@
+plugins { id 'com.android.application' }
+
+tasks.register('buildRust', Exec) {
+    workingDir rootProject.projectDir.parentFile
+    commandLine 'bash', 'tools/android-native.sh'
+}
+tasks.named('preBuild').configure { dependsOn 'buildRust' }
+
+android {
+    namespace 'de.obdentic.app'
+    compileSdk 36
+    defaultConfig {
+        applicationId 'de.obdentic.app'
+        minSdk 26
+        targetSdk 36
+        versionCode 1
+        versionName '0.1.0'
+        testInstrumentationRunner 'de.obdentic.app.AcceptanceRunner'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    packaging { jniLibs { useLegacyPackaging = false } }
+    lint { abortOnError true }
+}
