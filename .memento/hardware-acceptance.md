@@ -7,4 +7,6 @@ updated: 2026-10-23
 
 Real-vehicle acceptance is still open in issue #178 after the Android signal expansion. The previous vehicle session ended; do not assume the adapter and vehicle remain available.
 
-**Next step:** Review the current checklist and `docs/android.md`, then run one prepared acceptance session when the user confirms availability, including the added EA189 reads and recording/replay. Keep software/demo success separate from hardware evidence. Delete this memo when #178 is completed.
+The user explicitly requested a dedicated ash-candidate learning run, tracked in [#182](https://github.com/frankherchet/obdentic/issues/182). Prepare it alongside #178 to minimize vehicle visits; follow its separate session-design gate before considering any `10 03` experiment.
+
+**Next step:** Review both issue checklists and `docs/android.md`, prepare the missing bounded candidate test support, then schedule the prepared runs when the user confirms availability. Keep software/demo success separate from hardware evidence. Delete this memo when #178 and #182 are completed, or narrow it to the remaining gate.
