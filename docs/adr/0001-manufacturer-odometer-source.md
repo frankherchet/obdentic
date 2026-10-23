@@ -1,6 +1,6 @@
 # 0001. Manufacturer-specific odometer source for VW EA189-era vehicles
 Date: 2026-10-23
-Status: proposed
+Status: accepted
 
 ## Context
 The Android app reads the odometer only through standard Mode 01 PID 0xA6
@@ -57,7 +57,7 @@ Findings:
    path and violates REQ-007.3.
 
 ## Decision
-Proposed:
+Accepted by the maintainer on 2026-10-23:
 - Ship option 1 now: PID 0xA6 stays the only automatic odometer source.
 - Allow option 2 only as a separately refined follow-up feature, with these
   conditions:
