@@ -56,8 +56,13 @@ impl<'a> JobRuntime<'a> {
 
     /// Apply one authoritative runtime transition and record its evidence.
     pub async fn apply(&mut self, event: RuntimeEvent) -> Result<(), String> {
-        crate::scheduler::apply_runtime_event(self.runtime, self.state, self.capture.as_ref(), event)
-            .await
+        crate::scheduler::apply_runtime_event(
+            self.runtime,
+            self.state,
+            self.capture.as_ref(),
+            event,
+        )
+        .await
     }
 
     /// Emit a capture event directly, without a runtime transition. A no-op

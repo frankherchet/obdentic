@@ -29,9 +29,7 @@ impl fmt::Display for TransportFailure {
             Self::CommandTimedOut(command) => {
                 write!(formatter, "Carly command timed out: {command}")
             }
-            Self::NotificationStreamEnded => {
-                formatter.write_str("Carly notification stream ended")
-            }
+            Self::NotificationStreamEnded => formatter.write_str("Carly notification stream ended"),
         }
     }
 }
@@ -647,6 +645,20 @@ impl DiagnosticResponses {
         }
     }
 
+    pub(crate) fn observation_for_target(
+        &self,
+        target: &ResponderIdentity,
+        selection_error: Option<String>,
+    ) -> ResponseObservation {
+        ResponseObservation {
+            responses: self.capture_evidence(),
+            selected_responder: selection_error
+                .is_none()
+                .then(|| target.as_str().to_owned()),
+            selection_error,
+        }
+    }
+
     /// Select only a known responder. No value-based fallback is permitted.
     pub fn select(&self, target: &ResponderIdentity) -> Result<Vec<u8>, String> {
         let matches = self
@@ -969,7 +981,10 @@ where
                         let selection_error =
                             targeted_payload(&responses, request.expected_responder()).err();
                         Ok(EcuIdentificationReadEvidence {
-                            observations: vec![responses.observation(selection_error)],
+                            observations: vec![responses.observation_for_target(
+                                request.expected_responder(),
+                                selection_error,
+                            )],
                             responses,
                         })
                     }
@@ -988,7 +1003,9 @@ where
             Ok(first) => {
                 let selection_error = targeted_payload(&first, request.expected_responder()).err();
                 Ok(EcuIdentificationReadEvidence {
-                    observations: vec![first.observation(selection_error)],
+                    observations: vec![
+                        first.observation_for_target(request.expected_responder(), selection_error)
+                    ],
                     responses: first,
                 })
             }
@@ -1185,11 +1202,15 @@ where
         Ok(responses) => match targeted_payload(&responses, request.expected_responder()) {
             Ok(payload) => Ok(ReadEvidence {
                 payload,
-                observations: vec![responses.observation(None)],
+                observations: vec![
+                    responses.observation_for_target(request.expected_responder(), None)
+                ],
             }),
             Err(error) => Err(ReadEvidenceError {
                 error: error.clone(),
-                observations: vec![responses.observation(Some(error))],
+                observations: vec![
+                    responses.observation_for_target(request.expected_responder(), Some(error))
+                ],
             }),
         },
         Err(error) => Err(ReadEvidenceError {
@@ -1272,19 +1293,21 @@ fn targeted_payload(
     responses: &DiagnosticResponses,
     expected: &ResponderIdentity,
 ) -> Result<Vec<u8>, String> {
-    if let Some(unexpected) = responses
+    let expected_observed = responses
         .as_slice()
         .iter()
-        .find(|response| response.responder.as_ref() != Some(expected))
-    {
-        let observed = unexpected
-            .responder
-            .as_ref()
-            .map_or("unknown", ResponderIdentity::as_str);
-        return Err(format!(
-            "unexpected responder {observed} for targeted read; expected {}",
-            expected.as_str()
-        ));
+        .any(|response| response.responder.as_ref() == Some(expected));
+    if !expected_observed {
+        if let Some(unexpected) = responses.as_slice().first() {
+            let observed = unexpected
+                .responder
+                .as_ref()
+                .map_or("unknown", ResponderIdentity::as_str);
+            return Err(format!(
+                "unexpected responder {observed} for targeted read; expected {}",
+                expected.as_str()
+            ));
+        }
     }
     responses.select(expected)
 }

@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <instrumentation android:name="de.obdentic.app.AcceptanceRunner" android:targetPackage="de.obdentic.app" android:label="Offline phone acceptance" />
+    <instrumentation android:name="de.obdentic.app.RecordingAuditRunner" android:targetPackage="de.obdentic.app" android:label="Offline recording audit" />
+    <instrumentation
+        android:name="de.obdentic.app.HardwareAcceptanceRunner"
+        android:targetPackage="de.obdentic.app"
+        android:label="OBDentic live vehicle acceptance"
+        android:functionalTest="true" />
+</manifest>

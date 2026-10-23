@@ -24,6 +24,7 @@ pub mod jobs;
 pub mod knowledge_db;
 pub mod layout_observation;
 mod legacy_recording;
+pub mod mobile;
 pub mod observed_inventory;
 pub mod protocol;
 mod read;
