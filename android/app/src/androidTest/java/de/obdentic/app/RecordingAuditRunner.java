@@ -21,7 +21,7 @@ public final class RecordingAuditRunner extends Instrumentation {
             File[] files=new File(getTargetContext().getFilesDir(),"recordings").listFiles();
             if(files!=null) for(File file:files) if(file.isFile()&&file.getName().endsWith(".jsonl")) {
                 JSONObject report=new JSONObject();report.put("name",file.getName());report.put("bytes",file.length());
-                int tx=0,rx=0,reads=0,failures=0,decodeErrors=0,mismatches=0,jobs=0;boolean complete=false,header=false,invalid=false;String mode="unknown",reason="";
+                int tx=0,rx=0,reads=0,failures=0,decodeErrors=0,mismatches=0,jobs=0;boolean complete=false,header=false,invalid=false;String mode="unknown",reason="",profile="";
                 if(file.length()>64L*1024*1024) {report.put("error","Inspection limit exceeded");reports.put(report);continue;}
                 try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(file),StandardCharsets.UTF_8))) {
                     String line;int count=0;
@@ -29,13 +29,13 @@ public final class RecordingAuditRunner extends Instrumentation {
                         if(++count>200000 || line.length()>1048576) throw new IOException("Inspection limit exceeded");
                         if(complete) {invalid=true;break;}
                         JSONObject event=new JSONObject(line);String type=event.optString("type");
-                        if(!header) {if(!type.equals("session")||!event.optString("schema").equals("OBDENTIC-MOBILE")||event.optInt("version")!=1)throw new IOException("Unknown header");header=true;mode=event.optString("mode","unknown");continue;}
+                        if(!header) {if(!type.equals("session")||!event.optString("schema").equals("OBDENTIC-MOBILE")||event.optInt("version")!=1)throw new IOException("Unknown header");header=true;mode=event.optString("mode","unknown");profile=event.optString("profile");continue;}
                         if(type.equals("session_end")) {complete=true;reason=event.optString("reason");}
                         if(type.equals("wire")) {if(event.optString("direction").equals("TX"))tx++;if(event.optString("direction").equals("RX"))rx++;}
                         if(type.equals("action")) {
                             String action=event.optString("action");JSONObject envelope=event.optJSONObject("result");if(envelope==null) {invalid=true;continue;}
                             if(!envelope.optBoolean("ok")) {failures++;continue;}
-                            if(action.equals("read")||action.equals("dtc.scan")||(action.equals("ea189.dpf.probe")||action.equals("ea189.extended.probe"))) {
+                            if(action.equals("read")||action.equals("dtc.scan")||action.equals("ea189.dpf.probe")||action.equals("ea189.extended.probe")||action.equals("ea189.ash.probe")) {
                                 JSONObject data=envelope.optJSONObject("data");JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay."+action,data==null?"{}":data.toString()));
                                 if(!decoded.optBoolean("ok"))decodeErrors++;
                                 else if(action.equals("read")) {reads++;if(data==null||!Double.isFinite(data.optDouble("value",Double.NaN))||Math.abs(data.optDouble("value")-decoded.getJSONObject("data").optDouble("value"))>1e-9)mismatches++;}
@@ -47,7 +47,7 @@ public final class RecordingAuditRunner extends Instrumentation {
                 report.put("mode",mode);report.put("header",header);report.put("complete",complete&&!invalid);report.put("invalid",invalid);report.put("end_reason",reason);
                 report.put("tx",tx);report.put("rx",rx);report.put("decoded_reads",reads);report.put("recorded_errors",failures);report.put("decode_errors",decodeErrors);report.put("value_mismatches",mismatches);report.put("diagnostic_jobs",jobs);
                 reports.put(report);
-                if(mode.equals("live"))emit(file);
+                if(mode.equals("live")||(mode.equals("demo")&&profile.equals(TestSequence.PROFILE)&&complete&&!invalid))emit(file);
             }
             result.putString("stream",reports.toString(2));finish(Activity.RESULT_OK,result);
         } catch(Throwable error) {result.putString("stream","AUDIT FAILED: "+error.getClass().getSimpleName());finish(Activity.RESULT_CANCELED,result);}
