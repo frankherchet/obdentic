@@ -160,7 +160,8 @@ public final class ObdService extends Service {
         JSONObject support=result.optJSONObject("data"); if(support != null) { set("vehicle",support); applySupport(support); }
         JSONObject inventory=execute("inventory","");
         if(token!=generation) return;
-        String notice=observeVehicle(inventory.optJSONObject("data"));
+        String outcome=observeVehicle(inventory.optJSONObject("data")), notice=vehicleNotice(outcome,inventory.optJSONObject("data"));
+        readOdometer(inventory.optJSONObject("data"),outcome);
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
         JSONArray defaults=new JSONArray(); synchronized(stateLock) { JSONArray selected=state.optJSONArray("selected");
@@ -170,10 +171,12 @@ public final class ObdService extends Service {
         } if(defaults.length()>0) setSignals(defaults);
         message((mode.equals("demo") ? "Demo · synthetische Fahrzeugdaten" : "Carly bereit") + notice);
     }
-    /** Live sessions only: records the VIN-keyed vehicle and returns " · notice" (or "") for the status line. Never touches the adapter. */
+    /** Live sessions only: records the VIN-keyed vehicle and returns the store outcome (or ""). Never touches the adapter. */
     private String observeVehicle(JSONObject inventory) {
-        if(!mode.equals("live") || inventory==null) return "";
-        String outcome=vehicles.observe(inventory,System.currentTimeMillis());
+        return !mode.equals("live") || inventory==null ? "" : vehicles.observe(inventory,System.currentTimeMillis());
+    }
+    /** " · notice" (or "") for the status line. */
+    private String vehicleNotice(String outcome,JSONObject inventory) {
         switch(outcome) {
             case "unreadable_vin": return " · Fahrzeug nicht gespeichert · FIN nicht lesbar";
             case "store_unreadable": return " · "+VehicleStore.UNREADABLE;
@@ -181,6 +184,19 @@ public final class ObdService extends Service {
             case "switched": return " · Anderes Fahrzeug erkannt: "+vehicles.name(inventory.optString("vin"));
             default: return "";
         }
+    }
+    /** Live sessions, stored vehicle, PID A6 advertised only (REQ-015): one Mode 01 A6 read; success or failure goes to the vehicle record. */
+    private void readOdometer(JSONObject inventory,String outcome) throws Exception {
+        if(!mode.equals("live") || inventory==null || !(outcome.equals("created") || outcome.equals("updated") || outcome.equals("switched")) || !"supported".equals(signalStatus("vehicle.odometer"))) return;
+        String vin=inventory.optString("vin"); JSONObject result=execute("read","vehicle.odometer"); JSONObject data=result.optJSONObject("data");
+        long now=System.currentTimeMillis();
+        if(result.optBoolean("ok") && data!=null) vehicles.odometer(vin,data.optDouble("value"),now);
+        else vehicles.odometerFailure(vin,result.optString("error","Unbekannter Fehler"),now);
+    }
+    private String signalStatus(String semantic) {
+        synchronized(stateLock) { JSONArray signals=state.optJSONArray("signals");
+            for(int i=0;i<signals.length();i++) if(semantic.equals(signals.optJSONObject(i).optString("semantic"))) return signals.optJSONObject(i).optString("status"); }
+        return "";
     }
     public void selectVehicle(String vin) { vehicleAction(() -> { String error=vehicles.select(vin); return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
     public void renameVehicle(String vin,String name) { vehicleAction(() -> { String error=vehicles.rename(vin,name); return error==null?"Fahrzeug umbenannt: "+vehicles.name(vin):error; }); }
@@ -249,7 +265,7 @@ public final class ObdService extends Service {
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
             if(!argument.isEmpty()) updateValue(argument,result);
             if(isEa189Job(action)) applyDpf(result);
-            String notice=action.equals("inventory") ? observeVehicle(result.optJSONObject("data")) : "";
+            String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
         } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
     }
@@ -517,7 +533,10 @@ public final class ObdService extends Service {
             else if(c.equals("0100")) response="7E8 06 41 00 FF FF FF FF\r>";
             else if(c.equals("0120")) response="7E8 06 41 20 FF FF FF FF\r>";
             else if(c.equals("0140")) response="7E8 06 41 40 FF FF FF FF\r>";
-            else if(c.equals("0160")) response="7E8 06 41 60 E0 00 00 00\r>";
+            else if(c.equals("0160")) response="7E8 06 41 60 E0 00 00 01\r>";
+            else if(c.equals("0180")) response="7E8 06 41 80 00 00 00 01\r>";
+            else if(c.equals("01A0")) response="7E8 06 41 A0 04 00 00 00\r>";
+            else if(c.equals("01A6")) response="7E8 06 41 A6 00 12 D6 87\r>";
             else if(c.equals("0902")) response="7E8 10 14 49 02 01 57 56 57\r7E8 21 30 30 30 30 30 30 30\r7E8 22 30 30 30 30 30 30 30\r>";
             else if(c.equals("011F")) response="7E8 04 41 1F 04 B0\r>";
             else if(c.equals("0121")) response="7E8 04 41 21 00 64\r>";

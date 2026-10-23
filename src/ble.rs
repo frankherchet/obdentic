@@ -1221,7 +1221,7 @@ impl<E: AdapterLink> DiagnosticSession<E> {
 
     async fn discover_support(&mut self) -> Result<(), String> {
         self.elm_mut()?
-            .discover_support(highest_catalog_page())
+            .discover_support(crate::vehicle::highest_catalog_page())
             .await
     }
 
@@ -1252,15 +1252,7 @@ async fn discover_pid_support<E>(exchange: &mut E) -> Result<PidSupport, String>
 where
     E: ElmExchange,
 {
-    discover_pid_support_with_limit(exchange, highest_catalog_page()).await
-}
-
-fn highest_catalog_page() -> u8 {
-    crate::vehicle::signals()
-        .iter()
-        .map(|signal| signal.request().pid().saturating_sub(1) & !0x1f)
-        .max()
-        .unwrap_or(0)
+    discover_pid_support_with_limit(exchange, crate::vehicle::highest_catalog_page()).await
 }
 
 #[cfg(test)]

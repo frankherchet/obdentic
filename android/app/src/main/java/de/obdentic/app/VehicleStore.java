@@ -123,6 +123,34 @@ public final class VehicleStore {
         change.accept(next);
         return write(next) ? null : WRITE_FAILED;
     }
+    /** REQ-015.1/.4: stores the odometer; a lower value than the stored one is stored too and noted, never corrected. */
+    public synchronized String odometer(String vin, double km, long now) {
+        return mutate(vin, next -> {
+            JSONObject row = find(next, vin), old = row.optJSONObject("odometer");
+            row.remove("odometer_error");
+            row.remove("odometer_decrease");
+            if (old != null && km < old.optDouble("km")) {
+                JSONObject decrease = new JSONObject();
+                put(decrease, "previous_km", old.optDouble("km"));
+                put(decrease, "previous_at", old.optLong("read_at"));
+                put(row, "odometer_decrease", decrease);
+            }
+            JSONObject value = new JSONObject();
+            put(value, "km", km);
+            put(value, "read_at", now);
+            put(value, "source", "OBD PID A6");
+            put(row, "odometer", value);
+        });
+    }
+    /** REQ-015.3: records the failure; stored value and date stay untouched. */
+    public synchronized String odometerFailure(String vin, String error, long now) {
+        return mutate(vin, next -> {
+            JSONObject failure = new JSONObject();
+            put(failure, "error", error);
+            put(failure, "at", now);
+            put(find(next, vin), "odometer_error", failure);
+        });
+    }
     public synchronized String select(String vin) { return mutate(vin, next -> put(next, "selected", vin)); }
     public synchronized String rename(String vin, String name) {
         String trimmed = name == null ? "" : name.trim();

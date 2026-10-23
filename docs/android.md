@@ -8,7 +8,7 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 ## First release
 
 - Carly BLE scan, explicit connect/disconnect and recoverable permission errors.
-- 49 standard semantic measurements, vehicle-advertised support, live trends and sample age.
+- 50 standard semantic measurements, vehicle-advertised support, live trends and sample age.
 - VIN where readable and a **partial** functional responder inventory; this is not
   a full manufacturer installation list.
 - Stored Mode 03 DTCs, scoped by responder.
@@ -60,8 +60,8 @@ includes `10 03` preparation (UDS extended diagnostic session). A separate close
 preparation or any fallback. It requires validated engine targeting and retains
 uninterpreted responses/NRCs rather than manufacturing ash telemetry. No session-start
 traffic is added. The existing seven-value DPF job and its replay remain separate.
-Support discovery follows advertised continuation bits only, bounded through
-page `0x60` for the newly catalogued torque PIDs.
+Support discovery follows advertised continuation bits only, bounded by the highest page
+the catalog needs (currently `0xA0`, for the odometer PID `A6`).
 
 ## Known vehicles
 
@@ -76,9 +76,14 @@ opens the "Fahrzeuge" page (masked VIN, details, rename, delete with
 confirmation). Demo and replay sessions never touch the store, an unreadable VIN
 saves nothing, and selecting a record sends no adapter traffic. A corrupt file is
 reported and never overwritten implicitly; only a confirmed reset replaces it. A
-failed write leaves the previous file and the in-memory state unchanged. The
-odometer is not read yet, so the page shows "km-Stand nicht verfügbar". Covered by
-`VehicleRecordsAcceptance` (REQ-013).
+failed write leaves the previous file and the in-memory state unchanged. After
+the inventory of a live session for a stored vehicle, the odometer is read once through
+standard Mode 01 PID `A6` (`(A·2^24+B·2^16+C·2^8+D)/10` km) when the vehicle advertises
+it, and stored with read date and source "OBD PID A6"; when it is not advertised no
+request is sent. A failed read keeps the stored value and date and is shown in the
+details, as is a value lower than the stored one (the new value is stored, neither is
+corrected). Without a stored value the page shows "km-Stand nicht verfügbar". Covered
+by `VehicleRecordsAcceptance` (REQ-013, REQ-015) and the demo read in `AcceptanceRunner`.
 
 ## Build and install
 

@@ -47,7 +47,7 @@ const PROFILES: [ProfileMetadata; 2] = [
     },
 ];
 
-const SIGNALS: [SignalDefinition; 49] = [
+const SIGNALS: [SignalDefinition; 50] = [
     SignalDefinition::new(
         SignalMetadata {
             semantic: "engine.rpm",
@@ -979,6 +979,25 @@ const SIGNALS: [SignalDefinition; 49] = [
         Mode01::new(0x63, 2),
         |data| u16::from_be_bytes([data[0], data[1]]) as f64,
     ),
+    SignalDefinition::new(
+        SignalMetadata {
+            semantic: "vehicle.odometer",
+            profile: "obd2-v1",
+            protocol: "OBD-II Mode 01",
+            request: [0x01, 0xa6],
+            decoder: "((A * 16777216) + (B * 65536) + (C * 256) + D) / 10",
+            minimum: 0.0,
+            maximum: 429496729.5,
+            description: "Total vehicle distance traveled (odometer).",
+            subsystem: "diagnostics",
+            unit: "km",
+            provenance: "SAE J1979 Mode 01 PID A6",
+            confidence: "standards-derived/offline-tested",
+            hardware_validation: "rust-hardware-pending",
+        },
+        Mode01::new(0xa6, 4),
+        |data| u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as f64 / 10.0,
+    ),
 ];
 
 impl SignalDefinition {
@@ -1012,6 +1031,15 @@ pub(crate) fn signal(semantic: &str) -> Option<&'static SignalDefinition> {
 
 pub(crate) fn signals() -> &'static [SignalDefinition] {
     &SIGNALS
+}
+
+/// Highest PID support page (0x00, 0x20, ...) needed to cover every catalog PID.
+pub(crate) fn highest_catalog_page() -> u8 {
+    SIGNALS
+        .iter()
+        .map(|signal| signal.request.pid().saturating_sub(1) & !0x1f)
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn supported_profiles() -> &'static [ProfileMetadata] {
@@ -1483,6 +1511,17 @@ mod tests {
                 0.0,
                 65535.0,
             ),
+            // REQ-015.1: odometer is (A*2^24 + B*2^16 + C*2^8 + D) / 10 km.
+            (
+                "vehicle.odometer",
+                0xa6,
+                vec![0x41, 0xa6, 0x00, 0x12, 0xd6, 0x87],
+                123456.7,
+                vec![0x41, 0xa6, 0x00, 0x00, 0x00, 0x00],
+                vec![0x41, 0xa6, 0xff, 0xff, 0xff, 0xff],
+                0.0,
+                429496729.5,
+            ),
         ] {
             let definition = signal(semantic).expect("signal is catalogued");
             assert_eq!(definition.metadata().request, [0x01, pid]);
@@ -1618,6 +1657,7 @@ mod tests {
             ("engine.driver_demand_torque_percent", "%"),
             ("engine.actual_torque_percent", "%"),
             ("engine.reference_torque", "N·m"),
+            ("vehicle.odometer", "km"),
         ];
 
         assert_eq!(signals().len(), expected.len());
