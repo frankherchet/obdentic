@@ -210,21 +210,24 @@ public final class ObdService extends Service {
     }
     public void runJob(String action) {
         if(busy || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
-        if(!action.equals("inventory") && !action.equals("dtc.scan") && !action.equals("ea189.dpf.probe") && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
+        if(!action.equals("inventory") && !action.equals("dtc.scan") && !isEa189Job(action) && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
         busy=true; changed(); int token=generation;
         worker.execute(() -> { try {
             if(token!=generation) return;
             String argument=action.startsWith("read:") ? action.substring(5) : "";
-            if(action.equals("ea189.dpf.probe")) { JSONObject inventory=execute("inventory",""); if(token!=generation) return; set("vehicle",inventory.opt("data")); }
+            if(isEa189Job(action)) { JSONObject inventory=execute("inventory",""); if(token!=generation) return; set("vehicle",inventory.opt("data")); }
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
             if(token!=generation) return;
             set("jobResult",result);
             if(action.equals("inventory")) { set("vehicle",result.opt("data")); if(result.optJSONObject("data") != null) applySupport(result.optJSONObject("data")); }
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
             if(!argument.isEmpty()) updateValue(argument,result);
-            if(action.equals("ea189.dpf.probe")) applyDpf(result);
+            if(isEa189Job(action)) applyDpf(result);
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action : result.optString("error"));
         } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
+    }
+    private static boolean isEa189Job(String action) {
+        return action.equals("ea189.dpf.probe") || action.equals("ea189.extended.probe");
     }
     private void applyDpf(JSONObject result) {
         JSONObject data=result.optJSONObject("data"); if(data==null) return;
@@ -241,14 +244,15 @@ public final class ObdService extends Service {
         if(busy || !phase().equals("ready") || core==0) return;
         BleTransport active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
-        boolean dpf=recordingProfile.equals("ea189-dpf");
+        String probeAction=recordingProfile.equals("ea189-dpf")?"ea189.dpf.probe":recordingProfile.equals("ea189-extended")?"ea189.extended.probe":"";
+        boolean dpf=!probeAction.isEmpty();
         if((selected.length()==0 && !dpf) || SystemClock.elapsedRealtime()-lastPoll<(dpf?10000:500)) return;
         int token=generation;
         try {
             if(dpf) {
                 boolean validated; synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); validated=vehicle!=null && vehicle.optBoolean("engine_target_validated"); }
                 if(!validated) { JSONObject inventory=execute("inventory",""); if(token!=generation) return; set("vehicle",inventory.opt("data")); }
-                JSONObject result=execute("ea189.dpf.probe",""); if(token!=generation) return; applyDpf(result); set("jobResult",result);
+                JSONObject result=execute(probeAction,""); if(token!=generation) return; applyDpf(result); set("jobResult",result);
             } else {
                 long now=SystemClock.elapsedRealtime(), earliest=Long.MAX_VALUE; String semantic=null;
                 synchronized(due) { for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i); long next=due.getOrDefault(candidate,0L);
@@ -298,7 +302,7 @@ public final class ObdService extends Service {
                 recordingOriginNanos=SystemClock.elapsedRealtimeNanos();
                 writer=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory,name)),StandardCharsets.UTF_8));
                 set("recording",name);
-                JSONObject header=new JSONObject(); put(header,"type","session"); put(header,"schema","OBDENTIC-MOBILE"); put(header,"version",1); put(header,"mode",mode); put(header,"profile",profileId); put(header,"selected",signals);
+                JSONObject header=new JSONObject(); put(header,"type","session"); put(header,"schema","OBDENTIC-MOBILE"); put(header,"version",1); put(header,"mode",mode); put(header,"profile",profileId); put(header,"selected",profileId.equals("ea189-dpf")||profileId.equals("ea189-extended")?new JSONArray():signals);
                 synchronized(stateLock) { put(header,"vehicle",state.opt("vehicle")); put(header,"diagnostics",state.opt("diagnostics")); put(header,"catalog",state.opt("signals")); put(header,"profiles",state.opt("profiles")); }
                 // Notifications must not precede the header in the new evidence stream.
                 record(header);
@@ -306,7 +310,7 @@ public final class ObdService extends Service {
             }
             recordingProfile=profileId;
             synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?1200L:periods.optLong(i,1200L)); }
-            selectSignals(signals); message("Aufnahme läuft: " + profileId);
+            if(profileId.equals("ea189-dpf")||profileId.equals("ea189-extended"))set("selected",new JSONArray());else selectSignals(signals); message("Aufnahme läuft: " + profileId);
         } catch(IOException e) { message(e.getMessage()); }
     }
     public void stopRecording() { if(!worker.isShutdown()) worker.execute(this::stopRecordingNow); }
@@ -360,8 +364,8 @@ public final class ObdService extends Service {
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay.read",recorded.toString()));
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
-                        else if(action.equals("inventory")) set("vehicle",result.opt("data"));
-                        else if(action.equals("dtc.scan") || action.equals("ea189.dpf.probe")) {
+                        else if(action.equals("inventory")) restoreVehicle(result.optJSONObject("data"));
+                        else if(action.equals("dtc.scan") || isEa189Job(action)) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));
                             if(action.equals("dtc.scan")) set("diagnostics",decoded.opt("data")); else applyDpf(decoded);
@@ -369,8 +373,8 @@ public final class ObdService extends Service {
                         }
                         set("jobResult",result);
                     } else if(event.optString("type").equals("session")) {
-                        set("selected",event.optJSONArray("selected")==null?new JSONArray():event.optJSONArray("selected"));
-                        if(event.optJSONObject("vehicle")!=null) set("vehicle",event.optJSONObject("vehicle"));
+                        String savedProfile=event.optString("profile");if(savedProfile.equals("ea189-dpf")||savedProfile.equals("ea189-extended"))set("selected",new JSONArray());else selectSignals(event.optJSONArray("selected")==null?new JSONArray():event.optJSONArray("selected"));
+                        if(event.optJSONObject("vehicle")!=null) restoreVehicle(event.optJSONObject("vehicle"));
                         if(event.optJSONObject("diagnostics")!=null && event.optJSONObject("diagnostics").has("raw_response")) { JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay.dtc.scan",event.optJSONObject("diagnostics").toString())); set("diagnostics",decoded.opt("data")); }
                         set("replaySourceMode",event.optString("mode","unknown"));
                     } else if(event.optString("type").equals("wire")) { synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } }
@@ -380,6 +384,15 @@ public final class ObdService extends Service {
             }
         } catch(Exception e) { if(token==generation) { set("replayPartial",true); message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
         finally { if(token==generation) { busy=false; changed(); } } });
+    }
+    private void restoreVehicle(JSONObject vehicle) throws Exception {
+        if(vehicle==null)return;
+        String vin=vehicle.optString("vin","");
+        if(!vin.isEmpty()) {
+            JSONObject identity=new JSONObject(NativeCore.execute(core,"vin.describe",vin));
+            if(identity.optBoolean("ok"))put(vehicle,"vin_identity",identity.optJSONObject("data"));
+        }
+        set("vehicle",vehicle);
     }
     public void onDestroy() { disconnect(); worker.execute(this::destroyCore); worker.shutdown(); listener=null; current=null; super.onDestroy(); }
     private final class Demo implements NativeCore.Exchange {
@@ -392,8 +405,9 @@ public final class ObdService extends Service {
             else if(c.startsWith("AT")) response="OK\r>";
             else if(c.equals("0100")) response="7E8 06 41 00 FF FF FF FF\r>";
             else if(c.equals("0120")) response="7E8 06 41 20 FF FF FF FF\r>";
-            else if(c.equals("0140")) response="7E8 06 41 40 FF FF FF FE\r>";
-            else if(c.equals("0902")) response="7E8 10 14 49 02 01 44 45 4D\r7E8 21 54 30 30 30 30 30 30\r7E8 22 30 30 30 30 30 30 31\r>";
+            else if(c.equals("0140")) response="7E8 06 41 40 FF FF FF FF\r>";
+            else if(c.equals("0160")) response="7E8 06 41 60 E0 00 00 00\r>";
+            else if(c.equals("0902")) response="7E8 10 14 49 02 01 57 56 57\r7E8 21 30 30 30 30 30 30 30\r7E8 22 30 30 30 30 30 30 30\r>";
             else if(c.equals("011F")) response="7E8 04 41 1F 04 B0\r>";
             else if(c.equals("0121")) response="7E8 04 41 21 00 64\r>";
             else if(c.equals("0123")) response="7E8 04 41 23 0B B8\r>";
@@ -426,8 +440,41 @@ public final class ObdService extends Service {
             else if(c.equals("03")) response="7E8 07 43 01 33 00 00 00 00\r>";
             else if(c.equals("07")) response="7E8 03 47 00 00\r>";
             else if(c.equals("0A")) response="7E8 03 4A 00 00\r>";
-            else response="NO DATA\r>";
+            else {response=additionalDemoResponse(c);if(response==null)response="NO DATA\r>";}
             debug("RX",response); return response;
+        }
+        private String additionalDemoResponse(String command) {
+            String data;
+            switch(command) {
+                case "0106":case "0107":case "0108":case "0109":case "012E":case "012F":
+                case "0147":case "0148":case "0149":case "014B":case "0152":case "015A":data="80";break;
+                case "010A":data="64";break;
+                case "010E":data="90";break;
+                case "0122":data="03 20";break;
+                case "013C":case "013D":case "013E":case "013F":data="0F A0";break;
+                case "0143":data="01 00";break;
+                case "0144":data="80 00";break;
+                case "0159":data="0B B8";break;
+                case "015C":data="82";break;
+                case "015D":data="69 00";break;
+                case "015E":data="00 64";break;
+                case "0161":case "0162":data="96";break;
+                case "0163":data="01 90";break;
+                case "221153":data="00 0C";break;
+                case "22115A":data="01 F4";break;
+                case "22115B":case "22115C":case "2211C1":data="00";break;
+                case "221057":case "221149":data="03 E8";break;
+                case "2211BE":data="0E 2F";break;
+                case "22162D":data="0C 3B";break;
+                case "2210FF":case "221100":data="00 0A";break;
+                case "221104":case "221105":data="FF F6";break;
+                case "221169":case "22116A":data="0B B8";break;
+                default:return null;
+            }
+            boolean uds=command.startsWith("22");
+            int length=(uds?3:2)+data.split(" ").length;
+            return String.format(Locale.ROOT,"7E8 %02X %s %s %s\r>",length,uds?"62":"41",
+                uds?command.substring(2,4)+" "+command.substring(4):command.substring(2),data);
         }
     }
 }

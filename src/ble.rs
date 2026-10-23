@@ -2032,18 +2032,22 @@ mod tests {
             "410080000001\r>",
             "412080000001\r>",
             "414080000001\r>",
+            "416000000000\r>",
         ]);
 
         let support = discover_pid_support(&mut exchange).await.unwrap();
 
-        assert_eq!(exchange.commands(), ["0100\r", "0120\r", "0140\r"]);
+        assert_eq!(
+            exchange.commands(),
+            ["0100\r", "0120\r", "0140\r", "0160\r"]
+        );
         assert_eq!(support.status(0x01), SignalSupportStatus::Supported);
         assert_eq!(support.status(0x20), SignalSupportStatus::Supported);
         assert_eq!(support.status(0x21), SignalSupportStatus::Supported);
         assert_eq!(support.status(0x40), SignalSupportStatus::Supported);
         assert_eq!(support.status(0x41), SignalSupportStatus::Supported);
         assert_eq!(support.status(0x42), SignalSupportStatus::Unsupported);
-        assert_eq!(support.status(0x61), SignalSupportStatus::Unknown);
+        assert_eq!(support.status(0x61), SignalSupportStatus::Unsupported);
         assert_eq!(
             support.discovery,
             [
@@ -2061,6 +2065,11 @@ mod tests {
                     request: [0x01, 0x40],
                     responder: None,
                     response: [0x41, 0x40, 0x80, 0x00, 0x00, 0x01],
+                },
+                SupportDiscovery {
+                    request: [0x01, 0x60],
+                    responder: None,
+                    response: [0x41, 0x60, 0x00, 0x00, 0x00, 0x00],
                 },
             ]
         );

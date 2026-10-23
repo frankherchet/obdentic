@@ -89,6 +89,7 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                     "read" => "replay.read",
                     "dtc.scan" => "replay.dtc.scan",
                     "ea189.dpf.probe" => "replay.ea189.dpf.probe",
+                    "ea189.extended.probe" => "replay.ea189.extended.probe",
                     _ => continue,
                 };
                 let decoded: Value = serde_json::from_str(
@@ -178,5 +179,47 @@ mod tests {
         ).as_bytes()).unwrap();
         assert_eq!(value["complete"], false);
         assert!(value["last_values"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recomputes_the_closed_ea189_extended_job_offline() {
+        let readings: Vec<_> = obdentic::ea189::Ea189ExtendedSignal::ALL
+            .into_iter()
+            .map(|signal| {
+                let definition = signal.definition();
+                let [_, high, low] = definition.request_bytes();
+                let data = vec![0; definition.data_len()];
+                let mut response = format!("7E8 {:02X} 62 {high:02X} {low:02X}", data.len() + 3);
+                for byte in data {
+                    response.push_str(&format!(" {byte:02X}"));
+                }
+                json!({
+                    "semantic":signal.semantic(),
+                    "request":format!("22 {high:02X} {low:02X}"),
+                    "raw_response":format!("{response}\r>"),
+                    "value":999
+                })
+            })
+            .collect();
+        let recording = format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session","schema":"OBDENTIC-MOBILE","version":1,"mode":"demo","profile":"ea189-extended"}),
+            json!({"type":"action","action":"ea189.extended.probe","result":{"ok":true,"data":{"experimental":true,"readings":readings}}}),
+            json!({"type":"session_end","reason":"stopped"})
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert_eq!(report["complete"], true);
+        assert!(report["issues"].as_array().unwrap().is_empty());
+        assert_eq!(
+            report["diagnostic_jobs"][0]["data"]["readings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            obdentic::ea189::EA189_EXTENDED_PROBE_COUNT
+        );
+        let ash = &report["diagnostic_jobs"][0]["data"]["readings"][6];
+        assert_eq!(ash["semantic"], "dpf.oil_ash_volume");
+        assert_eq!(ash["value"], 0.0);
+        assert_eq!(ash["replay"], true);
     }
 }

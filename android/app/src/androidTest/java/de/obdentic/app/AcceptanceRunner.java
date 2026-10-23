@@ -37,9 +37,16 @@ public final class AcceptanceRunner extends Instrumentation {
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"), "demo initialization");
             JSONObject state = service.snapshot();
             require("demo".equals(state.optString("mode")), "Demo must be visibly separate from live");
-            require(state.getJSONArray("signals").length() >= 20, "Full semantic catalog");
-            require(state.getJSONArray("profiles").length() >= 4, "Capture profiles and DPF profile");
+            require(state.getJSONArray("signals").length() == 49, "Expanded semantic catalog");
+            require(state.getJSONArray("profiles").length() >= 6, "Capture profiles and explicit EA189 profiles");
             passed("Rust JNI library, real initialization/parser, signal and profile catalogs");
+
+            service.setSignals(new JSONArray());waitIdle();
+            JSONArray catalog=state.getJSONArray("signals");
+            for(int i=0;i<catalog.length();i++)job("read:"+catalog.getJSONObject(i).getString("semantic"));
+            require(service.snapshot().getJSONArray("values").length()==49,"Every catalog scalar decoded in Android demo");
+            service.setDemo();waitFor(() -> "ready".equals(service.snapshot().optString("phase"))&&!service.snapshot().optBoolean("busy"),"reset demo values");
+            passed("All 49 standard scalars decode through the actual Android/JNI transport seam");
 
             service.setSignals(new JSONArray().put("engine.rpm").put("engine.coolant_temperature"));
             waitFor(() -> service.snapshot().optJSONArray("values").length() >= 2, "live scalar reads");
@@ -56,6 +63,9 @@ public final class AcceptanceRunner extends Instrumentation {
 
             job("inventory");
             require(service.snapshot().optJSONObject("vehicle").optBoolean("engine_target_validated"), "Evidenced engine target");
+            JSONObject vinIdentity=service.snapshot().getJSONObject("vehicle").getJSONObject("vin_identity");
+            require("Volkswagen".equals(vinIdentity.optString("make_hint")),"Synthetic demo VIN manufacturer hint");
+            require(vinIdentity.isNull("model")&&vinIdentity.isNull("engine"),"WMI must not guess model or engine");
             job("dtc.scan");
             require(service.snapshot().getJSONObject("diagnostics").toString().contains("P0133"), "Responder-scoped DTC decoding");
             job("ea189.dpf.probe");
@@ -74,6 +84,11 @@ public final class AcceptanceRunner extends Instrumentation {
             File file = new File(new File(getTargetContext().getFilesDir(), "recordings"), filename);
             waitFor(() -> file.length() > 500, "recording evidence");
             long initial = file.length();
+            job("ea189.extended.probe");
+            JSONArray extended=service.snapshot().getJSONObject("jobResult").getJSONObject("data").getJSONArray("readings");
+            require(extended.length()==15,"All closed EA189 additional readings retained");
+            for(int i=0;i<extended.length();i++)require(extended.getJSONObject(i).has("value")&&extended.getJSONObject(i).optBoolean("experimental"),"Additional EA189 decoder succeeds and stays experimental");
+            capture(activity,"Diagnose","acceptance-diagnose.png");
             getUiAutomation().executeShellCommand("input keyevent 3").close();
             getUiAutomation().executeShellCommand("input keyevent 223").close();
             SystemClock.sleep(4000);
@@ -117,10 +132,14 @@ public final class AcceptanceRunner extends Instrumentation {
             service.openRecording(filename);
             waitFor(() -> "replay".equals(service.snapshot().optString("mode")) && !service.snapshot().optBoolean("busy"), "offline replay");
             require(service.snapshot().getJSONArray("values").length()>0,"Replay restores readings");
+            require(findValue(service.snapshot().getJSONArray("values"),"dpf.oil_ash_volume")!=null,"Replay restores new EA189 values");
+            require("Volkswagen".equals(service.snapshot().getJSONObject("vehicle").getJSONObject("vin_identity").optString("make_hint")),"Offline replay derives manufacturer locally");
             passed("Disconnect and offline replay without a live connection");
 
             long core=NativeCore.create((command,timeout)->{throw new AssertionError("Rejected/offline actions must never send traffic");});
             try {
+                JSONObject identity=new JSONObject(NativeCore.execute(core,"vin.describe","wvw00000000000000"));
+                require(identity.getJSONObject("data").getString("status").equals("identified"),"VIN helper never uses transport");
                 for(String action:new String[]{"dtc.clear","write","ATZ","uds.send"})
                     require(!new JSONObject(NativeCore.execute(core,action,"")).optBoolean("ok"),"Reject " + action);
                 JSONObject stored = new JSONObject().put("semantic","engine.rpm").put("value",999999)
@@ -132,6 +151,26 @@ public final class AcceptanceRunner extends Instrumentation {
 
             service.setDemo();
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"),"reconnect demo");
+            service.startRecording("ea189-extended");
+            waitFor(() -> !service.snapshot().optString("recording").isEmpty(),"additional EA189 recording profile");
+            String extendedFilename=service.snapshot().optString("recording");
+            waitFor(() -> findValue(service.snapshot().optJSONArray("values"),"dpf.oil_ash_volume")!=null,"explicit profile schedules additional readings");
+            service.stopRecording();
+            waitFor(() -> service.snapshot().optString("recording").isEmpty(),"additional EA189 recording stop");
+            require(service.snapshot().optJSONArray("selected").length()==0,"Stopping an OEM profile must not schedule OEM semantics as generic reads");
+            service.openRecording(extendedFilename);
+            waitFor(() -> "replay".equals(service.snapshot().optString("mode"))&&!service.snapshot().optBoolean("busy"),"additional profile replay");
+            require(service.snapshot().optJSONArray("selected").length()==0,"Replaying an OEM profile restores no generic polling selection");
+            require(findValue(service.snapshot().optJSONArray("values"),"dpf.oil_ash_volume")!=null,"Additional recording profile replay redecodes its readings");
+            service.setDemo();
+            waitFor(() -> "ready".equals(service.snapshot().optString("phase"))&&!service.snapshot().optBoolean("busy"),"return from OEM replay to demo");
+            JSONArray resumedSelection=service.snapshot().getJSONArray("selected");
+            for(int i=0;i<resumedSelection.length();i++){
+                boolean catalogued=false;
+                for(int j=0;j<catalog.length();j++)catalogued|=resumedSelection.optString(i).equals(catalog.getJSONObject(j).optString("semantic"));
+                require(catalogued,"Returning from OEM replay must retain only catalogued generic semantics");
+            }
+            passed("Explicit EA189 additional recording profile schedules a bounded job and stops cleanly");
             runOnMainSync(activity::recreate);
             SystemClock.sleep(1500);
             require("ready".equals(service.snapshot().optString("phase")),"Activity recreation preserves session");
@@ -154,6 +193,11 @@ public final class AcceptanceRunner extends Instrumentation {
     private void job(String action) throws Exception {
         waitIdle(); service.runJob(action); waitIdle();
         require(service.snapshot().optJSONObject("jobResult") != null && service.snapshot().getJSONObject("jobResult").optBoolean("ok"), action + ": " + service.snapshot().opt("jobResult"));
+    }
+    private JSONObject findValue(JSONArray values,String semantic) {
+        if(values==null)return null;
+        for(int i=0;i<values.length();i++){JSONObject value=values.optJSONObject(i);if(value!=null&&semantic.equals(value.optString("semantic")))return value;}
+        return null;
     }
     private Button findButton(View view,String text) {
         if(view instanceof Button && text.contentEquals(((Button)view).getText())) return (Button)view;
