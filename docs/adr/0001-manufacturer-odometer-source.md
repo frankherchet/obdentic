@@ -84,3 +84,14 @@ Accepted by the maintainer on 2026-10-23:
 - Newer VW platforms (MQB/MLB) and gateway-protected vehicles stay out of scope.
 - Mileage remains private vehicle evidence; captures and the profile archive are
   never committed or published.
+
+## Amendment (2026-10-23)
+During refinement of the follow-up feature (#198, REQ-016) the maintainer decided
+that the cluster definition starts in the closed Rust core, next to the existing
+evidence-gated EA189 candidates, instead of the Knowledge DB. Reason: Knowledge
+schema v2 can express the DID and decoder but not the manufacturer-specific
+request target (`714`/`77E`), and fingerprint-based applicability would first
+require identifying the cluster. The definition carries its source, COMMUNITY
+classification and pending hardware validation (REQ-016.8). Promotion into the
+Knowledge DB is reconsidered after the vehicle check, together with target
+modelling (#85/#86). All other decisions above stand.
