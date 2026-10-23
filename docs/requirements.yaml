@@ -295,3 +295,32 @@ requirements:
         text: When the odometer read fails with NO DATA, a negative response, a timeout or a malformed payload, the stored value and date remain unchanged, the record's details show the failure, and the raw TX/RX remains visible under Debug.
       - id: REQ-015.4
         text: When a newly read odometer value is lower than the stored one, the new value is stored and the record's details show that it is lower than the previous value, naming that value and its date, without correcting either value.
+
+  - id: REQ-016
+    title: Read the odometer explicitly from a VW instrument cluster (experimental)
+    type: functional
+    priority: could
+    status: accepted
+    source: "Conversation 2026-10-23: refinement under ADR 0001 (manufacturer-specific odometer source)"
+    description: >
+      For VW Group vehicles that do not advertise PID 0xA6, the user can start one
+      closed, experimental read of the instrument-cluster odometer. Its definition
+      comes from canonical Vehicle Knowledge, its result is stored as a separate
+      experimental source, and it never escalates to session or security services.
+    acceptance:
+      - id: REQ-016.1
+        text: In a live session whose stored vehicle has a VW Group manufacturer hint, the user-started job sends exactly one ReadDataByIdentifier 0x22 for DID 0x2203 to request target 0x714, accepts only a positive response from responder 0x77E, and for exactly 2 data bytes stores (A·256 + B) · 10 km with its read timestamp and the source "VW Kombiinstrument DID 2203 (experimentell)", separately from the PID 0xA6 value.
+      - id: REQ-016.2
+        text: The job cannot be started in replay, without an active session, without a stored vehicle, or when the VIN has no VW Group manufacturer hint; the app shows why and sends nothing.
+      - id: REQ-016.3
+        text: The job sends no service other than 0x22 for DID 0x2203 to 0x714, in particular no session change, SecurityAccess, RoutineControl, retry or other target, and restores functional addressing afterwards.
+      - id: REQ-016.4
+        text: When there is no response, a response only from other responders, a negative response or a timeout, the job ends without a value, stored values remain unchanged, the record shows the failure including any negative response code, and the raw TX/RX remains visible under Debug and in an active recording.
+      - id: REQ-016.5
+        text: A positive response with a payload length other than 2 data bytes is kept as raw evidence and shown as "nicht auswertbar", and no odometer value is stored.
+      - id: REQ-016.6
+        text: The vehicle list shows the PID 0xA6 value when one is stored, otherwise the cluster value marked "Kombiinstrument · experimentell"; the details show both sources separately with their dates and never merge or correct them.
+      - id: REQ-016.7
+        text: A recorded cluster read re-decodes offline from its raw response to the same result without adapter traffic.
+      - id: REQ-016.8
+        text: The job's definition and every stored result carry their source, the COMMUNITY classification and the pending hardware validation, and the record's details show them.
