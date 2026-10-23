@@ -1,0 +1,221 @@
+# yaml-language-server: $schema=./requirements.schema.json
+version: 1
+requirements:
+  - id: REQ-001
+    title: Support multiple vehicle brands through shared diagnostic layers
+    type: functional
+    priority: should
+    status: draft
+    source: "docs/project-goals.md §1: Multi-brand vehicle diagnostics"
+    description: >
+      OBDentic supports vehicle brands and ECU families through reusable adapter,
+      protocol, inventory, knowledge, scheduling, capture, and diagnostic layers.
+    acceptance:
+      - id: REQ-001.1
+        text: The same generic diagnostic flow can expose semantic facts for vehicles from multiple brands or vehicle families.
+      - id: REQ-001.2
+        text: Adding a vehicle platform does not require a parallel brand-specific adapter, protocol, inventory, scheduling, capture, or diagnostic stack.
+      - id: REQ-001.3
+        text: Offline fixture validation and real-hardware validation are reported as separate evidence.
+
+  - id: REQ-002
+    title: Keep canonical vehicle knowledge separate from private observations
+    type: constraint
+    priority: must
+    status: draft
+    source: "docs/project-goals.md §1: Multi-brand vehicle diagnostics; §8: Evidence, provenance and reproducibility"
+    description: >
+      Reusable vehicle-specific knowledge is versioned and provenance-aware, while
+      observations about a concrete vehicle remain private vehicle-local evidence.
+    acceptance:
+      - id: REQ-002.1
+        text: Canonical vehicle knowledge records its version, provenance, confidence, and hardware-validation state.
+      - id: REQ-002.2
+        text: Private observations about a concrete vehicle are distinguishable from reusable canonical knowledge.
+      - id: REQ-002.3
+        text: VINs, ECU serial numbers, and raw vehicle captures are not silently promoted into public canonical knowledge.
+
+  - id: REQ-003
+    title: Report ECU inventory with evidence and uncertainty preserved
+    type: functional
+    priority: must
+    status: draft
+    source: "docs/project-goals.md §2: Automatic ECU inventory and installation list"
+    description: >
+      The vehicle-local installation inventory combines safe, reproducible evidence
+      while keeping installation, reachability, role, and request-target facts distinct.
+    acceptance:
+      - id: REQ-003.1
+        text: Each ECU inventory entry distinguishes configured or installed evidence, observed or reachable evidence, logical role, and diagnostic request target, with provenance for those facts.
+      - id: REQ-003.2
+        text: A functional OBD responder alone is not reported as proof of ECU role or the complete vehicle installation list.
+      - id: REQ-003.3
+        text: When no trustworthy platform installation-list mechanism is available, the reported inventory is marked partial.
+      - id: REQ-003.4
+        text: Discovery does not use blind CAN-address sweeps, arbitrary OEM DID scans, or plausibility-based guessing.
+
+  - id: REQ-004
+    title: Support modular Bluetooth adapter backends
+    type: functional
+    priority: must
+    status: draft
+    source: "docs/project-goals.md §3: Modular Bluetooth adapter support"
+    description: >
+      Bluetooth adapter-specific behavior is separated from reusable command
+      dialects and vehicle or diagnostic knowledge.
+    acceptance:
+      - id: REQ-004.1
+        text: Adapter discovery, recognition, BLE services and characteristics, connection behavior, identity checks, and hardware quirks are handled by adapter-specific backends.
+      - id: REQ-004.2
+        text: Reusable ELM-compatible ASCII behavior is represented independently of adapter identity.
+      - id: REQ-004.3
+        text: Adding another Bluetooth adapter does not require duplicating semantic decoders or changing vehicle-specific knowledge.
+      - id: REQ-004.4
+        text: Current transport support requirements are limited to Bluetooth; USB and Wi-Fi are outside current product scope.
+
+  - id: REQ-005
+    title: Define recording profiles in semantic observation terms
+    type: functional
+    priority: should
+    status: draft
+    source: "docs/project-goals.md §4: Recording profiles and long-running evidence capture"
+    description: >
+      Declarative profiles select semantic observations and requested timing or
+      narrow observation policy, subject to subscription and safety policy.
+    acceptance:
+      - id: REQ-005.1
+        text: A recording profile can select semantic facts and request an observation interval without requiring protocol addresses or payloads.
+      - id: REQ-005.2
+        text: Profiles resolve against effective Vehicle Knowledge and pass through Subscription Policy and Safety Policy before causing transport activity.
+      - id: REQ-005.3
+        text: Profiles cannot define raw PIDs, DIDs, CAN addresses, UDS payloads, ELM commands, decoder formulas, session or SecurityAccess instructions, mutation switches, or coding, adaptation, or actuator commands.
+
+  - id: REQ-006
+    title: Preserve ECU-scoped DTC read evidence
+    type: functional
+    priority: should
+    status: draft
+    source: "docs/project-goals.md §5: Diagnostic trouble codes"
+    description: >
+      DTC access is exposed as bounded semantic diagnostic jobs, and returned
+      evidence remains tied to its ECU or responder.
+    acceptance:
+      - id: REQ-006.1
+        text: Each DTC result is associated with its responding ECU or responder and preserves the original diagnostic response.
+      - id: REQ-006.2
+        text: DTC presence is presented as evidence and is not by itself labeled a component-health verdict.
+      - id: REQ-006.3
+        text: Manufacturer- or ECU-specific DTC access is exposed only when supported by evidence-backed semantic jobs, without a raw protocol-send interface.
+
+  - id: REQ-007
+    title: Keep ordinary operation read-only and raw-command-free
+    type: constraint
+    priority: must
+    status: draft
+    source: "docs/project-goals.md §6: Safety model: read-only by default, narrowly gated service mutation; §9: Architectural invariants"
+    description: >
+      Read-only is the default process capability, and higher-level interfaces
+      cannot provide an unrestricted diagnostic command path or elevate it.
+    acceptance:
+      - id: REQ-007.1
+        text: Ordinary CLI, capture, TUI, MCP, and AI-assisted operation cannot mutate the vehicle by default.
+      - id: REQ-007.2
+        text: Profiles, layouts, MCP calls, AI prompts, and knowledge files cannot change the running process capability.
+      - id: REQ-007.3
+        text: Higher-level interfaces do not expose arbitrary CAN frames, UDS or OBD services, ELM commands, SecurityAccess, coding, adaptation, actuator tests, ECU reset, RoutineControl, or generic memory or identifier writes.
+      - id: REQ-007.4
+        text: Capture is passive and cannot initiate vehicle traffic.
+
+  - id: REQ-008
+    title: Gate the future DTC-clear capability narrowly at process start
+    type: functional
+    priority: should
+    status: draft
+    source: "docs/project-goals.md §6: Safety model: read-only by default, narrowly gated service mutation"
+    description: >
+      Future DTC clearing is the only intended mutating service capability and is
+      available only through an explicitly enabled, closed, reviewed operation.
+      This draft describes a future goal and does not assert that DTC clearing is
+      currently implemented or available.
+    acceptance:
+      - id: REQ-008.1
+        text: If DTC clearing is implemented, it is unavailable by default and can be enabled only by an explicit process-start capability.
+      - id: REQ-008.2
+        text: If enabled, clearing is exposed only as a typed DTC-clear job with bounded, known or evidenced target selection and no caller-provided raw service byte, CAN address, UDS payload, or ELM command.
+      - id: REQ-008.3
+        text: The clearing job preserves original DTC or read evidence before clearing, makes the mutation explicit in capture or audit evidence, and observes the result afterwards where practical.
+      - id: REQ-008.4
+        text: Enabling DTC clearing does not enable any other mutating operation, and no profile, layout, MCP call, AI prompt, or knowledge file can enable it dynamically.
+
+  - id: REQ-009
+    title: Limit AI-assisted diagnostics to semantic interfaces
+    type: functional
+    priority: should
+    status: draft
+    source: "docs/project-goals.md §7: AI-assisted diagnostics"
+    description: >
+      AI agents consume semantic vehicle evidence for reasoning and presentation;
+      they do not invent or execute unrestricted protocol traffic.
+    acceptance:
+      - id: REQ-009.1
+        text: An AI agent can inspect inventory, effective semantic facts, captures and snapshots, and request approved semantic reads, read-only jobs, or observation profiles.
+      - id: REQ-009.2
+        text: AI-assisted diagnosis can explain hypotheses and propose follow-up evidence collection through semantic interfaces.
+      - id: REQ-009.3
+        text: AI-facing interfaces expose no arbitrary raw CAN, UDS, or ELM commands and cannot elevate the process from read-only mode.
+      - id: REQ-009.4
+        text: A future process-level DTC-clear capability does not automatically grant that operation to MCP or AI tooling.
+
+  - id: REQ-010
+    title: Preserve captures for deterministic offline replay and re-decode
+    type: functional
+    priority: must
+    status: draft
+    source: "docs/project-goals.md §4: Recording profiles and long-running evidence capture; §8: Evidence, provenance and reproducibility"
+    description: >
+      Captures retain original transport evidence and enough context to reproduce
+      deterministic protocol normalization and offline vehicle-fact decoding.
+    acceptance:
+      - id: REQ-010.1
+        text: A persisted capture retains raw diagnostic and responder evidence along with request, response, responder, timing, and knowledge provenance needed for offline analysis.
+      - id: REQ-010.2
+        text: The same persisted capture can be re-decoded offline into deterministic normalized evidence and vehicle facts where the evidence justifies them.
+      - id: REQ-010.3
+        text: Capture and offline re-decode do not fabricate protocol traffic or replace original evidence.
+
+  - id: REQ-011
+    title: Keep ambiguity and knowledge provenance visible
+    type: constraint
+    priority: must
+    status: draft
+    source: "docs/project-goals.md §8: Evidence, provenance and reproducibility; §9: Architectural invariants"
+    description: >
+      Facts and interpretations remain traceable to evidence, and uncertain or
+      conflicting evidence is not silently resolved by plausibility.
+    acceptance:
+      - id: REQ-011.1
+        text: Responder evidence is preserved completely, and a response is never selected solely because its decoded value appears more plausible.
+      - id: REQ-011.2
+        text: Ambiguous evidence remains explicitly ambiguous rather than being guessed away.
+      - id: REQ-011.3
+        text: Vehicle-specific knowledge retains provenance, confidence, hardware-validation state, and applicable VERIFIED, COMMUNITY, INFERRED, or EXPERIMENTAL classification.
+      - id: REQ-011.4
+        text: Diagnostic reasoning consumes semantic facts and evidence without creating protocol traffic in the reverse direction.
+
+  - id: REQ-012
+    title: Serialize ownership and commands for each physical Bluetooth adapter
+    type: constraint
+    priority: must
+    status: draft
+    source: "docs/project-goals.md §9: Architectural invariants"
+    description: >
+      A single process or session actor owns each physical adapter, and diagnostic
+      commands remain sequential unless a reviewed protocol or backend establishes
+      safe concurrency.
+    acceptance:
+      - id: REQ-012.1
+        text: At most one process or session actor owns a physical Bluetooth adapter at a time.
+      - id: REQ-012.2
+        text: Physical diagnostic commands are sequential unless a reviewed protocol or backend establishes safe concurrent operation.
+      - id: REQ-012.3
+        text: Adapter identity, command dialect, protocol knowledge, Vehicle Knowledge, diagnostic reasoning, and presentation retain separate responsibilities.

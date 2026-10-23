@@ -1,20 +1,3 @@
 # Issue tracker: GitHub
 
-Issues and specifications for this repository live in GitHub Issues. Use the `gh` CLI for issue operations.
-
-## Conventions
-
-- Create: `gh issue create --title "..." --body "..."`.
-- Read: `gh issue view <number> --comments`.
-- List: `gh issue list` with the appropriate state and label filters.
-- Comment: `gh issue comment <number> --body "..."`.
-- Label: `gh issue edit <number> --add-label "..."` or `--remove-label "..."`.
-- Close: `gh issue close <number> --comment "..."`.
-
-Infer the repository from `git remote -v`; `gh` does this automatically inside this clone.
-
-## Pull requests as a triage surface
-
-**PRs as a request surface: no.**
-
-When a skill says “publish to the issue tracker”, create a GitHub issue. When it says “fetch the relevant ticket”, run `gh issue view <number> --comments`.
+The shared process is defined in [AGENTS.md — XP Workflow](../../AGENTS.md#xp-workflow). Use GitHub Issues for planning; pull requests deliver reviewed changes.

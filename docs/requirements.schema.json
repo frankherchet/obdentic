@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/frankherchet/skills/plugins/xp/requirements.schema.json",
+  "title": "XP workflow requirements",
+  "type": "object",
+  "required": ["version", "requirements"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "requirements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/requirement" }
+    }
+  },
+  "$defs": {
+    "requirement": {
+      "type": "object",
+      "required": ["id", "title", "type", "priority", "status", "acceptance"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^REQ-[0-9]{3,}$" },
+        "title": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["functional", "non-functional", "constraint"] },
+        "priority": { "enum": ["must", "should", "could", "wont"] },
+        "status": { "enum": ["draft", "accepted", "obsolete"] },
+        "source": { "type": "string", "description": "Where it came from: issue (#4), conversation, document." },
+        "description": { "type": "string" },
+        "acceptance": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "text"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "pattern": "^REQ-[0-9]{3,}\\.[0-9]+$" },
+              "text": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^REQ-[0-9]{3,}$" }
+        }
+      }
+    }
+  }
+}
