@@ -53,6 +53,7 @@ public final class ObdService extends Service {
         worker.scheduleWithFixedDelay(this::poll, 500, 500, TimeUnit.MILLISECONDS);
         worker.execute(() -> { try { long temporary = NativeCore.create((c,t) -> { throw new IOException("Not connected"); });
             try { applyCatalog(new JSONObject(NativeCore.execute(temporary,"catalog",""))); } finally { NativeCore.destroy(temporary); }
+            restoreSelection(selectedVin()); // REQ-013.6/REQ-014.1: after the catalog, so unknown semantics are filtered
         } catch (Throwable e) { message("Rust-Kern: " + e.getMessage()); } });
     }
     public int onStartCommand(Intent intent, int flags, int startId) { return START_NOT_STICKY; }
@@ -164,12 +165,39 @@ public final class ObdService extends Service {
         readOdometer(inventory.optJSONObject("data"),outcome);
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
-        JSONArray defaults=new JSONArray(); synchronized(stateLock) { JSONArray selected=state.optJSONArray("selected");
-            if(selected.length()==0) { JSONArray signals=state.optJSONArray("signals"); for(String semantic:new String[]{"engine.rpm","vehicle.speed","engine.coolant_temperature","engine.maf"})
-                for(int i=0;i<signals.length();i++) if(semantic.equals(signals.optJSONObject(i).optString("semantic")) && signals.optJSONObject(i).optString("status").equals("supported")) defaults.put(semantic);
-            }
-        } if(defaults.length()>0) setSignals(defaults);
+        boolean tracked=outcome.equals("created") || outcome.equals("updated") || outcome.equals("switched");
+        String vin=tracked ? inventory.optJSONObject("data").optString("vin") : "";
+        boolean stored=tracked && restoreSelection(vin); // REQ-014.1: stored selection wins over defaults
+        // REQ-014.4: a record without a stored selection (also one created while another was selected) gets the defaults below
+        if(tracked && !stored) set("selected",new JSONArray());
+        JSONArray defaults=stored ? new JSONArray() : defaultSelection();
+        if(defaults.length()>0) { selectSignals(defaults); if(tracked) storeSelection(); }
         message((mode.equals("demo") ? "Demo · synthetische Fahrzeugdaten" : "Carly bereit") + notice);
+    }
+    /** Existing default selection: the supported ones of rpm, speed, coolant and MAF, only while nothing is selected. Uses current-session status only. */
+    private JSONArray defaultSelection() {
+        JSONArray defaults=new JSONArray(); synchronized(stateLock) { JSONArray selected=state.optJSONArray("selected");
+            if(selected.length()==0) defaults=defaultSelection(state.optJSONArray("signals"));
+        } return defaults;
+    }
+    public static JSONArray defaultSelection(JSONArray signals) {
+        JSONArray defaults=new JSONArray();
+        for(String semantic:new String[]{"engine.rpm","vehicle.speed","engine.coolant_temperature","engine.maf"})
+            for(int i=0;i<signals.length();i++) if(semantic.equals(signals.optJSONObject(i).optString("semantic")) && signals.optJSONObject(i).optString("status").equals("supported")) defaults.put(semantic);
+        return defaults;
+    }
+    private String selectedVin() { return vehicles.snapshot().optString("selected"); }
+    /** REQ-014.1: applies the record's stored selection (catalog-filtered, no adapter traffic); false when it has none. Live mode only (REQ-013.4). */
+    private boolean restoreSelection(String vin) {
+        JSONArray stored=mode.equals("live") && !vin.isEmpty() ? vehicles.selection(vin) : null;
+        if(stored==null) return false;
+        selectSignals(stored); return true;
+    }
+    /** REQ-014.1: stores the current selection for the selected record; a write failure only sets the message, the selection stays applied. */
+    private void storeSelection() {
+        String vin=selectedVin(); if(!mode.equals("live") || vin.isEmpty()) return;
+        JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
+        String error=vehicles.setSelection(vin,selected); if(error!=null) message(error);
     }
     /** Live sessions only: records the VIN-keyed vehicle and returns the store outcome (or ""). Never touches the adapter. */
     private String observeVehicle(JSONObject inventory) {
@@ -198,7 +226,10 @@ public final class ObdService extends Service {
             for(int i=0;i<signals.length();i++) if(semantic.equals(signals.optJSONObject(i).optString("semantic"))) return signals.optJSONObject(i).optString("status"); }
         return "";
     }
-    public void selectVehicle(String vin) { vehicleAction(() -> { String error=vehicles.select(vin); return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
+    public void selectVehicle(String vin) { vehicleAction(() -> { String error=vehicles.select(vin);
+        boolean noRecording; synchronized(stateLock) { noRecording=state.optString("recording").isEmpty(); }
+        if(error==null && noRecording) restoreSelection(vin); // REQ-014.1
+        return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
     public void renameVehicle(String vin,String name) { vehicleAction(() -> { String error=vehicles.rename(vin,name); return error==null?"Fahrzeug umbenannt: "+vehicles.name(vin):error; }); }
     public void deleteVehicle(String vin) { vehicleAction(() -> { String name=vehicles.name(vin), error=vehicles.delete(vin); return error==null?"Fahrzeug gelöscht: "+name:error; }); }
     public void resetVehicleStore() { vehicleAction(() -> { String error=vehicles.reset(); return error==null?"Fahrzeugspeicher zurückgesetzt":error; }); }
@@ -239,6 +270,7 @@ public final class ObdService extends Service {
     public void setSignals(JSONArray semantics) {
         synchronized(stateLock) { if(!state.optString("recording").isEmpty()) { message("Messwertauswahl während Aufnahme gesperrt"); return; } }
         selectSignals(semantics);
+        storeSelection();
     }
     private void selectSignals(JSONArray semantics) {
         JSONArray checked=new JSONArray(); synchronized(stateLock) {
