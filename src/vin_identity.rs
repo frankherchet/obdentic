@@ -265,9 +265,28 @@ pub fn describe(vin: &str) -> Value {
     })
 }
 
+/// True when the local WMI record names a VW Group make (Volkswagen, Audi, Skoda,
+/// SEAT, Cupra). The partial table currently carries only Volkswagen and Audi.
+pub fn is_vw_group_vin(vin: &str) -> bool {
+    describe(vin)["make_hint"].as_str().is_some_and(|make| {
+        matches!(
+            make.to_lowercase().as_str(),
+            "volkswagen" | "audi" | "skoda" | "škoda" | "seat" | "cupra"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vw_group_gate_follows_the_local_make_hint() {
+        assert!(is_vw_group_vin("WVWZZZ1JZXW000001"));
+        assert!(is_vw_group_vin("WAUZZZ8K9AA000001"));
+        assert!(!is_vw_group_vin("WBAZZZ1JZXW000001"));
+        assert!(!is_vw_group_vin("WVW1"));
+    }
 
     #[test]
     fn normalizes_case_and_reports_only_a_cautious_make_hint() {

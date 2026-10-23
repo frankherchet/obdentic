@@ -134,6 +134,12 @@ public class MainActivity extends Activity {
         LinearLayout extra=card();note(extra,"EXPERIMENTELL · EA189 ZUSATZWERTE",0xffffca75);
         note(extra,"Nur für ein passendes EA189-Motorsteuergerät wählen. Zusätzliche Öl-, Ladedruck-, Kraftstoff- und Regenerationswerte sind noch nicht am Fahrzeug bestätigt. Statuszahlen bleiben ohne gesicherte Bedeutungszuordnung.",MUTED);
         job(extra,"EA189-Zusatzwerte abfragen","ea189.extended.probe");
+        LinearLayout cluster=card();note(cluster,"EXPERIMENTELL · VW KOMBIINSTRUMENT",0xffffca75);
+        note(cluster,"Liest einmalig den km-Stand aus dem Kombiinstrument (eine Abfrage, ohne Sitzungswechsel). Die Umrechnung ist noch nicht am Fahrzeug bestätigt; der Wert steht getrennt vom OBD-km-Stand.",MUTED);
+        String blocker=ObdService.clusterOdometerBlocker(state);
+        addButton(cluster,"km-Stand aus Kombiinstrument lesen",()->act(()->service().runJob(ObdService.CLUSTER_ODOMETER))).setEnabled(blocker==null&&!state.optBoolean("busy"));
+        if(blocker!=null)note(cluster,blocker,0xffffca75);
+        showClusterResult(cluster);
 
         JSONObject vehicle=state.optJSONObject("vehicle");
         if(vehicle!=null&&vehicle.length()>0)showInventory(vehicle);
@@ -166,6 +172,18 @@ public class MainActivity extends Activity {
         JSONArray signals=vehicle.optJSONArray("signals");if(signals!=null){int supported=0;for(int i=0;i<signals.length();i++)if("supported".equals(signals.optJSONObject(i).optString("status")))supported++;note(c,"Messwerte unterstützt: "+supported+" von "+signals.length(),MUTED);}
         if(vehicle.optBoolean("engine_target_validated"))note(c,"Motorsteuergerät gezielt geprüft",MUTED);
     }
+    /** REQ-016.4/.5/.8: the last cluster job result, with its source and validation state. */
+    private void showClusterResult(LinearLayout card){
+        JSONObject result=state.optJSONObject("jobResult"),data=result==null?null:result.optJSONObject("data");
+        if(data==null||!"vehicle.odometer.cluster".equals(data.optString("semantic")))return;
+        String outcome=data.optString("outcome");
+        if(outcome.equals("value"))note(card,km(data.optDouble("value_km"))+" · experimentell, ungeprüft",TEXT);
+        else if(outcome.equals("unparseable_length"))note(card,"nicht auswertbar · Rohantwort bleibt in Debug und Aufnahme erhalten",0xffffa79c);
+        else if(outcome.equals("negative_response"))note(card,"Vom Kombiinstrument abgelehnt · "+data.optString("error"),0xffffa79c);
+        else note(card,"Nicht gelesen · "+data.optString("error","Keine Antwort"),0xffffa79c);
+        smallNote(card,data.optString("source")+" · "+data.optString("classification")+" · "+hardwareValidation(data.optString("hardware_validation")),MUTED);
+    }
+    private static String hardwareValidation(String value){return value.equals("pending")?"Hardware-Validierung ausstehend":"Hardware-Validierung: "+value;}
     private void showDtcs(JSONObject dtcs){
         LinearLayout c=card();note(c,"GESPEICHERTE FEHLERCODES",ACCENT);JSONArray observations=dtcs.optJSONArray("observations");
         if(observations==null||observations.length()==0)note(c,"Keine Steuergeräte-Antworten",MUTED);
@@ -224,7 +242,7 @@ public class MainActivity extends Activity {
     private JSONObject selectedVehicle(){JSONObject store=vehicleStore();JSONArray rows=store.optJSONArray("vehicles");String selected=store.optString("selected");if(rows!=null)for(int i=0;i<rows.length();i++)if(selected.equals(rows.optJSONObject(i).optString("vin")))return rows.optJSONObject(i);return null;}
     private static String formatDate(long millis){return new java.text.SimpleDateFormat("dd.MM.yyyy",java.util.Locale.GERMANY).format(new java.util.Date(millis));}
     private String date(long millis){return formatDate(millis);}
-    private String km(double value){java.text.NumberFormat f=java.text.NumberFormat.getNumberInstance(java.util.Locale.GERMANY);f.setMaximumFractionDigits(1);return f.format(value)+" km";}
+    private static String km(double value){java.text.NumberFormat f=java.text.NumberFormat.getNumberInstance(java.util.Locale.GERMANY);f.setMaximumFractionDigits(1);return f.format(value)+" km";}
     private void vehicles(){
         title("Fahrzeuge","Lokal gespeichert · nur auf diesem Handy");
         JSONObject store=vehicleStore();
@@ -234,13 +252,23 @@ public class MainActivity extends Activity {
         for(int i=0;i<rows.length();i++){
             JSONObject row=rows.optJSONObject(i);if(row==null)continue;String vin=row.optString("vin"),name=row.optString("name");boolean selected=vin.equals(store.optString("selected"));
             LinearLayout c=card();note(c,name+(selected?" · gewählt":""),TEXT);
-            note(c,(vin.length()>=7?vin.substring(0,3)+"…"+vin.substring(vin.length()-4):vin)+" · "+(row.optJSONObject("odometer")==null?"km-Stand nicht verfügbar":km(row.optJSONObject("odometer").optDouble("km"))+" · "+date(row.optJSONObject("odometer").optLong("read_at"))),MUTED);
+            note(c,(vin.length()>=7?vin.substring(0,3)+"…"+vin.substring(vin.length()-4):vin)+" · "+odometerListText(row),MUTED);
             note(c,"Zuletzt verbunden: "+date(row.optLong("last_connected")),MUTED);
             addButton(c,"Auswählen",()->act(()->service().selectVehicle(vin))).setEnabled(!selected);
             addButton(c,"Details",()->showVehicle(row));addButton(c,"Umbenennen …",()->renameVehicle(vin,name));addButton(c,"Löschen …",()->confirmDeleteVehicle(vin,name));
         }
     }
+    /** REQ-016.6: PID A6 wins; otherwise the cluster value marked experimental; never merged or corrected. */
+    static String odometerListText(JSONObject row){
+        JSONObject a6=row.optJSONObject("odometer"),cluster=row.optJSONObject("cluster_odometer");
+        if(a6!=null)return km(a6.optDouble("km"))+" · "+formatDate(a6.optLong("read_at"));
+        if(cluster!=null)return km(cluster.optDouble("km"))+" · Kombiinstrument · experimentell · "+formatDate(cluster.optLong("read_at"));
+        return "km-Stand nicht verfügbar";
+    }
     private void showVehicle(JSONObject row){
+        new AlertDialog.Builder(this).setTitle(row.optString("name")).setMessage(vehicleDetails(row)).setPositiveButton("Schließen",null).show();
+    }
+    public static String vehicleDetails(JSONObject row){
         StringBuilder m=new StringBuilder("FIN: "+row.optString("vin")+"\nHerstellerhinweis: "+row.optString("manufacturer_hint","keiner"));
         JSONArray responders=row.optJSONArray("responders");StringBuilder ids=new StringBuilder();for(int i=0;responders!=null&&i<responders.length();i++){if(i>0)ids.append(", ");ids.append(responders.optString(i));}
         m.append("\nResponder: ").append(ids.length()==0?"keine":ids);
@@ -248,11 +276,14 @@ public class MainActivity extends Activity {
         m.append("\nMesswerte unterstützt: ").append(supported).append(" von ").append(signals==null?0:signals.length());
         m.append("\nMotorsteuergerät gezielt geprüft: ").append(row.optBoolean("engine_target_validated")?"ja":"nein");
         JSONObject odometer=row.optJSONObject("odometer"),failure=row.optJSONObject("odometer_error"),decrease=row.optJSONObject("odometer_decrease");
-        m.append("\nkm-Stand: ").append(odometer==null?"nicht verfügbar":km(odometer.optDouble("km"))+" (Quelle: "+odometer.optString("source")+", gelesen "+date(odometer.optLong("read_at"))+")");
-        if(failure!=null)m.append("\nLetzter Leseversuch fehlgeschlagen: ").append(failure.optString("error")).append(" (").append(date(failure.optLong("at"))).append(")");
-        if(decrease!=null)m.append("\nNiedriger als zuvor gelesen: ").append(km(decrease.optDouble("previous_km"))).append(" am ").append(date(decrease.optLong("previous_at")));
-        m.append("\nErste Verbindung: ").append(date(row.optLong("first_connected"))).append("\nLetzte Verbindung: ").append(date(row.optLong("last_connected")));
-        new AlertDialog.Builder(this).setTitle(row.optString("name")).setMessage(m).setPositiveButton("Schließen",null).show();
+        m.append("\nkm-Stand: ").append(odometer==null?"nicht verfügbar":km(odometer.optDouble("km"))+" (Quelle: "+odometer.optString("source")+", gelesen "+formatDate(odometer.optLong("read_at"))+")");
+        if(failure!=null)m.append("\nLetzter Leseversuch fehlgeschlagen: ").append(failure.optString("error")).append(" (").append(formatDate(failure.optLong("at"))).append(")");
+        if(decrease!=null)m.append("\nNiedriger als zuvor gelesen: ").append(km(decrease.optDouble("previous_km"))).append(" am ").append(formatDate(decrease.optLong("previous_at")));
+        JSONObject cluster=row.optJSONObject("cluster_odometer"),clusterFailure=row.optJSONObject("cluster_odometer_error");
+        if(cluster!=null)m.append("\nkm-Stand Kombiinstrument (experimentell): ").append(km(cluster.optDouble("km"))).append(" (Quelle: ").append(cluster.optString("source")).append(" · ").append(cluster.optString("classification")).append(" · ").append(hardwareValidation(cluster.optString("hardware_validation"))).append(", gelesen ").append(formatDate(cluster.optLong("read_at"))).append(")");
+        if(clusterFailure!=null)m.append("\nLetzter Kombiinstrument-Versuch fehlgeschlagen: ").append(clusterFailure.optString("error")).append(clusterFailure.has("raw")?" · Rohdaten: "+clusterFailure.optString("raw"):"").append(" (").append(formatDate(clusterFailure.optLong("at"))).append(")");
+        m.append("\nErste Verbindung: ").append(formatDate(row.optLong("first_connected"))).append("\nLetzte Verbindung: ").append(formatDate(row.optLong("last_connected")));
+        return m.toString();
     }
     private void renameVehicle(String vin,String name){
         android.widget.EditText input=new android.widget.EditText(this);input.setSingleLine(true);input.setText(name);input.selectAll();

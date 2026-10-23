@@ -44,6 +44,7 @@ pub mod vehicle;
 pub mod vehicle_cache;
 pub mod vehicle_knowledge;
 pub mod vin_identity;
+pub(crate) mod vw_cluster;
 
 pub use identity::{
     decode_mode09_pid02, IdentityDecodeError, IdentitySource, Provenance, VehicleIdentity, Vin,

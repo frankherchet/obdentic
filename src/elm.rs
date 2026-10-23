@@ -251,6 +251,41 @@ pub(crate) struct TargetedEa189AshProbeRequest {
     expected_responder: ResponderIdentity,
 }
 
+/// The one closed VW instrument-cluster odometer read (ADR 0001 amendment,
+/// REQ-016): DID `0x2203` to request header `714`, answered only by `77E`.
+/// It has no constructor input, so no caller can choose a DID or address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TargetedClusterOdometerRequest {
+    operation: crate::protocol::ReadOperation,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
+impl TargetedClusterOdometerRequest {
+    pub(crate) fn vw_cluster() -> Self {
+        use crate::vw_cluster::{DID, RESPONDER, TARGET};
+        Self {
+            operation: crate::protocol::ReadOperation::uds_read_data_by_identifier(DID),
+            target: RequestTarget::concrete(
+                crate::topology::ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical),
+                crate::topology::RequestAddress::new("elm-header", TARGET),
+            ),
+            expected_responder: ResponderIdentity::ElmHeader(RESPONDER.into()),
+        }
+    }
+}
+
+/// Outcome of the cluster read: nothing but evidence, no interpretation.
+#[derive(Debug)]
+pub(crate) struct ClusterOdometerReadEvidence {
+    /// `None` when setup or the transport failed before a response was read.
+    pub(crate) responses: Option<DiagnosticResponses>,
+    /// Setup or transport failure text.
+    pub(crate) error: Option<String>,
+    /// Restoring functional addressing failed; the session needs re-initialisation.
+    pub(crate) restore_error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetedEcuIdentificationRequest {
     candidate: crate::ecu_identification::IdentificationCandidate,
@@ -1119,6 +1154,44 @@ where
             observations: vec![responses.observation(None)],
             responses,
         })
+    }
+
+    /// One `22 2203` to `714`, then functional addressing is restored. There is
+    /// no retry, session change or fallback target.
+    pub(crate) async fn read_cluster_odometer_with_evidence(
+        &mut self,
+        request: &TargetedClusterOdometerRequest,
+    ) -> ClusterOdometerReadEvidence {
+        let read = match configure_target(
+            &mut self.exchange,
+            &request.target,
+            &request.expected_responder,
+        )
+        .await
+        {
+            Ok(()) => {
+                read_elm_targeted_uds_responses(
+                    &mut self.exchange,
+                    request.operation,
+                    request.operation.did(),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let restore_error = restore_functional(&mut self.exchange).await.err();
+        match read {
+            Ok(responses) => ClusterOdometerReadEvidence {
+                responses: Some(responses),
+                error: None,
+                restore_error,
+            },
+            Err(error) => ClusterOdometerReadEvidence {
+                responses: None,
+                error: Some(error),
+                restore_error,
+            },
+        }
     }
 
     pub(crate) async fn read_ecu_identification_with_evidence(

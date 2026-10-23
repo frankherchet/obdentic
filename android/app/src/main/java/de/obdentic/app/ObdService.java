@@ -283,12 +283,13 @@ public final class ObdService extends Service {
     }
     public void runJob(String action) {
         if(busy || sequenceIndex>=0 || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
-        if(!action.equals("inventory") && !action.equals("dtc.scan") && !isEa189Job(action) && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
+        if(!action.equals("inventory") && !action.equals("dtc.scan") && !isEa189Job(action) && !action.equals(CLUSTER_ODOMETER) && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
         busy=true; changed(); int token=generation;
         worker.execute(() -> { try {
             if(token!=generation) return;
             if(sequenceIndex>=0) { message("Während des Testlaufs sind andere Aufträge gesperrt"); return; }
             String argument=action.startsWith("read:") ? action.substring(5) : "";
+            if(action.equals(CLUSTER_ODOMETER)) { String blocked=clusterOdometerBlocker(snapshot()); if(blocked!=null) { message(blocked); return; } } // REQ-016.2: nothing is sent
             if(isEa189Job(action)) { JSONObject inventory=execute("inventory",""); if(token!=generation) return; set("vehicle",inventory.opt("data")); }
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
             if(token!=generation) return;
@@ -297,9 +298,46 @@ public final class ObdService extends Service {
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
             if(!argument.isEmpty()) updateValue(argument,result);
             if(isEa189Job(action)) applyDpf(result);
+            if(action.equals(CLUSTER_ODOMETER)) { message(storeClusterOdometer(result)); return; }
             String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
         } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
+    }
+    public static final String CLUSTER_ODOMETER = "vw.cluster.odometer";
+    /** REQ-016.2: null when the experimental cluster read may start, otherwise the German reason shown next to the disabled button. Busy state is not part of it. */
+    public static String clusterOdometerBlocker(JSONObject snapshot) {
+        String mode=snapshot.optString("mode","live");
+        if(mode.equals("replay")) return "Im Replay nicht verfügbar";
+        if(mode.equals("demo")) return "Kein gespeichertes Fahrzeug (Demo)";
+        if(!snapshot.optString("phase").equals("ready")) return "Keine aktive Sitzung";
+        JSONObject store=snapshot.optJSONObject("vehicles"), session=snapshot.optJSONObject("vehicle"), record=null;
+        JSONArray rows=store==null ? null : store.optJSONArray("vehicles");
+        for(int i=0;rows!=null && i<rows.length();i++) if(rows.optJSONObject(i).optString("vin").equals(store.optString("selected"))) record=rows.optJSONObject(i);
+        if(record==null) return "Kein gespeichertes Fahrzeug gewählt";
+        String vin=session==null ? "" : session.optString("vin");
+        if(vin.isEmpty() || !vin.equals(record.optString("vin"))) return "Das gewählte Fahrzeug ist nicht das verbundene";
+        if(!VehicleStore.isVwGroup(record.optString("manufacturer_hint"))) return "Kein Herstellerhinweis der VW-Gruppe";
+        return null;
+    }
+    /** REQ-016.1/.4/.5/.8: live mode only; the result goes to the record of the current session VIN, never into the PID A6 fields. Returns the status message. */
+    private String storeClusterOdometer(JSONObject result) {
+        JSONObject data=result.optJSONObject("data");
+        if(!result.optBoolean("ok") || data==null) return result.optString("error","Kombiinstrument-Auftrag nicht ausgeführt"); // refused: nothing was sent
+        String outcome=data.optString("outcome"), error, text;
+        long now=System.currentTimeMillis();
+        JSONObject session; synchronized(stateLock) { session=state.optJSONObject("vehicle"); }
+        String vin=session==null ? "" : session.optString("vin");
+        if(outcome.equals("value")) { long km=data.optLong("value_km");
+            text="Kombiinstrument: "+java.text.NumberFormat.getIntegerInstance(Locale.GERMANY).format(km)+" km (experimentell, ungeprüft)";
+            error=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin()) ? vehicles.clusterOdometer(vin,km,now,data.optString("source"),data.optString("classification"),data.optString("hardware_validation")) : null;
+        } else { JSONArray bytes=data.optJSONArray("response_data"); StringBuilder raw=new StringBuilder();
+            for(int i=0;bytes!=null && i<bytes.length();i++) raw.append(i>0?" ":"").append(String.format(Locale.ROOT,"%02X",bytes.optInt(i)));
+            boolean unreadable=outcome.equals("unparseable_length");
+            String reason=unreadable ? "nicht auswertbar" : data.optString("error","Keine Antwort");
+            text="Kombiinstrument-km-Stand nicht gelesen: "+reason;
+            error=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin()) ? vehicles.clusterOdometerFailure(vin,reason,unreadable ? raw.toString() : null,now) : null;
+        }
+        return error==null ? text : error;
     }
     private static boolean isEa189Job(String action) {
         return action.equals("ea189.dpf.probe") || action.equals("ea189.extended.probe");
@@ -514,10 +552,10 @@ public final class ObdService extends Service {
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
                         else if(action.equals("inventory")) restoreVehicle(result.optJSONObject("data"));
-                        else if(action.equals("dtc.scan") || action.equals("ea189.ash.probe") || isEa189Job(action)) {
+                        else if(action.equals("dtc.scan") || action.equals("ea189.ash.probe") || action.equals(CLUSTER_ODOMETER) || isEa189Job(action)) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));
-                            if(action.equals("dtc.scan")) set("diagnostics",decoded.opt("data")); else if(action.equals("ea189.ash.probe"))set("ashEvidence",decoded.opt("data")); else applyDpf(decoded);
+                            if(action.equals("dtc.scan")) set("diagnostics",decoded.opt("data")); else if(action.equals("ea189.ash.probe"))set("ashEvidence",decoded.opt("data")); else if(!action.equals(CLUSTER_ODOMETER)) applyDpf(decoded); // REQ-016.7: re-decoded, never stored
                             result=decoded;
                         }
                         set("jobResult",result);
@@ -590,6 +628,7 @@ public final class ObdService extends Service {
             else if(c.equals("2210F9")) response="7E8 05 62 10 F9 14 B4\r>";
             else if(c.equals("2214F5")) response="7E8 05 62 14 F5 00 0A\r>";
             else if(c.equals("22178C")) response="7E8 03 7F 22 31\r>";
+            else if(c.equals("222203")) response="77E 05 62 22 03 30 39\r>";
             else if(c.equals("010C")) response="7E8 04 41 0C 0C 80\r>";
             else if(c.equals("010D")) response="7E8 03 41 0D 00\r>";
             else if(c.equals("0105")) response="7E8 03 41 05 7B\r>";

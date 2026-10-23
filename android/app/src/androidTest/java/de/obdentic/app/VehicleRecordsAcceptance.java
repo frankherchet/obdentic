@@ -11,6 +11,7 @@ import java.util.Arrays;
 /** REQ-013 checks: store semantics on temp files, the service's own store, and (via {@link Screen}) the header chip. */
 final class VehicleRecordsAcceptance {
     interface Screen { void show(String vehicleName, String listText) throws Exception; }
+    private static final String SOURCE = "VW Kombiinstrument DID 2203 (experimentell)";
     private static final String VIN_A = "WVW00000000000000", VIN_B = "WVW00000000001111", VIN_C = "XXX00000000002222", VIN_UI = "WVW00000000009999", VIN_SEL_A = "WVW00000000008888", VIN_SEL_B = "WVW00000000007777";
 
     static void run(ObdService service, Screen screen) throws Exception {
@@ -27,6 +28,13 @@ final class VehicleRecordsAcceptance {
         JSONObject demo = new JSONObject(service.snapshot().getJSONObject("vehicle").toString());
         require(demo.optString("vin").equals(VIN_A), "demo inventory carries the synthetic VIN");
         require(own.snapshot().toString().equals(ownBefore), "REQ-013.4 demo initialize and demo inventory never create, update or select a record");
+        // REQ-016.2: the cluster job is unavailable in demo (no stored vehicle), with a visible reason, and sends nothing.
+        String demoReason = ObdService.clusterOdometerBlocker(service.snapshot());
+        require("Kein gespeichertes Fahrzeug (Demo)".equals(demoReason), "REQ-016.2 demo is blocked with a reason: " + demoReason);
+        int demoTraffic = service.snapshot().getJSONArray("debug").length();
+        service.runJob(ObdService.CLUSTER_ODOMETER);
+        waitFor(() -> !service.snapshot().optBoolean("busy") && demoReason.equals(service.snapshot().optString("message")), "REQ-016.2 demo cluster job refused");
+        require(service.snapshot().getJSONArray("debug").length() == demoTraffic && own.snapshot().toString().equals(ownBefore), "REQ-016.2 REQ-013.4 the refused demo job sends nothing and touches no record");
         File recordings = new File(service.getFilesDir(), "recordings");
         recordings.mkdirs();
         File replay = new File(recordings, "vehicles-replay-" + System.nanoTime() + ".jsonl");
@@ -185,6 +193,8 @@ final class VehicleRecordsAcceptance {
         require(garbled.odometer(VIN_A, 1, 1) != null && garbled.odometerFailure(VIN_A, "x", 1) != null && Arrays.equals(Files.readAllBytes(garbageFile.toPath()), garbage), "REQ-015 an unreadable store refuses odometer writes and stays untouched");
         garbageFile.delete(); new File(odoFile.getPath() + ".new").delete(); new File(odoFile.getPath() + ".bak").delete(); odoFile.delete();
 
+        cluster(dir, demo, again, garbage);
+
         // REQ-013.10: private storage excluded from backup; nothing exports records.
         require((service.getApplicationInfo().flags & ApplicationInfo.FLAG_ALLOW_BACKUP) == 0, "REQ-013.10 backup is disabled for the app");
 
@@ -197,8 +207,16 @@ final class VehicleRecordsAcceptance {
         waitFor(() -> service.snapshot().optString("message").equals("Fahrzeug umbenannt: Testwagen"), "service rename");
         screen.show("Testwagen", "WVW…9999 · km-Stand nicht verfügbar"); // REQ-015.2: no value stored
         long readAt = System.currentTimeMillis();
+        String day = new java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.GERMANY).format(new java.util.Date(readAt));
+        require(own.clusterOdometer(VIN_UI, 123450, readAt, SOURCE, "COMMUNITY", "pending") == null, "cluster odometer stored on the service store");
+        screen.show("Testwagen", "WVW…9999 · 123.450 km · Kombiinstrument · experimentell · " + day); // REQ-016.6: only the cluster value
         require(own.odometer(VIN_UI, 123456.7, readAt) == null, "odometer stored on the service store");
         screen.show("Testwagen", "WVW…9999 · 123.456,7 km · " + new java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.GERMANY).format(new java.util.Date(readAt))); // REQ-015.2: value and date
+        String details = MainActivity.vehicleDetails(record(own, VIN_UI));
+        require(details.contains("km-Stand: 123.456,7 km (Quelle: OBD PID A6, gelesen " + day + ")")
+            && details.contains("km-Stand Kombiinstrument (experimentell): 123.450 km (Quelle: " + SOURCE + " · COMMUNITY · Hardware-Validierung ausstehend, gelesen " + day + ")"), "REQ-016.6 REQ-016.8 details show both sources separately with dates, source, classification and pending validation: " + details);
+        require(own.clusterOdometerFailure(VIN_UI, "negative UDS response (NRC 0x31)", null, readAt) == null
+            && MainActivity.vehicleDetails(record(own, VIN_UI)).contains("Letzter Kombiinstrument-Versuch fehlgeschlagen: negative UDS response (NRC 0x31) (" + day + ")"), "REQ-016.4 details show the cluster failure including the NRC");
         service.deleteVehicle(VIN_UI);
         waitFor(() -> service.snapshot().optString("message").equals("Fahrzeug gelöscht: Testwagen"), "service delete");
         if (!ownSelection.isEmpty()) {
@@ -210,6 +228,77 @@ final class VehicleRecordsAcceptance {
         for (File f : new File[]{file, broken, new File(blocker, "x"), untouched}) { f.delete(); new File(f.getPath() + ".new").delete(); new File(f.getPath() + ".bak").delete(); }
         blocker.delete();
         lockedFile.delete(); new File(lockedFile.getPath() + ".new").delete(); new File(lockedFile.getPath() + ".bak").delete(); locked.delete();
+    }
+
+    /** REQ-016: cluster odometer on the record (store level), the UI gate decision, and the core via JNI. */
+    private static void cluster(File dir, JSONObject demo, JSONObject again, byte[] garbage) throws Exception {
+        File file = new File(dir, "vehicles-cluster-" + System.nanoTime() + ".json");
+        VehicleStore store = new VehicleStore(file);
+        require(store.observe(demo, 1000).equals("created"), "cluster test record");
+        require(store.odometer(VIN_A, 123456.7, 1500) == null, "PID A6 value next to the cluster value");
+        String a6 = record(store, VIN_A).getJSONObject("odometer").toString();
+        require(!record(store, VIN_A).has("cluster_odometer") && !record(store, VIN_A).has("cluster_odometer_error"), "REQ-016.1 a record without a cluster read has none");
+        require(store.clusterOdometer(VIN_A, 123450, 5000, SOURCE, "COMMUNITY", "pending") == null, "REQ-016.1 store the cluster value");
+        JSONObject value = record(store, VIN_A).getJSONObject("cluster_odometer");
+        require(value.getLong("km") == 123450 && value.getLong("read_at") == 5000 && value.getString("source").equals(SOURCE)
+            && value.getString("classification").equals("COMMUNITY") && value.getString("hardware_validation").equals("pending"), "REQ-016.1 REQ-016.8 value, timestamp, source, classification and pending validation are stored: " + value);
+        require(record(store, VIN_A).getJSONObject("odometer").toString().equals(a6), "REQ-016.1 REQ-016.6 the PID A6 fields are untouched");
+        require(new VehicleStore(file).snapshot().getJSONArray("vehicles").getJSONObject(0).getJSONObject("cluster_odometer").toString().equals(value.toString()), "REQ-016.1 cluster value survives a restart");
+        require(store.observe(again, 5500).equals("updated") && record(store, VIN_A).getJSONObject("cluster_odometer").toString().equals(value.toString()), "REQ-016.1 a later inventory keeps the stored cluster value");
+        require(store.clusterOdometerFailure(VIN_A, "negative UDS response (NRC 0x31)", null, 6000) == null, "REQ-016.4 store failure");
+        JSONObject failure = record(store, VIN_A).getJSONObject("cluster_odometer_error");
+        require(failure.getString("error").contains("NRC 0x31") && failure.getLong("at") == 6000 && !failure.has("raw"), "REQ-016.4 the failure includes the NRC and its date: " + failure);
+        require(record(store, VIN_A).getJSONObject("cluster_odometer").toString().equals(value.toString()) && record(store, VIN_A).getJSONObject("odometer").toString().equals(a6), "REQ-016.4 a failure leaves stored values unchanged");
+        require(store.clusterOdometerFailure(VIN_A, "nicht auswertbar", "00 12 D6", 6500) == null
+            && record(store, VIN_A).getJSONObject("cluster_odometer_error").getString("raw").equals("00 12 D6") && !record(store, VIN_A).getJSONObject("cluster_odometer").has("raw"), "REQ-016.5 an unreadable response keeps its raw bytes and stores no value");
+        require(store.clusterOdometer(VIN_A, 123460, 7000, SOURCE, "COMMUNITY", "pending") == null && !record(store, VIN_A).has("cluster_odometer_error")
+            && record(store, VIN_A).getJSONObject("odometer").toString().equals(a6), "REQ-016.1 a successful read clears the cluster failure and still never touches PID A6");
+        require(store.clusterOdometer(VIN_B, 1, 1, SOURCE, "COMMUNITY", "pending") != null && store.clusterOdometerFailure(VIN_B, "x", null, 1) != null, "REQ-016 unknown vehicle is refused");
+        File garbageFile = new File(dir, "vehicles-cluster-bad-" + System.nanoTime() + ".json");
+        Files.write(garbageFile.toPath(), garbage);
+        VehicleStore garbled = new VehicleStore(garbageFile);
+        require(garbled.clusterOdometer(VIN_A, 1, 1, SOURCE, "COMMUNITY", "pending") != null && garbled.clusterOdometerFailure(VIN_A, "x", null, 1) != null && Arrays.equals(Files.readAllBytes(garbageFile.toPath()), garbage), "REQ-016 an unreadable store refuses cluster writes and stays untouched");
+        garbageFile.delete(); new File(file.getPath() + ".new").delete(); new File(file.getPath() + ".bak").delete(); file.delete();
+
+        // REQ-016.2: the visible gate decision.
+        JSONObject live = new JSONObject().put("mode", "live").put("phase", "ready").put("vehicle", new JSONObject().put("vin", VIN_A))
+            .put("vehicles", new JSONObject().put("selected", VIN_A).put("vehicles", new JSONArray().put(new JSONObject().put("vin", VIN_A).put("manufacturer_hint", "Volkswagen"))));
+        require(ObdService.clusterOdometerBlocker(live) == null, "REQ-016.2 live session, matching stored VW record: allowed");
+        String[] reasons = {
+            ObdService.clusterOdometerBlocker(new JSONObject(live.toString()).put("mode", "replay")),
+            ObdService.clusterOdometerBlocker(new JSONObject(live.toString()).put("phase", "idle")),
+            ObdService.clusterOdometerBlocker(new JSONObject(live.toString()).put("vehicles", new JSONObject().put("selected", "").put("vehicles", new JSONArray()))),
+            ObdService.clusterOdometerBlocker(new JSONObject(live.toString()).put("vehicle", new JSONObject().put("vin", VIN_B))),
+            ObdService.clusterOdometerBlocker(new JSONObject(live.toString()).put("vehicle", new JSONObject())),
+            ObdService.clusterOdometerBlocker(new JSONObject(live.toString()).put("vehicles", new JSONObject().put("selected", VIN_A).put("vehicles", new JSONArray().put(new JSONObject().put("vin", VIN_A).put("manufacturer_hint", "BMW"))))),
+        };
+        for (String reason : reasons) require(reason != null && !reason.isEmpty(), "REQ-016.2 replay, no session, no stored vehicle, other vehicle, no VIN and non-VW each show a reason");
+        require(VehicleStore.isVwGroup("Volkswagen") && VehicleStore.isVwGroup("AUDI AG") && VehicleStore.isVwGroup("Škoda") && VehicleStore.isVwGroup("SEAT") && VehicleStore.isVwGroup("Cupra") && !VehicleStore.isVwGroup("BMW") && !VehicleStore.isVwGroup(""), "REQ-016.2 VW Group hints");
+
+        // REQ-016.7 / REQ-016.2 through JNI: replay re-decodes without an adapter; the live job refuses without an inventory and sends nothing.
+        long core = NativeCore.create((command, timeout) -> { throw new AssertionError("replay must not send traffic: " + command); });
+        try {
+            JSONObject recorded = new JSONObject().put("semantic", "vehicle.odometer.cluster").put("raw_response", "77E 05 62 22 03 30 39\r>").put("timestamp_ms", 1234);
+            JSONObject replay = new JSONObject(NativeCore.execute(core, "replay.vw.cluster.odometer", recorded.toString()));
+            require(replay.optBoolean("ok") && replay.getJSONObject("data").getInt("value_km") == 123450 && replay.getJSONObject("data").getBoolean("replay"), "REQ-016.7 the recorded raw response re-decodes to 123450 km without adapter traffic: " + replay);
+            require(!new JSONObject(NativeCore.execute(core, "vw.cluster.odometer", "2203")).optBoolean("ok"), "REQ-016.2 the cluster action accepts no argument");
+        } finally { NativeCore.destroy(core); }
+        final java.util.List<String> sent = new java.util.ArrayList<>();
+        long live2 = NativeCore.create((command, timeout) -> {
+            sent.add(command.trim());
+            String c = command.trim();
+            if (c.equals("ATI") || c.equals("ATZ")) return "ELM327\r>";
+            if (c.equals("AT@1")) return "CARLY-UNIVERSAL\r>";
+            if (c.startsWith("AT")) return "OK\r>";
+            if (c.equals("0100")) return "7E8 06 41 00 00 00 00 00\r>";
+            throw new AssertionError("no cluster traffic without an inventory: " + c);
+        });
+        try {
+            require(new JSONObject(NativeCore.execute(live2, "initialize", "")).optBoolean("ok"), "scripted initialize");
+            int before = sent.size();
+            JSONObject refused = new JSONObject(NativeCore.execute(live2, "vw.cluster.odometer", ""));
+            require(!refused.optBoolean("ok") && sent.size() == before && !sent.contains("222203") && !sent.contains("ATSH 714"), "REQ-016.2 the live job without an inventory is refused and the exchange is never called: " + refused);
+        } finally { NativeCore.destroy(live2); }
     }
 
     /** REQ-014 on the service in live mode without a connection (idle): selection restore, stored support labels, discovery untouched. */
