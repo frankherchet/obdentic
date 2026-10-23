@@ -22,6 +22,11 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 DPF interpretations remain experimental. Pending/permanent DTCs, freeze frames,
 full OEM fault-memory scans and DTC clearing are not implemented by this app.
 
+For a targeted read, selection uses the explicitly expected responder, never
+the decoded value. Additional responders remain in the evidence. A missing
+expected response or conflicting payloads from that same responder still fail;
+an untargeted functional read remains ambiguous when responders disagree.
+
 ## Build and install
 
 Prerequisites: JDK 17+, Rust 1.98.0, `rtk`, Android SDK platform 36, build tools
@@ -53,8 +58,10 @@ requires a new connection; existing files remain available as partial recordings
 ## Recording, privacy and desktop inspection
 
 Recordings live in the application's private `recordings/` directory. Cloud
-backup and device transfer are disabled. Export grants read-only access to the
-one chosen file through Android's share sheet. Uninstalling the application
+backup and device transfer are disabled. Export opens Android's system file
+picker so the user can save a copy, for example in Downloads for USB transfer.
+The internal content provider grants only read access to an individual recording.
+Uninstalling the application
 removes its private files, so export recordings you need to keep first.
 
 The mobile JSONL envelope is `OBDENTIC-MOBILE`, version 1. It preserves session
@@ -102,6 +109,14 @@ does **not** establish live BLE or vehicle acceptance.
 Real vehicle acceptance remains a separate required gate:
 
 Tracked separately in [acceptance issue #178](https://github.com/frankherchet/obdentic/issues/178).
+
+The optional `HardwareAcceptanceRunner` in the test APK automates the live gate
+(including five minutes of screen-off recording) only when explicitly invoked
+with the intended powered adapter and vehicle available. It must find exactly
+one Carly candidate and uses no hard-coded device identity. `RecordingAuditRunner`
+audits existing phone recordings completely offline, without starting a service.
+Both transfer evidence only over the local instrumentation connection; keep those
+outputs private and publish only sanitized acceptance summaries.
 
 1. Search for Carly, connect, inspect initialization TX/RX and supported signals.
 2. Read real measurements, inventory and stored DTCs; verify responder attribution.

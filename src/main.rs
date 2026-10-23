@@ -1099,9 +1099,7 @@ async fn run_diagnose_dtc_scan(
     state: &mut RuntimeState,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let recorder = recording
-        .map(CaptureSink::open)
-        .transpose()?;
+    let recorder = recording.map(CaptureSink::open).transpose()?;
     let sender = recorder.as_ref().map(CaptureSink::sender);
     let result = async {
         if sender.is_some() {
@@ -1437,9 +1435,7 @@ async fn run_ea189_dpf_capture(
 ) -> Result<(), String> {
     let profile = config.profile;
     let started = Instant::now();
-    let recorder = recording
-        .map(CaptureSink::open)
-        .transpose()?;
+    let recorder = recording.map(CaptureSink::open).transpose()?;
     let sender = recorder.as_ref().map(CaptureSink::sender);
     let result = async {
         if sender.is_some() {

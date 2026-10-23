@@ -320,9 +320,14 @@ mod tests {
     ) {
         let (runtime, task) = crate::runtime_actor::start();
         let mut state = crate::runtime_state::RuntimeState::default();
-        crate::scheduler::apply_runtime_event(&runtime, &mut state, None, RuntimeEvent::InitializationCompleted)
-            .await
-            .unwrap();
+        crate::scheduler::apply_runtime_event(
+            &runtime,
+            &mut state,
+            None,
+            RuntimeEvent::InitializationCompleted,
+        )
+        .await
+        .unwrap();
         (runtime, task, state)
     }
 
@@ -355,8 +360,10 @@ mod tests {
             .copied()
             .map(Into::into)
             .collect::<Vec<ObservationPlan>>();
-        let connect =
-            crate::ble::start_scripted_session(crate::test_support::ScriptedExchange::new(Vec::<String>::new()), false);
+        let connect = crate::ble::start_scripted_session(
+            crate::test_support::ScriptedExchange::new(Vec::<String>::new()),
+            false,
+        );
 
         let session = CaptureSession::start(
             "engine-baseline",
@@ -397,10 +404,7 @@ mod tests {
         task.abort();
     }
 
-    fn position(
-        events: &[CaptureEvent],
-        matches: impl Fn(&CaptureEvent) -> bool,
-    ) -> usize {
+    fn position(events: &[CaptureEvent], matches: impl Fn(&CaptureEvent) -> bool) -> usize {
         events
             .iter()
             .position(matches)

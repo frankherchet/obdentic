@@ -13,8 +13,8 @@ use crate::capture_events::CaptureEvent;
 use std::path::Path;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-pub use jsonl::{CaptureStatus, ParsedCapture};
 pub(crate) use jsonl::VERSION;
+pub use jsonl::{CaptureStatus, ParsedCapture};
 
 pub type CaptureSender = mpsc::Sender<CaptureEvent>;
 type Writer = JoinHandle<Result<(), String>>;
@@ -164,7 +164,11 @@ mod tests {
         sink.close().await.unwrap();
 
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(&contents[..3], b"MDF", "MF4 files start with the MDF magic bytes");
+        assert_eq!(
+            &contents[..3],
+            b"MDF",
+            "MF4 files start with the MDF magic bytes"
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

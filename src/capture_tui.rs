@@ -1,7 +1,7 @@
 use crate::{
     capture_events::{CaptureEvent, CaptureValue, SubscriptionFilterOutcome},
-    hex,
     capture_format::{self, CaptureStatus, ParsedCapture},
+    hex,
     tui::{self, DashboardLayout, Panel, View},
 };
 use ratatui::{

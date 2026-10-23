@@ -313,11 +313,13 @@ public final class ObdService extends Service {
     private void stopRecordingNow() { closeRecording("stopped",""); }
     private void closeRecording(String reason,String detail) {
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
+        boolean completed=false;
         synchronized(recordLock) {
             JSONObject end=new JSONObject(); put(end,"type","session_end"); put(end,"reason",reason); if(!detail.isEmpty()) put(end,"detail",detail); record(end);
-            if(writer!=null) { try { writer.close(); } catch(IOException e) { message("Aufnahme konnte nicht abgeschlossen werden: "+e.getMessage()); } writer=null; }
+            if(writer!=null) { try { writer.close(); completed=true; } catch(IOException e) { message("Aufnahme konnte nicht abgeschlossen werden: "+e.getMessage()); } writer=null; }
         }
         set("recording","");
+        if(completed) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
     }
     private void record(JSONObject event) {
         put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));

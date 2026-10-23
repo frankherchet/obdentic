@@ -160,19 +160,7 @@ impl<E: Exchange> MobileCore<E> {
                 }
                 .map_err(|error| error.error)?;
                 let transaction = request.complete("user", read.payload)?;
-                let observations: Vec<_> = read
-                    .observations
-                    .into_iter()
-                    .map(|observation| {
-                        json!({
-                            "selected_responder":observation.selected_responder,
-                            "selection_error":observation.selection_error,
-                            "responses":observation.responses.iter().map(|response| json!({
-                                "responder":response.responder,"payload":response.payload
-                            })).collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
+                let observations = response_observations_json(&read.observations);
                 Ok(
                     json!({"semantic":transaction.semantic(),"value":transaction.value(),
                     "unit":transaction.unit(),"timestamp_ms":transaction.timestamp_ms(),
@@ -236,7 +224,7 @@ impl<E: Exchange> MobileCore<E> {
                     .is_some_and(|r| r.as_str().eq_ignore_ascii_case("7E8"))
             })
         {
-            match self.validate_engine() {
+            match self.validate_engine(&mut data) {
                 Ok(mapping) => {
                     self.engine = Some(mapping);
                     data["engine_target_validated"] = json!(true);
@@ -250,7 +238,7 @@ impl<E: Exchange> MobileCore<E> {
         Ok(data)
     }
 
-    fn validate_engine(&mut self) -> Result<EcuTargetMapping, String> {
+    fn validate_engine(&mut self, data: &mut Value) -> Result<EcuTargetMapping, String> {
         // Same closed validation rule as observed_inventory: observed 7E8 + targeted RPM.
         let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
         let target =
@@ -261,15 +249,29 @@ impl<E: Exchange> MobileCore<E> {
             target.clone(),
             crate::elm::ResponderIdentity::ElmHeader("7E8".into()),
         )?;
-        let read = self
-            .runtime
-            .block_on(
-                self.session
-                    .as_mut()
-                    .unwrap()
-                    .read_targeted_with_evidence(&targeted),
-            )
-            .map_err(|e| e.error)?;
+        data["engine_validation_request"] = json!({
+            "semantic":"engine.rpm",
+            "request_payload":request.bytes(),
+            "target":"7E0",
+            "expected_responder":"7E8"
+        });
+        let read = match self.runtime.block_on(
+            self.session
+                .as_mut()
+                .unwrap()
+                .read_targeted_with_evidence(&targeted),
+        ) {
+            Ok(read) => {
+                data["engine_validation_observations"] =
+                    json!(response_observations_json(&read.observations));
+                read
+            }
+            Err(error) => {
+                data["engine_validation_observations"] =
+                    json!(response_observations_json(&error.observations));
+                return Err(error.error);
+            }
+        };
         request.complete("user", read.payload)?;
         let provenance = Provenance::new(
             "targeted engine.rpm Mode 01 validation",
@@ -353,6 +355,21 @@ impl<E: Exchange> MobileCore<E> {
         }
         Ok(json!({"experimental":true,"readings":readings}))
     }
+}
+
+fn response_observations_json(observations: &[crate::elm::ResponseObservation]) -> Vec<Value> {
+    observations
+        .iter()
+        .map(|observation| {
+            json!({
+                "selected_responder":observation.selected_responder,
+                "selection_error":observation.selection_error,
+                "responses":observation.responses.iter().map(|response| json!({
+                    "responder":response.responder,"payload":response.payload
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect()
 }
 
 fn diagnostic_evidence(responses: &crate::elm::DiagnosticResponses) -> Value {
@@ -578,13 +595,13 @@ mod tests {
     }
 
     #[test]
-    fn validated_engine_routes_live_reads_and_rejects_other_responders() {
+    fn validated_engine_routes_reads_by_exact_responder_and_preserves_observations() {
         let mut core = core(&[
             ("0100\r", "7E8 06 41 00 00 10 00 00\r>"),
             ("0902\r", "NO DATA\r>"),
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
-            ("010C\r", "7E8 04 41 0C 1F 40\r>"),
+            ("010C\r", "7E8 04 41 0C 1F 40\r7E9 04 41 0C 0C 80\r>"),
             ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
@@ -600,29 +617,129 @@ mod tests {
             ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
+            ("ATSH 7E0\r", "OK\r>"),
+            ("ATCRA 7E8\r", "OK\r>"),
+            ("010C\r", "7E9 04 41 0C 0C 80\r>"),
+            ("ATSP0\r", "OK\r>"),
+            ("ATSH 7DF\r", "OK\r>"),
+            ("ATCRA\r", "OK\r>"),
+            ("ATSH 7E0\r", "OK\r>"),
+            ("ATCRA 7E8\r", "OK\r>"),
+            ("010C\r", "7E8 04 41 0C 00 00\r7E8 04 41 0C FF FF\r>"),
+            ("ATSP0\r", "OK\r>"),
+            ("ATSH 7DF\r", "OK\r>"),
+            ("ATCRA\r", "OK\r>"),
         ]);
         assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let inventory = run(&mut core, "inventory", "");
+        assert_eq!(inventory["data"]["engine_target_validated"], true);
         assert_eq!(
-            run(&mut core, "inventory", "")["data"]["engine_target_validated"],
-            true
+            inventory["data"]["engine_validation_request"]["request_payload"],
+            json!([0x01, 0x0c])
         );
+        assert_eq!(
+            inventory["data"]["engine_validation_request"]["target"],
+            "7E0"
+        );
+        assert_eq!(
+            inventory["data"]["engine_validation_request"]["expected_responder"],
+            "7E8"
+        );
+        assert_eq!(
+            inventory["data"]["engine_validation_observations"][0]["selected_responder"],
+            "7E8"
+        );
+        let validation_responses = inventory["data"]["engine_validation_observations"][0]
+            ["responses"]
+            .as_array()
+            .unwrap();
+        assert_eq!(validation_responses.len(), 2);
+        assert_eq!(validation_responses[0]["responder"], "7E8");
+        assert_eq!(
+            validation_responses[0]["payload"],
+            json!([0x41, 0x0c, 0x1f, 0x40])
+        );
+        assert_eq!(validation_responses[1]["responder"], "7E9");
+        assert_eq!(
+            validation_responses[1]["payload"],
+            json!([0x41, 0x0c, 0x0c, 0x80])
+        );
+
         let read = run(&mut core, "read", "engine.rpm");
         assert_eq!(read["ok"], true, "{read}");
         assert_eq!(read["data"]["value"], 2000.0);
         assert_eq!(read["data"]["observations"][0]["selected_responder"], "7E8");
+
+        let mixed = run(&mut core, "read", "engine.rpm");
+        assert_eq!(mixed["ok"], true, "{mixed}");
+        assert_eq!(mixed["data"]["value"], 2000.0);
         assert_eq!(
-            read["data"]["observations"][0]["responses"]
+            mixed["data"]["observations"][0]["selected_responder"],
+            "7E8"
+        );
+        assert_eq!(
+            mixed["data"]["observations"][0]["responses"]
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            2
         );
+        assert_eq!(
+            mixed["data"]["observations"][0]["responses"][1]["responder"],
+            "7E9"
+        );
+
         let unexpected = run(&mut core, "read", "engine.rpm");
         assert_eq!(unexpected["ok"], false);
         assert!(unexpected["error"]
             .as_str()
             .unwrap()
             .contains("unexpected responder"));
+
+        let conflicting = run(&mut core, "read", "engine.rpm");
+        assert_eq!(conflicting["ok"], false);
+        assert!(conflicting["error"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting responses from responder 7E8"));
+    }
+
+    #[test]
+    fn engine_inventory_failure_keeps_targeted_response_evidence() {
+        let mut core = core(&[
+            ("0100\r", "7E8 06 41 00 00 10 00 00\r>"),
+            ("0902\r", "NO DATA\r>"),
+            ("ATSH 7E0\r", "OK\r>"),
+            ("ATCRA 7E8\r", "OK\r>"),
+            ("010C\r", "7E9 04 41 0C 0C 80\r>"),
+            ("ATSP0\r", "OK\r>"),
+            ("ATSH 7DF\r", "OK\r>"),
+            ("ATCRA\r", "OK\r>"),
+        ]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+
+        let inventory = run(&mut core, "inventory", "");
+
+        assert_eq!(inventory["ok"], true);
+        assert!(inventory["data"]["engine_target_error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected responder 7E9"));
+        assert_eq!(
+            inventory["data"]["engine_validation_request"]["request_payload"],
+            json!([0x01, 0x0c])
+        );
+        let observation = &inventory["data"]["engine_validation_observations"][0];
+        assert!(observation["selected_responder"].is_null());
+        assert!(observation["selection_error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected responder 7E9"));
+        assert_eq!(observation["responses"][0]["responder"], "7E9");
+        assert_eq!(
+            observation["responses"][0]["payload"],
+            json!([0x41, 0x0c, 0x0c, 0x80])
+        );
     }
     #[test]
     fn dtc_scan_preserves_negative_result_and_dpf_requires_target_evidence() {

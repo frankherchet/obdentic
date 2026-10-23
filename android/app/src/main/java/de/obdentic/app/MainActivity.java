@@ -47,12 +47,13 @@ public class MainActivity extends Activity {
     private String structure="", profile="";
     private String historyMode="";
     private boolean launchDemo=false, scanAfterPermission=false;
+    private String pendingExport="";
     private final Runnable poll=new Runnable(){public void run(){refresh();handler.postDelayed(this,500);}};
 
     @Override public void onCreate(Bundle saved){
         setTheme(android.R.style.Theme_Material_NoActionBar);
         super.onCreate(saved);
-        if(saved!=null){tab=saved.getInt("tab",0);profile=saved.getString("profile","");}
+        if(saved!=null){tab=saved.getInt("tab",0);profile=saved.getString("profile","");pendingExport=saved.getString("pendingExport","");}
         launchDemo="demo".equals(getIntent().getStringExtra("mode"));
         getWindow().setStatusBarColor(BG);getWindow().setNavigationBarColor(BG);
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(BG);
@@ -70,7 +71,7 @@ public class MainActivity extends Activity {
     }
     @Override protected void onResume(){super.onResume();handler.post(poll);}
     @Override protected void onPause(){handler.removeCallbacks(poll);super.onPause();}
-    @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("profile",profile);super.onSaveInstanceState(out);}
+    @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("profile",profile);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
     private ObdService service(){return ObdService.current;}
     private void act(Runnable action){try{if(service()!=null)action.run();else toast("Dienst startet. Bitte kurz warten.");}catch(Exception e){toast(e.getMessage()==null?"Aktion fehlgeschlagen":e.getMessage());}refresh();}
     private void refresh(){
@@ -195,7 +196,33 @@ public class MainActivity extends Activity {
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==7&&scanAfterPermission){scanAfterPermission=false;boolean allowed=true;for(int i=0;i<permissions.length;i++)if(!permissions[i].equals(Manifest.permission.POST_NOTIFICATIONS)&&results[i]!=PackageManager.PERMISSION_GRANTED)allowed=false;if(allowed)act(()->service().scan());else new AlertDialog.Builder(this).setTitle("Bluetooth-Berechtigung fehlt").setMessage("Erlaube Geräte in der Nähe in den Android-App-Einstellungen, um den Adapter zu suchen und zu verbinden.").setPositiveButton("Einstellungen",(d,w)->startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())))).setNegativeButton("Schließen",null).show();}}
     private void chooseSignals(){JSONArray signals=array("signals");String[] labels=new String[signals.length()];boolean[] checked=new boolean[signals.length()];for(int i=0;i<signals.length();i++){JSONObject s=signals.optJSONObject(i);String semantic=s.optString("semantic");labels[i]=signalLabel(semantic,s)+"  ·  "+s.optString("unit");checked[i]=contains(array("selected"),semantic);}new AlertDialog.Builder(this).setTitle("Live-Messwerte").setMultiChoiceItems(labels,checked,(d,which,on)->checked[which]=on).setPositiveButton("Übernehmen",(d,w)->{JSONArray selected=new JSONArray();for(int i=0;i<checked.length;i++)if(checked[i])selected.put(signals.optJSONObject(i).optString("semantic"));act(()->service().setSignals(selected));}).setNegativeButton("Abbrechen",null).show();}
     private void chooseProfile(){JSONArray p=array("profiles");String[] names=new String[p.length()];int chosen=0;for(int i=0;i<p.length();i++){JSONObject item=p.optJSONObject(i);names[i]=item.optString("id");if(names[i].equals(profile))chosen=i;}new AlertDialog.Builder(this).setTitle("Aufnahmeprofil").setSingleChoiceItems(names,chosen,(dialog,which)->{profile=names[which];structure="";dialog.dismiss();refresh();}).setNegativeButton("Schließen",null).show();}
-    private void export(String name){try{Uri uri=new Uri.Builder().scheme("content").authority("de.obdentic.app.files").appendPath("recordings").appendPath(name).build();Intent send=new Intent(Intent.ACTION_SEND).setType("application/octet-stream").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);send.setClipData(ClipData.newRawUri("Aufnahme",uri));startActivity(Intent.createChooser(send,"Aufnahme exportieren"));}catch(Exception e){toast("Export nicht möglich: "+e.getMessage());}}
+    private void export(String name) {
+        if(name.equals(state.optString("recording"))) {toast("Aufzeichnung vor dem Export stoppen");return;}
+        pendingExport=name;
+        Intent save=new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("application/x-ndjson").putExtra(Intent.EXTRA_TITLE,name);
+        try {startActivityForResult(save,41);} catch(Exception e) {pendingExport="";toast("Export nicht möglich: "+e.getMessage());}
+    }
+    @Override protected void onActivityResult(int request,int result,Intent data) {
+        super.onActivityResult(request,result,data);
+        if(request!=41)return;
+        String name=pendingExport;pendingExport="";
+        if(result!=RESULT_OK||data==null||data.getData()==null||name.isEmpty())return;
+        Uri destination=data.getData();
+        Uri source=new Uri.Builder().scheme("content").authority("de.obdentic.app.files").appendPath("recordings").appendPath(name).build();
+        new Thread(()->{
+            try {
+                try(java.io.InputStream input=getContentResolver().openInputStream(source);
+                    java.io.OutputStream output=getContentResolver().openOutputStream(destination,"wt")) {
+                    if(input==null||output==null)throw new java.io.IOException("Dateizugriff nicht verfügbar");
+                    byte[] buffer=new byte[8192];int count;
+                    while((count=input.read(buffer))!=-1)output.write(buffer,0,count);
+                    output.flush();
+                }
+                runOnUiThread(()->toast("Aufzeichnung gespeichert"));
+            } catch(Exception e) {runOnUiThread(()->toast("Export fehlgeschlagen: "+e.getMessage()));}
+        },"obdentic-export").start();
+    }
     private void collectHistory(){JSONArray values=array("values");String mode=state.optString("mode");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic"),stamp=mode+v.optString("updatedAt")+v.optString("value");if(stamp.equals(lastSamples.get(id)))continue;lastSamples.put(id,stamp);JSONArray recordedHistory=v.optJSONArray("history");if(recordedHistory!=null){ArrayList<Float> restored=new ArrayList<>();for(int j=0;j<recordedHistory.length();j++){JSONObject sample=recordedHistory.optJSONObject(j);if(sample!=null&&Double.isFinite(sample.optDouble("value",Double.NaN)))restored.add((float)sample.optDouble("value"));}histories.put(id,restored);continue;}double number=v.optDouble("value",Double.NaN);if(!Double.isFinite(number))continue;ArrayList<Float> h=histories.get(id);if(h==null){h=new ArrayList<>();histories.put(id,h);}h.add((float)number);while(h.size()>90)h.remove(0);}}
     private void updateValues(){JSONArray values=array("values");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic");TextView target=valueViews.get(id);if(target==null)continue;String error=v.optString("error","");String value=v.has("value")?v.optString("value"):v.optString("text","—");long age=Math.max(0,(System.currentTimeMillis()-v.optLong("updatedAt",System.currentTimeMillis()))/1000);boolean replay=state.optString("mode").equals("replay"),stale=age>10&&!replay;target.setText(error.isEmpty()?value+" "+v.optString("unit"):"Nicht verfügbar");target.setTextColor(error.isEmpty()&&!stale?TEXT:0xffffca75);target.setContentDescription(signalLabel(id,signal(id))+": "+target.getText()+(error.isEmpty()?"":". "+error));TextView freshness=freshnessViews.get(id);if(freshness!=null)freshness.setText(!error.isEmpty()?error:replay?"Aus gespeicherter Aufnahme":age<2?"Gerade aktualisiert":(stale?"Letzter Wert · ":"Aktualisiert · ")+"vor "+age+" s");SparklineView graph=graphViews.get(id);if(graph!=null)graph.setValues(histories.get(id));}}
     private JSONObject signal(String id){JSONArray signals=array("signals");for(int i=0;i<signals.length();i++){JSONObject s=signals.optJSONObject(i);if(s!=null&&s.optString("semantic").equals(id))return s;}JSONObject fallback=new JSONObject();try{fallback.put("semantic",id);fallback.put("title",id);}catch(Exception ignored){}return fallback;}

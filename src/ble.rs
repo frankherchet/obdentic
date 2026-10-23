@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 pub use crate::adapter::AdapterCandidate;
-use crate::elm::{AdapterLink, ElmExchange, ExchangeError, TransportFailure};
 #[cfg(test)]
 pub(crate) use crate::elm::{
     discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
@@ -23,6 +22,7 @@ pub use crate::elm::{
     SignalSupportStatus, SupportDiscovery, TargetedEcuIdentificationRequest, TargetedMode09Request,
     TargetedReadRequest,
 };
+use crate::elm::{AdapterLink, ElmExchange, ExchangeError, TransportFailure};
 use crate::elm::{ElmSession, TargetedDpfProbeRequest};
 pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
@@ -279,8 +279,7 @@ pub async fn prepare_diagnostic_session(
 }
 
 pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
-    let mut session =
-        DiagnosticSession::connect(adapter_id, ConnectMode::new(true, false)).await?;
+    let mut session = DiagnosticSession::connect(adapter_id, ConnectMode::new(true, false)).await?;
     let result = tokio::select! {
         identity = session.identify() => identity,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
@@ -325,8 +324,7 @@ async fn start_session_mode(
     discover_support: bool,
 ) -> Result<SessionClient, String> {
     let session =
-        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, discover_support))
-            .await?;
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, discover_support)).await?;
     Ok(start_session_actor(session))
 }
 
@@ -2070,8 +2068,9 @@ mod tests {
 
     #[tokio::test]
     async fn support_discovery_preserves_each_responder_and_payload() {
-        let mut exchange =
-            ScriptedExchange::new(vec!["7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>"]);
+        let mut exchange = ScriptedExchange::new(vec![
+            "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>",
+        ]);
 
         let support = discover_pid_support(&mut exchange).await.unwrap();
 
@@ -2095,8 +2094,9 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_functional_validation_queries_once_and_preserves_responders() {
-        let mut exchange =
-            ScriptedExchange::new(vec!["7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>"]);
+        let mut exchange = ScriptedExchange::new(vec![
+            "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>",
+        ]);
 
         let validation = validate_functional_support_exchange(&mut exchange)
             .await
@@ -2190,6 +2190,65 @@ mod tests {
                 "ATSH 7DF\r",
                 "ATCRA\r",
                 "010C\r",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_session_preserves_other_responders_after_exact_selection() {
+        let exchange = ScriptedExchange::new(vec![
+            "OK\r>",
+            "OK\r>",
+            "7E8 04 41 0C 1F 40\r7E9 04 41 0C 0C 80\r>",
+            "OK\r>",
+            "OK\r>",
+            "OK\r>",
+        ]);
+        let spy = exchange.spy();
+        let session = start_scripted_session(exchange, false).await.unwrap();
+
+        match session
+            .read_targeted_with_evidence(targeted_request())
+            .await
+            .unwrap()
+        {
+            ReadOutcome::Succeeded {
+                transaction,
+                observations,
+            } => {
+                assert_eq!(transaction.response(), [0x41, 0x0c, 0x1f, 0x40]);
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].selected_responder.as_deref(), Some("7E8"));
+                assert_eq!(observations[0].selection_error, None);
+                assert_eq!(observations[0].responses.len(), 2);
+                assert_eq!(
+                    observations[0].responses[0].responder.as_deref(),
+                    Some("7E8")
+                );
+                assert_eq!(
+                    observations[0].responses[1].responder.as_deref(),
+                    Some("7E9")
+                );
+                assert_eq!(
+                    observations[0].responses[1].payload,
+                    [0x41, 0x0c, 0x0c, 0x80]
+                );
+            }
+            ReadOutcome::Failed { error, .. } => {
+                panic!("unexpected targeted read failure: {error}")
+            }
+        }
+
+        session.shutdown().await.unwrap();
+        assert_eq!(
+            spy.commands(),
+            [
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "010C\r",
+                "ATSP0\r",
+                "ATSH 7DF\r",
+                "ATCRA\r",
             ]
         );
     }
