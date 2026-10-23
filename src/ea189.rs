@@ -344,6 +344,339 @@ impl std::fmt::Display for Ea189DpfProbeError {
 
 impl std::error::Error for Ea189DpfProbeError {}
 
+/// Count of reads in the separately selected extended experiment.
+pub const EA189_EXTENDED_PROBE_COUNT: usize = 15;
+pub const EA189_EXTENDED_SOURCE_VERSION: &str = "Car Scanner 2.1.50";
+pub const EA189_EXTENDED_SOURCE_PROFILE: &str =
+    "PQ35, PQ46: Diesel DPF var.10: EA189 1.6, 2.0L (UDS + VWTP2.0 AT/DSG)";
+pub const EA189_EXTENDED_HARDWARE_VALIDATION: &str = "unverified; extracted candidate definitions";
+
+/// One fixed, single-DID candidate from the extracted Car Scanner definitions.
+/// The source profile is unverified and does not enable extra adapter setup.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Ea189ExtendedSignal {
+    BoostPressureActual,
+    InjectorDeviationCylinder1,
+    InjectorDeviationCylinder3,
+    InjectorDeviationCylinder4,
+    InjectorDeviationCylinder2,
+    BoostPressureCommanded,
+    OilAshVolume,
+    FuelConsumptionSinceRegeneration,
+    FieldRegenerationRequestStatus,
+    ServiceRegenerationStatus,
+    FuelPressureActual,
+    FuelPressureCommanded,
+    EngineOilTemperature,
+    FieldRegenerationLockStatus,
+    FuelTemperature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ea189ExtendedSignalDefinition {
+    semantic: &'static str,
+    did: u16,
+    name: &'static str,
+    data_len: usize,
+    signed: bool,
+    multiplier: f64,
+    offset: f64,
+    unit: &'static str,
+}
+
+impl Ea189ExtendedSignalDefinition {
+    pub const fn semantic(self) -> &'static str {
+        self.semantic
+    }
+    pub const fn did(self) -> u16 {
+        self.did
+    }
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+    pub const fn data_len(self) -> usize {
+        self.data_len
+    }
+    pub const fn signed(self) -> bool {
+        self.signed
+    }
+    pub const fn multiplier(self) -> f64 {
+        self.multiplier
+    }
+    pub const fn offset(self) -> f64 {
+        self.offset
+    }
+    pub const fn unit(self) -> &'static str {
+        self.unit
+    }
+    pub const fn request_bytes(self) -> [u8; 3] {
+        let [high, low] = self.did.to_be_bytes();
+        [0x22, high, low]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExtendedScale {
+    data_len: usize,
+    signed: bool,
+    multiplier: f64,
+    offset: f64,
+    unit: &'static str,
+}
+
+const fn scale(
+    data_len: usize,
+    signed: bool,
+    multiplier: f64,
+    offset: f64,
+    unit: &'static str,
+) -> ExtendedScale {
+    ExtendedScale {
+        data_len,
+        signed,
+        multiplier,
+        offset,
+        unit,
+    }
+}
+
+const fn extended(
+    semantic: &'static str,
+    did: u16,
+    name: &'static str,
+    scale: ExtendedScale,
+) -> Ea189ExtendedSignalDefinition {
+    Ea189ExtendedSignalDefinition {
+        semantic,
+        did,
+        name,
+        data_len: scale.data_len,
+        signed: scale.signed,
+        multiplier: scale.multiplier,
+        offset: scale.offset,
+        unit: scale.unit,
+    }
+}
+
+impl Ea189ExtendedSignal {
+    pub const ALL: [Self; EA189_EXTENDED_PROBE_COUNT] = [
+        Self::BoostPressureActual,
+        Self::InjectorDeviationCylinder1,
+        Self::InjectorDeviationCylinder3,
+        Self::InjectorDeviationCylinder4,
+        Self::InjectorDeviationCylinder2,
+        Self::BoostPressureCommanded,
+        Self::OilAshVolume,
+        Self::FuelConsumptionSinceRegeneration,
+        Self::FieldRegenerationRequestStatus,
+        Self::ServiceRegenerationStatus,
+        Self::FuelPressureActual,
+        Self::FuelPressureCommanded,
+        Self::EngineOilTemperature,
+        Self::FieldRegenerationLockStatus,
+        Self::FuelTemperature,
+    ];
+
+    pub const fn definition(self) -> Ea189ExtendedSignalDefinition {
+        match self {
+            Self::BoostPressureActual => extended(
+                "engine.boost_pressure_actual",
+                0x1057,
+                "[ECM] Boost pressure actual",
+                scale(2, true, 1.0, 0.0, "hPa"),
+            ),
+            Self::InjectorDeviationCylinder1 => extended(
+                "engine.injector_deviation.cylinder_1",
+                0x10ff,
+                "[ECM] Injection amount deviation cylinder 1",
+                scale(2, true, 0.01, 0.0, "mg_stroke"),
+            ),
+            Self::InjectorDeviationCylinder3 => extended(
+                "engine.injector_deviation.cylinder_3",
+                0x1100,
+                "[ECM] Injection amount deviation cylinder 3",
+                scale(2, true, 0.01, 0.0, "mg_stroke"),
+            ),
+            Self::InjectorDeviationCylinder4 => extended(
+                "engine.injector_deviation.cylinder_4",
+                0x1104,
+                "[ECM] Injection amount deviation cylinder 4",
+                scale(2, true, 0.01, 0.0, "mg_stroke"),
+            ),
+            Self::InjectorDeviationCylinder2 => extended(
+                "engine.injector_deviation.cylinder_2",
+                0x1105,
+                "[ECM] Injection amount deviation cylinder 2",
+                scale(2, true, 0.01, 0.0, "mg_stroke"),
+            ),
+            Self::BoostPressureCommanded => extended(
+                "engine.boost_pressure_commanded",
+                0x1149,
+                "[ECM] Boost pressure commanded",
+                scale(2, true, 1.0, 0.0, "hPa"),
+            ),
+            Self::OilAshVolume => extended(
+                "dpf.oil_ash_volume",
+                0x1153,
+                "[ECM] DPF: oil ash volume",
+                scale(2, true, 0.01, 0.0, "liters"),
+            ),
+            Self::FuelConsumptionSinceRegeneration => extended(
+                "dpf.fuel_consumption_since_regeneration",
+                0x115a,
+                "[ECM] Particle filter: fuel consumption since last regeneration",
+                scale(2, true, 0.01, 0.0, "liters"),
+            ),
+            Self::FieldRegenerationRequestStatus => extended(
+                "dpf.field_regeneration_request_status",
+                0x115b,
+                "[ECM] Particle filter: field regeneration request status",
+                scale(1, false, 1.0, 0.0, "None"),
+            ),
+            Self::ServiceRegenerationStatus => extended(
+                "dpf.service_regeneration_status",
+                0x115c,
+                "[ECM] Service regeneration: status",
+                scale(1, false, 1.0, 0.0, "None"),
+            ),
+            Self::FuelPressureActual => extended(
+                "engine.rail_pressure_actual",
+                0x1169,
+                "[ECM] Fuel pressure (high) actual",
+                scale(2, true, 100.0, 0.0, "hPa"),
+            ),
+            Self::FuelPressureCommanded => extended(
+                "engine.rail_pressure_commanded",
+                0x116a,
+                "[ECM] Fuel pressure (high) commanded",
+                scale(2, true, 100.0, 0.0, "hPa"),
+            ),
+            Self::EngineOilTemperature => extended(
+                "engine.oil_temperature",
+                0x11be,
+                "[ECM] Engine oil temperature",
+                scale(2, false, 0.1, -273.1, "celicium"),
+            ),
+            Self::FieldRegenerationLockStatus => extended(
+                "dpf.field_regeneration_lock_status",
+                0x11c1,
+                "[ECM] Particle filter: field regeneration lock status",
+                scale(1, false, 1.0, 0.0, "None"),
+            ),
+            Self::FuelTemperature => extended(
+                "engine.fuel_temperature",
+                0x162d,
+                "[ECM] Fuel temperature",
+                scale(2, false, 0.1, -273.1, "celicium"),
+            ),
+        }
+    }
+
+    pub const fn semantic(self) -> &'static str {
+        self.definition().semantic()
+    }
+    pub const fn id(self) -> u16 {
+        self.definition().did()
+    }
+    pub const fn request_bytes(self) -> [u8; 3] {
+        self.definition().request_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ea189ExperimentalExtendedReading {
+    signal: Ea189ExtendedSignal,
+    value: f64,
+}
+
+impl Ea189ExperimentalExtendedReading {
+    pub const fn signal(self) -> Ea189ExtendedSignal {
+        self.signal
+    }
+    pub const fn semantic(self) -> &'static str {
+        self.signal.semantic()
+    }
+    pub const fn did(self) -> u16 {
+        self.signal.id()
+    }
+    pub const fn value(self) -> f64 {
+        self.value
+    }
+    pub const fn unit(self) -> &'static str {
+        self.signal.definition().unit()
+    }
+    pub const fn is_experimental(self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ea189ExtendedDecodeError {
+    UnsupportedProbe(Ea189ExtendedSignal),
+    MalformedPositiveResponse,
+    NegativeResponse { nrc: u8 },
+    WrongDid { expected: u16, actual: u16 },
+}
+
+impl std::fmt::Display for Ea189ExtendedDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedProbe(signal) => write!(
+                formatter,
+                "no decoder for EA189 extended DID {:04X}",
+                signal.id()
+            ),
+            Self::MalformedPositiveResponse => {
+                formatter.write_str("malformed UDS positive response")
+            }
+            Self::NegativeResponse { nrc } => {
+                write!(formatter, "negative UDS response (NRC 0x{nrc:02X})")
+            }
+            Self::WrongDid { expected, actual } => write!(
+                formatter,
+                "UDS response DID {actual:04X} does not match requested DID {expected:04X}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Ea189ExtendedDecodeError {}
+
+/// Decode only the fixed-width positive response shape admitted for a signal.
+pub fn decode_experimental_extended(
+    signal: Ea189ExtendedSignal,
+    response: &[u8],
+) -> Result<Ea189ExperimentalExtendedReading, Ea189ExtendedDecodeError> {
+    if response.len() == 3 && response[..2] == [0x7f, 0x22] {
+        return Err(Ea189ExtendedDecodeError::NegativeResponse { nrc: response[2] });
+    }
+    let definition = signal.definition();
+    if response.len() != definition.data_len() + 3 || response[0] != 0x62 {
+        return Err(Ea189ExtendedDecodeError::MalformedPositiveResponse);
+    }
+    let actual = u16::from_be_bytes([response[1], response[2]]);
+    if actual != definition.did() {
+        return Err(Ea189ExtendedDecodeError::WrongDid {
+            expected: definition.did(),
+            actual,
+        });
+    }
+    let raw = if definition.data_len() == 1 {
+        i64::from(response[3])
+    } else {
+        let bytes = [response[3], response[4]];
+        if definition.signed() {
+            i64::from(i16::from_be_bytes(bytes))
+        } else {
+            i64::from(u16::from_be_bytes(bytes))
+        }
+    };
+    Ok(Ea189ExperimentalExtendedReading {
+        signal,
+        value: raw as f64 * definition.multiplier() + definition.offset(),
+    })
+}
+
 /// Identity of the platform knowledge, independent of any one vehicle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ea189ProfileIdentity {
@@ -755,6 +1088,44 @@ mod tests {
             );
             assert_eq!(probe.definition(), *definition);
         }
+    }
+
+    #[test]
+    fn extended_candidates_are_a_fixed_unique_set_and_decode_source_scaling() {
+        assert_eq!(Ea189ExtendedSignal::ALL.len(), EA189_EXTENDED_PROBE_COUNT);
+        let mut dids = std::collections::BTreeSet::new();
+        for signal in Ea189ExtendedSignal::ALL {
+            let definition = signal.definition();
+            assert!(dids.insert(definition.did()));
+            assert!(definition.data_len() == 1 || definition.data_len() == 2);
+            assert!(!EA189_DPF_DIDS
+                .iter()
+                .any(|dpf| dpf.id() == definition.did()));
+            assert_eq!(signal.request_bytes()[0], 0x22);
+        }
+
+        let reading = decode_experimental_extended(
+            Ea189ExtendedSignal::InjectorDeviationCylinder1,
+            &[0x62, 0x10, 0xff, 0xff, 0x9c],
+        )
+        .unwrap();
+        assert_eq!(reading.semantic(), "engine.injector_deviation.cylinder_1");
+        assert_eq!(reading.value(), -1.0);
+        assert!(reading.is_experimental());
+        assert!(matches!(
+            decode_experimental_extended(Ea189ExtendedSignal::OilAshVolume, &[0x7f, 0x22, 0x31]),
+            Err(Ea189ExtendedDecodeError::NegativeResponse { nrc: 0x31 })
+        ));
+        assert!(matches!(
+            decode_experimental_extended(
+                Ea189ExtendedSignal::OilAshVolume,
+                &[0x62, 0x11, 0x5a, 0, 0]
+            ),
+            Err(Ea189ExtendedDecodeError::WrongDid {
+                expected: 0x1153,
+                actual: 0x115a
+            })
+        ));
     }
 
     #[test]

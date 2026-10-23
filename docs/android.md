@@ -8,13 +8,18 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 ## First release
 
 - Carly BLE scan, explicit connect/disconnect and recoverable permission errors.
-- Supported semantic measurements, live trends and sample age.
+- 49 standard semantic measurements, vehicle-advertised support, live trends and sample age.
 - VIN where readable and a **partial** functional responder inventory; this is not
   a full manufacturer installation list.
 - Stored Mode 03 DTCs, scoped by responder.
 - Seven experimental EA189 DPF probes, gated on validated engine targeting.
+- A separate, explicitly selected 15-value experimental EA189 additional-read job
+  and recording profile, including oil/boost/fuel data and uninterpreted regeneration
+  status numbers. These new interpretations are not hardware-validated.
 - The existing engine baseline, drive and OBD expansion capture profiles, plus
   repeated experimental DPF capture.
+- The `obd2-extended-validation` profile records additional standard scalars
+  conservatively; unavailable optional values are not assumed supported.
 - Private recording, foreground connected-device service, screen-off operation,
   explicit export, offline replay and timestamped raw TX/RX.
 - Demo responses pass through the real Rust parser; the mode is always visible.
@@ -26,6 +31,28 @@ For a targeted read, selection uses the explicitly expected responder, never
 the decoded value. Additional responders remain in the evidence. A missing
 expected response or conflicting payloads from that same responder still fail;
 an untargeted functional read remains ambiguous when responders disagree.
+
+## Vehicle identity and additional reads
+
+Inventory includes an offline, partial WMI manufacturer hint derived from a
+format-checked VIN. No VIN is sent to an external decoder. The initial sourced
+snapshot uses NHTSA vPIC records; [source details and KBA limitations](research/vin-identity.md)
+explain its incomplete European coverage. Model, engine and ECU compatibility
+remain unresolved; the first three VIN characters never select an OEM profile.
+
+`ea189.extended.probe` is a closed set of 15 fixed, engine-targeted `0x22` reads.
+The user must explicitly choose the EA189 job or its recording profile. It reuses
+validated `7E0`/`7E8` routing, preserves raw responder evidence and negative answers,
+and redecodes recordings offline. The candidates were checked against the locally
+extracted Car Scanner 2.1.50 EA189 profile and remain experimental with source
+metadata; their original upstream source is unknown. No executable vendor database,
+arbitrary formula, address or preparation sequence is imported.
+
+In particular, the `178C` ash-mass candidate is omitted: the source includes
+`10 03` preparation (UDS extended diagnostic session). No session-start traffic
+is added. The existing seven-value DPF job and its replay remain separate.
+Support discovery follows advertised continuation bits only, bounded through
+page `0x60` for the newly catalogued torque PIDs.
 
 ## Build and install
 

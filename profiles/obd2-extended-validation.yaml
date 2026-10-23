@@ -1,0 +1,30 @@
+version: 1
+id: obd2-extended-validation
+description: Additional standard OBD scalars; availability requires advertised PID support.
+observations:
+  - semantic: engine.rpm
+    interval: 4s
+  - semantic: engine.oil_temperature
+    interval: 15s
+    required: false
+  - semantic: engine.fuel_rate
+    interval: 10s
+    required: false
+  - semantic: vehicle.fuel_tank_level
+    interval: 30s
+    required: false
+  - semantic: engine.fuel_injection_timing
+    interval: 15s
+    required: false
+  - semantic: engine.driver_demand_torque_percent
+    interval: 10s
+    required: false
+  - semantic: engine.actual_torque_percent
+    interval: 10s
+    required: false
+  - semantic: engine.reference_torque
+    interval: 30s
+    required: false
+  - semantic: engine.commanded_equivalence_ratio
+    interval: 15s
+    required: false

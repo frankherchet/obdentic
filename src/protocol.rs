@@ -2,11 +2,24 @@
 pub(crate) struct Mode01 {
     pid: u8,
     data_len: usize,
+    optional_data_byte: bool,
 }
 
 impl Mode01 {
     pub(crate) const fn new(pid: u8, data_len: usize) -> Self {
-        Self { pid, data_len }
+        Self {
+            pid,
+            data_len,
+            optional_data_byte: false,
+        }
+    }
+
+    pub(crate) const fn new_with_optional_byte(pid: u8) -> Self {
+        Self {
+            pid,
+            data_len: 1,
+            optional_data_byte: true,
+        }
     }
 
     pub(crate) const fn bytes(self) -> [u8; 2] {
@@ -23,7 +36,9 @@ impl Mode01 {
 
     pub(crate) fn data<'a>(self, response: &'a [u8], semantic: &str) -> Result<&'a [u8], String> {
         let expected = self.data_len + 2;
-        if response.len() != expected || response[..2] != [0x41, self.pid] {
+        let valid_length = response.len() == expected
+            || (self.optional_data_byte && response.len() == expected + 1);
+        if !valid_length || response[..2] != [0x41, self.pid] {
             return Err(format!(
                 "invalid OBD-II {semantic} response: {}",
                 crate::hex(response)
@@ -132,8 +147,30 @@ impl std::fmt::Display for ReadResponseError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadOperation, ReadResponseError};
+    use super::{Mode01, ReadOperation, ReadResponseError};
     use crate::prepare_read;
+
+    #[test]
+    fn mode01_optional_trailing_byte_is_limited_to_declared_pids() {
+        let fuel_trim = Mode01::new_with_optional_byte(0x06);
+        assert_eq!(
+            fuel_trim.data(&[0x41, 0x06, 0x80], "trim").unwrap(),
+            &[0x80]
+        );
+        assert_eq!(
+            fuel_trim.data(&[0x41, 0x06, 0x80, 0x55], "trim").unwrap(),
+            &[0x80, 0x55]
+        );
+        assert!(fuel_trim.data(&[0x41, 0x06], "trim").is_err());
+        assert!(fuel_trim
+            .data(&[0x41, 0x06, 0x80, 0x55, 0xaa], "trim")
+            .is_err());
+
+        let fixed_length = Mode01::new(0x05, 1);
+        assert!(fixed_length
+            .data(&[0x41, 0x05, 0x80, 0x55], "coolant")
+            .is_err());
+    }
 
     #[test]
     fn uds_read_data_by_identifier_accepts_variable_payloads() {

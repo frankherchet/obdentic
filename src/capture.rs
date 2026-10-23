@@ -12,6 +12,8 @@ const ENGINE_BASELINE_YAML: &str = include_str!("../profiles/engine-baseline.yam
 const ENGINE_DRIVE_YAML: &str = include_str!("../profiles/engine-drive.yaml");
 const OBD2_EXPANSION_VALIDATION_YAML: &str =
     include_str!("../profiles/obd2-expansion-validation.yaml");
+const OBD2_EXTENDED_VALIDATION_YAML: &str =
+    include_str!("../profiles/obd2-extended-validation.yaml");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureProfile {
@@ -251,6 +253,7 @@ pub fn profile(spec: &str) -> Result<CaptureProfile, String> {
         "engine-baseline" => parse_profile_yaml(ENGINE_BASELINE_YAML),
         "engine-drive" => parse_profile_yaml(ENGINE_DRIVE_YAML),
         "obd2-expansion-validation" => parse_profile_yaml(OBD2_EXPANSION_VALIDATION_YAML),
+        "obd2-extended-validation" => parse_profile_yaml(OBD2_EXTENDED_VALIDATION_YAML),
         _ => Err(format!("unknown capture profile: {spec}")),
     }
 }
@@ -695,6 +698,7 @@ mod tests {
             "engine-baseline",
             "engine-drive",
             "obd2-expansion-validation",
+            "obd2-extended-validation",
         ] {
             let subscriptions = profile(name).unwrap().subscriptions().unwrap();
             let semantics = subscriptions

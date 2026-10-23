@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 
 use crate::{
     elm::{
-        ElmExchange, ElmSession, ExchangeError, TargetedDpfProbeRequest, TargetedReadRequest,
-        TransportFailure,
+        ElmExchange, ElmSession, ExchangeError, TargetedDpfProbeRequest,
+        TargetedEa189ExtendedProbeRequest, TargetedReadRequest, TransportFailure,
     },
     topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
@@ -68,11 +68,17 @@ impl<E: Exchange> MobileCore<E> {
         if action == "catalog" {
             return Ok(catalog());
         }
+        if action == "vin.describe" {
+            return Ok(crate::vin_identity::describe(argument));
+        }
         if action == "replay.dtc.scan" {
             return replay_dtc_scan(argument);
         }
         if action == "replay.ea189.dpf.probe" {
             return replay_dpf_probe(argument);
+        }
+        if action == "replay.ea189.extended.probe" {
+            return replay_ea189_extended_probe(argument);
         }
         if action == "replay.read" {
             let mut recorded: Value = serde_json::from_str(argument).map_err(|e| e.to_string())?;
@@ -96,7 +102,12 @@ impl<E: Exchange> MobileCore<E> {
         }
         if !matches!(
             action,
-            "initialize" | "inventory" | "read" | "dtc.scan" | "ea189.dpf.probe"
+            "initialize"
+                | "inventory"
+                | "read"
+                | "dtc.scan"
+                | "ea189.dpf.probe"
+                | "ea189.extended.probe"
         ) {
             return Err(format!("read-only mobile core rejected action: {action}"));
         }
@@ -117,7 +128,7 @@ impl<E: Exchange> MobileCore<E> {
             self.session = Some(ElmSession::new(exchange));
             setup?;
             self.runtime
-                .block_on(self.session.as_mut().unwrap().discover_support(0x40))?;
+                .block_on(self.session.as_mut().unwrap().discover_support(0x60))?;
             self.initialized = true;
             return Ok(self.support());
         }
@@ -187,6 +198,7 @@ impl<E: Exchange> MobileCore<E> {
                 )
             }
             "ea189.dpf.probe" => self.dpf(),
+            "ea189.extended.probe" => self.ea189_extended(),
             _ => unreachable!(),
         }
     }
@@ -208,7 +220,10 @@ impl<E: Exchange> MobileCore<E> {
             .block_on(self.session.as_mut().unwrap().identify());
         let mut data = self.support();
         match identity {
-            Ok(identity) => data["vin"] = json!(identity.vin().as_str()),
+            Ok(identity) => {
+                data["vin"] = json!(identity.vin().as_str());
+                data["vin_identity"] = crate::vin_identity::describe(identity.vin().as_str());
+            }
             Err(error) => data["identity_error"] = json!(error),
         }
         if self
@@ -348,13 +363,117 @@ impl<E: Exchange> MobileCore<E> {
         }
         if let Err(error) = self
             .runtime
-            .block_on(self.session.as_mut().unwrap().discover_support(0x40))
+            .block_on(self.session.as_mut().unwrap().discover_support(0x60))
         {
             self.initialized = false;
             return Err(error);
         }
         Ok(json!({"experimental":true,"readings":readings}))
     }
+
+    fn ea189_extended(&mut self) -> Result<Value, String> {
+        let mapping = self.engine.as_ref().ok_or(
+            "EA189 extended probes require an inventory with validated engine target evidence",
+        )?;
+        let mut readings = Vec::with_capacity(crate::ea189::EA189_EXTENDED_PROBE_COUNT);
+        for signal in crate::ea189::Ea189ExtendedSignal::ALL {
+            let request = TargetedEa189ExtendedProbeRequest::from_mapping(signal, mapping)?;
+            let outcome = self.runtime.block_on(
+                self.session
+                    .as_mut()
+                    .unwrap()
+                    .read_ea189_extended_probe_with_evidence(&request),
+            );
+            readings.push(match outcome {
+                Ok(read) => {
+                    let matching: Vec<_> = read.responses.as_slice().iter().filter(|response| {
+                        response.responder.as_ref().is_some_and(|responder| {
+                            responder.as_str().eq_ignore_ascii_case("7E8")
+                        })
+                    }).collect();
+                    let payload = match matching.first() {
+                        None => Err("expected responder 7E8 absent".to_string()),
+                        Some(first) if matching.iter().any(|response| response.payload != first.payload) => {
+                            Err("conflicting EA189 extended responses from expected responder".into())
+                        }
+                        Some(_) if !read.responses.errors().is_empty() => {
+                            Err(format!("incomplete UDS response: {}", read.responses.errors()[0].error))
+                        }
+                        Some(first) => Ok(first.payload.as_slice()),
+                    };
+                    let mut result = extended_signal_metadata(signal);
+                    result["raw_response"] = json!(read.responses.raw_response());
+                    result["responses"] = diagnostic_evidence(&read.responses);
+                    result["response_errors"] = diagnostic_errors(&read.responses);
+                    match payload.and_then(|payload| {
+                        crate::ea189::decode_experimental_extended(signal, payload)
+                            .map_err(|error| error.to_string())
+                    }) {
+                        Ok(reading) => {
+                            result["value"] = json!(reading.value());
+                            result["unit"] = json!(reading.unit());
+                            result
+                        }
+                        Err(error) => {
+                            result["error"] = json!(error);
+                            result
+                        }
+                    }
+                }
+                Err(error) => {
+                    let mut result = extended_signal_metadata(signal);
+                    result["error"] = json!(error.error);
+                    result["raw_response"] = Value::Null;
+                    result["responses"] = json!(error.observations.iter()
+                        .flat_map(|observation| observation.responses.iter())
+                        .map(|response| json!({"responder":response.responder,"payload":response.payload}))
+                        .collect::<Vec<_>>());
+                    result["response_errors"] = json!([]);
+                    result
+                }
+            });
+        }
+        let mut exchange = self.session.take().unwrap().into_exchange();
+        let restore = self
+            .runtime
+            .block_on(crate::adapter::initialize_carly(&mut exchange));
+        self.session = Some(ElmSession::new(exchange));
+        if let Err(error) = restore {
+            self.initialized = false;
+            return Err(format!("EA189 extended restoration failed: {error}"));
+        }
+        if let Err(error) = self
+            .runtime
+            .block_on(self.session.as_mut().unwrap().discover_support(0x60))
+        {
+            self.initialized = false;
+            return Err(error);
+        }
+        Ok(json!({"experimental":true,"readings":readings}))
+    }
+}
+
+fn extended_signal_metadata(signal: crate::ea189::Ea189ExtendedSignal) -> Value {
+    let definition = signal.definition();
+    json!({
+        "semantic":definition.semantic(),
+        "did":format!("{:04X}", definition.did()),
+        "request":crate::hex(&definition.request_bytes()),
+        "name":definition.name(),
+        "experimental":true,
+        "target":"7E0",
+        "expected_responder":"7E8",
+        "source_version":crate::ea189::EA189_EXTENDED_SOURCE_VERSION,
+        "source_profile":crate::ea189::EA189_EXTENDED_SOURCE_PROFILE,
+        "hardware_validation":crate::ea189::EA189_EXTENDED_HARDWARE_VALIDATION,
+        "source_definition":{
+            "data_length":definition.data_len(),
+            "signed":definition.signed(),
+            "multiplier":definition.multiplier(),
+            "offset":definition.offset(),
+            "unit":definition.unit()
+        }
+    })
 }
 
 fn response_observations_json(observations: &[crate::elm::ResponseObservation]) -> Vec<Value> {
@@ -516,8 +635,117 @@ fn replay_dpf_reading(recorded: &Value) -> Result<Value, String> {
     }
 }
 
+fn replay_ea189_extended_probe(argument: &str) -> Result<Value, String> {
+    let recorded: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
+    let readings = recorded
+        .get("readings")
+        .and_then(Value::as_array)
+        .ok_or("recording EA189 extended readings missing")?;
+    if readings.len() != crate::ea189::EA189_EXTENDED_PROBE_COUNT {
+        return Err("recording does not contain the fixed EA189 extended read set".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for reading in readings {
+        let semantic = reading
+            .get("semantic")
+            .and_then(Value::as_str)
+            .ok_or("recorded EA189 extended semantic missing")?;
+        if !crate::ea189::Ea189ExtendedSignal::ALL
+            .iter()
+            .any(|signal| signal.semantic() == semantic)
+            || !seen.insert(semantic)
+        {
+            return Err(format!(
+                "recording does not match the fixed EA189 extended read set: {semantic}"
+            ));
+        }
+    }
+    let replayed = readings
+        .iter()
+        .map(replay_ea189_extended_reading)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({"experimental":true,"replay":true,"readings":replayed}))
+}
+
+fn replay_ea189_extended_reading(recorded: &Value) -> Result<Value, String> {
+    let semantic = recorded
+        .get("semantic")
+        .and_then(Value::as_str)
+        .ok_or("recorded EA189 extended semantic missing")?;
+    let signal = crate::ea189::Ea189ExtendedSignal::ALL
+        .into_iter()
+        .find(|signal| signal.semantic() == semantic)
+        .ok_or_else(|| format!("unsupported recorded EA189 extended semantic: {semantic}"))?;
+    let request = recorded
+        .get("request")
+        .and_then(Value::as_str)
+        .ok_or("recorded EA189 extended request missing")?;
+    let expected_request = crate::hex(&signal.request_bytes());
+    if request != expected_request {
+        return Err(format!(
+            "recorded EA189 extended request for {semantic} does not match its fixed read"
+        ));
+    }
+    let raw_response = recorded
+        .get("raw_response")
+        .and_then(Value::as_str)
+        .filter(|raw| !raw.trim().is_empty());
+    let Some(raw_response) = raw_response else {
+        let mut result = extended_signal_metadata(signal);
+        result["error"] = json!("recording raw_response missing");
+        result["raw_response"] = Value::Null;
+        result["responses"] = json!([]);
+        result["response_errors"] = json!([]);
+        result["replay"] = json!(true);
+        return Ok(result);
+    };
+
+    let responses = crate::elm::normalize_uds_responses(raw_response, signal.id())?;
+    let matching: Vec<_> = responses
+        .as_slice()
+        .iter()
+        .filter(|response| {
+            response
+                .responder
+                .as_ref()
+                .is_some_and(|responder| responder.as_str().eq_ignore_ascii_case("7E8"))
+        })
+        .collect();
+    let payload = match matching.first() {
+        None => Err("expected responder 7E8 absent".to_string()),
+        Some(first)
+            if matching
+                .iter()
+                .any(|response| response.payload != first.payload) =>
+        {
+            Err("conflicting EA189 extended responses from expected responder".into())
+        }
+        Some(_) if !responses.errors().is_empty() => Err(format!(
+            "incomplete UDS response: {}",
+            responses.errors()[0].error
+        )),
+        Some(first) => Ok(first.payload.as_slice()),
+    };
+    let mut result = extended_signal_metadata(signal);
+    result["raw_response"] = json!(raw_response);
+    result["responses"] = diagnostic_evidence(&responses);
+    result["response_errors"] = diagnostic_errors(&responses);
+    result["replay"] = json!(true);
+    match payload.and_then(|payload| {
+        crate::ea189::decode_experimental_extended(signal, payload)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(reading) => {
+            result["value"] = json!(reading.value());
+            result["unit"] = json!(reading.unit());
+        }
+        Err(error) => result["error"] = json!(error),
+    }
+    Ok(result)
+}
+
 fn catalog() -> Value {
-    let mut profiles: Vec<_> = ["engine-baseline", "engine-drive", "obd2-expansion-validation"]
+    let mut profiles: Vec<_> = ["engine-baseline", "engine-drive", "obd2-expansion-validation", "obd2-extended-validation"]
         .into_iter().map(|id| {
             let profile = crate::capture::profile(id).expect("built-in capture profile must parse");
             let subscriptions = profile.subscriptions().expect("built-in subscriptions must resolve");
@@ -527,6 +755,19 @@ fn catalog() -> Value {
         }).collect();
     profiles.push(json!({"id":"ea189-dpf","description":"Experimental EA189 DPF probes", "experimental":true,
         "signals":crate::ea189::Ea189DpfProbe::ALL.iter().map(|p|p.semantic()).collect::<Vec<_>>()}));
+    profiles.push(json!({
+        "id":"ea189-extended",
+        "description":"Explicit experimental EA189 additional engine reads",
+        "experimental":true,
+        "default":false,
+        "action":"ea189.extended.probe",
+        "expected_reading_count":crate::ea189::EA189_EXTENDED_PROBE_COUNT,
+        "signals":[],
+        "probe_semantics":crate::ea189::Ea189ExtendedSignal::ALL.iter().map(|signal|signal.semantic()).collect::<Vec<_>>(),
+        "source_version":crate::ea189::EA189_EXTENDED_SOURCE_VERSION,
+        "source_profile":crate::ea189::EA189_EXTENDED_SOURCE_PROFILE,
+        "hardware_validation":crate::ea189::EA189_EXTENDED_HARDWARE_VALIDATION
+    }));
     json!({"signals":crate::supported_signals().iter().map(|s| {let m=s.metadata();json!({
         "semantic":m.semantic,"title":m.description,"unit":m.unit,"description":m.description,
         "minimum":m.minimum,"maximum":m.maximum,"subsystem":m.subsystem,"profile":m.profile,
@@ -562,6 +803,42 @@ mod tests {
         script.extend(extra.iter().copied());
         MobileCore::new(Script(script)).unwrap()
     }
+
+    #[derive(Default)]
+    struct ExtendedExchange {
+        commands: Vec<String>,
+        oem_reads: Vec<u16>,
+    }
+
+    impl Exchange for ExtendedExchange {
+        fn exchange(&mut self, command: &str, _: Duration) -> Result<String, String> {
+            self.commands.push(command.to_owned());
+            let command = command.trim();
+            Ok(match command {
+                "ATI" | "ATZ" => "ELM327\r>".into(),
+                "AT@1" => "CARLY-UNIVERSAL\r>".into(),
+                "ATE0" | "ATL0" | "ATS1" | "ATH1" | "ATSP0" | "ATSH 7E0" | "ATCRA 7E8"
+                | "ATSH 7DF" | "ATCRA" => "OK\r>".into(),
+                "0100" => "7E8 06 41 00 00 00 00 00\r>".into(),
+                "0902" => "NO DATA\r>".into(),
+                "010C" => "7E8 04 41 0C 1F 40\r>".into(),
+                request => {
+                    let signal = crate::ea189::Ea189ExtendedSignal::ALL
+                        .into_iter()
+                        .find(|signal| {
+                            crate::hex(&signal.request_bytes()).replace(' ', "") == request
+                        })
+                        .expect("only a closed EA189 extended request should be sent");
+                    self.oem_reads.push(signal.id());
+                    let definition = signal.definition();
+                    let mut payload = vec![0x62, (signal.id() >> 8) as u8, signal.id() as u8];
+                    payload.resize(3 + definition.data_len(), 0);
+                    format!("7E8 {:02X} {}\r>", payload.len(), crate::hex(&payload))
+                }
+            })
+        }
+    }
+
     fn run(core: &mut MobileCore<Script>, action: &str, argument: &str) -> Value {
         serde_json::from_str(&core.execute(action, argument)).unwrap()
     }
@@ -579,6 +856,72 @@ mod tests {
                 .len(),
             crate::supported_signals().len()
         );
+        let catalog = run(&mut core, "catalog", "");
+        let extended = &catalog["data"]["profiles"];
+        let profile = extended
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["id"] == "ea189-extended")
+            .unwrap();
+        assert_eq!(profile["default"], false);
+        assert_eq!(profile["action"], "ea189.extended.probe");
+        assert_eq!(profile["signals"], json!([]));
+        assert_eq!(
+            profile["expected_reading_count"],
+            crate::ea189::EA189_EXTENDED_PROBE_COUNT
+        );
+    }
+
+    #[test]
+    fn extended_job_requires_inventory_and_uses_only_the_closed_targeted_read_set() {
+        let mut without_target = core(&[]);
+        assert_eq!(run(&mut without_target, "initialize", "")["ok"], true);
+        let rejected = run(&mut without_target, "ea189.extended.probe", "");
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected["error"]
+            .as_str()
+            .unwrap()
+            .contains("validated engine target"));
+
+        let mut core = MobileCore::new(ExtendedExchange::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&core.execute("initialize", "")).unwrap()["ok"],
+            true
+        );
+        let inventory = serde_json::from_str::<Value>(&core.execute("inventory", "")).unwrap();
+        assert_eq!(inventory["data"]["engine_target_validated"], true);
+        let result =
+            serde_json::from_str::<Value>(&core.execute("ea189.extended.probe", "")).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        let readings = result["data"]["readings"].as_array().unwrap();
+        assert_eq!(readings.len(), crate::ea189::EA189_EXTENDED_PROBE_COUNT);
+        assert_eq!(readings[6]["semantic"], "dpf.oil_ash_volume");
+        assert_eq!(readings[6]["value"], 0.0);
+        assert_eq!(readings[6]["request"], "22 11 53");
+        assert_eq!(
+            readings[6]["source_version"],
+            crate::ea189::EA189_EXTENDED_SOURCE_VERSION
+        );
+        assert_eq!(readings[6]["responses"][0]["responder"], "7E8");
+        let exchange = core.session.take().unwrap().into_exchange().0;
+        assert_eq!(
+            exchange.oem_reads.len(),
+            crate::ea189::EA189_EXTENDED_PROBE_COUNT
+        );
+        assert_eq!(
+            exchange
+                .oem_reads
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            crate::ea189::EA189_EXTENDED_PROBE_COUNT
+        );
+        assert!(!exchange
+            .commands
+            .iter()
+            .any(|command| command.trim() == "1003"));
     }
     #[test]
     fn initialized_reads_reuse_session_and_preserve_responder() {
@@ -857,6 +1200,92 @@ mod tests {
             "recording raw_response missing"
         );
         assert!(missing["data"]["readings"][0].get("value").is_none());
+    }
+
+    #[test]
+    fn replay_extended_probe_redecodes_only_the_exact_read_set_and_rejects_spoofed_request() {
+        let readings: Vec<_> = crate::ea189::Ea189ExtendedSignal::ALL
+            .into_iter()
+            .map(|signal| {
+                let definition = signal.definition();
+                let request = crate::hex(&signal.request_bytes());
+                let data = if signal == crate::ea189::Ea189ExtendedSignal::OilAshVolume {
+                    vec![0x00, 0x64]
+                } else {
+                    vec![0; definition.data_len()]
+                };
+                let mut payload = vec![0x62, (signal.id() >> 8) as u8, signal.id() as u8];
+                payload.extend(data);
+                json!({
+                    "semantic":signal.semantic(),
+                    "request":request,
+                    "value":999,
+                    "raw_response":format!("7E8 {:02X} {}\r>",payload.len(),crate::hex(&payload))
+                })
+            })
+            .collect();
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let replay = run(
+            &mut core,
+            "replay.ea189.extended.probe",
+            &json!({"readings":readings}).to_string(),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        let ash = &replay["data"]["readings"][6];
+        assert_eq!(ash["value"], 1.0);
+        assert_eq!(ash["unit"], "liters");
+        assert_eq!(
+            ash["responses"][0]["payload"],
+            json!([0x62, 0x11, 0x53, 0, 0x64])
+        );
+        assert_eq!(ash["replay"], true);
+
+        let recorded = json!({"readings":[{
+            "semantic":"dpf.oil_ash_volume",
+            "request":"22 11 54",
+            "raw_response":"7E8 05 62 11 53 00 64\r>"
+        }]});
+        assert_eq!(
+            run(
+                &mut core,
+                "replay.ea189.extended.probe",
+                &recorded.to_string()
+            )["ok"],
+            false
+        );
+
+        let mut negative = json!({"readings":crate::ea189::Ea189ExtendedSignal::ALL.iter().map(|signal| {
+            let definition = signal.definition();
+            let raw_response = if *signal == crate::ea189::Ea189ExtendedSignal::OilAshVolume {
+                "7E8 03 7F 22 31\r>".to_owned()
+            } else {
+                let mut payload = vec![0x62, (signal.id() >> 8) as u8, signal.id() as u8];
+                payload.resize(3 + definition.data_len(), 0);
+                format!("7E8 {:02X} {}\r>", payload.len(), crate::hex(&payload))
+            };
+            json!({"semantic":signal.semantic(),"request":crate::hex(&signal.request_bytes()),"raw_response":raw_response})
+        }).collect::<Vec<_>>()});
+        let result = run(
+            &mut core,
+            "replay.ea189.extended.probe",
+            &negative.to_string(),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            result["data"]["readings"][6]["error"],
+            "negative UDS response (NRC 0x31)"
+        );
+        assert!(result["data"]["readings"][6].get("value").is_none());
+
+        negative["readings"].as_array_mut().unwrap().pop();
+        assert_eq!(
+            run(
+                &mut core,
+                "replay.ea189.extended.probe",
+                &negative.to_string()
+            )["ok"],
+            false
+        );
     }
 
     #[test]

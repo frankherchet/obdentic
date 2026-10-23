@@ -1,5 +1,7 @@
 # OBDentic agent instructions
 
+Project memos live in .memento/ — read .memento/INDEX.md at session start (memento skill).
+
 These instructions apply to any coding agent working in this repository, regardless of harness (Codex CLI, Claude Code, or otherwise). Harness-specific mechanics — which sub-agents exist and how to invoke them — live in that harness's own configuration; see "Harness-specific configuration" at the end of this file.
 
 ## Delegation
