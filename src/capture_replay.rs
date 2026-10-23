@@ -10,8 +10,8 @@ use crate::{
         CaptureDefinitionReference, CaptureEvent, CaptureKnowledgeContext, CaptureValue,
         ResponderEvidence,
     },
+    capture_format::ParsedCapture,
     ea189::{decode_experimental_dpf, Ea189DpfProbe, Ea189ExperimentalDpfReading},
-    jsonl_capture::ParsedCapture,
     knowledge_db::KnowledgePin,
     prepare_read,
     telemetry::TelemetryState,
@@ -531,7 +531,7 @@ mod tests {
         capture_events::{
             CaptureDefinitionReference, CaptureKnowledgeContext, ReadTiming, ResponderEvidence,
         },
-        jsonl_capture::CaptureStatus,
+        capture_format::CaptureStatus,
         knowledge_db::KnowledgePin,
     };
 

@@ -213,9 +213,6 @@ impl RuntimeClient {
     }
 }
 
-/// Compatibility alias for callers that name the client after the actor.
-pub type Client = RuntimeClient;
-
 enum Command {
     Event {
         event: RuntimeEvent,
@@ -234,11 +231,6 @@ pub fn start() -> (RuntimeClient, JoinHandle<()>) {
     let (commands, receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let task = tokio::spawn(run(receiver));
     (RuntimeClient { commands }, task)
-}
-
-/// Explicitly named entry point for integrations that avoid a generic `start`.
-pub fn start_runtime_actor() -> (RuntimeClient, JoinHandle<()>) {
-    start()
 }
 
 async fn run(mut commands: mpsc::Receiver<Command>) {

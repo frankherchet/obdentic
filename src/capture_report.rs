@@ -6,7 +6,7 @@ use crate::{
         DiagnosticJobStepStatus, DtcObservationFact, DtcTransportOutcome,
         SubscriptionFilterOutcome,
     },
-    jsonl_capture::{CaptureStatus, ParsedCapture},
+    capture_format::{CaptureStatus, ParsedCapture, VERSION},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -240,7 +240,7 @@ pub fn render_inspection(path: &str, capture: &ParsedCapture) -> String {
     let summary = summary(capture);
     let mut output = format!(
         "Capture: {path}\nFormat: JSONL {}\nStatus: {}\nProfile: {}\nKnowledge: {}\nStarted: {}\nDuration: {}\nEvents: {}\nReads: {} succeeded, {} failed\nSkipped: {} events, {} slots\nDiagnostic jobs: {} started, {} completed, {} failed, {} cancelled\nDiagnostic steps: {} success, {} recoverable, {} fatal, {} skipped\nDTC transport observations: {}\nDTC decoded observations: {}\nLifecycle events: {}\n\nSignals\n",
-        crate::jsonl_capture::VERSION,
+        VERSION,
         status(capture.status),
         summary.profile.as_deref().unwrap_or("unavailable"),
         knowledge_context(summary.knowledge_context.as_ref()),

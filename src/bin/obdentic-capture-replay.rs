@@ -1,4 +1,4 @@
-use obdentic::{capture_replay::CaptureReplay, jsonl_capture, tui};
+use obdentic::{capture_format, capture_replay::CaptureReplay, tui};
 use std::{env, path::Path};
 
 fn main() {
@@ -20,7 +20,7 @@ fn run() -> Result<(), String> {
         }
     };
 
-    let capture = jsonl_capture::read(Path::new(capture_path))?;
+    let capture = capture_format::read(Path::new(capture_path))?;
     let replay = CaptureReplay::from_capture(&capture);
     if replay.transactions().is_empty() {
         let detail = replay

@@ -4,7 +4,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::{
-    elm::{ElmExchange, ElmSession, TargetedDpfProbeRequest, TargetedReadRequest},
+    elm::{
+        ElmExchange, ElmSession, ExchangeError, TargetedDpfProbeRequest, TargetedReadRequest,
+        TransportFailure,
+    },
     topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
         RequestAddress, RequestTarget, RequestTargetEvidence, ResponderIdentity, RoleAssignment,
@@ -19,8 +22,14 @@ pub trait Exchange: Send {
 
 struct PlatformExchange<E>(E);
 impl<E: Exchange> ElmExchange for PlatformExchange<E> {
-    async fn exchange(&mut self, command: &str, timeout: Duration) -> Result<String, String> {
-        self.0.exchange(command, timeout)
+    async fn exchange(
+        &mut self,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<String, ExchangeError> {
+        self.0
+            .exchange(command, timeout)
+            .map_err(|error| TransportFailure::WriteFailed(error).into())
     }
 }
 
@@ -118,10 +127,38 @@ impl<E: Exchange> MobileCore<E> {
         match action {
             "read" => {
                 let request = crate::prepare_read(argument)?;
-                let read = self
-                    .runtime
-                    .block_on(self.session.as_mut().unwrap().read_with_evidence(request))
-                    .map_err(|error| error.error)?;
+                let read = if let Some(mapping) = &self.engine {
+                    if !self
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .supported()
+                        .supports_pid(request.pid())
+                    {
+                        return Err(format!("vehicle does not advertise support for {argument}"));
+                    }
+                    let targeted = TargetedReadRequest::new(
+                        request,
+                        mapping.target().target().clone(),
+                        crate::elm::ResponderIdentity::ElmHeader(
+                            mapping
+                                .expected_responder()
+                                .value()
+                                .ok_or("validated engine responder missing")?
+                                .into(),
+                        ),
+                    )?;
+                    self.runtime.block_on(
+                        self.session
+                            .as_mut()
+                            .unwrap()
+                            .read_targeted_with_evidence(&targeted),
+                    )
+                } else {
+                    self.runtime
+                        .block_on(self.session.as_mut().unwrap().read_with_evidence(request))
+                }
+                .map_err(|error| error.error)?;
                 let transaction = request.complete("user", read.payload)?;
                 let observations: Vec<_> = read
                     .observations
@@ -538,6 +575,54 @@ mod tests {
         );
         assert_eq!(run(&mut core, "read", "dtc.clear")["ok"], false);
         assert_eq!(run(&mut core, "read", "vehicle.speed")["ok"], false);
+    }
+
+    #[test]
+    fn validated_engine_routes_live_reads_and_rejects_other_responders() {
+        let mut core = core(&[
+            ("0100\r", "7E8 06 41 00 00 10 00 00\r>"),
+            ("0902\r", "NO DATA\r>"),
+            ("ATSH 7E0\r", "OK\r>"),
+            ("ATCRA 7E8\r", "OK\r>"),
+            ("010C\r", "7E8 04 41 0C 1F 40\r>"),
+            ("ATSP0\r", "OK\r>"),
+            ("ATSH 7DF\r", "OK\r>"),
+            ("ATCRA\r", "OK\r>"),
+            ("ATSH 7E0\r", "OK\r>"),
+            ("ATCRA 7E8\r", "OK\r>"),
+            ("010C\r", "7E8 04 41 0C 1F 40\r>"),
+            ("ATSP0\r", "OK\r>"),
+            ("ATSH 7DF\r", "OK\r>"),
+            ("ATCRA\r", "OK\r>"),
+            ("ATSH 7E0\r", "OK\r>"),
+            ("ATCRA 7E8\r", "OK\r>"),
+            ("010C\r", "7E8 04 41 0C 1F 40\r7E9 04 41 0C 0C 80\r>"),
+            ("ATSP0\r", "OK\r>"),
+            ("ATSH 7DF\r", "OK\r>"),
+            ("ATCRA\r", "OK\r>"),
+        ]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        assert_eq!(
+            run(&mut core, "inventory", "")["data"]["engine_target_validated"],
+            true
+        );
+        let read = run(&mut core, "read", "engine.rpm");
+        assert_eq!(read["ok"], true, "{read}");
+        assert_eq!(read["data"]["value"], 2000.0);
+        assert_eq!(read["data"]["observations"][0]["selected_responder"], "7E8");
+        assert_eq!(
+            read["data"]["observations"][0]["responses"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let unexpected = run(&mut core, "read", "engine.rpm");
+        assert_eq!(unexpected["ok"], false);
+        assert!(unexpected["error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected responder"));
     }
     #[test]
     fn dtc_scan_preserves_negative_result_and_dpf_requires_target_evidence() {

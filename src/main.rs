@@ -18,12 +18,14 @@ use obdentic::{
         CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, DtcObservationFact,
         DtcTransportOutcome, ReadTiming, SubscriptionFilterOutcome,
     },
+    capture_format::{self, CaptureSender, CaptureSink},
     capture_replay::CaptureReplay,
     capture_report, capture_tui,
     diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus, KnownTarget},
     dtc,
     ecu_identification::EcuIdentificationPlan,
-    ecu_identification_discovery, hex, jsonl_capture,
+    ecu_identification_discovery, hex,
+    jobs::{self, plan_capture, CaptureSession, JobRuntime},
     knowledge_db::KnowledgeCatalog,
     layout_observation::{self, LayoutFreshnessPolicy},
     prepare_read, record, replay,
@@ -270,12 +272,12 @@ async fn run() -> Result<(), String> {
                 .await
             }
             Command::CaptureInspect(path) => {
-                let capture = jsonl_capture::read(Path::new(&path))?;
+                let capture = capture_format::read(Path::new(&path))?;
                 print!("{}", capture_report::render_inspection(&path, &capture));
                 Ok(())
             }
             Command::CaptureCapability(path) => {
-                let capture = jsonl_capture::read(Path::new(&path))?;
+                let capture = capture_format::read(Path::new(&path))?;
                 print!("{}", capture_report::render_capability(&path, &capture));
                 Ok(())
             }
@@ -355,28 +357,26 @@ async fn run() -> Result<(), String> {
                     tui::run_live(&layout, telemetry, audit, policy_state)
                 } else {
                     let plans = routed_observation_plans(&adapter_id, subscriptions).await?;
-                    let (recorder, writer) = match recording.as_deref() {
-                        Some(path) => {
-                            let (sender, writer) = jsonl_capture::start(Path::new(path))?;
-                            (Some(sender), Some(writer))
-                        }
-                        None => (None, None),
-                    };
-                    if let Some(sender) = recorder.as_ref() {
+                    let recorder = recording
+                        .as_deref()
+                        .map(|path| CaptureSink::open(Path::new(path)))
+                        .transpose()?;
+                    let sender = recorder.as_ref().map(CaptureSink::sender);
+                    if sender.is_some() {
                         apply_runtime_event(
                             &runtime,
                             &mut runtime_state,
-                            Some(sender),
+                            sender,
                             RuntimeEvent::recording(RecordingState::Active),
                         )
                         .await?;
                     }
                     let scheduler = match TelemetryScheduler::start_with_runtime(
-                        &adapter_id,
+                        ble::start_session(&adapter_id),
                         plans,
                         telemetry.clone(),
                         audit.clone(),
-                        recorder.clone(),
+                        sender.cloned(),
                         None,
                         None,
                         runtime.clone(),
@@ -386,8 +386,9 @@ async fn run() -> Result<(), String> {
                     {
                         Ok(scheduler) => scheduler,
                         Err(error) => {
-                            if let Some(sender) = recorder.as_ref() {
-                                record_capture_start_failure(sender, "tui.live", &error).await?;
+                            if let Some(sender) = sender {
+                                jobs::record_capture_start_failure(sender, "tui.live", &error)
+                                    .await?;
                                 apply_runtime_event(
                                     &runtime,
                                     &mut runtime_state,
@@ -397,9 +398,8 @@ async fn run() -> Result<(), String> {
                                 .await?;
                             }
                             let shutdown =
-                                finish_runtime(&runtime, &mut runtime_state, recorder.as_ref())
-                                    .await;
-                            let recorded = finish_capture(recorder, writer).await;
+                                finish_runtime(&runtime, &mut runtime_state, sender).await;
+                            let recorded = finish_capture(recorder).await;
                             shutdown?;
                             recorded?;
                             return Err(error);
@@ -407,7 +407,7 @@ async fn run() -> Result<(), String> {
                     };
                     let result = tui::run_live(&layout, telemetry, audit, policy_state);
                     let stopped = scheduler.stop().await;
-                    let inactive = if let Some(sender) = recorder.as_ref() {
+                    let inactive = if let Some(sender) = sender {
                         apply_runtime_event(
                             &runtime,
                             &mut runtime_state,
@@ -418,9 +418,8 @@ async fn run() -> Result<(), String> {
                     } else {
                         Ok(())
                     };
-                    let shutdown =
-                        finish_runtime(&runtime, &mut runtime_state, recorder.as_ref()).await;
-                    let recorded = finish_capture(recorder, writer).await;
+                    let shutdown = finish_runtime(&runtime, &mut runtime_state, sender).await;
+                    let recorded = finish_capture(recorder).await;
                     result?;
                     stopped?;
                     inactive?;
@@ -1101,9 +1100,9 @@ async fn run_diagnose_dtc_scan(
 ) -> Result<(), String> {
     let started = Instant::now();
     let recorder = recording
-        .map(jsonl_capture::JsonlRecorder::start)
+        .map(CaptureSink::open)
         .transpose()?;
-    let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
+    let sender = recorder.as_ref().map(CaptureSink::sender);
     let result = async {
         if sender.is_some() {
             emit_capture_started(sender, Some("dtc.scan".into())).await?;
@@ -1154,7 +1153,7 @@ async fn run_diagnose_dtc_scan_inner(
     adapter_id: &str,
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
 ) -> Result<(), String> {
     let job = DiagnosticJob::dtc_scan(DiagnosticScope::VehicleWide);
     let plan = job.plan();
@@ -1439,9 +1438,9 @@ async fn run_ea189_dpf_capture(
     let profile = config.profile;
     let started = Instant::now();
     let recorder = recording
-        .map(jsonl_capture::JsonlRecorder::start)
+        .map(CaptureSink::open)
         .transpose()?;
-    let sender = recorder.as_ref().map(jsonl_capture::JsonlRecorder::sender);
+    let sender = recorder.as_ref().map(CaptureSink::sender);
     let result = async {
         if sender.is_some() {
             emit_capture_started(sender, Some(profile.into())).await?;
@@ -1495,7 +1494,7 @@ async fn run_diagnose_ea189_dpf_probe_inner(
     adapter_id: &str,
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     started: Instant,
     config: Ea189DpfCaptureConfig<'_>,
 ) -> Result<(), String> {
@@ -1955,7 +1954,7 @@ fn longitudinal_context_plan(
 }
 
 struct LongitudinalCycleContext<'a> {
-    recorder: Option<&'a jsonl_capture::Sender>,
+    recorder: Option<&'a CaptureSender>,
     started: Instant,
     due_us: u64,
     reads: &'a [LongitudinalContextRead],
@@ -2118,7 +2117,7 @@ async fn capture_longitudinal_context_cycle(
 }
 
 async fn emit_longitudinal_response_observations(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     context_read: &LongitudinalContextRead,
     observations: &[ble::TargetedReadObservation],
     offset_us: u64,
@@ -2172,7 +2171,7 @@ async fn cached_engine_mapping(adapter_id: &str) -> Result<EcuTargetMapping, Str
 async fn finish_diagnostic(
     runtime: &RuntimeClient,
     state: &mut RuntimeState,
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
 ) -> Result<(), String> {
     apply_runtime_event(
         runtime,
@@ -2212,7 +2211,7 @@ fn dtc_evidence(
 }
 
 async fn record_protocol_negotiation(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     negotiation: &ble::ProtocolNegotiation,
 ) -> Result<(), String> {
     for observation in negotiation.observations() {
@@ -2233,7 +2232,7 @@ async fn record_protocol_negotiation(
 }
 
 async fn record_dtc_transport_evidence(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     job: &DiagnosticJob,
     responses: &ble::DiagnosticResponses,
 ) -> Result<(), String> {
@@ -2271,7 +2270,7 @@ async fn record_dtc_transport_evidence(
 }
 
 async fn record_dtc_facts(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     job: &DiagnosticJob,
     result: &dtc::DtcScanResult,
 ) -> Result<(), String> {
@@ -2648,35 +2647,22 @@ async fn run_capture(
     profile.admit(capability)?;
     let configured = profile.subscriptions()?;
     let advertised = ble::supported_signals(adapter_id).await?;
-    let total = configured.len();
-    let (subscriptions, capture_subscriptions) =
-        filter_capture_subscriptions(configured, &advertised);
-    if subscriptions.is_empty() {
-        return Err(format!(
-            "capture profile {profile_name} has no signals supported by the adapter"
-        ));
-    }
-    let plans = routed_observation_plans(adapter_id, subscriptions.clone()).await?;
+    let plan = plan_capture(profile_name, configured, &advertised)?;
+    let plans = routed_observation_plans(adapter_id, plan.scheduled().to_vec()).await?;
 
-    let (sender, writer) = jsonl_capture::start(path)?;
-    apply_runtime_event(
-        runtime,
-        runtime_state,
-        Some(&sender),
-        RuntimeEvent::recording(RecordingState::Active),
-    )
-    .await?;
+    let sink = CaptureSink::open(path)?;
+    let mut rt = JobRuntime::new(runtime, runtime_state, Some(sink.sender().clone()));
     println!("capture profile  {profile_name}");
     println!(
         "capture signals  {}/{} supported",
-        subscriptions.len(),
-        total
+        plan.scheduled().len(),
+        plan.total_configured()
     );
     println!(
         "capture budget   {} reads/s conservative",
         capability.request_budget_per_second()
     );
-    for subscription in &capture_subscriptions {
+    for subscription in plan.subscriptions() {
         println!(
             "capture signal   {}  {} ms  {}",
             subscription.semantic(),
@@ -2691,113 +2677,42 @@ async fn run_capture(
     println!("capture record   {}", path.display());
     println!("capture connecting...  wait for session initialization");
 
-    let scheduler = match TelemetryScheduler::start_with_runtime(
-        adapter_id,
+    let session = CaptureSession::start(
+        profile_name,
+        &plan,
         plans,
+        ble::start_session(adapter_id),
         Arc::new(Mutex::new(TelemetryState::new(600)?)),
         Arc::new(Mutex::new(AuditState::new(600)?)),
-        Some(sender.clone()),
-        Some(profile.name().into()),
-        Some(capture_subscriptions),
-        runtime.clone(),
-        None,
+        &mut rt,
+        sink,
     )
-    .await
-    {
-        Ok(scheduler) => scheduler,
-        Err(error) => {
-            record_capture_start_failure(&sender, profile.name(), &error).await?;
-            let inactive = apply_runtime_event(
-                runtime,
-                runtime_state,
-                Some(&sender),
-                RuntimeEvent::recording(RecordingState::Inactive),
-            )
-            .await;
-            let shutdown = finish_runtime(runtime, runtime_state, Some(&sender)).await;
-            let recorded = finish_capture(Some(sender), Some(writer)).await;
-            inactive?;
-            shutdown?;
-            recorded?;
-            return Err(error);
-        }
-    };
+    .await?;
     println!("capture running  press Ctrl-C to stop");
 
-    let wait_result = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            println!("capture stopping...");
-            signal.map_err(|error| format!("Ctrl-C listener failed: {error}"))
-        },
-        _ = wait_for_scheduler(&scheduler) => Err("capture session stopped unexpectedly".into()),
-    };
-    let stopped = scheduler.stop().await;
-    let inactive = apply_runtime_event(
-        runtime,
-        runtime_state,
-        Some(&sender),
-        RuntimeEvent::recording(RecordingState::Inactive),
-    )
-    .await;
-    let shutdown = finish_runtime(runtime, runtime_state, Some(&sender)).await;
-    let recorded = finish_capture(Some(sender), Some(writer)).await;
-    stopped?;
-    wait_result?;
-    inactive?;
-    shutdown?;
-    recorded?;
+    session
+        .run_until(
+            async {
+                let signal = tokio::signal::ctrl_c().await;
+                println!("capture stopping...");
+                signal.map_err(|error| format!("Ctrl-C listener failed: {error}"))
+            },
+            &mut rt,
+        )
+        .await?;
     println!("capture stopped");
     Ok(())
 }
 
-fn filter_capture_subscriptions(
-    configured: Vec<Subscription>,
-    advertised: &[ble::SignalSupport],
-) -> (Vec<Subscription>, Vec<CaptureSubscription>) {
-    let mut scheduled = Vec::new();
-    let mut decisions = Vec::new();
-    for subscription in configured {
-        let filter = match advertised
-            .iter()
-            .find(|signal| signal.semantic == subscription.semantic())
-            .map(|signal| signal.status)
-            .unwrap_or(ble::SignalSupportStatus::Unknown)
-        {
-            ble::SignalSupportStatus::Supported => SubscriptionFilterOutcome::Scheduled,
-            ble::SignalSupportStatus::Unsupported => SubscriptionFilterOutcome::Unsupported,
-            ble::SignalSupportStatus::Unknown => SubscriptionFilterOutcome::Unknown,
-        };
-        decisions.push(CaptureSubscription::new(
-            subscription.semantic(),
-            subscription.interval_us(),
-            filter,
-        ));
-        if filter == SubscriptionFilterOutcome::Scheduled {
-            scheduled.push(subscription);
-        }
-    }
-    (scheduled, decisions)
-}
-
-async fn wait_for_scheduler(scheduler: &TelemetryScheduler) {
-    while !scheduler.is_finished() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn finish_capture(
-    sender: Option<jsonl_capture::Sender>,
-    writer: Option<jsonl_capture::Writer>,
-) -> Result<(), String> {
-    match (sender, writer) {
-        (Some(sender), Some(writer)) => jsonl_capture::close(sender, writer).await,
-        (None, None) => Ok(()),
-        _ => Err("JSONL recorder has incomplete ownership".into()),
+async fn finish_capture(sink: Option<CaptureSink>) -> Result<(), String> {
+    match sink {
+        Some(sink) => sink.close().await,
+        None => Ok(()),
     }
 }
 
 async fn emit_capture_event(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     event: CaptureEvent,
 ) -> Result<(), String> {
     if let Some(recorder) = recorder {
@@ -2810,7 +2725,7 @@ async fn emit_capture_event(
 }
 
 async fn emit_capture_started(
-    recorder: Option<&jsonl_capture::Sender>,
+    recorder: Option<&CaptureSender>,
     profile: Option<String>,
 ) -> Result<(), String> {
     let Some(recorder) = recorder else {
@@ -2823,32 +2738,6 @@ async fn emit_capture_started(
     )
     .await?;
     emit_capture_event(Some(recorder), CaptureEvent::knowledge_context(context)).await
-}
-
-async fn record_capture_start_failure(
-    sender: &jsonl_capture::Sender,
-    profile: &str,
-    error: &str,
-) -> Result<(), String> {
-    let wallclock_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_millis()
-        .try_into()
-        .map_err(|_| "wall clock timestamp exceeds supported range")?;
-    let context = obdentic::capture_events::CaptureKnowledgeContext::current()?;
-    for event in [
-        CaptureEvent::capture_started(Some(wallclock_ms), Some(profile.into())),
-        CaptureEvent::knowledge_context(context),
-        CaptureEvent::session_error(error),
-        CaptureEvent::SessionStopped { offset_us: 0 },
-    ] {
-        sender
-            .send(event)
-            .await
-            .map_err(|_| "capture recorder is closed".to_string())?;
-    }
-    Ok(())
 }
 
 fn planned_layout_subscriptions(
@@ -2971,7 +2860,7 @@ fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
 fn run_capture_dpf_report(paths: &[String]) -> Result<(), String> {
     let mut replays = Vec::with_capacity(paths.len());
     for path in paths {
-        replays.push(CaptureReplay::from_capture(&jsonl_capture::read(
+        replays.push(CaptureReplay::from_capture(&capture_format::read(
             Path::new(path),
         )?));
     }
@@ -3464,34 +3353,6 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).into()).collect()
-    }
-
-    #[tokio::test]
-    async fn startup_failure_is_preserved_in_the_capture_event_stream() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        record_capture_start_failure(&sender, "engine-baseline", "Carly setup timed out")
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            receiver.recv().await,
-            Some(CaptureEvent::CaptureStarted {
-                profile: Some(profile),
-                ..
-            }) if profile == "engine-baseline"
-        ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(CaptureEvent::KnowledgeContext { .. })
-        ));
-        assert_eq!(
-            receiver.recv().await,
-            Some(CaptureEvent::session_error("Carly setup timed out"))
-        );
-        assert_eq!(
-            receiver.recv().await,
-            Some(CaptureEvent::SessionStopped { offset_us: 0 })
-        );
     }
 
     #[tokio::test]
@@ -4106,38 +3967,6 @@ mod tests {
             .lines()
             .any(|line| line.starts_with("engine.load\tunknown\t")));
         assert_eq!(output.lines().count(), supported_signals().len() + 1);
-    }
-
-    #[test]
-    fn capture_filter_schedules_only_advertised_signals_and_records_all_decisions() {
-        let configured = capture::profile("engine-baseline")
-            .unwrap()
-            .subscriptions()
-            .unwrap();
-        let (scheduled, decisions) = filter_capture_subscriptions(
-            configured,
-            &[
-                ble::SignalSupport {
-                    semantic: "engine.rpm",
-                    status: ble::SignalSupportStatus::Supported,
-                },
-                ble::SignalSupport {
-                    semantic: "engine.maf",
-                    status: ble::SignalSupportStatus::Unsupported,
-                },
-            ],
-        );
-
-        assert_eq!(scheduled.len(), 1);
-        assert_eq!(scheduled[0].semantic(), "engine.rpm");
-        assert_eq!(scheduled[0].interval(), Duration::from_secs(1));
-        assert_eq!(decisions.len(), 13);
-        assert_eq!(decisions[0].filter(), SubscriptionFilterOutcome::Scheduled);
-        assert_eq!(
-            decisions[1].filter(),
-            SubscriptionFilterOutcome::Unsupported
-        );
-        assert_eq!(decisions[2].filter(), SubscriptionFilterOutcome::Unknown);
     }
 
     #[test]

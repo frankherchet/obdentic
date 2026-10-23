@@ -193,7 +193,7 @@ mod tests {
     use super::*;
     use crate::{
         capture_events::{CaptureEvent, ResponderEvidence},
-        jsonl_capture::{CaptureStatus, ParsedCapture},
+        capture_format::{CaptureStatus, ParsedCapture},
     };
 
     fn dpf_response(value: [u8; 2]) -> CaptureEvent {

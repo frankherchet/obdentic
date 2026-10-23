@@ -1,3 +1,4 @@
+use super::{CaptureSender as Sender, Writer};
 use crate::{
     capture_events::{
         validate_diagnostic_error, validate_diagnostic_job_id, validate_diagnostic_mode,
@@ -7,6 +8,7 @@ use crate::{
         SubscriptionFilterOutcome, MAX_DTC_DECODER_LEN, MAX_DTC_PROVENANCE_LEN,
     },
     diagnostic_job::JobStatus,
+    hex,
     runtime_reducer::{ContextUpdate, RuntimeEvent},
     runtime_state::{
         RecordingState, RuntimeState, SafetyCapability, SourceState, TopologyState, TransportState,
@@ -19,18 +21,12 @@ use std::{
     io::{self, Write},
     path::Path,
 };
-use tokio::{
-    sync::mpsc,
-    task::{self, JoinHandle},
-};
+use tokio::{sync::mpsc, task};
 
-pub const SCHEMA: &str = "OBDENTIC-CAPTURE";
-pub const VERSION: u64 = 1;
+pub(super) const SCHEMA: &str = "OBDENTIC-CAPTURE";
+pub(crate) const VERSION: u64 = 1;
 const CHANNEL_CAPACITY: usize = 64;
 const FLUSH_EVERY: u64 = 16;
-
-pub type Sender = mpsc::Sender<CaptureEvent>;
-pub type Writer = JoinHandle<Result<(), String>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureStatus {
@@ -44,13 +40,10 @@ pub struct ParsedCapture {
     pub status: CaptureStatus,
 }
 
-/// Starts a private recorder, replacing an earlier capture at the same path.
-pub fn start(path: &Path) -> Result<(Sender, Writer), String> {
-    crate::capture_writer::start(path)
-}
-
-/// JSONL plugin entry point used by the capture-writer registry.
-pub(crate) fn start_jsonl(path: &Path) -> Result<(Sender, Writer), String> {
+/// Starts the JSONL sink at `path`. Called only through
+/// [`CaptureSink::open`](super::CaptureSink::open), which picks this by
+/// file extension and wraps a failure with the format name and path.
+pub(super) fn start(path: &Path) -> Result<(Sender, Writer), String> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -68,43 +61,6 @@ pub(crate) fn start_jsonl(path: &Path) -> Result<(Sender, Writer), String> {
     let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let task = task::spawn_blocking(move || write_events(file, receiver));
     Ok((sender, task))
-}
-
-/// Convenience owner for callers that do not need to keep the task separate.
-pub struct JsonlRecorder {
-    sender: Option<Sender>,
-    task: Option<Writer>,
-}
-
-impl JsonlRecorder {
-    pub fn start(path: &Path) -> Result<Self, String> {
-        let (sender, task) = start(path)?;
-        Ok(Self {
-            sender: Some(sender),
-            task: Some(task),
-        })
-    }
-
-    pub fn sender(&self) -> &Sender {
-        self.sender
-            .as_ref()
-            .expect("recorder sender already closed")
-    }
-
-    pub async fn close(mut self) -> Result<(), String> {
-        self.sender.take();
-        self.task
-            .take()
-            .expect("recorder task already closed")
-            .await
-            .map_err(|error| format!("capture recorder stopped unexpectedly: {error}"))?
-    }
-}
-
-pub async fn close(sender: Sender, task: Writer) -> Result<(), String> {
-    drop(sender);
-    task.await
-        .map_err(|error| format!("capture recorder stopped unexpectedly: {error}"))?
 }
 
 fn write_events(mut file: File, mut receiver: mpsc::Receiver<CaptureEvent>) -> Result<(), String> {
@@ -139,7 +95,7 @@ fn header() -> String {
     format!("{{\"schema\":\"{SCHEMA}\",\"version\":{VERSION},\"type\":\"header\"}}\n")
 }
 
-pub(crate) fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
+pub(super) fn event_line(sequence: u64, event: &CaptureEvent) -> Result<String, String> {
     let mut object = format!("{{\"schema\":\"{SCHEMA}\",\"version\":{VERSION},\"type\":",);
     match event {
         CaptureEvent::CaptureStarted {
@@ -650,15 +606,7 @@ fn push_string(object: &mut String, value: &str) {
     object.push('"');
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn read(path: &Path) -> Result<ParsedCapture, String> {
+pub(super) fn read(path: &Path) -> Result<ParsedCapture, String> {
     let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let mut lines = contents.lines();
     let header_line = lines
@@ -731,10 +679,6 @@ pub fn read(path: &Path) -> Result<ParsedCapture, String> {
             CaptureStatus::Partial
         },
     })
-}
-
-pub fn read_events(path: &Path) -> Result<Vec<CaptureEvent>, String> {
-    Ok(read(path)?.events)
 }
 
 fn expect_schema(object: &Object, line_number: usize) -> Result<(), String> {
@@ -2150,7 +2094,11 @@ mod tests {
     }
 
     async fn finish(sender: Sender, writer: Writer) {
-        close(sender, writer).await.unwrap();
+        drop(sender);
+        writer
+            .await
+            .unwrap()
+            .expect("capture recorder stopped unexpectedly");
     }
 
     fn events() -> Vec<CaptureEvent> {
@@ -2338,7 +2286,7 @@ mod tests {
         assert!(contents.contains("\"source\":\"7E8\""));
         assert!(!contents.contains("VIN"));
         assert!(!contents.contains("raw_command"));
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         fs::remove_file(path).unwrap();
     }
 
@@ -2368,7 +2316,7 @@ mod tests {
         }
         finish(sender, writer).await;
 
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"filter_outcome\":\"scheduled\""));
         assert!(contents.contains("\"filter_outcome\":\"unsupported\""));
@@ -2423,7 +2371,7 @@ mod tests {
         assert!(contents.contains("\"type\":\"protocol_negotiation_observed\""));
         assert!(contents.contains("\"request_payload\":\"01 00\""));
         assert!(!contents.contains("dtc_observation"));
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         fs::remove_file(path).unwrap();
     }
 
@@ -2464,7 +2412,7 @@ mod tests {
         assert!(contents.contains("\"code\":\"P010C\""));
         assert!(contents.contains("\"type\":\"decode_error\""));
         assert!(!contents.contains("raw_command"));
-        assert_eq!(read_events(&path).unwrap(), expected);
+        assert_eq!(read(&path).unwrap().events, expected);
         fs::remove_file(path).unwrap();
     }
 
@@ -2503,7 +2451,7 @@ mod tests {
         assert!(contents.contains("phase/ready"));
         assert!(!contents.contains("VIN"));
         assert_eq!(
-            read_events(&path).unwrap(),
+            read(&path).unwrap().events,
             vec![CaptureEvent::RuntimeStateChanged {
                 transition_sequence: 0,
                 from,
@@ -2580,7 +2528,7 @@ mod tests {
         }
         finish(sender, writer).await;
 
-        let parsed = read_events(&path).unwrap();
+        let parsed = read(&path).unwrap().events;
         assert_eq!(
             parsed,
             runtime_events
@@ -2604,7 +2552,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            read_events(&path).unwrap(),
+            read(&path).unwrap().events,
             vec![CaptureEvent::SupportDiscovery {
                 request_payload: vec![0x01, 0x00],
                 responder: None,
@@ -2635,7 +2583,7 @@ mod tests {
         finish(sender, writer).await;
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"offset_us\":12345678"));
-        assert_eq!(read_events(&path).unwrap(), vec![expected]);
+        assert_eq!(read(&path).unwrap().events, vec![expected]);
         fs::remove_file(path).unwrap();
 
         let path = temp_path("legacy-response-offset");
@@ -2644,7 +2592,7 @@ mod tests {
             "{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"header\"}\n{\"schema\":\"OBDENTIC-CAPTURE\",\"version\":1,\"type\":\"responses_observed\",\"sequence\":0,\"semantic\":\"dpf.soot_mass_calculated\",\"request_payload\":\"22 11 4F\",\"responses\":[{\"responder\":\"7E8\",\"payload\":\"62 11 4F 04 F8\"}],\"selected_responder\":\"7E8\",\"selection_error\":null}\n",
         )
         .unwrap();
-        let events = read_events(&path).unwrap();
+        let events = read(&path).unwrap().events;
         assert!(matches!(
             events.as_slice(),
             [CaptureEvent::ResponsesObserved {
@@ -2678,7 +2626,7 @@ mod tests {
         }
         finish(sender, writer).await;
         assert_eq!(read(&path).unwrap().status, CaptureStatus::Partial);
-        assert_eq!(read_events(&path).unwrap().len(), 3);
+        assert_eq!(read(&path).unwrap().events.len(), 3);
         fs::remove_file(path).unwrap();
     }
 

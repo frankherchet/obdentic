@@ -151,6 +151,9 @@ public final class ObdService extends Service {
         if(!result.optBoolean("ok")) throw new IOException(result.optString("error","Initialisierung fehlgeschlagen"));
         applyCatalog(execute("catalog",""));
         JSONObject support=result.optJSONObject("data"); if(support != null) { set("vehicle",support); applySupport(support); }
+        JSONObject inventory=execute("inventory","");
+        if(token!=generation) return;
+        if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
         JSONArray defaults=new JSONArray(); synchronized(stateLock) { JSONArray selected=state.optJSONArray("selected");
             if(selected.length()==0) { JSONArray signals=state.optJSONArray("signals"); for(String semantic:new String[]{"engine.rpm","vehicle.speed","engine.coolant_temperature","engine.maf"})

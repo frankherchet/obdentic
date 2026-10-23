@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 pub use crate::adapter::AdapterCandidate;
-#[cfg(test)]
-use crate::elm::ElmExchange;
+use crate::elm::{AdapterLink, ElmExchange, ExchangeError, TransportFailure};
 #[cfg(test)]
 pub(crate) use crate::elm::{
     discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
@@ -221,33 +220,39 @@ pub async fn scan() -> Result<Vec<AdapterCandidate>, String> {
     crate::adapter::scan().await
 }
 
+/// Merges a one-shot operation's result with its own disconnect outcome:
+/// the operation's error wins over a clean disconnect, and a disconnect
+/// failure is appended to whatever error (if any) the operation produced.
+async fn finish_after_disconnect<T>(
+    result: Result<T, String>,
+    mut session: DiagnosticSession,
+) -> Result<T, String> {
+    match (result, session.disconnect().await) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
 pub async fn read(adapter_id: &str, request: ReadRequest) -> Result<Transaction, String> {
-    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
+    let mut session = DiagnosticSession::connect(adapter_id, ConnectMode::new(true, true)).await?;
     let result = tokio::select! {
         outcome = session.read_with_evidence(request) => outcome.into_transaction(),
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(transaction), Ok(())) => Ok(transaction),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 pub async fn read_targeted(
     adapter_id: &str,
     request: TargetedReadRequest,
 ) -> Result<Transaction, String> {
-    let mut session = DiagnosticSession::connect_with_adapter_io(adapter_id, true).await?;
+    let mut session = DiagnosticSession::connect(adapter_id, ConnectMode::new(true, true)).await?;
     let result = tokio::select! {
         outcome = session.read_targeted(request) => outcome,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(transaction), Ok(())) => Ok(transaction),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 /// Connect and initialize an ELM327 session, then establish the automatic
@@ -257,7 +262,7 @@ pub async fn prepare_diagnostic_session(
     adapter_id: &str,
 ) -> Result<PreparedDiagnosticSession, String> {
     let mut session =
-        DiagnosticSession::connect_with_adapter_io_mode(adapter_id, false, false).await?;
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, false)).await?;
     let negotiation = match session.establish_protocol().await {
         Ok(negotiation) => negotiation,
         Err(error) => {
@@ -273,27 +278,14 @@ pub async fn prepare_diagnostic_session(
     })
 }
 
-/// Compatibility helper for callers that do not need the explicit protocol
-/// evidence. The semantic DTC request remains exactly one Mode 03 command.
-pub async fn read_stored_dtcs(adapter_id: &str) -> Result<DiagnosticResponses, String> {
-    prepare_diagnostic_session(adapter_id)
-        .await?
-        .read_stored_dtcs()
-        .await
-}
-
 pub async fn identify(adapter_id: &str) -> Result<crate::identity::VehicleIdentity, String> {
     let mut session =
-        DiagnosticSession::connect_without_support_discovery(adapter_id, true).await?;
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(true, false)).await?;
     let result = tokio::select! {
         identity = session.identify() => identity,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(identity), Ok(())) => Ok(identity),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 /// Connect, initialize the adapter, and validate functional support with one
@@ -303,27 +295,18 @@ pub async fn validate_functional_support(
     adapter_id: &str,
 ) -> Result<Vec<SupportDiscovery>, String> {
     let mut session =
-        DiagnosticSession::connect_without_support_discovery(adapter_id, false).await?;
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, false)).await?;
     let result = tokio::select! {
         support = session.validate_functional_support() => support,
         _ = tokio::signal::ctrl_c() => Err("cancelled".into()),
     };
-    match (result, session.disconnect().await) {
-        (Ok(support), Ok(())) => Ok(support),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    finish_after_disconnect(result, session).await
 }
 
 pub async fn supported_signals(adapter_id: &str) -> Result<Vec<SignalSupport>, String> {
-    let mut session = DiagnosticSession::connect(adapter_id).await?;
-    let result = Ok(session.signal_support());
-    match (result, session.disconnect().await) {
-        (Ok(support), Ok(())) => Ok(support),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
+    let session = DiagnosticSession::connect(adapter_id, ConnectMode::new(false, true)).await?;
+    let support = session.signal_support();
+    finish_after_disconnect(Ok(support), session).await
 }
 
 pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
@@ -333,7 +316,7 @@ pub async fn start_session(adapter_id: &str) -> Result<SessionClient, String> {
 /// Start the same closed session while mirroring adapter TX/RX for a bounded
 /// diagnostic probe. No caller-controlled ELM command path is exposed.
 pub async fn start_session_with_adapter_io(adapter_id: &str) -> Result<SessionClient, String> {
-    let session = DiagnosticSession::connect_with_adapter_io_mode(adapter_id, true, true).await?;
+    let session = DiagnosticSession::connect(adapter_id, ConnectMode::new(true, true)).await?;
     Ok(start_session_actor(session))
 }
 
@@ -342,15 +325,28 @@ async fn start_session_mode(
     discover_support: bool,
 ) -> Result<SessionClient, String> {
     let session =
-        DiagnosticSession::connect_with_adapter_io_mode(adapter_id, false, discover_support)
+        DiagnosticSession::connect(adapter_id, ConnectMode::new(false, discover_support))
             .await?;
     Ok(start_session_actor(session))
 }
 
-fn start_session_actor(session: DiagnosticSession) -> SessionClient {
+fn start_session_actor<E: AdapterLink + 'static>(session: DiagnosticSession<E>) -> SessionClient {
     let (sender, receiver) = mpsc::channel(16);
     tokio::spawn(session_actor(session, receiver));
     SessionClient { sender }
+}
+
+/// A [`SessionClient`] backed by a scripted exchange rather than real
+/// hardware. Shared across this module's tests and other modules'
+/// (e.g. the scheduler's), so every crate test that needs a session can
+/// use the same fake adapter seam.
+#[cfg(test)]
+pub(crate) async fn start_scripted_session(
+    exchange: crate::test_support::ScriptedExchange,
+    discover_support: bool,
+) -> Result<SessionClient, String> {
+    let session = DiagnosticSession::from_exchange(exchange, discover_support).await?;
+    Ok(start_session_actor(session))
 }
 
 #[derive(Clone)]
@@ -601,8 +597,8 @@ fn request_budget_for(service_time: Duration) -> u32 {
     u32::try_from(budget).unwrap_or(u32::MAX)
 }
 
-async fn session_actor(
-    mut session: DiagnosticSession,
+async fn session_actor<E: AdapterLink + 'static>(
+    mut session: DiagnosticSession<E>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
     let mut health = SessionHealth::default();
@@ -659,7 +655,7 @@ async fn session_actor(
                         let _ = reply.send(Ok(responses));
                     }
                     Err(error) => {
-                        if health.observe(&error) {
+                        if health.observe(session.take_transport_failure(), &error) {
                             let fatal = health.unhealthy().unwrap().to_owned();
                             session.disconnect_best_effort().await;
                             disconnect_done = true;
@@ -720,7 +716,7 @@ async fn session_actor(
                         let _ = reply.send(Ok(responses));
                     }
                     Err(error) => {
-                        if health.observe(&error) {
+                        if health.observe(session.take_transport_failure(), &error) {
                             let fatal = health.unhealthy().unwrap().to_owned();
                             session.disconnect_best_effort().await;
                             disconnect_done = true;
@@ -745,7 +741,7 @@ async fn session_actor(
                         let _ = reply.send(Ok(responses));
                     }
                     Err(error) => {
-                        if health.observe(&error) {
+                        if health.observe(session.take_transport_failure(), &error) {
                             let fatal = health.unhealthy().unwrap().to_owned();
                             session.disconnect_best_effort().await;
                             disconnect_done = true;
@@ -781,8 +777,8 @@ async fn session_actor(
     }
 }
 
-async fn process_read_outcome(
-    session: &mut DiagnosticSession,
+async fn process_read_outcome<E: AdapterLink>(
+    session: &mut DiagnosticSession<E>,
     health: &mut SessionHealth,
     service: &mut RequestServiceEstimator,
     disconnect_done: &mut bool,
@@ -804,7 +800,7 @@ async fn process_read_outcome(
             error,
             observations,
         } => {
-            if health.observe(&error) {
+            if health.observe(session.take_transport_failure(), &error) {
                 let fatal = health.unhealthy().unwrap().to_owned();
                 session.disconnect_best_effort().await;
                 *disconnect_done = true;
@@ -823,8 +819,8 @@ async fn process_read_outcome(
     }
 }
 
-async fn process_dpf_probe_outcome(
-    session: &mut DiagnosticSession,
+async fn process_dpf_probe_outcome<E: AdapterLink>(
+    session: &mut DiagnosticSession<E>,
     health: &mut SessionHealth,
     service: &mut RequestServiceEstimator,
     disconnect_done: &mut bool,
@@ -846,7 +842,7 @@ async fn process_dpf_probe_outcome(
             error,
             observations,
         } => {
-            if health.observe(&error) {
+            if health.observe(session.take_transport_failure(), &error) {
                 let fatal = health.unhealthy().unwrap().to_owned();
                 session.disconnect_best_effort().await;
                 *disconnect_done = true;
@@ -865,8 +861,8 @@ async fn process_dpf_probe_outcome(
     }
 }
 
-async fn process_ecu_identification_outcome(
-    session: &mut DiagnosticSession,
+async fn process_ecu_identification_outcome<E: AdapterLink>(
+    session: &mut DiagnosticSession<E>,
     health: &mut SessionHealth,
     service: &mut RequestServiceEstimator,
     disconnect_done: &mut bool,
@@ -888,7 +884,7 @@ async fn process_ecu_identification_outcome(
             error,
             observations,
         } => {
-            if health.observe(&error) {
+            if health.observe(session.take_transport_failure(), &error) {
                 let fatal = health.unhealthy().unwrap().to_owned();
                 session.disconnect_best_effort().await;
                 *disconnect_done = true;
@@ -918,12 +914,16 @@ impl SessionHealth {
         self.consecutive_transport_failures = 0;
     }
 
-    /// Returns true only when this error crosses the fatal transport threshold.
-    fn observe(&mut self, error: &str) -> bool {
+    /// Returns true only when this error crosses the fatal transport
+    /// threshold. `transport_failure` is `Some` only when the read that
+    /// produced `error` itself failed at the byte transport (see
+    /// [`DiagnosticSession::take_transport_failure`]); a data/response
+    /// failure resets the streak instead.
+    fn observe(&mut self, transport_failure: Option<TransportFailure>, error: &str) -> bool {
         if self.unhealthy.is_some() {
             return false;
         }
-        if !is_transport_failure(error) {
+        if transport_failure.is_none() {
             self.consecutive_transport_failures = 0;
             return false;
         }
@@ -944,51 +944,108 @@ pub(crate) fn is_session_unhealthy(error: &str) -> bool {
     error.starts_with(SESSION_UNHEALTHY_PREFIX)
 }
 
-fn is_transport_failure(error: &str) -> bool {
-    [
-        "Carly write timed out:",
-        "Carly write failed:",
-        "Carly command timed out:",
-        "Carly notification stream ended",
-        "diagnostic session is closed",
-        "diagnostic session stopped before responding",
-    ]
-    .iter()
-    .any(|marker| error.contains(marker))
+/// Errors with a session/transport boundary are fatal to a live operation;
+/// semantic/data errors remain recoverable for bounded reads.
+pub fn is_fatal_session_error(error: &str) -> bool {
+    error.starts_with("diagnostic session became unresponsive")
+        || [
+            "Bluetooth ",
+            "BLE ",
+            "Carly ",
+            "diagnostic session is ",
+            "diagnostic session stopped ",
+        ]
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
 }
 
-/// One connected, initialized, read-only Carly diagnostic path.
-pub struct DiagnosticSession {
-    elm: Option<ElmSession<CarlyCuaV200>>,
+/// Records the last [`TransportFailure`] an [`AdapterLink`] produced, so the
+/// session actor can classify health without matching on error text. Kept
+/// as an [`ElmExchange`]/[`AdapterLink`] wrapper rather than a field on
+/// [`DiagnosticSession`] so it observes every exchange the ELM dialect layer
+/// makes, not just the ones a caller sees the result of.
+struct HealthTap<E> {
+    inner: E,
+    last_transport_failure: Option<TransportFailure>,
 }
 
-impl DiagnosticSession {
-    pub async fn connect(adapter_id: &str) -> Result<Self, String> {
-        Self::connect_with_adapter_io(adapter_id, false).await
+impl<E> HealthTap<E> {
+    fn new(inner: E) -> Self {
+        Self {
+            inner,
+            last_transport_failure: None,
+        }
     }
 
-    async fn connect_without_support_discovery(
-        adapter_id: &str,
-        show_adapter_io: bool,
-    ) -> Result<Self, String> {
-        Self::connect_with_adapter_io_mode(adapter_id, show_adapter_io, false).await
+    fn take_transport_failure(&mut self) -> Option<TransportFailure> {
+        self.last_transport_failure.take()
+    }
+}
+
+impl<E: ElmExchange> ElmExchange for HealthTap<E> {
+    async fn exchange(
+        &mut self,
+        command: &str,
+        command_timeout: Duration,
+    ) -> Result<String, ExchangeError> {
+        let result = self.inner.exchange(command, command_timeout).await;
+        if let Err(ExchangeError::Transport(ref failure)) = result {
+            self.last_transport_failure = Some(failure.clone());
+        }
+        result
+    }
+}
+
+impl<E: AdapterLink> AdapterLink for HealthTap<E> {
+    async fn disconnect(&mut self) -> Result<(), String> {
+        self.inner.disconnect().await
     }
 
-    async fn connect_with_adapter_io(
-        adapter_id: &str,
-        show_adapter_io: bool,
-    ) -> Result<Self, String> {
-        Self::connect_with_adapter_io_mode(adapter_id, show_adapter_io, true).await
+    async fn disconnect_best_effort(&mut self) {
+        self.inner.disconnect_best_effort().await;
     }
+}
 
-    async fn connect_with_adapter_io_mode(
-        adapter_id: &str,
-        show_adapter_io: bool,
-        discover_support: bool,
-    ) -> Result<Self, String> {
-        let backend = CarlyCuaV200::connect(adapter_id, show_adapter_io).await?;
+/// One connected, initialized, read-only diagnostic path over any
+/// [`AdapterLink`]. Two adapters satisfy the bound: the production Carly
+/// backend (the default type parameter) and a scripted fake used in tests,
+/// so this is a real seam rather than a hypothetical one.
+pub(crate) struct DiagnosticSession<E: AdapterLink = CarlyCuaV200> {
+    elm: Option<ElmSession<HealthTap<E>>>,
+}
+
+impl DiagnosticSession<CarlyCuaV200> {
+    async fn connect(adapter_id: &str, mode: ConnectMode) -> Result<Self, String> {
+        let backend = CarlyCuaV200::connect(adapter_id, mode.show_adapter_io).await?;
+        Self::from_exchange(backend, mode.discover_support).await
+    }
+}
+
+/// Which of the two connect-time options a one-shot session needs: whether
+/// to mirror adapter TX/RX, and whether to run the Mode 01 PID-support
+/// discovery pages before returning.
+#[derive(Clone, Copy)]
+struct ConnectMode {
+    show_adapter_io: bool,
+    discover_support: bool,
+}
+
+impl ConnectMode {
+    const fn new(show_adapter_io: bool, discover_support: bool) -> Self {
+        Self {
+            show_adapter_io,
+            discover_support,
+        }
+    }
+}
+
+impl<E: AdapterLink> DiagnosticSession<E> {
+    /// Build a session directly from an already-connected adapter, skipping
+    /// any transport-specific connect handshake. Used in production by the
+    /// Carly connect path above, and in tests with a scripted exchange.
+    async fn from_exchange(exchange: E, discover_support: bool) -> Result<Self, String> {
         let mut session = Self {
-            elm: Some(ElmSession::new(backend)),
+            elm: Some(ElmSession::new(HealthTap::new(exchange))),
         };
         if discover_support {
             if let Err(error) = session.discover_support().await {
@@ -999,8 +1056,13 @@ impl DiagnosticSession {
         Ok(session)
     }
 
-    pub async fn read(&mut self, request: ReadRequest) -> Result<Transaction, String> {
-        self.read_with_evidence(request).await.into_transaction()
+    /// The [`TransportFailure`] the most recent exchange produced, if any.
+    /// `None` means either the last exchange succeeded, or it failed with a
+    /// well-formed but unusable response rather than a transport failure.
+    fn take_transport_failure(&mut self) -> Option<TransportFailure> {
+        self.elm
+            .as_mut()
+            .and_then(|elm| elm.exchange_mut().take_transport_failure())
     }
 
     pub async fn read_targeted(
@@ -1180,7 +1242,7 @@ impl DiagnosticSession {
             .collect()
     }
 
-    fn elm_mut(&mut self) -> Result<&mut ElmSession<CarlyCuaV200>, String> {
+    fn elm_mut(&mut self) -> Result<&mut ElmSession<HealthTap<E>>, String> {
         self.elm
             .as_mut()
             .ok_or_else(|| "diagnostic session is closed".to_string())
@@ -1206,38 +1268,11 @@ fn highest_catalog_page() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use crate::test_support::ScriptedExchange;
 
     const INIT_COMMANDS: [&str; 9] = [
         "ATI\r", "AT@1\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r", "0100\r",
     ];
-
-    struct ScriptedExchange {
-        responses: VecDeque<Result<String, String>>,
-        commands: Vec<String>,
-    }
-
-    impl ScriptedExchange {
-        fn captured(responses: Vec<String>) -> Self {
-            Self {
-                responses: responses.into_iter().map(Ok).collect(),
-                commands: Vec::new(),
-            }
-        }
-    }
-
-    impl ElmExchange for ScriptedExchange {
-        async fn exchange(
-            &mut self,
-            command: &str,
-            _command_timeout: Duration,
-        ) -> Result<String, String> {
-            self.commands.push(command.into());
-            self.responses
-                .pop_front()
-                .unwrap_or_else(|| Err("script ended before adapter response".into()))
-        }
-    }
 
     async fn initialize_with_support<E>(exchange: &mut E) -> Result<PidSupport, String>
     where
@@ -1248,22 +1283,11 @@ mod tests {
     }
 
     fn captured_responses() -> Vec<String> {
-        [
-            "ELM327 v1.4 v100\r>",
-            "carly-universal v200\r>",
-            "ELM327 v1.4 v100\r>",
-            "OK\r>",
-            "OK\r>",
-            "OK\r>",
-            "OK\r>",
-            "OK\r>",
-            // Keep the fixture on the first page; continuation is tested separately.
-            "4100BE3EB812\r>",
-            "410C0000\r>",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+        let mut responses = ScriptedExchange::carly_init_responses();
+        // Keep the fixture on the first page; continuation is tested separately.
+        responses.push("4100BE3EB812\r>".into());
+        responses.push("410C0000\r>".into());
+        responses
     }
 
     fn targeted_request() -> TargetedReadRequest {
@@ -1474,28 +1498,38 @@ mod tests {
         assert_eq!(estimator.capability().request_budget_per_second(), 1);
     }
 
+    fn write_timed_out(command: &str) -> TransportFailure {
+        TransportFailure::WriteTimedOut(command.into())
+    }
+
+    fn command_timed_out(command: &str) -> TransportFailure {
+        TransportFailure::CommandTimedOut(command.into())
+    }
+
     #[test]
     fn transport_health_stops_after_two_consecutive_transport_failures() {
         let mut health = SessionHealth::default();
 
-        assert!(!health.observe("Carly write timed out: 010C"));
-        assert!(health.observe("Carly command timed out: 010D"));
+        assert!(!health.observe(Some(write_timed_out("010C")), "Carly write timed out: 010C"));
+        assert!(health.observe(
+            Some(command_timed_out("010D")),
+            "Carly command timed out: 010D"
+        ));
 
         let error = health.unhealthy().unwrap();
         assert!(is_session_unhealthy(error));
         assert!(error.contains("Carly command timed out: 010D"));
-        assert!(!health.observe("Carly write timed out: 0105"));
+        assert!(!health.observe(Some(write_timed_out("0105")), "Carly write timed out: 0105"));
     }
 
     #[test]
     fn recoverable_read_errors_reset_transport_failure_count() {
         let mut health = SessionHealth::default();
 
-        assert!(!health.observe("Carly write timed out: 010C"));
-        assert!(!health.observe("conflicting 010C responses"));
-        assert!(!health.observe("Carly write timed out: 010D"));
+        assert!(!health.observe(Some(write_timed_out("010C")), "Carly write timed out: 010C"));
+        assert!(!health.observe(None, "conflicting 010C responses"));
+        assert!(!health.observe(Some(write_timed_out("010D")), "Carly write timed out: 010D"));
         assert!(health.unhealthy().is_none());
-        assert!(!is_transport_failure("conflicting 010C responses"));
     }
 
     #[test]
@@ -1503,20 +1537,136 @@ mod tests {
         let mut health = SessionHealth::default();
         let mut dispatched = 0;
 
-        for error in [
-            "Carly write timed out: 010C",
-            "Carly write timed out: 010D",
-            "Carly write timed out: 0105",
-        ] {
+        for command in ["010C", "010D", "0105"] {
             if health.unhealthy().is_some() {
                 break;
             }
             dispatched += 1;
-            health.observe(error);
+            health.observe(
+                Some(write_timed_out(command)),
+                &format!("Carly write timed out: {command}"),
+            );
         }
 
         assert_eq!(dispatched, 2);
         assert!(health.unhealthy().is_some());
+    }
+
+    fn scripted_command_timeouts() -> impl Iterator<Item = Result<String, ExchangeError>> {
+        std::iter::repeat_with(|| {
+            Err(ExchangeError::Transport(TransportFailure::CommandTimedOut(
+                "ATSH 7E0\r".into(),
+            )))
+        })
+    }
+
+    #[tokio::test]
+    async fn two_consecutive_transport_failures_stop_the_session_and_gate_a_third_read() {
+        let exchange = ScriptedExchange::from_results(scripted_command_timeouts().take(10));
+        let spy = exchange.spy();
+        let client = start_scripted_session(exchange, false).await.unwrap();
+
+        let first = client.read_targeted(targeted_request()).await.unwrap_err();
+        assert!(!is_session_unhealthy(&first));
+
+        let second = client.read_targeted(targeted_request()).await.unwrap_err();
+        assert!(is_session_unhealthy(&second));
+
+        let commands_before_third = spy.commands().len();
+        let third = client.read_targeted(targeted_request()).await.unwrap_err();
+        assert!(is_session_unhealthy(&third));
+        assert_eq!(
+            spy.commands().len(),
+            commands_before_third,
+            "the health gate must reject the third read without touching the exchange"
+        );
+
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            spy.disconnects(),
+            1,
+            "the best-effort disconnect runs exactly once, when the session first goes unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_data_error_resets_the_transport_failure_streak() {
+        // Call 1: `configure_target`'s first command times out; the ELM
+        // dialect layer still runs `restore_functional`, which succeeds.
+        let first_call_fails_but_restores = scripted_command_timeouts().take(1).chain(
+            ["OK\r>", "OK\r>", "OK\r>"]
+                .into_iter()
+                .map(|response| Ok(response.to_string())),
+        );
+        // Call 2: every exchange succeeds, but the response comes from the
+        // wrong responder, so the read fails on data, not on transport.
+        let second_call_is_a_data_error = [
+            "OK\r>",
+            "OK\r>",
+            "7E9 04 41 0C 00 00 00 00\r>",
+            "OK\r>",
+            "OK\r>",
+            "OK\r>",
+        ]
+        .into_iter()
+        .map(|response| Ok(response.to_string()));
+        // Call 3: another transport failure. If call 2 had not reset the
+        // streak, this would be the session's second consecutive one.
+        let third_call_fails = scripted_command_timeouts().take(4);
+
+        let exchange = ScriptedExchange::from_results(
+            first_call_fails_but_restores
+                .chain(second_call_is_a_data_error)
+                .chain(third_call_fails),
+        );
+        let client = start_scripted_session(exchange, false).await.unwrap();
+
+        let first = client.read_targeted(targeted_request()).await.unwrap_err();
+        assert!(!is_session_unhealthy(&first));
+
+        let second = client.read_targeted(targeted_request()).await.unwrap_err();
+        assert!(second.contains("unexpected responder 7E9"));
+        assert!(!is_session_unhealthy(&second));
+
+        // If the data error above had not reset the streak, this transport
+        // failure would be the session's second consecutive one.
+        let third = client.read_targeted(targeted_request()).await.unwrap_err();
+        assert!(!is_session_unhealthy(&third));
+
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_disconnects_a_healthy_session_exactly_once() {
+        let exchange = ScriptedExchange::new(Vec::<String>::new());
+        let spy = exchange.spy();
+        let client = start_scripted_session(exchange, false).await.unwrap();
+
+        client.shutdown().await.unwrap();
+
+        assert_eq!(spy.disconnects(), 1);
+    }
+
+    #[test]
+    fn every_transport_failure_and_session_boundary_message_is_fatal() {
+        for failure in [
+            TransportFailure::WriteTimedOut("010C\r".into()),
+            TransportFailure::WriteFailed("disconnected".into()),
+            TransportFailure::CommandTimedOut("010C\r".into()),
+            TransportFailure::NotificationStreamEnded,
+        ] {
+            let message = format!("{SESSION_UNHEALTHY_PREFIX}: {failure}");
+            assert!(is_fatal_session_error(&message), "{message}");
+            assert!(is_session_unhealthy(&message), "{message}");
+        }
+        for message in [
+            "diagnostic session is closed",
+            "diagnostic session stopped before responding",
+            "diagnostic session stopped before disconnecting",
+        ] {
+            assert!(is_fatal_session_error(message), "{message}");
+        }
+        assert!(!is_fatal_session_error("conflicting 010C responses"));
     }
 
     #[test]
@@ -1697,25 +1847,25 @@ mod tests {
 
     #[tokio::test]
     async fn stored_dtc_transport_uses_only_the_bounded_mode03_command() {
-        let mut exchange = ScriptedExchange::captured(vec!["43 01 0C\r>".into()]);
+        let mut exchange = ScriptedExchange::new(vec!["43 01 0C\r>"]);
 
         let responses = read_elm_mode03_responses(&mut exchange).await.unwrap();
 
-        assert_eq!(exchange.commands, ["03\r"]);
+        assert_eq!(exchange.commands(), ["03\r"]);
         assert_eq!(responses.as_slice()[0].payload, [0x43, 0x01, 0x0c]);
     }
 
     #[tokio::test]
     async fn protocol_negotiation_keeps_hardware_0100_evidence_out_of_mode03() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "SEARCHING...\r7E8 06 41 00 98 3B A0 13 00\r7E9 06 41 00 98 18 00 01 AA\r>".into(),
-            "7E8 03 43 00 00\r7E9 03 43 01 0C\r>".into(),
+        let mut exchange = ScriptedExchange::new(vec![
+            "SEARCHING...\r7E8 06 41 00 98 3B A0 13 00\r7E9 06 41 00 98 18 00 01 AA\r>",
+            "7E8 03 43 00 00\r7E9 03 43 01 0C\r>",
         ]);
 
         let negotiation = establish_elm_protocol(&mut exchange).await.unwrap();
         let responses = read_elm_mode03_responses(&mut exchange).await.unwrap();
 
-        assert_eq!(exchange.commands, ["0100\r", "03\r"]);
+        assert_eq!(exchange.commands(), ["0100\r", "03\r"]);
         assert_eq!(negotiation.observations().len(), 2);
         assert_eq!(
             negotiation.observations()[0],
@@ -1742,15 +1892,15 @@ mod tests {
 
     #[tokio::test]
     async fn identity_negotiates_protocol_before_mode09_pid02() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "7E8 06 41 00 98 3B A0 13 00\r>".into(),
-            "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4A 5A 58\r7E8 22 57 30 30 30 30 30 31\r>".into(),
+        let mut exchange = ScriptedExchange::new(vec![
+            "7E8 06 41 00 98 3B A0 13 00\r>",
+            "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4A 5A 58\r7E8 22 57 30 30 30 30 30 31\r>",
         ]);
 
         let identity = read_elm_identity(&mut exchange).await.unwrap();
 
         assert_eq!(identity.vin().as_str(), "WVWZZZ1JZXW000001");
-        assert_eq!(exchange.commands, ["0100\r", "0902\r"]);
+        assert_eq!(exchange.commands(), ["0100\r", "0902\r"]);
     }
 
     #[test]
@@ -1769,10 +1919,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_protocol_negotiation_never_dispatches_mode03() {
-        let mut exchange = ScriptedExchange::captured(vec!["NO DATA\r>".into()]);
+        let mut exchange = ScriptedExchange::new(vec!["NO DATA\r>"]);
 
         assert!(establish_elm_protocol(&mut exchange).await.is_err());
-        assert_eq!(exchange.commands, ["0100\r"]);
+        assert_eq!(exchange.commands(), ["0100\r"]);
     }
 
     #[test]
@@ -1880,15 +2030,15 @@ mod tests {
 
     #[tokio::test]
     async fn follows_support_pages_only_when_the_continuation_bit_is_set() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "410080000001\r>".into(),
-            "412080000001\r>".into(),
-            "414080000001\r>".into(),
+        let mut exchange = ScriptedExchange::new(vec![
+            "410080000001\r>",
+            "412080000001\r>",
+            "414080000001\r>",
         ]);
 
         let support = discover_pid_support(&mut exchange).await.unwrap();
 
-        assert_eq!(exchange.commands, ["0100\r", "0120\r", "0140\r"]);
+        assert_eq!(exchange.commands(), ["0100\r", "0120\r", "0140\r"]);
         assert_eq!(support.status(0x01), SignalSupportStatus::Supported);
         assert_eq!(support.status(0x20), SignalSupportStatus::Supported);
         assert_eq!(support.status(0x21), SignalSupportStatus::Supported);
@@ -1920,9 +2070,8 @@ mod tests {
 
     #[tokio::test]
     async fn support_discovery_preserves_each_responder_and_payload() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>".into(),
-        ]);
+        let mut exchange =
+            ScriptedExchange::new(vec!["7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>"]);
 
         let support = discover_pid_support(&mut exchange).await.unwrap();
 
@@ -1946,15 +2095,14 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_functional_validation_queries_once_and_preserves_responders() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>".into(),
-        ]);
+        let mut exchange =
+            ScriptedExchange::new(vec!["7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>"]);
 
         let validation = validate_functional_support_exchange(&mut exchange)
             .await
             .unwrap();
 
-        assert_eq!(exchange.commands, ["0100\r"]);
+        assert_eq!(exchange.commands(), ["0100\r"]);
         assert_eq!(validation.len(), 2);
         assert_eq!(
             validation[0].responder,
@@ -1968,7 +2116,7 @@ mod tests {
 
     #[tokio::test]
     async fn replays_captured_zero_rpm_session_in_exact_command_order() {
-        let mut exchange = ScriptedExchange::captured(captured_responses());
+        let mut exchange = ScriptedExchange::new(captured_responses());
         let request = crate::prepare_read("engine.rpm").unwrap();
         let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
@@ -1976,8 +2124,8 @@ mod tests {
             .complete("user", read_elm(&mut exchange, request).await.unwrap())
             .unwrap();
 
-        assert_eq!(exchange.commands[..9], INIT_COMMANDS);
-        assert_eq!(exchange.commands[9], "010C\r");
+        assert_eq!(exchange.commands()[..9], INIT_COMMANDS);
+        assert_eq!(exchange.commands()[9], "010C\r");
         assert_eq!(transaction.response(), [0x41, 0x0c, 0x00, 0x00]);
         assert_eq!(transaction.value(), 0.0);
 
@@ -1998,7 +2146,7 @@ mod tests {
         let mut responses = captured_responses();
         responses[9] = "410C0000\r410C0004\r>".into();
         responses.push("410C0000\r>".into());
-        let mut exchange = ScriptedExchange::captured(responses);
+        let mut exchange = ScriptedExchange::new(responses);
         let request = crate::prepare_read("engine.rpm").unwrap();
         let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
@@ -2007,19 +2155,19 @@ mod tests {
             read_elm(&mut exchange, request).await.unwrap(),
             vec![0x41, 0x0c, 0x00, 0x00]
         );
-        assert_eq!(&exchange.commands[9..], ["010C\r", "010C\r"]);
+        assert_eq!(&exchange.commands()[9..], ["010C\r", "010C\r"]);
     }
 
     #[tokio::test]
     async fn targeted_read_configures_expected_headers_and_restores_functional_state() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "7E8 04 41 0C 00 00 00 00\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "410C0000\r>".into(),
+        let mut exchange = ScriptedExchange::new(vec![
+            "OK\r>",
+            "OK\r>",
+            "7E8 04 41 0C 00 00 00 00\r>",
+            "OK\r>",
+            "OK\r>",
+            "OK\r>",
+            "410C0000\r>",
         ]);
         let request = targeted_request();
 
@@ -2033,7 +2181,7 @@ mod tests {
         assert_eq!(read.payload, vec![0x41, 0x0c, 0x00, 0x00]);
         assert_eq!(functional, vec![0x41, 0x0c, 0x00, 0x00]);
         assert_eq!(
-            exchange.commands,
+            exchange.commands(),
             [
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
@@ -2048,13 +2196,13 @@ mod tests {
 
     #[tokio::test]
     async fn targeted_read_rejects_an_unexpected_responder() {
-        let mut exchange = ScriptedExchange::captured(vec![
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "7E9 04 41 0C 00 00 00 00\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
-            "OK\r>".into(),
+        let mut exchange = ScriptedExchange::new(vec![
+            "OK\r>",
+            "OK\r>",
+            "7E9 04 41 0C 00 00 00 00\r>",
+            "OK\r>",
+            "OK\r>",
+            "OK\r>",
         ]);
 
         let error = read_elm_targeted_with_evidence(&mut exchange, &targeted_request())
@@ -2064,11 +2212,11 @@ mod tests {
 
         assert!(error.contains("unexpected responder 7E9"));
         assert_eq!(
-            &exchange.commands[..3],
+            &exchange.commands()[..3],
             ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r"]
         );
         assert_eq!(
-            &exchange.commands[3..],
+            &exchange.commands()[3..],
             ["ATSP0\r", "ATSH 7DF\r", "ATCRA\r"]
         );
     }
@@ -2100,7 +2248,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_evidence_preserves_responder_and_payload_before_decode() {
-        let mut exchange = ScriptedExchange::captured(vec!["7e8 04 41 0C 00 00 00 00\r>".into()]);
+        let mut exchange = ScriptedExchange::new(vec!["7e8 04 41 0C 00 00 00 00\r>"]);
         let request = crate::prepare_read("engine.rpm").unwrap();
 
         let read = read_elm_with_evidence(&mut exchange, request)
@@ -2125,7 +2273,7 @@ mod tests {
     #[tokio::test]
     async fn read_evidence_keeps_both_attempts_when_conflict_remains() {
         let conflict = "7E8 04 41 0C 00 00 00 00\r7E9 04 41 0C 00 04 00 00\r>";
-        let mut exchange = ScriptedExchange::captured(vec![conflict.into(), conflict.into()]);
+        let mut exchange = ScriptedExchange::new(vec![conflict, conflict]);
         let request = crate::prepare_read("engine.rpm").unwrap();
 
         let failure = read_elm_with_evidence(&mut exchange, request)
@@ -2146,7 +2294,7 @@ mod tests {
         let mut responses = captured_responses();
         responses[9] = conflict.into();
         responses.push(conflict.into());
-        let mut exchange = ScriptedExchange::captured(responses);
+        let mut exchange = ScriptedExchange::new(responses);
         let request = crate::prepare_read("engine.rpm").unwrap();
         let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
@@ -2154,20 +2302,20 @@ mod tests {
         let error = read_elm(&mut exchange, request).await.unwrap_err();
         assert!(error.contains("conflicting 010C responses"));
         assert!(error.contains("410C0000\\r410C0004\\r>"), "{error}");
-        assert_eq!(&exchange.commands[9..], ["010C\r", "010C\r"]);
+        assert_eq!(&exchange.commands()[9..], ["010C\r", "010C\r"]);
     }
 
     #[tokio::test]
     async fn does_not_retry_other_normalization_errors() {
         let mut responses = captured_responses();
         responses[9] = "NO DATA\r>".into();
-        let mut exchange = ScriptedExchange::captured(responses);
+        let mut exchange = ScriptedExchange::new(responses);
         let request = crate::prepare_read("engine.rpm").unwrap();
         let supported = initialize_with_support(&mut exchange).await.unwrap();
         assert!(supports_pid(&supported, request.pid()));
 
         assert!(read_elm(&mut exchange, request).await.is_err());
-        assert_eq!(&exchange.commands[9..], ["010C\r"]);
+        assert_eq!(&exchange.commands()[9..], ["010C\r"]);
     }
 
     #[tokio::test]
@@ -2186,7 +2334,7 @@ mod tests {
             let mut responses = captured_responses();
             responses[8] = "410008190000\r>".into();
             responses[9] = response.into();
-            let mut exchange = ScriptedExchange::captured(responses);
+            let mut exchange = ScriptedExchange::new(responses);
             let request = crate::prepare_read(semantic).unwrap();
             let supported = initialize_with_support(&mut exchange).await.unwrap();
             assert!(supports_pid(&supported, request.pid()));
@@ -2194,8 +2342,8 @@ mod tests {
                 .complete("user", read_elm(&mut exchange, request).await.unwrap())
                 .unwrap();
 
-            assert_eq!(exchange.commands[..9], INIT_COMMANDS);
-            assert_eq!(exchange.commands[9], command);
+            assert_eq!(exchange.commands()[..9], INIT_COMMANDS);
+            assert_eq!(exchange.commands()[9], command);
             assert_eq!(transaction.value(), value);
             assert_eq!(transaction.unit(), unit);
         }
@@ -2205,7 +2353,7 @@ mod tests {
     async fn initialization_and_pid_support_are_cached_across_sequential_reads() {
         let mut responses = captured_responses();
         responses.push("41055A\r>".into());
-        let mut exchange = ScriptedExchange::captured(responses);
+        let mut exchange = ScriptedExchange::new(responses);
         let rpm = crate::prepare_read("engine.rpm").unwrap();
         let coolant = crate::prepare_read("engine.coolant_temperature").unwrap();
 
@@ -2222,12 +2370,12 @@ mod tests {
         assert_eq!(rpm.value(), 0.0);
         assert_eq!(coolant.value(), 50.0);
         assert_eq!(
-            exchange.commands,
+            exchange.commands(),
             [INIT_COMMANDS.as_slice(), &["010C\r", "0105\r"],].concat()
         );
         assert_eq!(
             exchange
-                .commands
+                .commands()
                 .iter()
                 .filter(|command| *command == "0100\r")
                 .count(),
@@ -2246,7 +2394,7 @@ mod tests {
         ] {
             let mut responses = captured_responses();
             responses[index] = response.into();
-            let mut exchange = ScriptedExchange::captured(responses);
+            let mut exchange = ScriptedExchange::new(responses);
 
             let request = crate::prepare_read("engine.rpm").unwrap();
             let failed = if index < INIT_COMMANDS.len() {
@@ -2257,7 +2405,7 @@ mod tests {
             };
             assert!(failed);
             assert_eq!(
-                exchange.commands,
+                exchange.commands(),
                 [INIT_COMMANDS.as_slice(), &["010C\r"]][..].concat()[..=index]
             );
         }
