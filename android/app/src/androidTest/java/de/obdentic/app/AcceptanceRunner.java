@@ -29,6 +29,9 @@ public final class AcceptanceRunner extends Instrumentation {
     @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); screenOff = arguments != null && "true".equals(arguments.getString("screenOff")); start(); }
     @Override public void onStart() {
         Bundle result = new Bundle();
+        // Demo recordings made by this run must not be auto-exported into the user's real export folder.
+        boolean userAutoExport = RecordingExporter.auto(getTargetContext());
+        RecordingExporter.setAuto(getTargetContext(), false);
         try {
             Intent launch = new Intent(getTargetContext(), MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -215,9 +218,11 @@ public final class AcceptanceRunner extends Instrumentation {
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"),"restore demo for UI review");
             for(String name:new String[]{"acceptance-live.png","acceptance-diagnose.png","acceptance-debug.png","acceptance-connection.png","acceptance-recordings.png","acceptance-vehicles.png","demo-recording.jsonl"}) emitArtifact(name);
             result.putString("stream", report + "\nDESK ACCEPTANCE PASSED\nReal Carly/vehicle acceptance remains separate.\n");
+            RecordingExporter.setAuto(getTargetContext(), userAutoExport);
             finish(Activity.RESULT_OK,result);
         } catch(Throwable error) {
             result.putString("stream",report + "\nFAILED: " + error + "\n" + android.util.Log.getStackTraceString(error));
+            RecordingExporter.setAuto(getTargetContext(), userAutoExport);
             finish(Activity.RESULT_CANCELED,result);
         }
     }
