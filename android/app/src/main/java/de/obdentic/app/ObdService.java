@@ -82,10 +82,13 @@ public final class ObdService extends Service {
     private static void put(JSONObject object, String key, Object value) { try { object.put(key,value); } catch (JSONException e) { throw new IllegalArgumentException(e); } }
     private void set(String key,Object value) { synchronized(stateLock) { put(state,key,value); } changed(); }
     private String phase() { synchronized(stateLock) { return state.optString("phase"); } }
-    private void message(String value) { set("message",value); }
+    /** REQ-021: counts messages, so a button can tell that a (possibly identical) message for its action arrived. */
+    private void message(String value) { synchronized(stateLock) { put(state,"messageSeq",state.optLong("messageSeq")+1); put(state,"message",value); } changed(); }
+    /** REQ-021: pending buttons live here, not in the Activity, so they survive its recreation. */
+    public final PendingActions pending = new PendingActions();
     public JSONObject snapshot() {
         synchronized(stateLock) { put(state,"busy",busy || sequenceIndex>=0); put(state,"records",listRecords()); put(state,"vehicles",vehicles.snapshot());
-            put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
+            put(state,"autoExport",RecordingExporter.auto(this)); put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
             try { return new JSONObject(state.toString()); } catch(JSONException e) { return new JSONObject(); } }
     }
     private boolean permitted() {

@@ -15,10 +15,12 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -32,6 +34,37 @@ import java.util.Map;
 /** Local-only diagnostic workbench. Transport and jobs belong to ObdService. */
 public class MainActivity extends Activity {
     private static final int BG=0xff0c121b, CARD=0xff17212e, TEXT=0xffedf3fa, MUTED=0xffa5b5c7, ACCENT=0xff63dfc1;
+    /** The visible instance, for the phone acceptance (cleared on pause). */
+    public static volatile MainActivity resumed;
+    /** The last text sent to accessibility services (REQ-021.5). */
+    public volatile String lastAnnouncement="";
+    /**
+     * REQ-021 action -> how its end is observed in the service snapshot (any service message after the tap, counted by messageSeq, also ends it:
+     * that is the error or refusal text). Limits: connect 30 s, search 15 s, jobs and export 60 s, rest 10 s.
+     *   rec.start  recording non-empty            rec.stop   recording empty
+     *   test.run   recording non-empty            scan       phase left "scanning" after its message
+     *   connect    phase ready/error, or refusal  disconnect message "Getrennt"
+     *   job        busy false after its message   export.all message with the result
+     *   auto.export autoExport flipped            auto.connect autoConnect flipped      auto.stop autoPending false
+     *   vehicle.*  message with the result
+     */
+    private static boolean msg(JSONObject now,JSONObject base){return now.optLong("messageSeq")!=base.optLong("messageSeq");}
+    private static boolean recording(JSONObject s){return !s.optString("recording").isEmpty();}
+    private static final PendingActions.Spec
+        REC_START=new PendingActions.Spec("rec.start","Aufzeichnung starten","Aufzeichnung wird gestartet …",10000,(n,b)->recording(n)||msg(n,b)),
+        REC_STOP=new PendingActions.Spec("rec.stop","Aufzeichnung stoppen","Aufzeichnung wird gestoppt …",10000,(n,b)->!recording(n)||msg(n,b)),
+        TEST_RUN=new PendingActions.Spec("test.run","Testlauf starten","Testlauf wird gestartet …",10000,(n,b)->recording(n)||msg(n,b)),
+        SCAN=new PendingActions.Spec("scan","Adapter suchen","Suche läuft …",15000,(n,b)->!"scanning".equals(n.optString("phase"))&&msg(n,b)),
+        CONNECT=new PendingActions.Spec("connect","Verbinden","Verbinde …",30000,(n,b)->{String p=n.optString("phase");return p.equals("ready")||p.equals("error")||(msg(n,b)&&!n.optBoolean("busy")&&!p.equals("connecting"));}),
+        DISCONNECT=new PendingActions.Spec("disconnect","Verbindung trennen","Trenne …",10000,MainActivity::msg),
+        AUTO_CONNECT=new PendingActions.Spec("auto.connect","Automatisch verbinden","Ändere automatische Verbindung …",10000,(n,b)->n.optBoolean("autoConnect")!=b.optBoolean("autoConnect")||msg(n,b)),
+        AUTO_STOP=new PendingActions.Spec("auto.stop","Automatische Verbindung stoppen","Stoppe automatische Verbindung …",10000,(n,b)->!n.optBoolean("autoPending")||msg(n,b)),
+        AUTO_EXPORT=new PendingActions.Spec("auto.export","Automatischer Export","Ändere automatischen Export …",10000,(n,b)->n.optBoolean("autoExport")!=b.optBoolean("autoExport")),
+        EXPORT_ALL=new PendingActions.Spec("export.all","Alle exportieren","Exportiere …",60000,MainActivity::msg),
+        VEHICLE_SELECT=new PendingActions.Spec("vehicle.select","Fahrzeug auswählen","Wähle Fahrzeug …",10000,MainActivity::msg),
+        VEHICLE_RENAME=new PendingActions.Spec("vehicle.rename","Fahrzeug umbenennen","Benenne um …",10000,MainActivity::msg),
+        VEHICLE_DELETE=new PendingActions.Spec("vehicle.delete","Fahrzeug löschen","Lösche Fahrzeug …",10000,MainActivity::msg);
+    private static PendingActions.Spec jobSpec(String name){return new PendingActions.Spec("job",name,"Auftrag läuft …",60000,(n,b)->!n.optBoolean("busy")&&msg(n,b));}
     private final Handler handler=new Handler(Looper.getMainLooper());
     private final Map<String,TextView> valueViews=new HashMap<>();
     private final Map<String,TextView> freshnessViews=new HashMap<>();
@@ -74,15 +107,37 @@ public class MainActivity extends Activity {
     }
     @Override protected void onStart(){super.onStart();getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}
     @Override protected void onStop(){getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);super.onStop();}
-    @Override protected void onResume(){super.onResume();handler.post(poll);if(service()!=null)service().resumeIfBlocked();}
-    @Override protected void onPause(){handler.removeCallbacks(poll);super.onPause();}
+    @Override protected void onResume(){super.onResume();resumed=this;handler.post(poll);if(service()!=null)service().resumeIfBlocked();}
+    @Override protected void onPause(){handler.removeCallbacks(poll);if(resumed==this)resumed=null;super.onPause();}
     @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("profile",profile);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
     private ObdService service(){return ObdService.current;}
     private void act(Runnable action){try{if(service()!=null)action.run();else toast("Dienst startet. Bitte kurz warten.");}catch(Exception e){toast(e.getMessage()==null?"Aktion fehlgeschlagen":e.getMessage());}refresh();}
+    /** REQ-021.1/.4: starts the pending state, then the service call; a second tap while pending starts nothing. */
+    private void perform(PendingActions.Spec spec,String suffix,Runnable call){
+        ObdService s=service();if(s==null){toast("Dienst startet. Bitte kurz warten.");return;}
+        if(!s.pending.start(spec,suffix,s.snapshot(),SystemClock.elapsedRealtime()))return;
+        announce(spec.pending);
+        try{call.run();}catch(Exception e){s.pending.resolve(spec.key+suffix);toast(e.getMessage()==null?"Aktion fehlgeschlagen":e.getMessage());}
+        refresh();
+    }
+    /** REQ-021.1/.5: while pending the button is disabled, shows the pending text (also as content description) and a progress indicator. */
+    private Button actionButton(LinearLayout parent,PendingActions.Spec spec,String suffix,String idle,boolean enabled,Runnable onTap){
+        boolean pend=service()!=null&&service().pending.isPending(spec.key+suffix);
+        Button b=button(pend?spec.pending:idle,onTap);b.setEnabled(enabled&&!pend);
+        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,dp(5),0,dp(3));
+        if(!pend){parent.addView(b,p);return b;}
+        b.setContentDescription(spec.pending);
+        LinearLayout r=row();ProgressBar bar=new ProgressBar(this,null,android.R.attr.progressBarStyleSmall);bar.setIndeterminate(true);bar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        r.addView(bar,new LinearLayout.LayoutParams(dp(28),dp(28)));r.addView(b,new LinearLayout.LayoutParams(0,-2,1));parent.addView(r,p);return b;
+    }
+    private void announce(String text){lastAnnouncement=text;if(status!=null)status.announceForAccessibility(text);}
     private void refresh(){
         if(service()==null)return;
         if(launchDemo){launchDemo=false;service().setDemo();}
         state=service().snapshot();
+        PendingActions pending=service().pending;long seq=state.optLong("messageSeq");
+        for(PendingActions.Entry e:pending.observe(state))announce(msg(state,e.baseline)?state.optString("message"):e.name+" abgeschlossen"); // REQ-021.2/.5
+        for(PendingActions.Entry e:pending.expire(SystemClock.elapsedRealtime())){String note="Keine Rückmeldung · "+e.name;pending.setNotice(note,seq);announce(note);} // REQ-021.3
         JSONObject chosen=selectedVehicle();String chipName=chosen==null?"Kein Fahrzeug gewählt":chosen.optString("name");
         chip.setText(chipName);chip.setContentDescription("Gewähltes Fahrzeug: "+(chosen==null?"keines":chipName));
         String mode=state.optString("mode","live"), phase=state.optString("phase","idle");
@@ -90,12 +145,12 @@ public class MainActivity extends Activity {
         if(mode.equals("replay")&&state.optBoolean("replayPartial"))replayBadge+="\nTEILAUFNAHME";
         badge.setText(mode.equals("demo")?"DEMO · SIMULIERT":mode.equals("replay")?replayBadge:phase.equals("ready")?"LIVE · ADAPTER":"LIVE · GETRENNT");
         int tint=mode.equals("live")?ACCENT:0xffffca75;badge.setTextColor(tint);
-        String message=state.optString("message","");
+        String message=pending.notice(seq);if(message.isEmpty())message=state.optString("message","");
         status.setText(phaseName(phase)+(state.optBoolean("busy")?" · Auftrag läuft":"")+(message.isEmpty()?"":"\n"+message));
         status.setTextColor(phase.equals("error")?0xffffa79c:MUTED);
         if(!historyMode.equals(mode)){historyMode=mode;histories.clear();lastSamples.clear();}
         collectHistory();
-        String key=tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles");
+        String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles");
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle");
         if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile")+"|"+state.opt("testSequence")+"|"+state.opt("ashEvidence");
@@ -137,7 +192,7 @@ public class MainActivity extends Activity {
         LinearLayout cluster=card();note(cluster,"EXPERIMENTELL · VW KOMBIINSTRUMENT",0xffffca75);
         note(cluster,"Liest einmalig den km-Stand aus dem Kombiinstrument (eine Abfrage, ohne Sitzungswechsel). Die Umrechnung ist noch nicht am Fahrzeug bestätigt; der Wert steht getrennt vom OBD-km-Stand.",MUTED);
         String blocker=ObdService.clusterOdometerBlocker(state);
-        addButton(cluster,"km-Stand aus Kombiinstrument lesen",()->act(()->service().runJob(ObdService.CLUSTER_ODOMETER))).setEnabled(blocker==null&&!state.optBoolean("busy"));
+        actionButton(cluster,jobSpec("km-Stand aus Kombiinstrument lesen"),":"+ObdService.CLUSTER_ODOMETER,"km-Stand aus Kombiinstrument lesen",blocker==null&&!state.optBoolean("busy"),()->perform(jobSpec("km-Stand aus Kombiinstrument lesen"),":"+ObdService.CLUSTER_ODOMETER,()->service().runJob(ObdService.CLUSTER_ODOMETER)));
         if(blocker!=null)note(cluster,blocker,0xffffca75);
         showClusterResult(cluster);
 
@@ -204,7 +259,7 @@ public class MainActivity extends Activity {
     }
     private String displayResponder(String responder){return responder.isEmpty()?"Unbekannter Responder":responder;}
     private String dpfLabel(String semantic){switch(semantic){case "dpf.soot_mass_calculated":return "Berechnete Rußmasse";case "dpf.soot_mass_measured":return "Gemessene Rußmasse";case "dpf.distance_since_regeneration":return "Strecke seit Regeneration";case "dpf.time_since_regeneration":return "Zeit seit Regeneration";case "exhaust.temperature.pre_dpf":return "Abgastemperatur vor DPF (Zuordnung experimentell)";case "exhaust.temperature.post_dpf":return "Abgastemperatur nach DPF (Zuordnung experimentell)";case "dpf.differential_pressure":return "Differenzdruck am DPF";case "dpf.oil_ash_volume":return "Öl-Aschevolumen";case "dpf.fuel_consumption_since_regeneration":return "Kraftstoff seit letzter Regeneration";case "dpf.field_regeneration_request_status":return "Regenerationsanforderung · Rohstatus";case "dpf.service_regeneration_status":return "Service-Regeneration · Rohstatus";case "dpf.field_regeneration_lock_status":return "Regenerationssperre · Rohstatus";case "engine.boost_pressure_actual":return "Ladedruck Ist";case "engine.boost_pressure_commanded":return "Ladedruck Soll";case "engine.oil_temperature":return "Motoröltemperatur";case "engine.fuel_temperature":return "Kraftstofftemperatur";case "engine.rail_pressure_actual":return "Raildruck Ist";case "engine.rail_pressure_commanded":return "Raildruck Soll";case "engine.injector_deviation.cylinder_1":return "Einspritzmengenabweichung Zylinder 1";case "engine.injector_deviation.cylinder_2":return "Einspritzmengenabweichung Zylinder 2";case "engine.injector_deviation.cylinder_3":return "Einspritzmengenabweichung Zylinder 3";case "engine.injector_deviation.cylinder_4":return "Einspritzmengenabweichung Zylinder 4";default:return semantic;}}
-    private void job(LinearLayout parent,String label,String action){Button b=addButton(parent,label,()->act(()->service().runJob(action)));b.setEnabled(canRun());}
+    private void job(LinearLayout parent,String label,String action){PendingActions.Spec spec=jobSpec(label);actionButton(parent,spec,":"+action,label,canRun(),()->perform(spec,":"+action,()->service().runJob(action)));}
     private boolean canRun(){String mode=state.optString("mode");return !state.optBoolean("busy")&&!mode.equals("replay")&&(mode.equals("demo")||state.optString("phase").equals("ready"));}
     private void recordings(){
         title("Aufnahmen","Lokal sichern · später ohne Auto untersuchen");
@@ -213,7 +268,8 @@ public class MainActivity extends Activity {
         LinearLayout c=card();note(c,"AUFNAHMEPROFIL / TESTSEQUENZ",ACCENT);addButton(c,profile.isEmpty()?"Profil auswählen":chosen.optString("title",profile),this::chooseProfile);
         if(profile.equals(TestSequence.PROFILE))note(c,"Einmaliger Test: Motorsteuergerät prüfen → beide Asche-Kandidaten lesen → DPF-Vergleich → Drehzahl prüfen. Stoppt automatisch. Antworten bleiben experimentelle Rohdaten; es erfolgt kein Sitzungswechsel.",MUTED);
         boolean running=!state.optString("recording").isEmpty();
-        Button start=addButton(c,running?"Aufzeichnung stoppen":profile.equals(TestSequence.PROFILE)?"Testlauf vorbereiten …":"Aufzeichnung starten",()->act(()->{if(running)service().stopRecording();else if(profile.equals(TestSequence.PROFILE))prepareTestSequence();else service().startRecording(profile);}));start.setEnabled(running||canRun());
+        boolean test=profile.equals(TestSequence.PROFILE);String selectedProfile=profile;
+        actionButton(c,running?REC_STOP:test?TEST_RUN:REC_START,"",running?"Aufzeichnung stoppen":test?"Testlauf vorbereiten …":"Aufzeichnung starten",running||canRun(),()->{if(running)perform(REC_STOP,"",()->service().stopRecording());else if(test)prepareTestSequence();else perform(REC_START,"",()->service().startRecording(selectedProfile));});
         note(c,running?"● "+state.optString("recording"):"Aufzeichnungen enthalten möglicherweise Fahrzeugkennungen. Export erfolgt nur auf deine ausdrückliche Auswahl.",running?ACCENT:MUTED);
         JSONObject sequence=state.optJSONObject("testSequence");
         if(sequence!=null&&sequence.length()>0){note(c,sequence.optString("context_label")+" · selbst angegeben",MUTED);String outcome=sequence.optString("status");note(c,outcome.equals("running")?"Schritt "+sequence.optInt("step")+" / "+sequence.optInt("total")+" · "+sequence.optString("label"):outcome.equals("completed")?"Testlauf aufgezeichnet · Auswertung offen":outcome.equals("incomplete")?"Unvollständige Aufnahme · Testlauf nicht abgeschlossen":"Testlauf abgebrochen · Teilaufnahme gesichert",outcome.equals("aborted")||outcome.equals("incomplete")?0xffffa79c:ACCENT);}
@@ -228,8 +284,8 @@ public class MainActivity extends Activity {
         LinearLayout c=card();note(c,"EXPORT",ACCENT);
         note(c,folder.isEmpty()?"Kein Export-Ordner gewählt":"Export-Ordner: "+folderName(folder),folder.isEmpty()?MUTED:TEXT);
         addButton(c,"Export-Ordner wählen …",this::chooseFolder);
-        addButton(c,"Alle exportieren",()->act(()->service().exportAll())).setEnabled(!folder.isEmpty());
-        addButton(c,"Automatischer Export: "+(auto?"an":"aus"),()->{if(!auto&&RecordingExporter.folder(this).isEmpty()){toast("Zuerst Export-Ordner wählen");return;}RecordingExporter.setAuto(this,!auto);structure="";refresh();});
+        actionButton(c,EXPORT_ALL,"","Alle exportieren",!folder.isEmpty(),()->perform(EXPORT_ALL,"",()->service().exportAll()));
+        actionButton(c,AUTO_EXPORT,"","Automatischer Export: "+(auto?"an":"aus"),true,()->{if(!auto&&RecordingExporter.folder(this).isEmpty()){toast("Zuerst Export-Ordner wählen");return;}perform(AUTO_EXPORT,"",()->RecordingExporter.setAuto(this,!auto));});
         addButton(c,"Aufnahmen teilen …",this::shareAll);
         smallNote(c,"Empfohlen: Download/OBDentic. Exportierte Aufnahmen können FIN, Steuergerätekennungen und km-Stand enthalten; nur abgeschlossene Aufnahmen werden kopiert, Originale bleiben auf dem Handy.",MUTED);
     }
@@ -263,7 +319,7 @@ public class MainActivity extends Activity {
         String[] labels={"Zündung an · Motor aus","Motor im Leerlauf"};String[] contexts={"engine_off","idle"};
         new AlertDialog.Builder(this).setTitle("Betriebszustand für diesen Testlauf").setItems(labels,(dialog,which)->{
             String selectedProfile=profile;
-            new AlertDialog.Builder(this).setTitle("Asche-Testlauf starten?").setMessage(labels[which]+"\n\nBitte diesen Zustand während des gesamten Testlaufs beibehalten. Deine Angabe wird zusammen mit den Messantworten gespeichert. Der Test endet automatisch; nicht verfügbare Werte bleiben als Ergebnis erhalten.").setPositiveButton("Testlauf starten",(d,w)->act(()->service().startRecording(selectedProfile,contexts[which]))).setNegativeButton("Abbrechen",null).show();
+            new AlertDialog.Builder(this).setTitle("Asche-Testlauf starten?").setMessage(labels[which]+"\n\nBitte diesen Zustand während des gesamten Testlaufs beibehalten. Deine Angabe wird zusammen mit den Messantworten gespeichert. Der Test endet automatisch; nicht verfügbare Werte bleiben als Ergebnis erhalten.").setPositiveButton("Testlauf starten",(d,w)->perform(TEST_RUN,"",()->service().startRecording(selectedProfile,contexts[which]))).setNegativeButton("Abbrechen",null).show();
         }).setNegativeButton("Abbrechen",null).show();
     }
     private JSONObject vehicleStore(){JSONObject v=state.optJSONObject("vehicles");return v==null?new JSONObject():v;}
@@ -282,8 +338,8 @@ public class MainActivity extends Activity {
             LinearLayout c=card();note(c,name+(selected?" · gewählt":""),TEXT);
             note(c,(vin.length()>=7?vin.substring(0,3)+"…"+vin.substring(vin.length()-4):vin)+" · "+odometerListText(row),MUTED);
             note(c,"Zuletzt verbunden: "+date(row.optLong("last_connected")),MUTED);
-            addButton(c,"Auswählen",()->act(()->service().selectVehicle(vin))).setEnabled(!selected);
-            addButton(c,"Details",()->showVehicle(row));addButton(c,"Umbenennen …",()->renameVehicle(vin,name));addButton(c,"Löschen …",()->confirmDeleteVehicle(vin,name));
+            actionButton(c,VEHICLE_SELECT,":"+vin,"Auswählen",!selected,()->perform(VEHICLE_SELECT,":"+vin,()->service().selectVehicle(vin)));
+            addButton(c,"Details",()->showVehicle(row));actionButton(c,VEHICLE_RENAME,":"+vin,"Umbenennen …",true,()->renameVehicle(vin,name));actionButton(c,VEHICLE_DELETE,":"+vin,"Löschen …",true,()->confirmDeleteVehicle(vin,name));
         }
     }
     /** REQ-016.6: PID A6 wins; otherwise the cluster value marked experimental; never merged or corrected. */
@@ -315,9 +371,9 @@ public class MainActivity extends Activity {
     }
     private void renameVehicle(String vin,String name){
         android.widget.EditText input=new android.widget.EditText(this);input.setSingleLine(true);input.setText(name);input.selectAll();
-        new AlertDialog.Builder(this).setTitle("Fahrzeug umbenennen").setMessage("1 bis 40 Zeichen").setView(input).setPositiveButton("Speichern",(d,w)->act(()->service().renameVehicle(vin,input.getText().toString()))).setNegativeButton("Abbrechen",null).show();
+        new AlertDialog.Builder(this).setTitle("Fahrzeug umbenennen").setMessage("1 bis 40 Zeichen").setView(input).setPositiveButton("Speichern",(d,w)->{String entered=input.getText().toString();perform(VEHICLE_RENAME,":"+vin,()->service().renameVehicle(vin,entered));}).setNegativeButton("Abbrechen",null).show();
     }
-    private void confirmDeleteVehicle(String vin,String name){new AlertDialog.Builder(this).setTitle("Fahrzeug endgültig löschen?").setMessage(name+"\n\nDer Eintrag wird dauerhaft aus dem internen Speicher gelöscht. Aufnahmen bleiben erhalten.").setPositiveButton("Endgültig löschen",(d,w)->act(()->service().deleteVehicle(vin))).setNegativeButton("Abbrechen",null).show();}
+    private void confirmDeleteVehicle(String vin,String name){new AlertDialog.Builder(this).setTitle("Fahrzeug endgültig löschen?").setMessage(name+"\n\nDer Eintrag wird dauerhaft aus dem internen Speicher gelöscht. Aufnahmen bleiben erhalten.").setPositiveButton("Endgültig löschen",(d,w)->perform(VEHICLE_DELETE,":"+vin,()->service().deleteVehicle(vin))).setNegativeButton("Abbrechen",null).show();}
     private void confirmResetVehicles(){new AlertDialog.Builder(this).setTitle("Fahrzeugspeicher zurücksetzen?").setMessage("Alle gespeicherten Fahrzeuge werden dauerhaft gelöscht und der Speicher wird neu angelegt. Aufnahmen bleiben erhalten.").setPositiveButton("Zurücksetzen",(d,w)->act(()->service().resetVehicleStore())).setNegativeButton("Abbrechen",null).show();}
     private void confirmDeleteRecording(String name){new AlertDialog.Builder(this).setTitle("Aufnahme endgültig löschen?").setMessage("Diese Datei wird dauerhaft aus dem internen Speicher gelöscht. Exportierte Kopien bleiben bestehen.\n\n"+name).setPositiveButton("Endgültig löschen",(dialog,which)->act(()->service().deleteRecording(name))).setNegativeButton("Abbrechen",null).show();}
     private void debug(){
@@ -330,18 +386,18 @@ public class MainActivity extends Activity {
     private String debugText(){StringBuilder s=new StringBuilder();JSONArray logs=array("debug");for(int i=0;i<logs.length();i++){JSONObject j=logs.optJSONObject(i);if(j==null){s.append(logs.optString(i)).append('\n');continue;}s.append(j.optString("at")).append("  ").append(j.optString("direction")).append("  ").append(j.optString("text")).append('\n');}return s.toString();}
     private void connection(){
         title("Adapter","Carly-Adapter suchen und gezielt verbinden");
-        LinearLayout c=card();addButton(c,"Adapter suchen",this::requestScan);Button disconnect=addButton(c,"Verbindung trennen",()->act(()->service().disconnect()));disconnect.setEnabled(!state.optString("phase").equals("idle"));
+        LinearLayout c=card();actionButton(c,SCAN,"","Adapter suchen",true,this::requestScan);actionButton(c,DISCONNECT,"","Verbindung trennen",!state.optString("phase").equals("idle"),()->perform(DISCONNECT,"",()->service().disconnect()));
         boolean autoOn=state.optBoolean("autoConnect",true);String known=state.optString("knownAdapter");
         LinearLayout auto=card();note(auto,"AUTOMATISCH VERBINDEN",ACCENT);
         note(auto,known.isEmpty()?"Noch kein Adapter bekannt · wird nach der ersten erfolgreichen Verbindung gemerkt":"Bekannter Adapter: "+known+" · Verbindung beim Start und nach Abbruch, Pausen 2, 5, 10 s, dann alle 30 s",known.isEmpty()?MUTED:TEXT);
-        addButton(auto,"Automatisch verbinden: "+(autoOn?"an":"aus"),()->act(()->service().setAutoConnect(!autoOn)));
-        if(state.optBoolean("autoPending"))addButton(auto,"Automatische Verbindung stoppen",()->act(()->service().stopAutoConnect()));
+        actionButton(auto,AUTO_CONNECT,"","Automatisch verbinden: "+(autoOn?"an":"aus"),true,()->perform(AUTO_CONNECT,"",()->service().setAutoConnect(!autoOn)));
+        if(state.optBoolean("autoPending")||service().pending.isPending(AUTO_STOP.key))actionButton(auto,AUTO_STOP,"","Automatische Verbindung stoppen",true,()->perform(AUTO_STOP,"",()->service().stopAutoConnect()));
         JSONArray devices=array("devices");if(devices.length()==0)note(c,"Noch keine Adapter gefunden. Adapter mit Strom versorgen, Bluetooth einschalten und Suche starten.",MUTED);
-        for(int i=0;i<devices.length();i++){JSONObject d=devices.optJSONObject(i);if(d==null)continue;String address=d.optString("address"),name=d.optString("name","Bluetooth-Gerät");LinearLayout device=card();note(device,name,TEXT);note(device,address+" · "+d.optInt("rssi")+" dBm",MUTED);Button b=addButton(device,"Verbinden",()->act(()->service().connect(address)));b.setEnabled(!state.optBoolean("busy"));}
+        for(int i=0;i<devices.length();i++){JSONObject d=devices.optJSONObject(i);if(d==null)continue;String address=d.optString("address"),name=d.optString("name","Bluetooth-Gerät");LinearLayout device=card();note(device,name,TEXT);note(device,address+" · "+d.optInt("rssi")+" dBm",MUTED);actionButton(device,CONNECT,":"+address,"Verbinden",!state.optBoolean("busy"),()->perform(CONNECT,":"+address,()->service().connect(address)));}
         LinearLayout demo=card();note(demo,"OHNE FAHRZEUG TESTEN",ACCENT);note(demo,"Die Demo liefert simulierte Messwerte und Diagnoseantworten. Aufnahmen und Export lassen sich damit am Schreibtisch prüfen.",MUTED);addButton(demo,"Demo starten",()->act(()->{service().setDemo();tab=0;structure="";buildNav();}));
     }
-    private void requestScan(){ArrayList<String> missing=new ArrayList<>();if(Build.VERSION.SDK_INT>=31){missing.add(Manifest.permission.BLUETOOTH_SCAN);missing.add(Manifest.permission.BLUETOOTH_CONNECT);}else missing.add(Manifest.permission.ACCESS_FINE_LOCATION);if(Build.VERSION.SDK_INT>=33)missing.add(Manifest.permission.POST_NOTIFICATIONS);missing.removeIf(p->checkSelfPermission(p)==PackageManager.PERMISSION_GRANTED);if(!missing.isEmpty()){scanAfterPermission=true;requestPermissions(missing.toArray(new String[0]),7);}else act(()->service().scan());}
-    @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==7&&scanAfterPermission){scanAfterPermission=false;boolean allowed=true;for(int i=0;i<permissions.length;i++)if(!permissions[i].equals(Manifest.permission.POST_NOTIFICATIONS)&&results[i]!=PackageManager.PERMISSION_GRANTED)allowed=false;if(allowed)act(()->service().scan());else new AlertDialog.Builder(this).setTitle("Bluetooth-Berechtigung fehlt").setMessage("Erlaube Geräte in der Nähe in den Android-App-Einstellungen, um den Adapter zu suchen und zu verbinden.").setPositiveButton("Einstellungen",(d,w)->startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())))).setNegativeButton("Schließen",null).show();}}
+    private void requestScan(){ArrayList<String> missing=new ArrayList<>();if(Build.VERSION.SDK_INT>=31){missing.add(Manifest.permission.BLUETOOTH_SCAN);missing.add(Manifest.permission.BLUETOOTH_CONNECT);}else missing.add(Manifest.permission.ACCESS_FINE_LOCATION);if(Build.VERSION.SDK_INT>=33)missing.add(Manifest.permission.POST_NOTIFICATIONS);missing.removeIf(p->checkSelfPermission(p)==PackageManager.PERMISSION_GRANTED);if(!missing.isEmpty()){scanAfterPermission=true;requestPermissions(missing.toArray(new String[0]),7);}else perform(SCAN,"",()->service().scan());}
+    @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==7&&scanAfterPermission){scanAfterPermission=false;boolean allowed=true;for(int i=0;i<permissions.length;i++)if(!permissions[i].equals(Manifest.permission.POST_NOTIFICATIONS)&&results[i]!=PackageManager.PERMISSION_GRANTED)allowed=false;if(allowed)perform(SCAN,"",()->service().scan());else new AlertDialog.Builder(this).setTitle("Bluetooth-Berechtigung fehlt").setMessage("Erlaube Geräte in der Nähe in den Android-App-Einstellungen, um den Adapter zu suchen und zu verbinden.").setPositiveButton("Einstellungen",(d,w)->startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())))).setNegativeButton("Schließen",null).show();}}
     /** REQ-014.2: current-session support wins; otherwise the selected record's last observation, marked with its date. */
     public static String supportLabel(String current,String stored,long seenAt){
         if(!current.isEmpty())return current.equals("unsupported")?" · nicht unterstützt":current.equals("supported")?"":" · ungeprüft";
