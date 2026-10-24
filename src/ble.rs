@@ -1584,7 +1584,7 @@ mod tests {
         // Call 1: `configure_target`'s first command times out; the ELM
         // dialect layer still runs `restore_functional`, which succeeds.
         let first_call_fails_but_restores = scripted_command_timeouts().take(1).chain(
-            ["OK\r>", "OK\r>", "OK\r>"]
+            ["OK\r>", "OK\r>"]
                 .into_iter()
                 .map(|response| Ok(response.to_string())),
         );
@@ -1594,7 +1594,6 @@ mod tests {
             "OK\r>",
             "OK\r>",
             "7E9 04 41 0C 00 00 00 00\r>",
-            "OK\r>",
             "OK\r>",
             "OK\r>",
         ]
@@ -2167,7 +2166,6 @@ mod tests {
             "7E8 04 41 0C 00 00 00 00\r>",
             "OK\r>",
             "OK\r>",
-            "OK\r>",
             "410C0000\r>",
         ]);
         let request = targeted_request();
@@ -2187,7 +2185,6 @@ mod tests {
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
                 "010C\r",
-                "ATSP0\r",
                 "ATSH 7DF\r",
                 "ATCRA\r",
                 "010C\r",
@@ -2201,7 +2198,6 @@ mod tests {
             "OK\r>",
             "OK\r>",
             "7E8 04 41 0C 1F 40\r7E9 04 41 0C 0C 80\r>",
-            "OK\r>",
             "OK\r>",
             "OK\r>",
         ]);
@@ -2247,7 +2243,6 @@ mod tests {
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
                 "010C\r",
-                "ATSP0\r",
                 "ATSH 7DF\r",
                 "ATCRA\r",
             ]
@@ -2262,7 +2257,6 @@ mod tests {
             "7E9 04 41 0C 00 00 00 00\r>",
             "OK\r>",
             "OK\r>",
-            "OK\r>",
         ]);
 
         let error = read_elm_targeted_with_evidence(&mut exchange, &targeted_request())
@@ -2275,10 +2269,7 @@ mod tests {
             &exchange.commands()[..3],
             ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r"]
         );
-        assert_eq!(
-            &exchange.commands()[3..],
-            ["ATSP0\r", "ATSH 7DF\r", "ATCRA\r"]
-        );
+        assert_eq!(&exchange.commands()[3..], ["ATSH 7DF\r", "ATCRA\r"]);
     }
 
     #[test]

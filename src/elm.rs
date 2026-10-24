@@ -1510,8 +1510,9 @@ pub(crate) async fn restore_functional<E>(exchange: &mut E) -> Result<(), String
 where
     E: ElmExchange,
 {
+    // No `ATSP0` here: it defers a protocol search to the next OBD request,
+    // which would then be answered with the `01 00` search reply (#207).
     for (command, error) in [
-        ("ATSP0\r", "functional protocol reset failed"),
         ("ATSH 7DF\r", "functional request header reset failed"),
         ("ATCRA\r", "functional response filter reset failed"),
     ] {
@@ -3083,6 +3084,65 @@ mod tests {
         assert_eq!(exchange.commands(), ["010D\r", "010D\r"]);
     }
 
+    /// Models the ELM327/Carly behavior from docs/carly-cua-v200.md §9: `ATSP0`
+    /// defers the protocol search to the next OBD request, which is then
+    /// answered with the `0100` reply instead of its own.
+    struct SearchAfterAtsp0 {
+        searching: bool,
+        commands: Vec<String>,
+    }
+
+    impl ElmExchange for SearchAfterAtsp0 {
+        async fn exchange(
+            &mut self,
+            command: &str,
+            _command_timeout: Duration,
+        ) -> Result<String, ExchangeError> {
+            self.commands.push(command.trim().to_owned());
+            Ok(match command.trim() {
+                "ATSP0" => {
+                    self.searching = true;
+                    "OK\r>".into()
+                }
+                c if c.starts_with("AT") => "OK\r>".into(),
+                _ if self.searching => {
+                    self.searching = false;
+                    "SEARCHING...\r7E8 06 41 00 98 3B A0 13 00\r>".into()
+                }
+                "010C" => "7E8 04 41 0C 1A F8\r>".into(),
+                other => panic!("unexpected command {other}"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_207_repeated_targeted_reads_do_not_retrigger_protocol_search() {
+        let mut exchange = SearchAfterAtsp0 {
+            searching: false,
+            commands: Vec::new(),
+        };
+        let request = TargetedReadRequest::new(
+            crate::prepare_read("engine.rpm").unwrap(),
+            crate::topology::RequestTarget::concrete(
+                crate::topology::ProtocolContext::new(
+                    crate::topology::Protocol::Obd2,
+                    crate::topology::AddressingContext::Physical,
+                ),
+                crate::topology::RequestAddress::new("elm-header", "7e0"),
+            ),
+            ResponderIdentity::ElmHeader("7e8".into()),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            let read = read_elm_targeted_with_evidence(&mut exchange, &request)
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.error));
+            assert_eq!(read.payload, [0x41, 0x0c, 0x1a, 0xf8]);
+        }
+        assert!(!exchange.commands.iter().any(|c| c.starts_with("ATSP")));
+    }
+
     #[tokio::test]
     async fn generic_mode01_does_not_retry_adapter_rejection() {
         let mut exchange = ScriptedExchange::new(["NO DATA\r>"]);
@@ -3142,7 +3202,6 @@ mod tests {
             "7E8 05 62 F1 89 31 2E 55 55\r>",
             "OK\r>",
             "OK\r>",
-            "OK\r>",
         ]);
         let mut session = ElmSession::new(exchange);
 
@@ -3161,7 +3220,6 @@ mod tests {
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
                 "22F189\r",
-                "ATSP0\r",
                 "ATSH 7DF\r",
                 "ATCRA\r",
             ]
@@ -3232,7 +3290,6 @@ mod tests {
             "7E8 03 7F 22 31 55 55\r>",
             "OK\r>",
             "OK\r>",
-            "OK\r>",
         ]);
         let mut session = ElmSession::new(exchange);
 
@@ -3249,7 +3306,6 @@ mod tests {
                 "ATSH 7E0\r",
                 "ATCRA 7E8\r",
                 "22F189\r",
-                "ATSP0\r",
                 "ATSH 7DF\r",
                 "ATCRA\r",
             ]
@@ -3264,7 +3320,6 @@ mod tests {
             "OK\r>",
             "7E8 06 41 00 98 3B A0 13 00\r>",
             "7E8 05 62 F1 89 31 2E 55 55\r>",
-            "OK\r>",
             "OK\r>",
             "OK\r>",
         ]);
@@ -3289,7 +3344,6 @@ mod tests {
                 "ATCRA 7E8\r",
                 "22F189\r",
                 "22F189\r",
-                "ATSP0\r",
                 "ATSH 7DF\r",
                 "ATCRA\r",
             ]
@@ -3300,8 +3354,7 @@ mod tests {
     async fn ecu_identification_stops_after_one_stale_mode01_retry() {
         let request = canonical_ecu_identification_request();
         let stale = "7E8 06 41 00 98 3B A0 13 00\r>";
-        let exchange =
-            ScriptedExchange::new(["OK\r>", "OK\r>", stale, stale, "OK\r>", "OK\r>", "OK\r>"]);
+        let exchange = ScriptedExchange::new(["OK\r>", "OK\r>", stale, stale, "OK\r>", "OK\r>"]);
         let mut session = ElmSession::new(exchange);
 
         let read = session
@@ -3322,7 +3375,6 @@ mod tests {
                 "ATCRA 7E8\r",
                 "22F189\r",
                 "22F189\r",
-                "ATSP0\r",
                 "ATSH 7DF\r",
                 "ATCRA\r",
             ]

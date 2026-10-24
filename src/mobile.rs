@@ -1345,9 +1345,9 @@ mod tests {
     }
 
     /// Commands after the inventory's engine validation (last `010C` plus its
-    /// three-command restore), i.e. only the cluster job's traffic.
+    /// two-command restore), i.e. only the cluster job's traffic.
     fn job_traffic(commands: &[String]) -> Vec<String> {
-        let start = commands.iter().rposition(|c| c.trim() == "010C").unwrap() + 4;
+        let start = commands.iter().rposition(|c| c.trim() == "010C").unwrap() + 3;
         commands[start..]
             .iter()
             .map(|c| c.trim().to_owned())
@@ -1376,14 +1376,7 @@ mod tests {
         let commands = cluster_commands(&mut core);
         assert_eq!(
             job_traffic(&commands),
-            [
-                "ATSH 714",
-                "ATCRA 77E",
-                "222203",
-                "ATSP0",
-                "ATSH 7DF",
-                "ATCRA"
-            ]
+            ["ATSH 714", "ATCRA 77E", "222203", "ATSH 7DF", "ATCRA"]
         );
     }
 
@@ -1832,31 +1825,26 @@ mod tests {
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
             ("010C\r", "7E8 04 41 0C 1F 40\r7E9 04 41 0C 0C 80\r>"),
-            ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
             ("010C\r", "7E8 04 41 0C 1F 40\r>"),
-            ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
             ("010C\r", "7E8 04 41 0C 1F 40\r7E9 04 41 0C 0C 80\r>"),
-            ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
             ("010C\r", "7E9 04 41 0C 0C 80\r>"),
-            ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
             ("010C\r", "7E8 04 41 0C 00 00\r7E8 04 41 0C FF FF\r>"),
-            ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
         ]);
@@ -1942,7 +1930,6 @@ mod tests {
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
             ("010C\r", "7E9 04 41 0C 0C 80\r>"),
-            ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
         ]);
@@ -2257,7 +2244,6 @@ mod tests {
             ("ATSH 7E0\r", "OK\r>"),
             ("ATCRA 7E8\r", "OK\r>"),
             ("010C\r", "7E8 04 41 0C 1F 40\r>"),
-            ("ATSP0\r", "OK\r>"),
             ("ATSH 7DF\r", "OK\r>"),
             ("ATCRA\r", "OK\r>"),
         ]);
