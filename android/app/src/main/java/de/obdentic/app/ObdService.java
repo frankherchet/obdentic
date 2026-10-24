@@ -23,7 +23,21 @@ public final class ObdService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private volatile int generation;
-    private volatile BleTransport transport;
+    private volatile Link transport;
+    /** The live adapter link: BLE in the app, a fake in acceptance tests (REQ-020). */
+    public interface Link extends NativeCore.Exchange { boolean isOpen(); void close(); }
+    public interface Connector { Link open(String address) throws Exception; }
+    /** Test seams (REQ-020): replace BLE as the live link and the Bluetooth/permission state. All null in the app. */
+    public volatile Connector connector;
+    public volatile Boolean permissionOverride, bluetoothOverride;
+    private static final String PREFS = "adapter", KNOWN = "known_address", AUTO = "auto";
+    private ReconnectPolicy policy = new ReconnectPolicy(true);
+    private volatile String sessionAddress = "", pendingProfile = "", retryNote = "";
+    private volatile long nextAttemptAt;
+    private final Runnable retryTick = this::retryTick;
+    private final BroadcastReceiver bluetoothReceiver = new BroadcastReceiver() {
+        public void onReceive(Context context, Intent intent) { if (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) == BluetoothAdapter.STATE_ON) resumeIfBlocked(); }
+    };
     private volatile boolean busy;
     private long core;
     private BluetoothLeScanner scanner;
@@ -41,6 +55,9 @@ public final class ObdService extends Service {
     public volatile VehicleStore vehicles;
     public void onCreate() {
         super.onCreate(); current = this;
+        policy = new ReconnectPolicy(autoConnectEnabled(this));
+        IntentFilter bluetoothState = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(bluetoothReceiver, bluetoothState, Context.RECEIVER_NOT_EXPORTED); else registerReceiver(bluetoothReceiver, bluetoothState);
         vehicles = new VehicleStore(new File(getFilesDir(), "vehicles.json"));
         synchronized (stateLock) {
             put(state,"phase","idle"); put(state,"mode","live"); put(state,"busy",false);
@@ -55,6 +72,7 @@ public final class ObdService extends Service {
             try { applyCatalog(new JSONObject(NativeCore.execute(temporary,"catalog",""))); } finally { NativeCore.destroy(temporary); }
             restoreSelection(selectedVin()); // REQ-013.6/REQ-014.1: after the catalog, so unknown semantics are filtered
         } catch (Throwable e) { message("Rust-Kern: " + e.getMessage()); } });
+        autoStart(); // REQ-020.2
     }
     public int onStartCommand(Intent intent, int flags, int startId) { return START_NOT_STICKY; }
     public IBinder onBind(Intent intent) { return null; }
@@ -67,9 +85,11 @@ public final class ObdService extends Service {
     private void message(String value) { set("message",value); }
     public JSONObject snapshot() {
         synchronized(stateLock) { put(state,"busy",busy || sequenceIndex>=0); put(state,"records",listRecords()); put(state,"vehicles",vehicles.snapshot());
+            put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
             try { return new JSONObject(state.toString()); } catch(JSONException e) { return new JSONObject(); } }
     }
     private boolean permitted() {
+        Boolean forced = permissionOverride; if (forced != null) return forced;
         return Build.VERSION.SDK_INT < 31 || (checkSelfPermission("android.permission.BLUETOOTH_SCAN") == PackageManager.PERMISSION_GRANTED
             && checkSelfPermission("android.permission.BLUETOOTH_CONNECT") == PackageManager.PERMISSION_GRANTED);
     }
@@ -109,8 +129,8 @@ public final class ObdService extends Service {
         try {
             Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
             PendingIntent pending = PendingIntent.getActivity(this,0,launch,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
-            Notification notification = new Notification.Builder(this,"connection").setContentTitle("OBDentic verbunden")
-                .setContentText("Diagnose und lokale Aufzeichnung laufen").setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            Notification notification = new Notification.Builder(this,"connection").setContentTitle(policy.pending() ? "OBDentic verbindet automatisch" : "OBDentic verbunden")
+                .setContentText(policy.pending() ? "Wartet auf den bekannten Adapter" : "Diagnose und lokale Aufzeichnung laufen").setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
                 .setContentIntent(pending).setOngoing(true).build();
             if(Build.VERSION.SDK_INT >= 29) startForeground(1,notification,android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
             else startForeground(1,notification);
@@ -120,26 +140,98 @@ public final class ObdService extends Service {
         } catch(RuntimeException e) { message("Hintergrundverbindung: " + e.getMessage()); return false; }
     }
     public void connect(String address) {
-        if (!permitted()) { message("Bluetooth-Berechtigungen fehlen"); return; }
-        if (busy || phase().equals("ready")) { message("Zuerst aktuelle Verbindung trennen"); return; }
-        BluetoothAdapter adapter=adapter();
-        if(adapter==null || !adapter.isEnabled()) { message("Bitte Bluetooth einschalten"); return; }
-        stopScan(); resetSessionData(); int token=++generation; busy=true; mode="live"; set("mode",mode); set("phase","connecting");
-        if(!foreground()) { busy=false; set("phase","error"); return; }
+        String blocked=connectBlocker(); if(blocked!=null) { message(blocked); return; }
+        main.removeCallbacks(retryTick); policy.userConnect(); pendingProfile=""; // REQ-020.4/.8: a manual connection is the user's own
+        connectNow(address);
+    }
+    /** The German reason why nothing may connect now (REQ-020.9), or null. */
+    private String environmentBlocker() {
+        if (!permitted()) return "Bluetooth-Berechtigungen fehlen";
+        Boolean forced=bluetoothOverride; BluetoothAdapter adapter=adapter();
+        return (forced != null ? forced : adapter != null && adapter.isEnabled()) ? null : "Bitte Bluetooth einschalten";
+    }
+    private String connectBlocker() {
+        String blocked=environmentBlocker();
+        return blocked == null && (busy || phase().equals("ready")) ? "Zuerst aktuelle Verbindung trennen" : blocked;
+    }
+    /** Starts the live connection (guards already checked); false when the foreground service could not start. */
+    private boolean connectNow(String address) {
+        stopScan(); resetSessionData(); sessionAddress=""; int token=++generation; busy=true; mode="live"; set("mode",mode); set("phase","connecting");
+        if(!foreground()) { busy=false; set("phase","error"); return false; }
         worker.execute(() -> {
             try {
-                destroyCore(); BleTransport next=new BleTransport(this::debug); transport=next;
-                if(token != generation) { next.close(); return; }
-                next.connect(this,adapter.getRemoteDevice(address));
+                destroyCore(); Link next;
+                if(connector != null) { next=connector.open(address); if(token != generation) { next.close(); return; } transport=next; }
+                else {
+                    BleTransport ble=new BleTransport(this::debug); transport=ble;
+                    if(token != generation) { ble.close(); return; }
+                    BluetoothAdapter adapter=adapter(); if(adapter == null) throw new IOException("Bluetooth nicht verfügbar");
+                    ble.connect(this,adapter.getRemoteDevice(address)); next=ble; // direct GATT connect to the exact address, no scan needed
+                }
                 if(token != generation) return;
                 core=NativeCore.create(next); initialize(token);
+                if(token == generation && phase().equals("ready")) connected(address);
             } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } }
         });
+        return true;
     }
+    /** REQ-020.1/.8: worker thread, right after initialize and inventory. Remembers the adapter; continues an interrupted recording as a new one. */
+    private void connected(String address) {
+        sessionAddress=address; getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString(KNOWN,address).commit();
+        policy.success(); String resume=pendingProfile; pendingProfile="";
+        foreground();
+        if(!resume.isEmpty()) startRecording(resume); // queued behind this task, so busy is clear by then
+    }
+    public static boolean autoConnectEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO,true); }
+    /** The last successfully connected adapter's address, or "". App-private; never exported or shown in full. */
+    public String knownAdapter() { return getSharedPreferences(PREFS,MODE_PRIVATE).getString(KNOWN,""); }
+    private String maskedAdapter() { String address=knownAdapter(); return address.length() <= 5 ? address : "…"+address.substring(address.length()-5); }
+    /** REQ-020.6 */
+    public void setAutoConnect(boolean on) {
+        getSharedPreferences(PREFS,MODE_PRIVATE).edit().putBoolean(AUTO,on).commit();
+        boolean pending=policy.pending(); policy.setEnabled(on);
+        if(!on && pending) disconnect();
+        message(on ? "Automatische Verbindung an" : "Automatische Verbindung aus");
+        String p=phase();
+        if(on && !pending && !busy && mode.equals("live") && (p.equals("idle") || p.equals("error") || p.equals("disconnected"))) autoStart();
+    }
+    /** REQ-020.4: the stop button; ends pending or running automatic attempts. */
+    public void stopAutoConnect() { if(policy.pending()) { disconnect(); message("Automatische Verbindung gestoppt"); } }
+    /** REQ-020.2: app start (and switching on). Connects the known adapter when allowed; otherwise says why. */
+    public void autoStart() {
+        main.post(() -> { main.removeCallbacks(retryTick); if(!knownAdapter().isEmpty() && mode.equals("live") && policy.startup()) attempt(); });
+    }
+    /** REQ-020.9: Bluetooth turned on, or the app came back to the foreground (permission may have been granted). */
+    public void resumeIfBlocked() {
+        main.post(() -> { if(policy.state() == ReconnectPolicy.State.BLOCKED && environmentBlocker() == null && policy.unblock()) attempt(); });
+    }
+    /** Main thread; the policy is CONNECTING. Only ever connects the exact known address (REQ-020.5). */
+    private void attempt() {
+        String blocked=environmentBlocker();
+        if(blocked != null) { policy.block(); message(blocked+" · Automatische Verbindung wartet"); return; }
+        String known=knownAdapter(), p=phase();
+        if(known.isEmpty() || !mode.equals("live") || p.equals("ready")) { policy.success(); return; } // demo, replay or already connected
+        if(busy || p.equals("scanning") || p.equals("connecting")) { long delay=policy.failed(); if(delay >= 0) schedule(delay,"Adapter-Suche läuft"); return; }
+        message("Automatische Verbindung zum bekannten Adapter …");
+        if(!connectNow(known)) { long delay=policy.failed(); if(delay >= 0) schedule(delay,"Adapter nicht erreichbar"); }
+    }
+    private void schedule(long delayMs,String note) {
+        nextAttemptAt=SystemClock.elapsedRealtime()+delayMs; retryNote=note; main.removeCallbacks(retryTick); main.post(retryTick);
+    }
+    /** REQ-020.3: once a second until the pause is over; shows when the next attempt follows. */
+    private void retryTick() {
+        long left=nextAttemptAt-SystemClock.elapsedRealtime();
+        if(left > 0) {
+            if(phase().equals("error")) message(retryNote+" · neuer Versuch in "+(left+999)/1000+" s"+(pendingProfile.isEmpty() ? "" : " · Aufnahme wird fortgesetzt"));
+            main.postDelayed(retryTick,Math.min(1000,left));
+        } else if(policy.attemptDue()) attempt();
+    }
+    /** Test seam: a working link answering like the demo, but in live mode. */
+    public Link simulatedLink() { return new Demo("live"); }
     public void setDemo() {
         disconnect(); resetSessionData(); int token=++generation; busy=true; mode="demo"; set("mode",mode); set("phase","connecting");
         if(permitted()) foreground();
-        worker.execute(() -> { try { destroyCore(); core=NativeCore.create(new Demo()); initialize(token); }
+        worker.execute(() -> { try { destroyCore(); core=NativeCore.create(new Demo("demo")); initialize(token); }
             catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
     }
     private void resetSessionData() {
@@ -247,19 +339,30 @@ public final class ObdService extends Service {
     private void releaseWakeLock() { if(wakeLock != null && wakeLock.isHeld()) wakeLock.release(); }
     private void destroyCore() { if(core!=0) { NativeCore.destroy(core); core=0; } }
     public void disconnect() {
-        ++generation; stopScan(); BleTransport active=transport; transport=null; if(active!=null) active.close();
+        policy.stop(); main.removeCallbacks(retryTick); pendingProfile=""; sessionAddress=""; // REQ-020.4
+        ++generation; stopScan(); Link active=transport; transport=null; if(active!=null) active.close();
         busy=false; worker.execute(() -> closeRecording("disconnected","Verbindung getrennt")); set("phase","disconnected"); message("Getrennt"); stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock();
         worker.execute(this::destroyCore);
     }
     private void fail(int token,Throwable error) {
         if(token!=generation) return;
-        BleTransport active=transport; transport=null; if(active!=null) active.close(); destroyCore();
-        set("phase","error"); message(error.getMessage()==null ? error.toString():error.getMessage()); closeRecording("error",error.getMessage()==null?error.toString():error.getMessage()); stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock();
+        String text=error.getMessage()==null ? error.toString():error.getMessage();
+        boolean live=mode.equals("live"), established=!sessionAddress.isEmpty(); sessionAddress="";
+        String resume=established ? ReconnectPolicy.resumeProfile(recordingProfile,sequenceIndex>=0) : ""; // REQ-020.8: before the recording closes
+        Link active=transport; transport=null; if(active!=null) active.close(); destroyCore();
+        set("phase","error"); message(text); closeRecording("error",text);
+        long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
+        if(delay < 0) { pendingProfile=""; stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock(); return; }
+        if(established) pendingProfile=resume;
+        String note=established ? "Verbindung verloren" : "Adapter nicht erreichbar", blocked=environmentBlocker();
+        foreground(); // stays a foreground service while waiting, so the retry may start in the background
+        if(blocked != null) { policy.block(); message(note+" · "+blocked+" · Automatische Verbindung wartet"); releaseWakeLock(); return; } // REQ-020.9
+        schedule(delay,note);
     }
     private JSONObject execute(String action,String argument) throws Exception {
         JSONObject result=new JSONObject(NativeCore.execute(core,action,argument));
         JSONObject event=new JSONObject(); put(event,"type","action"); put(event,"action",action); put(event,"argument",argument); put(event,"result",result); record(event);
-        BleTransport active = transport; if(mode.equals("live") && active != null && !active.isOpen()) throw new IOException("BLE-Verbindung beendet; bitte neu verbinden");
+        Link active = transport; if(mode.equals("live") && active != null && !active.isOpen()) throw new IOException("BLE-Verbindung beendet; bitte neu verbinden");
         return result;
     }
     private void applyCatalog(JSONObject result) {
@@ -351,11 +454,11 @@ public final class ObdService extends Service {
         }
     }
     private void poll() {
-        if(wakeLock!=null && SystemClock.elapsedRealtime()-lastWakeRefresh>5*60*1000L && (phase().equals("ready") || phase().equals("connecting"))) {
+        if(wakeLock!=null && SystemClock.elapsedRealtime()-lastWakeRefresh>5*60*1000L && (phase().equals("ready") || phase().equals("connecting") || policy.state()==ReconnectPolicy.State.WAITING)) {
             wakeLock.acquire(10*60*1000L); lastWakeRefresh=SystemClock.elapsedRealtime();
         }
         if(busy || !phase().equals("ready") || core==0) return;
-        BleTransport active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
+        Link active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
         if(sequenceIndex>=0) { pollSequence(); return; }
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
         String probeAction=recordingProfile.equals("ea189-dpf")?"ea189.dpf.probe":recordingProfile.equals("ea189-extended")?"ea189.extended.probe":"";
@@ -611,10 +714,14 @@ public final class ObdService extends Service {
         }
         set("vehicle",vehicle);
     }
-    public void onDestroy() { disconnect(); worker.execute(this::destroyCore); worker.shutdown(); listener=null; current=null; super.onDestroy(); }
-    private final class Demo implements NativeCore.Exchange {
+    public void onDestroy() { disconnect(); try { unregisterReceiver(bluetoothReceiver); } catch(IllegalArgumentException ignored) {} worker.execute(this::destroyCore); worker.shutdown(); listener=null; current=null; super.onDestroy(); }
+    private final class Demo implements Link {
+        private final String only; private volatile boolean open=true;
+        Demo(String only) { this.only=only; }
+        public boolean isOpen() { return open; }
+        public void close() { open=false; }
         public String exchange(String command,long timeoutMs) throws Exception {
-            if(!mode.equals("demo")) throw new IOException("Demo stopped");
+            if(!mode.equals(only) || !open) throw new IOException("Demo stopped");
             debug("TX",command); String c=command.trim().replace(" ","").toUpperCase(Locale.ROOT); String response;
             if(c.equals("ATI") || c.equals("ATZ")) response="ELM327 v1.4 DEMO\r>";
             else if(c.equals("AT@1")) response="CARLY-UNIVERSAL DEMO\r>";

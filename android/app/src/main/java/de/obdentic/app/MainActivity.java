@@ -74,7 +74,7 @@ public class MainActivity extends Activity {
     }
     @Override protected void onStart(){super.onStart();getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}
     @Override protected void onStop(){getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);super.onStop();}
-    @Override protected void onResume(){super.onResume();handler.post(poll);}
+    @Override protected void onResume(){super.onResume();handler.post(poll);if(service()!=null)service().resumeIfBlocked();}
     @Override protected void onPause(){handler.removeCallbacks(poll);super.onPause();}
     @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("profile",profile);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
     private ObdService service(){return ObdService.current;}
@@ -100,7 +100,7 @@ public class MainActivity extends Activity {
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle");
         if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile")+"|"+state.opt("testSequence")+"|"+state.opt("ashEvidence");
         if(tab==3)key+="|"+(array("debug").length()==0);
-        if(tab==4)key+="|"+array("devices").toString();
+        if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
         if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->scroll.scrollTo(0,y));}
         updateValues();
         if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText()))debugLog.setText(content);}
@@ -331,6 +331,11 @@ public class MainActivity extends Activity {
     private void connection(){
         title("Adapter","Carly-Adapter suchen und gezielt verbinden");
         LinearLayout c=card();addButton(c,"Adapter suchen",this::requestScan);Button disconnect=addButton(c,"Verbindung trennen",()->act(()->service().disconnect()));disconnect.setEnabled(!state.optString("phase").equals("idle"));
+        boolean autoOn=state.optBoolean("autoConnect",true);String known=state.optString("knownAdapter");
+        LinearLayout auto=card();note(auto,"AUTOMATISCH VERBINDEN",ACCENT);
+        note(auto,known.isEmpty()?"Noch kein Adapter bekannt · wird nach der ersten erfolgreichen Verbindung gemerkt":"Bekannter Adapter: "+known+" · Verbindung beim Start und nach Abbruch, Pausen 2, 5, 10 s, dann alle 30 s",known.isEmpty()?MUTED:TEXT);
+        addButton(auto,"Automatisch verbinden: "+(autoOn?"an":"aus"),()->act(()->service().setAutoConnect(!autoOn)));
+        if(state.optBoolean("autoPending"))addButton(auto,"Automatische Verbindung stoppen",()->act(()->service().stopAutoConnect()));
         JSONArray devices=array("devices");if(devices.length()==0)note(c,"Noch keine Adapter gefunden. Adapter mit Strom versorgen, Bluetooth einschalten und Suche starten.",MUTED);
         for(int i=0;i<devices.length();i++){JSONObject d=devices.optJSONObject(i);if(d==null)continue;String address=d.optString("address"),name=d.optString("name","Bluetooth-Gerät");LinearLayout device=card();note(device,name,TEXT);note(device,address+" · "+d.optInt("rssi")+" dBm",MUTED);Button b=addButton(device,"Verbinden",()->act(()->service().connect(address)));b.setEnabled(!state.optBoolean("busy"));}
         LinearLayout demo=card();note(demo,"OHNE FAHRZEUG TESTEN",ACCENT);note(demo,"Die Demo liefert simulierte Messwerte und Diagnoseantworten. Aufnahmen und Export lassen sich damit am Schreibtisch prüfen.",MUTED);addButton(demo,"Demo starten",()->act(()->{service().setDemo();tab=0;structure="";buildNav();}));

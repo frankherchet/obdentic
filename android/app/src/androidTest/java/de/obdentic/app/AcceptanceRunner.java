@@ -32,6 +32,10 @@ public final class AcceptanceRunner extends Instrumentation {
         // Demo recordings made by this run must not be auto-exported into the user's real export folder.
         boolean userAutoExport = RecordingExporter.auto(getTargetContext());
         RecordingExporter.setAuto(getTargetContext(), false);
+        // The user's known adapter must neither be connected automatically nor changed by this run (REQ-020): switch off before the app starts, restore at the end.
+        android.content.SharedPreferences adapterPrefs = getTargetContext().getSharedPreferences("adapter", android.content.Context.MODE_PRIVATE);
+        java.util.Map<String, ?> userAdapter = new java.util.HashMap<>(adapterPrefs.getAll());
+        adapterPrefs.edit().putBoolean("auto", false).commit();
         try {
             Intent launch = new Intent(getTargetContext(), MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -203,6 +207,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Recording export (REQ-018): copy/skip/conflict/partial-failure/unavailable-folder logic against a directory target, active recording excluded, byte-identical copies, originals untouched, opt-in automatic export after stop and disconnect, share intent with read-only provider URIs, unchanged permissions (system folder picker itself not driven)");
             VehicleRecordsAcceptance.run(service,(name,listText) -> showVehicles(activity,name,listText));
             passed("Known vehicles: VIN-keyed records, stored odometer, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
+            ReconnectAcceptance.run(service,getTargetContext());
+            passed("Automatic connection (REQ-020): policy schedule 2/5/10/30 s and reset, known adapter stored/replaced app-private, retries only to the known address, manual disconnect/stop/demo/replay end attempts, switch default on and persisted, partial recording kept and same-profile continuation, test sequence never restarted, Bluetooth/permission off shows the reason and resumes, no job repeated; fake adapter link, no real BLE (direct GATT connect, engine start/stop and app restart remain for #178)");
             runOnMainSync(activity::recreate);
             SystemClock.sleep(1500);
             require("ready".equals(service.snapshot().optString("phase")),"Activity recreation preserves session");
@@ -218,13 +224,19 @@ public final class AcceptanceRunner extends Instrumentation {
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"),"restore demo for UI review");
             for(String name:new String[]{"acceptance-live.png","acceptance-diagnose.png","acceptance-debug.png","acceptance-connection.png","acceptance-recordings.png","acceptance-vehicles.png","demo-recording.jsonl"}) emitArtifact(name);
             result.putString("stream", report + "\nDESK ACCEPTANCE PASSED\nReal Carly/vehicle acceptance remains separate.\n");
-            RecordingExporter.setAuto(getTargetContext(), userAutoExport);
+            RecordingExporter.setAuto(getTargetContext(), userAutoExport); restoreAdapterPrefs(adapterPrefs, userAdapter);
             finish(Activity.RESULT_OK,result);
         } catch(Throwable error) {
             result.putString("stream",report + "\nFAILED: " + error + "\n" + android.util.Log.getStackTraceString(error));
-            RecordingExporter.setAuto(getTargetContext(), userAutoExport);
+            RecordingExporter.setAuto(getTargetContext(), userAutoExport); restoreAdapterPrefs(adapterPrefs, userAdapter);
             finish(Activity.RESULT_CANCELED,result);
         }
+    }
+    private static void restoreAdapterPrefs(android.content.SharedPreferences prefs, java.util.Map<String, ?> saved) {
+        android.content.SharedPreferences.Editor editor = prefs.edit().clear();
+        if (saved.get("known_address") instanceof String) editor.putString("known_address", (String) saved.get("known_address"));
+        if (saved.get("auto") instanceof Boolean) editor.putBoolean("auto", (Boolean) saved.get("auto"));
+        editor.commit();
     }
     private void job(String action) throws Exception {
         waitIdle(); service.runJob(action); waitIdle();
