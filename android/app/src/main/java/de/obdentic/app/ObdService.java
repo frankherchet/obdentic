@@ -444,14 +444,32 @@ public final class ObdService extends Service {
         if(sequenceIndex>=0) sequenceProgress(reason.equals("completed")?"completed":"aborted",detail);
         sequenceIndex=-1;
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
-        boolean completed=false;
+        boolean completed=false; String closed; synchronized(stateLock) { closed=state.optString("recording"); }
         synchronized(recordLock) {
             JSONObject end=new JSONObject(); put(end,"type","session_end"); put(end,"reason",reason); if(!detail.isEmpty()) put(end,"detail",detail); record(end);
             if(writer!=null) { try { writer.close(); completed=true; } catch(IOException e) { message("Aufnahme konnte nicht abgeschlossen werden: "+e.getMessage()); } writer=null; }
         }
         set("recording","");
         if(completed) message(reason.equals("completed")?"Testlauf aufgezeichnet · Antworten auswerten":reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
+        if(completed && !closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty())) exportNow(closed); // REQ-018.4: any ending reason
     }
+    /** Test seam (REQ-018): when set, replaces the stored folder as export destination. */
+    public volatile RecordingExporter.Target exportTarget;
+    public void exportAll() { if(!worker.isShutdown()) worker.execute(() -> exportNow(null)); }
+    /** REQ-018.2/.3/.6: worker thread only. Copies completed recordings (all, or just {@code only}); the recording being written is never a candidate. */
+    private void exportNow(String only) {
+        RecordingExporter.Target target=exportTarget; String stored=RecordingExporter.folder(this);
+        if(target==null) {
+            if(stored.isEmpty()) { if(only==null) message("Kein Export-Ordner gewählt"); return; }
+            try { target=RecordingExporter.tree(this,stored); } catch(RecordingExporter.Unavailable e) { exportUnavailable(); return; }
+        }
+        List<File> files=new ArrayList<>();
+        synchronized(recordLock) { String active; synchronized(stateLock) { active=state.optString("recording"); }
+            for(String name:RecordingExporter.completed(listRecords(),active)) if(only==null || name.equals(only)) try { files.add(recordingFile(name)); } catch(IOException ignored) { /* not an app-written name */ } }
+        RecordingExporter.Result result=RecordingExporter.export(files,target);
+        if(result.unavailable) exportUnavailable(); else message(result.message());
+    }
+    private void exportUnavailable() { if(exportTarget==null) RecordingExporter.setFolder(this,""); message(RecordingExporter.UNAVAILABLE); }
     private void sequenceProgress(String status,String label) {
         JSONObject progress;
         synchronized(stateLock) {
@@ -487,7 +505,9 @@ public final class ObdService extends Service {
     private void record(JSONObject event) {
         put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
             try { writer.write(event.toString()); writer.newLine(); writer.flush(); }
-            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; if(sequenceIndex>=0){sequenceIndex=-1;synchronized(stateLock){put(state.optJSONObject("testSequence"),"status","aborted");}} synchronized(due) { due.clear(); intervals.clear(); } set("recording",""); message("Aufnahmefehler: "+e.getMessage()); }
+            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; if(sequenceIndex>=0){sequenceIndex=-1;synchronized(stateLock){put(state.optJSONObject("testSequence"),"status","aborted");}} synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=state.optString("recording"); } set("recording",""); message("Aufnahmefehler: "+e.getMessage());
+                // REQ-018.4: a recording ended by a write error is auto-exported too (after the lock is released).
+                if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(failed)); }
         }
     }
     private void debug(String direction,String text) {

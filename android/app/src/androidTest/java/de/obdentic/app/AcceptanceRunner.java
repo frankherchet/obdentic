@@ -195,6 +195,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Completed recording is permanently deleted while its exported copy remains");
             TestSequenceAcceptance.run(service,getTargetContext().getFilesDir());
             passed("Finite ash sequence, operator context, raw candidate evidence, automatic completion, replay and manual stop");
+            RecordingExportAcceptance.run(service,getTargetContext());
+            passed("Recording export (REQ-018): copy/skip/conflict/partial-failure/unavailable-folder logic against a directory target, active recording excluded, byte-identical copies, originals untouched, opt-in automatic export after stop and disconnect, share intent with read-only provider URIs, unchanged permissions (system folder picker itself not driven)");
             VehicleRecordsAcceptance.run(service,(name,listText) -> showVehicles(activity,name,listText));
             passed("Known vehicles: VIN-keyed records, stored odometer, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
             runOnMainSync(activity::recreate);
