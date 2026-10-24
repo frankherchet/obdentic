@@ -36,10 +36,12 @@ jobs:
             echo "::error::Step 'Verify the tagged commit is on main' failed: $GITHUB_SHA is not on main. Nothing was signed or distributed."
             exit 1
           fi
-          ok="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
-            --jq '[.check_runs[] | select(.name == "check" and .conclusion == "success")] | length')"
-          if [[ "$ok" -lt 1 ]]; then
-            echo "::error::Step 'Verify CI passed' failed: no successful CI check for $GITHUB_SHA (missing, running or failed). Nothing was signed or distributed; re-run once CI is green."
+          runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100")"
+          conclusion() { jq -r --arg n "$1" '[.check_runs[] | select(.name == $n) | .conclusion] | if index("success") then "success" elif index("skipped") then "skipped" else "none" end' <<<"$runs"; }
+          check="$(conclusion check)"
+          # Docs-only commits skip `check` (#213); `changes` then proves CI ran and found no code changes.
+          if [[ "$check" != "success" && !( "$check" == "skipped" && "$(conclusion changes)" == "success" ) ]]; then
+            echo "::error::Step 'Verify CI passed' failed: no successful CI check for $GITHUB_SHA (need check=success, or check=skipped with changes=success for a docs-only commit; found check=$check). Nothing was signed or distributed; re-run once CI is green."
             exit 1
           fi
 

@@ -12,7 +12,7 @@ import java.util.*;
 
 /** REQ-018: copies completed internal recordings into a user-chosen folder or hands them to the share sheet. Never modifies the originals. */
 public final class RecordingExporter {
-    public static final String MIME = "application/x-ndjson", AUTHORITY = "de.obdentic.app.files";
+    public static final String MIME = "application/x-ndjson";
     private static final String PREFS = "export", FOLDER = "folder", AUTO = "auto";
 
     /** Export destination; the folder picker's tree URI in the app, a plain directory in tests. */
@@ -71,13 +71,16 @@ public final class RecordingExporter {
         return names;
     }
 
-    public static Uri uri(String name) { return new Uri.Builder().scheme("content").authority(AUTHORITY).appendPath("recordings").appendPath(name).build(); }
+    /** Provider authority: the running app id (debug and release coexist), see AndroidManifest. */
+    public static String authority(Context context) { return context.getPackageName() + ".files"; }
+
+    public static Uri uri(Context context, String name) { return new Uri.Builder().scheme("content").authority(authority(context)).appendPath("recordings").appendPath(name).build(); }
 
     /** REQ-018.5: one share intent for all given recordings, read access only through the existing provider. */
-    public static Intent share(List<String> names) {
+    public static Intent share(Context context, List<String> names) {
         ArrayList<Uri> uris = new ArrayList<>(); ClipData clip = null;
         for (String name : names) {
-            Uri uri = uri(name); uris.add(uri);
+            Uri uri = uri(context, name); uris.add(uri);
             if (clip == null) clip = ClipData.newRawUri(name, uri); else clip.addItem(new ClipData.Item(uri));
         }
         Intent intent = new Intent(Intent.ACTION_SEND_MULTIPLE).setType(MIME).putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)

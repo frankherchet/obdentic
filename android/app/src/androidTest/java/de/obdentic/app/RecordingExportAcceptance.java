@@ -92,7 +92,7 @@ final class RecordingExportAcceptance {
             exportAndWait(service, "Kein Export-Ordner gewählt");
 
             // REQ-018.5: share intent
-            Intent share = RecordingExporter.share(names);
+            Intent share = RecordingExporter.share(context, names);
             require(Intent.ACTION_SEND_MULTIPLE.equals(share.getAction()) && RecordingExporter.MIME.equals(share.getType()), "REQ-018.5 SEND_MULTIPLE with the recording MIME type");
             require((share.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0 && (share.getFlags() & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == 0, "REQ-018.5 read grant only");
             ArrayList<Uri> uris = share.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
@@ -100,11 +100,11 @@ final class RecordingExportAcceptance {
             require(uris != null && uris.size() == n && clip != null && clip.getItemCount() == n, "REQ-018.5 every recording is a stream and a clip item");
             for (int i = 0; i < n; i++) {
                 Uri uri = uris.get(i);
-                require(uri.equals(clip.getItemAt(i).getUri()) && "content".equals(uri.getScheme()) && "de.obdentic.app.files".equals(uri.getAuthority())
+                require(uri.equals(clip.getItemAt(i).getUri()) && "content".equals(uri.getScheme()) && RecordingExporter.authority(context).equals(uri.getAuthority())
                     && uri.getPath().equals("/recordings/" + names.get(i)), "REQ-018.5 provider URI for " + names.get(i) + ": " + uri);
                 try (InputStream in = context.getContentResolver().openInputStream(uri)) { require(in != null && in.read() == '{', "REQ-018.5 provider serves " + names.get(i)); }
             }
-            require(!uris.contains(RecordingExporter.uri(active)), "REQ-018.5 the active recording is not shared");
+            require(!uris.contains(RecordingExporter.uri(context, active)), "REQ-018.5 the active recording is not shared");
             try { context.getContentResolver().openFileDescriptor(uris.get(0), "w").close(); require(false, "REQ-018.5 provider must stay read-only"); }
             catch (FileNotFoundException expected) { /* read-only */ }
 

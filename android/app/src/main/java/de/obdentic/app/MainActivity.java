@@ -247,7 +247,7 @@ public class MainActivity extends Activity {
     private void shareAll(){
         java.util.List<String> names=RecordingExporter.completed(array("records"),state.optString("recording"));
         if(names.isEmpty()){toast("Keine abgeschlossenen Aufnahmen");return;}
-        try{startActivity(Intent.createChooser(RecordingExporter.share(names),"Aufnahmen teilen"));}catch(Exception e){toast("Teilen nicht möglich: "+e.getMessage());}
+        try{startActivity(Intent.createChooser(RecordingExporter.share(this,names),"Aufnahmen teilen"));}catch(Exception e){toast("Teilen nicht möglich: "+e.getMessage());}
     }
     private void showAshEvidence(JSONArray readings){
         LinearLayout evidence=card();note(evidence,"ASCHE-KANDIDATEN · AUSWERTUNG OFFEN",ACCENT);
@@ -372,7 +372,7 @@ public class MainActivity extends Activity {
         String name=pendingExport;pendingExport="";
         if(result!=RESULT_OK||data==null||data.getData()==null||name.isEmpty())return;
         Uri destination=data.getData();
-        Uri source=new Uri.Builder().scheme("content").authority("de.obdentic.app.files").appendPath("recordings").appendPath(name).build();
+        Uri source=new Uri.Builder().scheme("content").authority(RecordingExporter.authority(this)).appendPath("recordings").appendPath(name).build();
         new Thread(()->{
             try {
                 try(java.io.InputStream input=getContentResolver().openInputStream(source);

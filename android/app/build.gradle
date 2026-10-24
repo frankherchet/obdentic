@@ -39,7 +39,13 @@ android {
         }
     }
     buildTypes {
+        // Coexists with the Firebase release app (de.obdentic.app). The androidTest manifest targets this id.
+        debug {
+            applicationIdSuffix '.debug'
+            manifestPlaceholders = [testedApp: 'de.obdentic.app.debug', appLabel: 'OBDentic Debug']
+        }
         release {
+            manifestPlaceholders = [appLabel: 'OBDentic']
             minifyEnabled false
             if (releaseSigningReady) signingConfig signingConfigs.release
         }
