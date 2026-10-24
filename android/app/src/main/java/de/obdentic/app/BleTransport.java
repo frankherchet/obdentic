@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
 /** One GATT connection; never call exchange on the callback thread. */
-final class BleTransport implements NativeCore.Exchange {
+final class BleTransport implements ObdService.Link {
     static final UUID SERVICE = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb");
     static final UUID CHANNEL = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb");
     private static final UUID CCC = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
@@ -125,8 +125,8 @@ final class BleTransport implements NativeCore.Exchange {
             lock.notifyAll();
         }
     }
-    boolean isOpen() { synchronized(lock) { return ready && !closed && failure == null; } }
-    void close() {
+    public boolean isOpen() { synchronized(lock) { return ready && !closed && failure == null; } }
+    public void close() {
         synchronized (lock) {
             if (closed) return;
             closed = true; ready = false; lock.notifyAll();

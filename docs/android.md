@@ -111,6 +111,26 @@ signal from the record's last observation with its date ("unterstützt (zuletzt 
 22.10.2026)"); stored support never skips discovery or decides whether a read is sent, every
 live connection still discovers support and the current observation replaces the stored one.
 
+## Automatic connection
+
+The app remembers the last successfully connected adapter (its address, in the app-private
+`adapter` preferences; backup is disabled and the address is never exported or recorded) and
+connects to exactly that address, directly through GATT and without a scan, when the app starts
+and after an unexpected connection loss (REQ-020). A failed attempt is retried after 2, 5 and
+10 seconds and then every 30 seconds; the status line shows when the next attempt follows. The
+foreground service stays up while waiting, so retries also run with the screen off. A manual
+"Verbindung trennen", the "Automatische Verbindung stoppen" button, starting the demo or opening
+a replay ends the attempts; none follow until the user connects or the app is started again.
+"Automatisch verbinden" on the Adapter tab (default on, persisted) switches the feature.
+With Bluetooth off or a permission missing no attempt is made, the status line says why, and
+attempts resume when Bluetooth turns on (or when the app returns to the foreground).
+
+After an automatic connection only the existing initialization and inventory run, with the normal
+vehicle-record handling; no earlier job is repeated. A recording interrupted by the loss stays
+saved as a partial recording (`session_end` reason `error`); after the reconnection a new recording
+with the same profile starts. A test sequence is never restarted: its operating context must be
+stated again by the user.
+
 ## Build and install
 
 Prerequisites: JDK 17+, Rust 1.98.0, `rtk`, Android SDK platform 36, build tools
@@ -313,7 +333,9 @@ rtk proxy adb shell am instrument -w de.obdentic.app.test/de.obdentic.app.Accept
 Grant Bluetooth and notification permissions before running acceptance. The
 runner exercises the real JNI/core with a simulated adapter, profile recording
 (including background operation after pressing Home), export provider, offline
-re-decoding, reconnect and Activity recreation. The default run does not turn
+re-decoding, reconnect, Activity recreation and automatic connection (a fake adapter link and fake
+Bluetooth/permission state; it switches automatic connection off for the run and restores the
+user's known adapter and setting afterwards). The default run does not turn
 the screen off or lock the phone. The real screen-off check is opt-in: add
 `-e screenOff true` to the `am instrument` command (the phone is left locked
 afterwards). It emits synthetic screenshots and a demo recording as instrumentation
