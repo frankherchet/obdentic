@@ -2461,4 +2461,42 @@ mod tests {
             );
         }
     }
+
+    use crate::test_support::NoFunctionalAfterRestore;
+
+    #[tokio::test]
+    async fn issue_221_functional_operations_after_targeted_reads_reinitialize_first() {
+        let (model, log) = NoFunctionalAfterRestore::new();
+        let mut session = DiagnosticSession::from_exchange(model, false)
+            .await
+            .unwrap();
+        session
+            .read_targeted(targeted_request())
+            .await
+            .expect("targeted read");
+        assert_eq!(NoFunctionalAfterRestore::atz_count(&log), 0);
+
+        let identity = session.identify().await.expect("identify after targeted");
+        assert_eq!(identity.vin().as_str(), "WVWZZZ1KZAM123456");
+        assert_eq!(NoFunctionalAfterRestore::atz_count(&log), 1);
+
+        // Functional again: nothing targeted since the re-initialization.
+        session.identify().await.expect("second identify");
+        assert_eq!(NoFunctionalAfterRestore::atz_count(&log), 1);
+    }
+
+    #[tokio::test]
+    async fn issue_221_consecutive_targeted_reads_do_not_reinitialize() {
+        let (model, log) = NoFunctionalAfterRestore::new();
+        let mut session = DiagnosticSession::from_exchange(model, false)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            session
+                .read_targeted(targeted_request())
+                .await
+                .expect("targeted read");
+        }
+        assert_eq!(NoFunctionalAfterRestore::atz_count(&log), 0);
+    }
 }
