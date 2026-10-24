@@ -9,7 +9,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <application android:label="OBDentic" android:theme="@android:style/Theme.Material.NoActionBar"
+    <application android:label="${appLabel}" android:theme="@android:style/Theme.Material.NoActionBar"
         android:icon="@drawable/ic_obdentic" android:dataExtractionRules="@xml/data_extraction_rules"
         android:allowBackup="false" android:fullBackupContent="false" android:supportsRtl="true" android:usesCleartextTraffic="false">
         <activity android:name=".MainActivity" android:exported="true">
