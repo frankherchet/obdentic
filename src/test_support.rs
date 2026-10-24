@@ -119,3 +119,80 @@ impl AdapterLink for ScriptedExchange {
         self.shared.lock().unwrap().disconnects += 1;
     }
 }
+
+/// Shared command log of a scripted adapter model.
+pub(crate) type CommandLog = Arc<Mutex<Vec<String>>>;
+
+/// Carly model (#215, #221): after an explicit `ATSH 7DF` + bare `ATCRA`
+/// restore, functional `0100`/`0902` answer `NO DATA` until the next `ATZ`.
+pub(crate) struct NoFunctionalAfterRestore {
+    log: CommandLog,
+    broken: bool,
+    searching: bool,
+}
+
+impl NoFunctionalAfterRestore {
+    pub(crate) fn new() -> (Self, CommandLog) {
+        let log = CommandLog::default();
+        let model = Self {
+            log: log.clone(),
+            broken: false,
+            searching: false,
+        };
+        (model, log)
+    }
+
+    pub(crate) fn atz_count(log: &CommandLog) -> usize {
+        log.lock().unwrap().iter().filter(|c| *c == "ATZ").count()
+    }
+
+    /// The adapter's reply to one command (`\r` terminators are ignored).
+    pub(crate) fn respond(&mut self, command: &str) -> String {
+        let command = command.trim();
+        self.log.lock().unwrap().push(command.to_owned());
+        match command {
+            "ATI" => "ELM327\r>".into(),
+            "AT@1" => "CARLY-UNIVERSAL\r>".into(),
+            "ATZ" => {
+                self.broken = false;
+                "ELM327\r>".into()
+            }
+            "ATSP0" => {
+                self.searching = true;
+                "OK\r>".into()
+            }
+            "ATCRA" => {
+                self.broken = true;
+                "OK\r>".into()
+            }
+            c if c.starts_with("AT") => "OK\r>".into(),
+            "0100" | "0902" if self.broken => "NO DATA\r>".into(),
+            "0100" if self.searching => {
+                self.searching = false;
+                "SEARCHING...\r7E8 06 41 00 98 3B A0 12 00\r>".into()
+            }
+            "0100" => "7E8 06 41 00 98 3B A0 12 00\r>".into(),
+            "0902" => "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4B 5A 41\r7E8 22 4D 31 32 33 34 35 36\r>".into(),
+            "010C" => "7E8 04 41 0C 1F 40\r>".into(),
+            other => panic!("unexpected command {other}"),
+        }
+    }
+}
+
+impl ElmExchange for NoFunctionalAfterRestore {
+    async fn exchange(
+        &mut self,
+        command: &str,
+        _command_timeout: Duration,
+    ) -> Result<String, ExchangeError> {
+        Ok(self.respond(command))
+    }
+}
+
+impl AdapterLink for NoFunctionalAfterRestore {
+    async fn disconnect(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn disconnect_best_effort(&mut self) {}
+}

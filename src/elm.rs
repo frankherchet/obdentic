@@ -966,6 +966,11 @@ pub(crate) struct EcuIdentificationReadEvidence {
 pub(crate) struct ElmSession<E> {
     exchange: E,
     supported: PidSupport,
+    /// A targeted operation ran since the last full Carly initialization. Its
+    /// bare `ATSH 7DF`/`ATCRA` restore does not reliably bring functional
+    /// responses back on Carly, so functional operations re-initialize first
+    /// (#215, #221).
+    functional_dirty: bool,
 }
 
 impl<E> ElmSession<E>
@@ -976,6 +981,7 @@ where
         Self {
             exchange,
             supported: PidSupport::default(),
+            functional_dirty: false,
         }
     }
 
@@ -996,17 +1002,40 @@ where
         Ok(())
     }
 
+    /// (Re-)establish functional addressing with the generic ELM setup (`ATZ`
+    /// … `ATSP0`) plus support discovery. Adapter-specific identity checks stay
+    /// with the adapter backend and run before this when a session starts.
+    pub(crate) async fn reinitialize(&mut self) -> Result<(), String> {
+        initialize_elm(&mut self.exchange).await?;
+        self.discover_support(crate::vehicle::highest_catalog_page())
+            .await?;
+        self.functional_dirty = false;
+        Ok(())
+    }
+
+    /// Functional operations call this first; it costs nothing unless a
+    /// targeted operation ran since the last initialization.
+    async fn ensure_functional(&mut self) -> Result<(), String> {
+        if self.functional_dirty {
+            self.reinitialize().await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn establish_protocol(&mut self) -> Result<ProtocolNegotiation, String> {
+        self.ensure_functional().await?;
         establish_elm_protocol(&mut self.exchange).await
     }
 
     pub(crate) async fn identify(&mut self) -> Result<crate::identity::VehicleIdentity, String> {
+        self.ensure_functional().await?;
         read_elm_identity(&mut self.exchange).await
     }
 
     pub(crate) async fn validate_functional_support(
         &mut self,
     ) -> Result<Vec<SupportDiscovery>, String> {
+        self.ensure_functional().await?;
         validate_functional_support_exchange(&mut self.exchange).await
     }
 
@@ -1014,6 +1043,12 @@ where
         &mut self,
         request: ReadRequest,
     ) -> Result<ReadEvidence, ReadEvidenceError> {
+        self.ensure_functional()
+            .await
+            .map_err(|error| ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })?;
         if !self.supported.supports_pid(request.pid()) {
             return Err(ReadEvidenceError {
                 error: format!(
@@ -1030,6 +1065,7 @@ where
         &mut self,
         request: &TargetedReadRequest,
     ) -> Result<ReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
         read_elm_targeted_with_evidence(&mut self.exchange, request).await
     }
 
@@ -1037,6 +1073,7 @@ where
         &mut self,
         request: &TargetedMode09Request,
     ) -> Result<DiagnosticResponses, String> {
+        self.functional_dirty = true;
         if let Err(error) = configure_target(
             &mut self.exchange,
             request.target(),
@@ -1070,6 +1107,7 @@ where
     }
 
     pub(crate) async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
+        self.ensure_functional().await?;
         read_elm_mode03_responses(&mut self.exchange).await
     }
 
@@ -1077,6 +1115,7 @@ where
         &mut self,
         request: &TargetedDpfProbeRequest,
     ) -> Result<DpfProbeReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
         configure_target(
             &mut self.exchange,
             request.target(),
@@ -1104,6 +1143,7 @@ where
         &mut self,
         request: &TargetedEa189ExtendedProbeRequest,
     ) -> Result<DpfProbeReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
         configure_target(
             &mut self.exchange,
             request.target(),
@@ -1132,6 +1172,7 @@ where
         &mut self,
         request: &TargetedEa189AshProbeRequest,
     ) -> Result<DpfProbeReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
         configure_target(
             &mut self.exchange,
             request.target(),
@@ -1162,6 +1203,7 @@ where
         &mut self,
         request: &TargetedClusterOdometerRequest,
     ) -> ClusterOdometerReadEvidence {
+        self.functional_dirty = true;
         let read = match configure_target(
             &mut self.exchange,
             &request.target,
@@ -1198,6 +1240,7 @@ where
         &mut self,
         request: &TargetedEcuIdentificationRequest,
     ) -> Result<EcuIdentificationReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
         if let Err(error) = configure_target(
             &mut self.exchange,
             request.target(),
@@ -1279,6 +1322,7 @@ where
         &mut self,
         probe: &FunctionalEcuSerialProbe,
     ) -> Result<DiagnosticResponses, String> {
+        self.ensure_functional().await?;
         read_elm_functional_ecu_serial_responses(&mut self.exchange, probe).await
     }
 }
