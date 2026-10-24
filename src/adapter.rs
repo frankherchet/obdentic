@@ -138,6 +138,15 @@ pub(crate) async fn initialize_carly<E>(exchange: &mut E) -> Result<(), String>
 where
     E: ElmExchange,
 {
+    verify_carly(exchange).await?;
+    initialize_elm(exchange).await
+}
+
+/// Carly identity check only (`ATI`, `AT@1`); the generic ELM setup follows separately.
+pub(crate) async fn verify_carly<E>(exchange: &mut E) -> Result<(), String>
+where
+    E: ElmExchange,
+{
     verify_elm327(exchange).await?;
     let identity = exchange.exchange("AT@1\r", Duration::from_secs(3)).await?;
     require_response(
@@ -145,8 +154,7 @@ where
         "CARLY-UNIVERSAL",
         false,
         "AT@1 did not identify a Carly adapter",
-    )?;
-    initialize_elm(exchange).await
+    )
 }
 
 impl ElmExchange for CarlyCuaV200 {

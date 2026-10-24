@@ -44,10 +44,6 @@ pub struct MobileCore<E> {
     engine: Option<EcuTargetMapping>,
     /// VIN read by the latest inventory of this session; gates the cluster job.
     inventory_vin: Option<String>,
-    /// A targeted operation ran since the last full Carly (re-)initialization.
-    /// Its bare `ATSH 7DF`/`ATCRA` restore does not reliably bring functional
-    /// responses back on Carly, so functional operations re-initialize first (#215).
-    functional_dirty: bool,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -61,44 +57,26 @@ impl<E: Exchange> MobileCore<E> {
             initialized: false,
             engine: None,
             inventory_vin: None,
-            functional_dirty: false,
         })
     }
 
-    /// The one proven way to (re-)establish functional addressing: the closed
-    /// Carly setup plus support discovery. `restore_label` prefixes setup errors.
+    /// Full Carly (re-)initialization; `restore_label` prefixes its errors.
+    /// Functional operations re-initialize on their own after targeted ones
+    /// (`ElmSession`, #215/#221).
     fn reinitialize(&mut self, restore_label: Option<&str>) -> Result<(), String> {
         self.initialized = false;
-        let mut exchange = self
-            .session
-            .take()
-            .ok_or("session unavailable")?
-            .into_exchange();
-        let setup = self
-            .runtime
-            .block_on(crate::adapter::initialize_carly(&mut exchange));
-        self.session = Some(ElmSession::new(exchange));
-        setup.map_err(|error| match restore_label {
-            Some(label) => format!("{label} failed: {error}"),
-            None => error,
-        })?;
-        self.runtime.block_on(
-            self.session
-                .as_mut()
-                .unwrap()
-                .discover_support(crate::vehicle::highest_catalog_page()),
-        )?;
+        let session = self.session.as_mut().ok_or("session unavailable")?;
+        self.runtime
+            .block_on(async {
+                // The mobile core only drives Carly: verify it before the generic reset.
+                crate::adapter::verify_carly(session.exchange_mut()).await?;
+                session.reinitialize().await
+            })
+            .map_err(|error| match restore_label {
+                Some(label) => format!("{label} failed: {error}"),
+                None => error,
+            })?;
         self.initialized = true;
-        self.functional_dirty = false;
-        Ok(())
-    }
-
-    /// Untargeted operations need functional responses; re-initialize only if a
-    /// targeted operation ran since the last initialization (#215).
-    fn ensure_functional(&mut self) -> Result<(), String> {
-        if self.functional_dirty {
-            self.reinitialize(None)?;
-        }
         Ok(())
     }
 
@@ -183,11 +161,6 @@ impl<E: Exchange> MobileCore<E> {
         match action {
             "read" => {
                 let request = crate::prepare_read(argument)?;
-                if self.engine.is_none() {
-                    self.ensure_functional()?;
-                } else {
-                    self.functional_dirty = true;
-                }
                 let read = if let Some(mapping) = &self.engine {
                     if !self
                         .session
@@ -230,7 +203,6 @@ impl<E: Exchange> MobileCore<E> {
             }
             "inventory" => self.inventory(),
             "dtc.scan" => {
-                self.ensure_functional()?;
                 let responses = self
                     .runtime
                     .block_on(self.session.as_mut().unwrap().read_stored_dtcs())?;
@@ -269,7 +241,6 @@ impl<E: Exchange> MobileCore<E> {
         // discovery no longer observes the expected engine responder.
         self.engine = None;
         self.inventory_vin = None;
-        self.ensure_functional()?;
         let identity = self
             .runtime
             .block_on(self.session.as_mut().unwrap().identify());
@@ -311,7 +282,6 @@ impl<E: Exchange> MobileCore<E> {
 
     fn validate_engine(&mut self, data: &mut Value) -> Result<EcuTargetMapping, String> {
         // Same closed validation rule as observed_inventory: observed 7E8 + targeted RPM.
-        self.functional_dirty = true;
         let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
         let target =
             RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0"));
@@ -532,7 +502,6 @@ impl<E: Exchange> MobileCore<E> {
             .authorize_activity(Activity::Diagnose, OperationRequest::VwClusterOdometer)
             .map_err(|error| error.to_string())?;
         let request = TargetedClusterOdometerRequest::vw_cluster();
-        self.functional_dirty = true;
         let read = self.runtime.block_on(
             self.session
                 .as_mut()
@@ -2239,19 +2208,19 @@ mod tests {
         assert!(core.engine.is_some());
 
         // The targeted validation dirtied functional addressing (#215), so the
-        // second inventory re-initializes; the new discovery has no 7E8.
-        core.session = Some(ElmSession::new(PlatformExchange(Script(VecDeque::from([
-            ("ATI\r", "ELM327\r>"),
-            ("AT@1\r", "CARLY-UNIVERSAL\r>"),
-            ("ATZ\r", "ELM327\r>"),
-            ("ATE0\r", "OK\r>"),
-            ("ATL0\r", "OK\r>"),
-            ("ATS1\r", "OK\r>"),
-            ("ATH1\r", "OK\r>"),
-            ("ATSP0\r", "OK\r>"),
-            ("0100\r", "7E9 06 41 00 00 10 00 00\r>"),
-            ("0100\r", "NO DATA\r>"),
-        ])))));
+        // second inventory re-initializes with the generic ELM reset (no
+        // adapter identity check); the new discovery has no 7E8.
+        *core.session.as_mut().unwrap().exchange_mut() =
+            PlatformExchange(Script(VecDeque::from([
+                ("ATZ\r", "ELM327\r>"),
+                ("ATE0\r", "OK\r>"),
+                ("ATL0\r", "OK\r>"),
+                ("ATS1\r", "OK\r>"),
+                ("ATH1\r", "OK\r>"),
+                ("ATSP0\r", "OK\r>"),
+                ("0100\r", "7E9 06 41 00 00 10 00 00\r>"),
+                ("0100\r", "NO DATA\r>"),
+            ])));
         assert_eq!(run(&mut core, "inventory", "")["ok"], true);
         assert!(core.engine.is_none());
     }
@@ -2297,62 +2266,21 @@ mod tests {
         }
     }
 
-    /// Carly model (#215): after an explicit `ATSH 7DF` + bare `ATCRA` restore,
-    /// functional `0100`/`0902` answer `NO DATA` until the next `ATZ` init.
-    struct NoFunctionalAfterRestore {
-        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        broken: bool,
-        searching: bool,
-    }
-
-    impl Exchange for NoFunctionalAfterRestore {
+    impl Exchange for crate::test_support::NoFunctionalAfterRestore {
         fn exchange(&mut self, command: &str, _: Duration) -> Result<String, String> {
-            let command = command.trim();
-            self.log.lock().unwrap().push(command.to_owned());
-            Ok(match command {
-                "ATI" => "ELM327\r>".into(),
-                "AT@1" => "CARLY-UNIVERSAL\r>".into(),
-                "ATZ" => {
-                    self.broken = false;
-                    "ELM327\r>".into()
-                }
-                "ATSP0" => {
-                    self.searching = true;
-                    "OK\r>".into()
-                }
-                "ATCRA" => {
-                    self.broken = true;
-                    "OK\r>".into()
-                }
-                c if c.starts_with("AT") => "OK\r>".into(),
-                "0100" | "0902" if self.broken => "NO DATA\r>".into(),
-                "0100" if self.searching => {
-                    self.searching = false;
-                    "SEARCHING...\r7E8 06 41 00 98 3B A0 12 00\r>".into()
-                }
-                "0100" => "7E8 06 41 00 98 3B A0 12 00\r>".into(),
-                "0902" => "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4B 5A 41\r7E8 22 4D 31 32 33 34 35 36\r>".into(),
-                "010C" => "7E8 04 41 0C 1F 40\r>".into(),
-                other => panic!("unexpected command {other}"),
-            })
+            Ok(self.respond(command))
         }
     }
 
-    type Log = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+    use crate::test_support::{CommandLog as Log, NoFunctionalAfterRestore};
 
     fn broken_core() -> (MobileCore<NoFunctionalAfterRestore>, Log) {
-        let log = Log::default();
-        let core = MobileCore::new(NoFunctionalAfterRestore {
-            log: log.clone(),
-            broken: false,
-            searching: false,
-        })
-        .unwrap();
-        (core, log)
+        let (model, log) = NoFunctionalAfterRestore::new();
+        (MobileCore::new(model).unwrap(), log)
     }
 
     fn atz_count(log: &Log) -> usize {
-        log.lock().unwrap().iter().filter(|c| *c == "ATZ").count()
+        NoFunctionalAfterRestore::atz_count(log)
     }
 
     #[test]
