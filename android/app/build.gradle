@@ -1,5 +1,9 @@
 plugins { id 'com.android.application' }
 
+def releaseSigningEnv = ['OBDENTIC_KEYSTORE_FILE', 'OBDENTIC_KEYSTORE_PASSWORD',
+                         'OBDENTIC_KEY_ALIAS', 'OBDENTIC_KEY_PASSWORD']
+def releaseSigningReady = releaseSigningEnv.every { System.getenv(it) } // Groovy truth: set and non-empty
+
 tasks.register('buildRust', Exec) {
     workingDir rootProject.projectDir.parentFile
     commandLine 'bash', 'tools/android-native.sh'
@@ -13,8 +17,8 @@ android {
         applicationId 'de.obdentic.app'
         minSdk 26
         targetSdk 36
-        versionCode 1
-        versionName '0.1.0'
+        versionCode((findProperty('obdenticVersionCode') ?: '1') as int)
+        versionName((findProperty('obdenticVersionName') ?: '0.1.0') as String)
         testInstrumentationRunner 'de.obdentic.app.AcceptanceRunner'
         ndk { abiFilters 'arm64-v8a' }
     }
@@ -24,4 +28,33 @@ android {
     }
     packaging { jniLibs { useLegacyPackaging = false } }
     lint { abortOnError true }
+    signingConfigs {
+        if (releaseSigningReady) {
+            release {
+                storeFile file(System.getenv('OBDENTIC_KEYSTORE_FILE'))
+                storePassword System.getenv('OBDENTIC_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('OBDENTIC_KEY_ALIAS')
+                keyPassword System.getenv('OBDENTIC_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (releaseSigningReady) signingConfig signingConfigs.release
+        }
+    }
 }
+
+// Release builds exist only with the signing environment (REQ-017.3); debug,
+// lint and androidTest never need it (REQ-017.5).
+tasks.register('requireReleaseSigning') {
+    doFirst {
+        if (!releaseSigningReady) {
+            throw new GradleException('Release build refused: set ' + releaseSigningEnv.join(', ') +
+                ' (non-empty). Release APKs are never built unsigned or debug-signed.')
+        }
+    }
+}
+tasks.configureEach { if (it.name == 'preReleaseBuild') dependsOn 'requireReleaseSigning' }
+tasks.named('buildRust').configure { mustRunAfter 'requireReleaseSigning' }
