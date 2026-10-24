@@ -324,3 +324,29 @@ requirements:
         text: A recorded cluster read re-decodes offline from its raw response to the same result without adapter traffic.
       - id: REQ-016.8
         text: The job's definition and every stored result carry their source, the COMMUNITY classification and the pending hardware validation, and the record's details show them.
+
+  - id: REQ-017
+    title: Distribute signed Android test builds through Firebase App Distribution
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-24: remote Android updates"
+    description: >
+      Version tags produce a release-signed Android APK that reaches the tester
+      through Firebase App Distribution, installs as an update over the previous
+      build, and changes neither the app's permissions nor local debug builds.
+    acceptance:
+      - id: REQ-017.1
+        text: Pushing a tag vX.Y.Z on a commit of the default branch builds, after the existing checks pass, a release APK signed with the project release key, with versionName X.Y.Z and versionCode taken from the CI run number, and uploads it to Firebase App Distribution for the configured tester group.
+      - id: REQ-017.2
+        text: Pull requests, branch pushes and untagged commits never sign or distribute an APK, and signing and Firebase credentials are only available to the tag workflow of the repository itself.
+      - id: REQ-017.3
+        text: When signing or Firebase credentials are missing or invalid, or a check fails, the workflow fails with a message naming the failed step and distributes nothing; no unsigned or debug-signed APK is ever uploaded.
+      - id: REQ-017.4
+        text: The release keystore, its passwords and the Firebase service-account key never appear in the repository, build logs or build artifacts.
+      - id: REQ-017.5
+        text: Local and CI debug builds, lint and acceptance builds work unchanged without any release signing material.
+      - id: REQ-017.6
+        text: A distributed version installs over the previously distributed version on the test phone as an update, without uninstalling and keeping the app's private data.
+      - id: REQ-017.7
+        text: The distributed APK contains only the app, not the acceptance test APK, captures or evidence, and declares exactly the permissions of the debug build.
