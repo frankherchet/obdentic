@@ -137,7 +137,7 @@ public final class AcceptanceRunner extends Instrumentation {
             java.nio.file.Files.copy(file.toPath(),new File(getTargetContext().getExternalFilesDir("acceptance"),"demo-recording.jsonl").toPath(),java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             passed("Profile recording, background operation"+(screenOff?" with screen off":" (screen stays on; opt in with -e screenOff true)")+", explicit stop and flushed TX/RX evidence");
 
-            Uri uri = Uri.parse("content://de.obdentic.app.files/recordings/" + filename);
+            Uri uri = Uri.parse("content://" + getTargetContext().getPackageName() + ".files/recordings/" + filename);
             try(ParcelFileDescriptor fd=getTargetContext().getContentResolver().openFileDescriptor(uri,"r")) {
                 require(fd != null && fd.getStatSize() > 0, "Content URI export readable");
             }

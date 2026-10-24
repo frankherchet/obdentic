@@ -404,7 +404,7 @@ public final class HardwareAcceptanceRunner extends Instrumentation {
     }
 
     private void verifyReadOnlyExport(String filename, long expectedLength) throws Exception {
-        Uri uri = new Uri.Builder().scheme("content").authority("de.obdentic.app.files")
+        Uri uri = new Uri.Builder().scheme("content").authority(getTargetContext().getPackageName() + ".files")
             .appendPath("recordings").appendPath(filename).build();
         try (ParcelFileDescriptor descriptor = getTargetContext().getContentResolver().openFileDescriptor(uri, "r")) {
             require(descriptor != null && descriptor.getStatSize() == expectedLength,
