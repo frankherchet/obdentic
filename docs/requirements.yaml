@@ -402,3 +402,34 @@ requirements:
         text: The script only reads from the phone and never writes, deletes or installs anything on it.
       - id: REQ-019.6
         text: With `--report`, the script runs `obdentic-mobile-report` on each newly pulled file and shows its result.
+
+  - id: REQ-020
+    title: Connect automatically to the known adapter on start and after connection loss
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-24: in-car findings (adapter drops at engine start/stop)"
+    description: >
+      The Android app remembers the last successfully connected adapter and connects
+      to it automatically when the app starts and after an unexpected connection loss,
+      retrying with pauses until it succeeds or the user stops it. Interrupted
+      recordings stay partial and continue in a new recording with the same profile.
+    acceptance:
+      - id: REQ-020.1
+        text: After a successful live connection, the app stores that adapter's address in app-private storage as the known adapter, replacing a previously known one; the address is excluded from backup and never exported.
+      - id: REQ-020.2
+        text: When the app starts with a known adapter, automatic connection enabled, Bluetooth on and the required permissions granted, it connects to the known adapter without user action and shows the attempt in the status line.
+      - id: REQ-020.3
+        text: After an unexpected connection loss, the app retries connecting to the known adapter after pauses of 2, 5 and 10 seconds and then every 30 seconds until it succeeds or the user stops it, and shows when the next attempt follows.
+      - id: REQ-020.4
+        text: "A manual \"Verbindung trennen\", starting the demo or opening a replay stops automatic connection attempts, and none start again until the user connects or the app is started again."
+      - id: REQ-020.5
+        text: Only the known adapter's exact address is connected automatically; any other discovered device is never connected without user action.
+      - id: REQ-020.6
+        text: The user can switch automatic connection off and on; it is on by default, and the setting stays across app restarts.
+      - id: REQ-020.7
+        text: After an automatic connection, only the existing read-only initialization and inventory run automatically, with the normal vehicle-record handling; no other job is repeated.
+      - id: REQ-020.8
+        text: A recording interrupted by connection loss stays saved as a partial recording; after the automatic reconnection a new recording with the same profile starts automatically, while a test sequence is never restarted automatically.
+      - id: REQ-020.9
+        text: With Bluetooth off or a required permission missing, no attempt is made, the app shows why, and attempts resume once Bluetooth is on again while the app runs.
