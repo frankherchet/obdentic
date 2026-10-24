@@ -350,3 +350,55 @@ requirements:
         text: A distributed version installs over the previously distributed version on the test phone as an update, without uninstalling and keeping the app's private data.
       - id: REQ-017.7
         text: The distributed APK contains only the app, not the acceptance test APK, captures or evidence, and declares exactly the permissions of the debug build.
+
+  - id: REQ-018
+    title: Export Android recordings to a chosen folder and share them
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-24: simpler recording export"
+    description: >
+      The user exports completed recordings with one tap, optionally automatically,
+      into a remembered folder, or hands them to the Android share sheet, without
+      new app permissions and without moving or changing the internal originals.
+    acceptance:
+      - id: REQ-018.1
+        text: The user chooses an export folder once through the system folder picker, after a notice that recordings can contain VINs, ECU identifiers and mileage; the folder stays chosen across app restarts and is shown on the recordings tab.
+      - id: REQ-018.2
+        text: "\"Alle exportieren\" copies every completed internal recording that is not yet present in the export folder with the same name and size, skips present ones, and reports the numbers of copied, skipped and failed files."
+      - id: REQ-018.3
+        text: A recording that is still being written is never exported.
+      - id: REQ-018.4
+        text: Automatic export is off by default; when the user turns it on, every recording that ends by stop, completion, disconnect or error is copied to the export folder, and the setting stays across app restarts.
+      - id: REQ-018.5
+        text: "\"Aufnahmen teilen …\" hands all completed recordings to the Android share sheet as read-only content URIs, without adding an app permission."
+      - id: REQ-018.6
+        text: When the export folder is missing or its permission was revoked, export stops with a message asking to choose the folder again and changes no internal recording; when a copy fails midway, the incomplete target file is removed.
+      - id: REQ-018.7
+        text: Every exported file is byte-identical to its internal recording, and export never deletes, moves or modifies an internal recording.
+      - id: REQ-018.8
+        text: The app declares exactly the same permissions as before; neither internet access nor a storage permission is added.
+
+  - id: REQ-019
+    title: Pull exported recordings to the computer over adb
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-24: simpler recording export"
+    description: >
+      A repository script copies exported recordings from the phone's export folder
+      over USB or wireless adb into an untracked evidence directory, read-only on the
+      phone, and flags incomplete recordings.
+    acceptance:
+      - id: REQ-019.1
+        text: With exactly one adb device connected over USB or wireless debugging, `tools/pull-recordings.sh` copies every `.jsonl` file from the phone folder `/sdcard/Download/OBDentic` (overridable) into `evidence/phone/` (overridable), skipping files already present there with the same name and size, and prints copied and skipped counts.
+      - id: REQ-019.2
+        text: The script refuses a destination that is not ignored by git, so recordings can never land in a tracked path.
+      - id: REQ-019.3
+        text: Each pulled file is reported as complete when its last line is a session_end marker and as partial otherwise; partial files are still kept.
+      - id: REQ-019.4
+        text: With no device, more than one device, or a missing phone folder, the script exits non-zero with a clear message and writes nothing.
+      - id: REQ-019.5
+        text: The script only reads from the phone and never writes, deletes or installs anything on it.
+      - id: REQ-019.6
+        text: With `--report`, the script runs `obdentic-mobile-report` on each newly pulled file and shows its result.
