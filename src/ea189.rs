@@ -623,13 +623,13 @@ impl Ea189ExtendedSignal {
                 "dpf.field_regeneration_request_status",
                 0x115b,
                 "[ECM] Particle filter: field regeneration request status",
-                scale(1, false, 1.0, 0.0, "None"),
+                scale(1, false, 1.0, 0.0, ""),
             ),
             Self::ServiceRegenerationStatus => extended(
                 "dpf.service_regeneration_status",
                 0x115c,
                 "[ECM] Service regeneration: status",
-                scale(1, false, 1.0, 0.0, "None"),
+                scale(1, false, 1.0, 0.0, ""),
             ),
             Self::FuelPressureActual => extended(
                 "engine.rail_pressure_actual",
@@ -647,19 +647,19 @@ impl Ea189ExtendedSignal {
                 "engine.oil_temperature",
                 0x11be,
                 "[ECM] Engine oil temperature",
-                scale(2, false, 0.1, -273.1, "celicium"),
+                scale(2, false, 0.1, -273.1, "°C"),
             ),
             Self::FieldRegenerationLockStatus => extended(
                 "dpf.field_regeneration_lock_status",
                 0x11c1,
                 "[ECM] Particle filter: field regeneration lock status",
-                scale(1, false, 1.0, 0.0, "None"),
+                scale(1, false, 1.0, 0.0, ""),
             ),
             Self::FuelTemperature => extended(
                 "engine.fuel_temperature",
                 0x162d,
                 "[ECM] Fuel temperature",
-                scale(2, false, 0.1, -273.1, "celicium"),
+                scale(2, false, 0.1, -273.1, "°C"),
             ),
         }
     }
@@ -1290,5 +1290,25 @@ mod tests {
             Err(Ea189ProfileError::InvalidTargetEvidence(_))
         ));
         assert!(profile.signals().next().is_none());
+    }
+
+    #[test]
+    fn issue_216_raw_status_definitions_have_no_unit() {
+        // Raw status values and typo/placeholder units must never reach a display as unit text.
+        for signal in Ea189ExtendedSignal::ALL {
+            let unit = signal.definition().unit();
+            assert!(
+                ["hPa", "mg_stroke", "liters", "\u{b0}C", ""].contains(&unit),
+                "{} has bogus unit {unit:?}",
+                signal.semantic()
+            );
+        }
+        for signal in [
+            Ea189ExtendedSignal::FieldRegenerationRequestStatus,
+            Ea189ExtendedSignal::ServiceRegenerationStatus,
+            Ea189ExtendedSignal::FieldRegenerationLockStatus,
+        ] {
+            assert_eq!(signal.definition().unit(), "", "{}", signal.semantic());
+        }
     }
 }
