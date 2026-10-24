@@ -158,9 +158,32 @@ only the phone's internal file; exported copies remain. Stop an active recording
 first, or leave a loaded replay before deleting its file.
 
 Recordings live in the application's private `recordings/` directory. Cloud
-backup and device transfer are disabled. Export opens Android's system file
-picker so the user can save a copy, for example in Downloads for USB transfer.
-The internal content provider grants only read access to an individual recording.
+backup and device transfer are disabled. Recordings can contain VINs, ECU
+identifiers and mileage, so nothing leaves the app without an explicit choice.
+The **EXPORT** card on the recordings tab offers:
+
+- **Datei exportieren …** (per recording): Android's system file picker saves one copy.
+- **Export-Ordner wählen …**: choose a folder once with Android's system folder
+  picker, after a privacy notice. The choice is remembered across restarts and shown
+  on the card. Recommended: `Download/OBDentic`, the default source of
+  `tools/pull-recordings.sh` (added by a separate change), so USB or wireless adb,
+  Syncthing or similar can collect the files.
+- **Alle exportieren**: copies every completed recording that is not yet in the
+  folder with the same name and size, skips present ones and reports copied, skipped
+  and failed counts. A same-named file of a different size is reported as failed and
+  never overwritten. The recording being written is never exported.
+- **Automatischer Export: aus/an**: off by default. When on, each recording is
+  copied right after it ends (stop, completion, disconnect or error).
+- **Aufnahmen teilen …**: hands all completed recordings to the Android share sheet
+  as read-only content URIs.
+
+If the folder was deleted or its permission revoked, export stops with "Export-Ordner
+nicht verfügbar · bitte neu wählen", the stored choice is cleared and nothing
+internal changes. A copy that fails midway removes the incomplete target file.
+Copies are byte-identical; export never deletes, moves or modifies the internal
+recordings. It needs no storage permission and no network: the application's
+permissions are unchanged (no `INTERNET`, no storage permission), using the Storage
+Access Framework folder grant and the internal read-only content provider.
 Uninstalling the application
 removes its private files, so export recordings you need to keep first.
 
