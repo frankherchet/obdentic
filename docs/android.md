@@ -147,6 +147,13 @@ rtk env JAVA_HOME="/path/to/jdk/Contents/Home" \
 rtk proxy adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+The debug build installs as `de.obdentic.app.debug`; the Firebase release build is
+`de.obdentic.app`. Both coexist on the same phone, each with its own data (vehicle
+records, settings), and the release build is the daily app. The debug build is for
+development and desk acceptance only. The recording provider authority follows the
+installed app id (`<app id>.files`); the shared `Download/OBDentic` export folder works
+for both.
+
 Gradle builds and packages the Rust JNI library automatically. `ANDROID_NDK_HOME`
 can select a different compatible NDK installation. The build adds no Java/Kotlin
 runtime dependencies beyond Android itself. APKs, JNI binaries, local SDK paths
@@ -327,7 +334,7 @@ rtk env JAVA_HOME="/path/to/jdk/Contents/Home" \
   ANDROID_HOME="$HOME/Library/Android/sdk" \
   ./android/gradlew -p android :app:assembleDebugAndroidTest
 rtk proxy adb install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-rtk proxy adb shell am instrument -w de.obdentic.app.test/de.obdentic.app.AcceptanceRunner
+rtk proxy adb shell am instrument -w de.obdentic.app.debug.test/de.obdentic.app.AcceptanceRunner
 ```
 
 Grant Bluetooth and notification permissions before running acceptance. The
@@ -346,11 +353,14 @@ Real vehicle acceptance remains a separate required gate:
 
 Tracked separately in [acceptance issue #178](https://github.com/frankherchet/obdentic/issues/178).
 
-The optional `HardwareAcceptanceRunner` in the test APK automates the live gate
+The test APK is `de.obdentic.app.debug.test` and instruments the debug app
+`de.obdentic.app.debug` (the release app is never instrumented). The optional
+`HardwareAcceptanceRunner` in the test APK (`am instrument -w
+de.obdentic.app.debug.test/de.obdentic.app.HardwareAcceptanceRunner`) automates the live gate
 (including five minutes of screen-off recording) only when explicitly invoked
 with the intended powered adapter and vehicle available. It must find exactly
 one Carly candidate and uses no hard-coded device identity. `RecordingAuditRunner`
-audits existing phone recordings completely offline, without starting a service.
+(`de.obdentic.app.debug.test/de.obdentic.app.RecordingAuditRunner`) audits existing phone recordings completely offline, without starting a service.
 Both transfer evidence only over the local instrumentation connection; keep those
 outputs private and publish only sanitized acceptance summaries.
 
