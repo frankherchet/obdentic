@@ -433,3 +433,27 @@ requirements:
         text: A recording interrupted by connection loss stays saved as a partial recording; after the automatic reconnection a new recording with the same profile starts automatically, while a test sequence is never restarted automatically.
       - id: REQ-020.9
         text: With Bluetooth off or a required permission missing, no attempt is made, the app shows why, and attempts resume once Bluetooth is on again while the app runs.
+
+  - id: REQ-021
+    title: Show immediate pending feedback on state-changing buttons
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-24: in-car usability (#210)"
+    description: >
+      Buttons whose action completes asynchronously show at once that the tap was
+      received and is in progress, end that state on the result or after a bounded
+      time with a clear message, and never start the action twice.
+    acceptance:
+      - id: REQ-021.1
+        text: "Tapping an asynchronous action button (start or stop recording, test run, search, connect, disconnect, Diagnose jobs, export all, automatic export, automatic connection, vehicle select, rename and delete) immediately disables that button, replaces its label with a pending text such as \"Aufzeichnung wird gestartet …\" and shows a progress indicator."
+      - id: REQ-021.2
+        text: The pending state ends as soon as the action's target state is observed or an error message for it arrives; the button then shows its label for the new state and is usable again.
+      - id: REQ-021.3
+        text: "When neither the target state nor an error arrives within the action's time limit (connect 30 s, search 15 s, Diagnose jobs 60 s, export 60 s, every other action 10 s), the pending state ends with the message \"Keine Rückmeldung · <Aktion>\", the button becomes usable again, and a late result still updates the displayed state."
+      - id: REQ-021.4
+        text: Further taps on a button in the pending state start no additional action.
+      - id: REQ-021.5
+        text: The pending text and the final state are exposed to accessibility services through the button's content description and an announcement.
+      - id: REQ-021.6
+        text: A pending state stays visible across tab switches and Activity recreation until it ends by REQ-021.2 or REQ-021.3.
