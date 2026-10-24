@@ -247,6 +247,57 @@ can mirror `Download/OBDentic` to a folder on the computer under `evidence/`. Th
 transfer is end-to-end encrypted, peer to peer, with no cloud storage. Keep the
 target inside `evidence/` so recordings stay untracked.
 
+## Distribute test builds (Firebase App Distribution)
+
+Pushing a tag `vX.Y.Z` on a commit of `main` runs
+`.github/workflows/android-release.yml`. It only runs when the existing CI check
+already succeeded for that commit (otherwise it stops and distributes nothing),
+builds a release APK signed with the project key (versionName `X.Y.Z`,
+versionCode = workflow run number), verifies it with `tools/verify-release-apk.sh`
+(not debug-signed, not debuggable, not the test APK, no captures, exactly the
+permissions of `AndroidManifest.xml`) and uploads it with the Firebase CLI to the
+tester group. Pull requests, branch pushes and untagged commits never sign or
+upload. The app contains no Firebase SDK and no internet permission; the App
+Tester app on the phone does the notifying and installing. Local debug builds are
+unchanged and need no keystore; `:app:assembleRelease` without the signing
+environment fails on purpose.
+
+One-time setup (by you, in the Firebase console and GitHub):
+
+1. Create a Firebase project, add an Android app with package `de.obdentic.app`,
+   and under App Distribution create a tester group (default name `testers`) with
+   your e-mail.
+2. Create a service account with the role "Firebase App Distribution Admin" and
+   download its JSON key.
+3. Create the release keystore outside the repository and back it up (a lost
+   keystore means no further updates over the installed app):
+
+   ```sh
+   keytool -genkeypair -v -keystore obdentic-release.jks -keyalg RSA -keysize 4096 \
+     -validity 10000 -alias obdentic
+   base64 -i obdentic-release.jks | pbcopy
+   ```
+
+4. Add repository secrets: `ANDROID_KEYSTORE_BASE64` (the base64 above),
+   `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` (`obdentic`),
+   `ANDROID_KEY_PASSWORD`, `FIREBASE_SERVICE_ACCOUNT_JSON` (the JSON key's
+   content) and `FIREBASE_APP_ID` (like `1:123456789:android:abc123`, from the
+   Firebase project settings). Optional repository variable
+   `FIREBASE_TESTER_GROUP` (default `testers`).
+5. On the phone install Firebase App Tester and accept the invitation. The first
+   distributed build has a different signature than the debug build you have now,
+   so Android needs one uninstall: export your recordings first (uninstalling
+   deletes all app data). Later versions install as updates and keep their data.
+
+Release a version:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+If the upload fails (network, quota), re-run the workflow; it uploads the same
+version again. Missing secrets are listed by name in the failing step.
+
 ## Acceptance
 
 Build and install the instrumentation APK, then run it with the phone unlocked:

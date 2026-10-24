@@ -14,7 +14,9 @@ if [[ ! -x "$linker" ]]; then
   echo "Install Android NDK 27.2.12479018 or set ANDROID_NDK_HOME: missing $linker" >&2
   exit 1
 fi
-rtk env PATH="$HOME/.cargo/bin:/opt/local/bin:/usr/bin:/bin" \
+runner=(env)
+command -v rtk >/dev/null 2>&1 && runner=(rtk env)
+"${runner[@]}" PATH="$HOME/.cargo/bin:/opt/local/bin:/usr/bin:/bin" \
   CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$linker" \
   cargo +1.98.0 build --manifest-path "$repo_dir/android/native/Cargo.toml" \
   --target aarch64-linux-android --release --locked
