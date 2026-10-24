@@ -187,6 +187,43 @@ vehicle evidence. Keep them under untracked `evidence/` or `captures/`; never
 commit or attach them to an issue/PR. Debug copy and file export are explicit
 local user actions.
 
+## Pull recordings to the computer
+
+Choose `Download/OBDentic` as the app's export folder; that is the script's
+default phone folder. Then pull everything that was exported into the untracked
+`evidence/phone/` directory:
+
+```sh
+rtk tools/pull-recordings.sh            # copy new recordings, skip existing ones
+rtk tools/pull-recordings.sh --report   # also run obdentic-mobile-report on new files
+```
+
+The script reads from the phone only (`adb devices`, `shell ls/stat/test`, `pull`)
+and refuses destinations that git does not ignore. It needs exactly one adb device,
+skips files that already exist locally with the same name and size, and labels each
+copied file `complete` (it ends with `session_end`) or `partial`. Partial files are
+kept. `--source` and `--dest` override the phone folder and the git-ignored local
+directory. `tools/test-pull-recordings.sh` tests the script against a stubbed `adb`.
+It works with debug and release builds because it never uses `run-as`.
+
+**Without a cable (wireless debugging, Android 11+):** In the developer options,
+enable *Wireless debugging* and choose *Pair device with pairing code*. Then pair
+once and connect:
+
+```sh
+rtk proxy adb pair <phone-ip>:<pairing-port>    # enter the shown code
+rtk proxy adb connect <phone-ip>:<debug-port>
+rtk tools/pull-recordings.sh
+```
+
+The phone and the computer must be on the same network. Disconnect any USB cable
+first, otherwise the script sees two devices and refuses.
+
+**Automatic sync (optional):** With automatic export enabled in the app, Syncthing
+can mirror `Download/OBDentic` to a folder on the computer under `evidence/`. The
+transfer is end-to-end encrypted, peer to peer, with no cloud storage. Keep the
+target inside `evidence/` so recordings stay untracked.
+
 ## Acceptance
 
 Build and install the instrumentation APK, then run it with the phone unlocked:
