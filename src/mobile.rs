@@ -44,6 +44,10 @@ pub struct MobileCore<E> {
     engine: Option<EcuTargetMapping>,
     /// VIN read by the latest inventory of this session; gates the cluster job.
     inventory_vin: Option<String>,
+    /// A targeted operation ran since the last full Carly (re-)initialization.
+    /// Its bare `ATSH 7DF`/`ATCRA` restore does not reliably bring functional
+    /// responses back on Carly, so functional operations re-initialize first (#215).
+    functional_dirty: bool,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -57,7 +61,45 @@ impl<E: Exchange> MobileCore<E> {
             initialized: false,
             engine: None,
             inventory_vin: None,
+            functional_dirty: false,
         })
+    }
+
+    /// The one proven way to (re-)establish functional addressing: the closed
+    /// Carly setup plus support discovery. `restore_label` prefixes setup errors.
+    fn reinitialize(&mut self, restore_label: Option<&str>) -> Result<(), String> {
+        self.initialized = false;
+        let mut exchange = self
+            .session
+            .take()
+            .ok_or("session unavailable")?
+            .into_exchange();
+        let setup = self
+            .runtime
+            .block_on(crate::adapter::initialize_carly(&mut exchange));
+        self.session = Some(ElmSession::new(exchange));
+        setup.map_err(|error| match restore_label {
+            Some(label) => format!("{label} failed: {error}"),
+            None => error,
+        })?;
+        self.runtime.block_on(
+            self.session
+                .as_mut()
+                .unwrap()
+                .discover_support(crate::vehicle::highest_catalog_page()),
+        )?;
+        self.initialized = true;
+        self.functional_dirty = false;
+        Ok(())
+    }
+
+    /// Untargeted operations need functional responses; re-initialize only if a
+    /// targeted operation ran since the last initialization (#215).
+    fn ensure_functional(&mut self) -> Result<(), String> {
+        if self.functional_dirty {
+            self.reinitialize(None)?;
+        }
+        Ok(())
     }
 
     /// No caller-supplied wire bytes, addresses or write capabilities are accepted.
@@ -132,23 +174,7 @@ impl<E: Exchange> MobileCore<E> {
             self.initialized = false;
             self.engine = None;
             self.inventory_vin = None;
-            let mut exchange = self
-                .session
-                .take()
-                .ok_or("session unavailable")?
-                .into_exchange();
-            let setup = self
-                .runtime
-                .block_on(crate::adapter::initialize_carly(&mut exchange));
-            self.session = Some(ElmSession::new(exchange));
-            setup?;
-            self.runtime.block_on(
-                self.session
-                    .as_mut()
-                    .unwrap()
-                    .discover_support(crate::vehicle::highest_catalog_page()),
-            )?;
-            self.initialized = true;
+            self.reinitialize(None)?;
             return Ok(self.support());
         }
         if !self.initialized {
@@ -157,6 +183,11 @@ impl<E: Exchange> MobileCore<E> {
         match action {
             "read" => {
                 let request = crate::prepare_read(argument)?;
+                if self.engine.is_none() {
+                    self.ensure_functional()?;
+                } else {
+                    self.functional_dirty = true;
+                }
                 let read = if let Some(mapping) = &self.engine {
                     if !self
                         .session
@@ -199,6 +230,7 @@ impl<E: Exchange> MobileCore<E> {
             }
             "inventory" => self.inventory(),
             "dtc.scan" => {
+                self.ensure_functional()?;
                 let responses = self
                     .runtime
                     .block_on(self.session.as_mut().unwrap().read_stored_dtcs())?;
@@ -237,6 +269,7 @@ impl<E: Exchange> MobileCore<E> {
         // discovery no longer observes the expected engine responder.
         self.engine = None;
         self.inventory_vin = None;
+        self.ensure_functional()?;
         let identity = self
             .runtime
             .block_on(self.session.as_mut().unwrap().identify());
@@ -278,6 +311,7 @@ impl<E: Exchange> MobileCore<E> {
 
     fn validate_engine(&mut self, data: &mut Value) -> Result<EcuTargetMapping, String> {
         // Same closed validation rule as observed_inventory: observed 7E8 + targeted RPM.
+        self.functional_dirty = true;
         let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
         let target =
             RequestTarget::concrete(context.clone(), RequestAddress::new("elm-header", "7E0"));
@@ -375,24 +409,7 @@ impl<E: Exchange> MobileCore<E> {
             });
         }
         // DPF uses physical addressing; restore with complete closed adapter setup.
-        let mut exchange = self.session.take().unwrap().into_exchange();
-        let restore = self
-            .runtime
-            .block_on(crate::adapter::initialize_carly(&mut exchange));
-        self.session = Some(ElmSession::new(exchange));
-        if let Err(error) = restore {
-            self.initialized = false;
-            return Err(format!("DPF restoration failed: {error}"));
-        }
-        if let Err(error) = self.runtime.block_on(
-            self.session
-                .as_mut()
-                .unwrap()
-                .discover_support(crate::vehicle::highest_catalog_page()),
-        ) {
-            self.initialized = false;
-            return Err(error);
-        }
+        self.reinitialize(Some("DPF restoration"))?;
         Ok(json!({"experimental":true,"readings":readings}))
     }
 
@@ -458,24 +475,7 @@ impl<E: Exchange> MobileCore<E> {
                 }
             });
         }
-        let mut exchange = self.session.take().unwrap().into_exchange();
-        let restore = self
-            .runtime
-            .block_on(crate::adapter::initialize_carly(&mut exchange));
-        self.session = Some(ElmSession::new(exchange));
-        if let Err(error) = restore {
-            self.initialized = false;
-            return Err(format!("EA189 extended restoration failed: {error}"));
-        }
-        if let Err(error) = self.runtime.block_on(
-            self.session
-                .as_mut()
-                .unwrap()
-                .discover_support(crate::vehicle::highest_catalog_page()),
-        ) {
-            self.initialized = false;
-            return Err(error);
-        }
+        self.reinitialize(Some("EA189 extended restoration"))?;
         Ok(json!({"experimental":true,"readings":readings}))
     }
 
@@ -513,24 +513,7 @@ impl<E: Exchange> MobileCore<E> {
         }
 
         // Restore Carly's normal functional setup after the bounded physical reads.
-        let mut exchange = self.session.take().unwrap().into_exchange();
-        let restore = self
-            .runtime
-            .block_on(crate::adapter::initialize_carly(&mut exchange));
-        self.session = Some(ElmSession::new(exchange));
-        if let Err(error) = restore {
-            self.initialized = false;
-            return Err(format!("EA189 ash probe restoration failed: {error}"));
-        }
-        if let Err(error) = self.runtime.block_on(
-            self.session
-                .as_mut()
-                .unwrap()
-                .discover_support(crate::vehicle::highest_catalog_page()),
-        ) {
-            self.initialized = false;
-            return Err(error);
-        }
+        self.reinitialize(Some("EA189 ash probe restoration"))?;
         Ok(json!({"experimental":true,"readings":readings}))
     }
 
@@ -549,6 +532,7 @@ impl<E: Exchange> MobileCore<E> {
             .authorize_activity(Activity::Diagnose, OperationRequest::VwClusterOdometer)
             .map_err(|error| error.to_string())?;
         let request = TargetedClusterOdometerRequest::vw_cluster();
+        self.functional_dirty = true;
         let read = self.runtime.block_on(
             self.session
                 .as_mut()
@@ -2254,7 +2238,18 @@ mod tests {
         );
         assert!(core.engine.is_some());
 
+        // The targeted validation dirtied functional addressing (#215), so the
+        // second inventory re-initializes; the new discovery has no 7E8.
         core.session = Some(ElmSession::new(PlatformExchange(Script(VecDeque::from([
+            ("ATI\r", "ELM327\r>"),
+            ("AT@1\r", "CARLY-UNIVERSAL\r>"),
+            ("ATZ\r", "ELM327\r>"),
+            ("ATE0\r", "OK\r>"),
+            ("ATL0\r", "OK\r>"),
+            ("ATS1\r", "OK\r>"),
+            ("ATH1\r", "OK\r>"),
+            ("ATSP0\r", "OK\r>"),
+            ("0100\r", "7E9 06 41 00 00 10 00 00\r>"),
             ("0100\r", "NO DATA\r>"),
         ])))));
         assert_eq!(run(&mut core, "inventory", "")["ok"], true);
@@ -2300,5 +2295,103 @@ mod tests {
             assert!(reading.get("raw_response").is_some());
             assert!(!reading["responses"].as_array().unwrap().is_empty());
         }
+    }
+
+    /// Carly model (#215): after an explicit `ATSH 7DF` + bare `ATCRA` restore,
+    /// functional `0100`/`0902` answer `NO DATA` until the next `ATZ` init.
+    struct NoFunctionalAfterRestore {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        broken: bool,
+        searching: bool,
+    }
+
+    impl Exchange for NoFunctionalAfterRestore {
+        fn exchange(&mut self, command: &str, _: Duration) -> Result<String, String> {
+            let command = command.trim();
+            self.log.lock().unwrap().push(command.to_owned());
+            Ok(match command {
+                "ATI" => "ELM327\r>".into(),
+                "AT@1" => "CARLY-UNIVERSAL\r>".into(),
+                "ATZ" => {
+                    self.broken = false;
+                    "ELM327\r>".into()
+                }
+                "ATSP0" => {
+                    self.searching = true;
+                    "OK\r>".into()
+                }
+                "ATCRA" => {
+                    self.broken = true;
+                    "OK\r>".into()
+                }
+                c if c.starts_with("AT") => "OK\r>".into(),
+                "0100" | "0902" if self.broken => "NO DATA\r>".into(),
+                "0100" if self.searching => {
+                    self.searching = false;
+                    "SEARCHING...\r7E8 06 41 00 98 3B A0 12 00\r>".into()
+                }
+                "0100" => "7E8 06 41 00 98 3B A0 12 00\r>".into(),
+                "0902" => "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4B 5A 41\r7E8 22 4D 31 32 33 34 35 36\r>".into(),
+                "010C" => "7E8 04 41 0C 1F 40\r>".into(),
+                other => panic!("unexpected command {other}"),
+            })
+        }
+    }
+
+    type Log = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn broken_core() -> (MobileCore<NoFunctionalAfterRestore>, Log) {
+        let log = Log::default();
+        let core = MobileCore::new(NoFunctionalAfterRestore {
+            log: log.clone(),
+            broken: false,
+            searching: false,
+        })
+        .unwrap();
+        (core, log)
+    }
+
+    fn atz_count(log: &Log) -> usize {
+        log.lock().unwrap().iter().filter(|c| *c == "ATZ").count()
+    }
+
+    #[test]
+    fn issue_215_inventory_after_targeted_operations_reinitializes_before_functional_requests() {
+        let (mut core, log) = broken_core();
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let first = run(&mut core, "inventory", "");
+        assert!(first["data"]["identity_error"].is_null(), "{first}");
+        assert_eq!(first["data"]["vin"], "WVWZZZ1KZAM123456");
+        assert_eq!(first["data"]["engine_target_validated"], true);
+
+        // Targeted live polling leaves the adapter in the restored state.
+        assert_eq!(run(&mut core, "read", "engine.rpm")["ok"], true);
+        assert_eq!(atz_count(&log), 1);
+
+        let second = run(&mut core, "inventory", "");
+        assert!(second["data"]["identity_error"].is_null(), "{second}");
+        assert_eq!(second["data"]["vin"], "WVWZZZ1KZAM123456");
+        assert_eq!(atz_count(&log), 2);
+    }
+
+    #[test]
+    fn issue_215_consecutive_targeted_reads_do_not_reinitialize() {
+        let (mut core, log) = broken_core();
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let inventory = run(&mut core, "inventory", "");
+        assert_eq!(inventory["data"]["engine_target_validated"], true);
+        for _ in 0..3 {
+            assert_eq!(run(&mut core, "read", "engine.rpm")["ok"], true);
+        }
+        assert_eq!(atz_count(&log), 1);
+    }
+
+    #[test]
+    fn issue_215_inventory_directly_after_initialize_does_not_reinitialize() {
+        let (mut core, log) = broken_core();
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let inventory = run(&mut core, "inventory", "");
+        assert_eq!(inventory["data"]["vin"], "WVWZZZ1KZAM123456");
+        assert_eq!(atz_count(&log), 1);
     }
 }
