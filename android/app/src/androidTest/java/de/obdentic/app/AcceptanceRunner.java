@@ -101,6 +101,7 @@ public final class AcceptanceRunner extends Instrumentation {
             require(extended.length()==15,"All closed EA189 additional readings retained");
             for(int i=0;i<extended.length();i++)require(extended.getJSONObject(i).has("value")&&extended.getJSONObject(i).optBoolean("experimental"),"Additional EA189 decoder succeeds and stays experimental");
             capture(activity,"Diagnose","acceptance-diagnose.png");
+            FormatAcceptance.run(extended);passed("#216 EA189 values render rounded, German, with display units, raw status without unit, cylinders 1-4");
             getUiAutomation().executeShellCommand("input keyevent 3").close();
             waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) == 0,"Activity clears keep-screen-on when paused");
             long backgrounded=file.length();
