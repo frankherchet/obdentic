@@ -23,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 /** Phone acceptance against simulated BLE responses passed through the real Rust core. */
 public final class AcceptanceRunner extends Instrumentation {
     private ObdService service;
+    private Activity activity;
     private final StringBuilder report = new StringBuilder();
     private boolean screenOff;
     /** Default runs never lock the phone; pass `-e screenOff true` to also exercise a real screen-off period. */
@@ -39,7 +40,7 @@ public final class AcceptanceRunner extends Instrumentation {
         try {
             Intent launch = new Intent(getTargetContext(), MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            Activity activity = startActivitySync(launch);
+            activity = startActivitySync(launch);
             waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0,"Visible Activity keeps the screen awake");
             passed("The visible app keeps the display awake");
             waitFor(() -> ObdService.current != null, "service creation");
@@ -73,6 +74,8 @@ public final class AcceptanceRunner extends Instrumentation {
             service.setSignals(new JSONArray());
             waitIdle();
             passed("Live RPM/coolant readings and changing observation selection");
+            activity = PendingFeedbackAcceptance.run(this, activity, service); // recreates the Activity (REQ-021.6)
+            passed("Pending feedback (REQ-021): disabled pending button with text, indicator and content description, tap while pending ignored, state survives tab switch and Activity recreation, ends on the observed target state, time-limit message and usable button, announcements, real recording start and stop");
 
             job("inventory");
             require(service.snapshot().optJSONObject("vehicle").optBoolean("engine_target_validated"), "Evidenced engine target");
