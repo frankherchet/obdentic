@@ -1,12 +1,15 @@
 //! Closed mobile facade. Platform code supplies transport, never diagnostic commands.
+mod knowledge;
+pub(crate) mod uds;
+
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::{
     elm::{
-        ElmExchange, ElmSession, ExchangeError, TargetedMultiReadRequest, TargetedReadRequest,
-        TransportFailure,
+        ElmExchange, ElmSession, ExchangeError, TargetedEcuIdentificationRequest,
+        TargetedMultiReadRequest, TargetedReadRequest, TransportFailure,
     },
     runtime_state::Activity,
     safety::{OperationRequest, SafetyPolicy},
@@ -22,6 +25,9 @@ use crate::{
 pub trait Exchange: Send {
     fn exchange(&mut self, command: &str, timeout: Duration) -> Result<String, String>;
 }
+
+#[cfg(test)]
+mod acceptance_tests;
 
 struct PlatformExchange<E>(E);
 impl<E: Exchange> ElmExchange for PlatformExchange<E> {
@@ -45,6 +51,10 @@ pub struct MobileCore<E> {
     session: Option<ElmSession<PlatformExchange<E>>>,
     initialized: bool,
     engine: Option<EcuTargetMapping>,
+    vehicle_manufacturer: Option<String>,
+    knowledge: Option<knowledge::MobileKnowledge>,
+    uds: uds::UdsSessionState,
+    uds_error: Option<String>,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -57,7 +67,32 @@ impl<E: Exchange> MobileCore<E> {
             session: Some(ElmSession::new(PlatformExchange(exchange))),
             initialized: false,
             engine: None,
+            vehicle_manufacturer: None,
+            knowledge: None,
+            uds: uds::UdsSessionState::default(),
+            uds_error: None,
         })
+    }
+
+    /// Mark the physical transport as disconnected after the platform has
+    /// attempted `uds.disable` and closed its link.
+    pub fn on_disconnect(&mut self) {
+        self.uds.on_disconnect();
+        self.initialized = false;
+        self.engine = None;
+        self.vehicle_manufacturer = None;
+        self.knowledge = None;
+    }
+
+    /// Clear an indeterminate session only after the platform confirms a new
+    /// physical adapter connection.
+    pub fn on_reconnect(&mut self) {
+        self.uds.on_reconnect();
+        self.uds_error = None;
+        self.initialized = false;
+        self.engine = None;
+        self.vehicle_manufacturer = None;
+        self.knowledge = None;
     }
 
     /// Full Carly initialization. Functional operations re-initialize on
@@ -76,17 +111,28 @@ impl<E: Exchange> MobileCore<E> {
 
     /// No caller-supplied wire bytes, addresses or write capabilities are accepted.
     pub fn execute(&mut self, action: &str, argument: &str) -> String {
-        let result = self.dispatch(action, argument);
-        match result {
+        let mut result = self.dispatch(action, argument);
+        let offline_action =
+            action.starts_with("replay.") || matches!(action, "vin.describe" | "catalog");
+        if result.is_err() && self.uds.is_active() && !offline_action {
+            let cleanup = self.disable_uds_outcome();
+            if cleanup["state"] == "indeterminate" {
+                let original = result.as_ref().err().cloned().unwrap_or_default();
+                let cleanup_error = cleanup["error"].as_str().unwrap_or("UDS cleanup failed");
+                result = Err(format!("{original}; {cleanup_error}"));
+            }
+        }
+        let mut envelope = match result {
             Ok(data) => json!({"ok":true,"data":data}),
             Err(error) => json!({"ok":false,"error":error}),
-        }
-        .to_string()
+        };
+        envelope["uds"] = self.uds_snapshot();
+        envelope.to_string()
     }
 
     fn dispatch(&mut self, action: &str, argument: &str) -> Result<Value, String> {
         if action == "catalog" {
-            return Ok(catalog());
+            return Ok(self.catalog());
         }
         if action == "vin.describe" {
             return Ok(crate::vin_identity::describe(argument));
@@ -97,13 +143,25 @@ impl<E: Exchange> MobileCore<E> {
         if action == "replay.adapter.throughput" {
             return throughput::replay(argument);
         }
+        if action == "replay.ecu.discover" || action == "replay.knowledge.learn" {
+            let recorded: Value =
+                serde_json::from_str(argument).map_err(|error| error.to_string())?;
+            return if action == "replay.ecu.discover" {
+                knowledge::replay_discovery(&recorded)
+            } else {
+                knowledge::replay_learning(&recorded)
+            };
+        }
         if action == "replay.read" {
             let mut recorded: Value = serde_json::from_str(argument).map_err(|e| e.to_string())?;
             let semantic = recorded
                 .get("semantic")
                 .and_then(Value::as_str)
                 .ok_or("recording semantic missing")?;
-            let request = crate::prepare_read(semantic)?;
+            let request = match crate::prepare_read(semantic) {
+                Ok(request) => request,
+                Err(_) => return knowledge::replay_read(&recorded),
+            };
             let response: Vec<u8> = serde_json::from_value(
                 recorded
                     .get("response")
@@ -119,7 +177,16 @@ impl<E: Exchange> MobileCore<E> {
         }
         if !matches!(
             action,
-            "initialize" | "inventory" | "read" | "dtc.scan" | "adapter.throughput"
+            "initialize"
+                | "inventory"
+                | "read"
+                | "dtc.scan"
+                | "adapter.throughput"
+                | "ecu.discover"
+                | "knowledge.learn"
+                | "uds.enable"
+                | "uds.disable"
+                | "uds.tick"
         ) {
             return Err(format!("read-only mobile core rejected action: {action}"));
         }
@@ -127,8 +194,17 @@ impl<E: Exchange> MobileCore<E> {
             return Err("this closed action accepts no argument".into());
         }
         if action == "initialize" {
+            self.disable_uds()?;
+            if self.uds.snapshot().status == uds::UdsSessionStatus::Indeterminate {
+                return Err(
+                    "UDS session state is indeterminate; reconnect before diagnostics".into(),
+                );
+            }
             self.initialized = false;
             self.engine = None;
+            self.vehicle_manufacturer = None;
+            self.knowledge = None;
+            self.uds_error = None;
             self.reinitialize()?;
             return Ok(self.support());
         }
@@ -136,41 +212,16 @@ impl<E: Exchange> MobileCore<E> {
             return Err("initialize the adapter first".into());
         }
         match action {
-            "read" => {
-                let request = crate::prepare_read(argument)?;
-                let read = if self.engine.is_some() {
-                    if !self
-                        .session
-                        .as_ref()
-                        .unwrap()
-                        .supported()
-                        .supports_pid(request.pid())
-                    {
-                        return Err(format!("vehicle does not advertise support for {argument}"));
-                    }
-                    let targeted = self.targeted_read(request)?;
-                    self.runtime.block_on(
-                        self.session
-                            .as_mut()
-                            .unwrap()
-                            .read_targeted_with_evidence(&targeted),
-                    )
-                } else {
-                    self.runtime
-                        .block_on(self.session.as_mut().unwrap().read_with_evidence(request))
-                }
-                .map_err(|error| error.error)?;
-                let transaction = request.complete("user", read.payload)?;
-                let observations = response_observations_json(&read.observations);
-                Ok(
-                    json!({"semantic":transaction.semantic(),"value":transaction.value(),
-                    "unit":transaction.unit(),"timestamp_ms":transaction.timestamp_ms(),
-                    "response":transaction.response(),"observations":observations}),
-                )
-            }
+            "read" => self.read_signal(argument),
             "inventory" => self.inventory(),
             "adapter.throughput" => self.adapter_throughput(THROUGHPUT_LIMIT),
+            "ecu.discover" => self.discover_ecus(),
+            "knowledge.learn" => self.learn_knowledge(knowledge::LEARNING_LIMIT),
+            "uds.enable" => self.enable_uds(),
+            "uds.disable" => Ok(self.disable_uds_outcome()),
+            "uds.tick" => Ok(self.tick_uds()),
             "dtc.scan" => {
+                self.disable_uds()?;
                 let responses = self
                     .runtime
                     .block_on(self.session.as_mut().unwrap().read_stored_dtcs())?;
@@ -190,6 +241,530 @@ impl<E: Exchange> MobileCore<E> {
             }
             _ => unreachable!(),
         }
+    }
+
+    fn read_signal(&mut self, semantic: &str) -> Result<Value, String> {
+        let request = match crate::prepare_read(semantic) {
+            Ok(request) => request,
+            Err(error) => {
+                let Some(knowledge) = self.knowledge.as_ref() else {
+                    return Err(error);
+                };
+                let resolved = knowledge.select_signal(semantic, |target, definition| {
+                    self.uds_can_read(target, definition)
+                })?;
+                let catalog = knowledge.catalog.clone();
+                if resolved.definition.requires_extended_session() {
+                    if !self.uds_can_read(&resolved.candidate, &resolved.definition) {
+                        return Err("Knowledge DID is not enabled for this ECU session".into());
+                    }
+                    let keepalive = self.tick_uds();
+                    if !keepalive["active"].as_bool().unwrap_or(false)
+                        || !keepalive["error"].is_null()
+                    {
+                        return Err(keepalive["error"]
+                            .as_str()
+                            .unwrap_or("UDS session is no longer active")
+                            .to_owned());
+                    }
+                    let uds_at_request = self.uds_snapshot();
+                    let outcome = self.runtime.block_on(self.uds.read(
+                        self.session.as_mut().ok_or("session unavailable")?,
+                        &resolved.definition,
+                        Instant::now(),
+                    ));
+                    let result = match outcome.evidence {
+                        Some(mut evidence) => {
+                            evidence.observations = outcome.read_observations.clone();
+                            Ok(evidence)
+                        }
+                        None => Err(crate::elm::ReadEvidenceError {
+                            error: outcome
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "Knowledge DID was not answered".into()),
+                            observations: outcome.read_observations.clone(),
+                        }),
+                    };
+                    self.uds_error = outcome.error.clone();
+                    let mut result = knowledge::read_result(&catalog, &resolved, result);
+                    result["uds"] = uds_at_request;
+                    result["uds_state_after_read"] = self.uds_snapshot();
+                    result["uds_state_after_read"]["state"] = json!(outcome.status.as_str());
+                    let cleanup_observations = outcome
+                        .observations
+                        .get(outcome.read_observations.len()..)
+                        .unwrap_or_default();
+                    result["uds_session_observations"] =
+                        json!(response_observations_json(cleanup_observations));
+                    if result["status"] == "unavailable" && self.uds.is_active() {
+                        self.disable_uds()?;
+                    } else if result["status"] == "unavailable"
+                        && outcome.status == uds::UdsSessionStatus::Inactive
+                    {
+                        if let Err(error) = self.restore_functional_addressing() {
+                            result["functional_restore_error"] = json!(error);
+                        }
+                    }
+                    return Ok(result);
+                }
+                let uds_at_request =
+                    if self.uds.is_active() && self.uds_target_matches(&resolved.candidate) {
+                        let keepalive = self.tick_uds();
+                        if !keepalive["error"].is_null() {
+                            return Err(keepalive["error"]
+                                .as_str()
+                                .unwrap_or("UDS session maintenance failed")
+                                .to_owned());
+                        }
+                        self.uds_snapshot()
+                    } else {
+                        self.disable_uds()?;
+                        self.uds_snapshot()
+                    };
+                SafetyPolicy::read_only()
+                    .authorize_activity(
+                        Activity::Diagnose,
+                        OperationRequest::knowledge_read(&resolved.definition)
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let (definition, target, responder) = knowledge::definition_read_request(&resolved);
+                let result = self.runtime.block_on(
+                    self.session
+                        .as_mut()
+                        .ok_or("session unavailable")?
+                        .read_knowledge_with_evidence(&definition, &target, &responder),
+                );
+                let mut result = knowledge::read_result(&catalog, &resolved, result);
+                result["uds"] = uds_at_request;
+                let mut session_observations = Value::Null;
+                if result["status"] == "unavailable" && self.uds.is_active() {
+                    let cleanup = self.disable_uds_outcome();
+                    session_observations = cleanup["observations"].clone();
+                    if let Some(error) = cleanup["error"].as_str() {
+                        result["uds_cleanup_error"] = json!(error);
+                    }
+                }
+                result["uds_state_after_read"] = self.uds_snapshot();
+                if !session_observations.is_null() {
+                    result["uds_session_observations"] = session_observations;
+                }
+                return Ok(result);
+            }
+        };
+        self.disable_uds()?;
+        let read = if self.engine.is_some() {
+            if !self
+                .session
+                .as_ref()
+                .ok_or("session unavailable")?
+                .supported()
+                .supports_pid(request.pid())
+            {
+                return Err(format!("vehicle does not advertise support for {semantic}"));
+            }
+            let targeted = self.targeted_read(request)?;
+            self.runtime.block_on(
+                self.session
+                    .as_mut()
+                    .ok_or("session unavailable")?
+                    .read_targeted_with_evidence(&targeted),
+            )
+        } else {
+            self.runtime.block_on(
+                self.session
+                    .as_mut()
+                    .ok_or("session unavailable")?
+                    .read_with_evidence(request),
+            )
+        }
+        .map_err(|error| error.error)?;
+        let transaction = request.complete("user", read.payload)?;
+        let mut result = json!({
+            "semantic":transaction.semantic(),"value":transaction.value(),
+            "unit":transaction.unit(),"timestamp_ms":transaction.timestamp_ms(),
+            "response":transaction.response(),
+            "observations":response_observations_json(&read.observations)
+        });
+        result["uds"] = self.uds_snapshot();
+        Ok(result)
+    }
+
+    fn discover_ecus(&mut self) -> Result<Value, String> {
+        self.disable_uds()?;
+        let manufacturer = self
+            .vehicle_manufacturer
+            .as_deref()
+            .ok_or("run inventory first; the vehicle manufacturer is not identified")?;
+        let mut knowledge = knowledge::MobileKnowledge::embedded(manufacturer)?;
+        let target_ids = knowledge
+            .targets
+            .iter()
+            .map(|target| target.candidate.id.clone())
+            .collect::<Vec<_>>();
+        let presence = knowledge.presence_candidate().clone();
+        let other_candidates = knowledge
+            .plan
+            .candidates()
+            .iter()
+            .filter(|candidate| candidate.did() != knowledge::PRESENCE_DID)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut stopped = false;
+
+        for target_id in target_ids {
+            if stopped {
+                break;
+            }
+            SafetyPolicy::read_only()
+                .authorize_activity(
+                    Activity::Diagnose,
+                    OperationRequest::EcuIdentification(presence.clone()),
+                )
+                .map_err(|error| error.to_string())?;
+            let target = knowledge
+                .candidate(&target_id)
+                .cloned()
+                .ok_or_else(|| format!("pinned target disappeared: {target_id}"))?;
+            let request = TargetedEcuIdentificationRequest::from_evidence(
+                &presence,
+                &target.request_evidence(),
+                &target.responder,
+            )?;
+            let outcome = self.runtime.block_on(
+                self.session
+                    .as_mut()
+                    .ok_or("session unavailable")?
+                    .read_identification_once_with_evidence(&request),
+            );
+            let fatal = outcome
+                .as_ref()
+                .err()
+                .is_some_and(|error| crate::scheduler::is_fatal_runtime_error(&error.error));
+            let (observation, present) = knowledge::identification_observation(
+                &knowledge.catalog,
+                &target,
+                &presence,
+                outcome,
+            )?;
+            knowledge.record(&target_id, observation);
+            if fatal {
+                stopped = true;
+                continue;
+            }
+            if !present {
+                continue;
+            }
+            for candidate in &other_candidates {
+                SafetyPolicy::read_only()
+                    .authorize_activity(
+                        Activity::Diagnose,
+                        OperationRequest::EcuIdentification(candidate.clone()),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let request = TargetedEcuIdentificationRequest::from_evidence(
+                    candidate,
+                    &target.request_evidence(),
+                    &target.responder,
+                )?;
+                let outcome = self.runtime.block_on(
+                    self.session
+                        .as_mut()
+                        .ok_or("session unavailable")?
+                        .read_identification_once_with_evidence(&request),
+                );
+                let fatal = outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| crate::scheduler::is_fatal_runtime_error(&error.error));
+                let (observation, _) = knowledge::identification_observation(
+                    &knowledge.catalog,
+                    &target,
+                    candidate,
+                    outcome,
+                )?;
+                knowledge.record(&target_id, observation);
+                if fatal {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+
+        let restore_error = self.restore_functional_addressing().err();
+        if restore_error.is_some() {
+            stopped = true;
+        }
+        let mut result = knowledge.observations_json();
+        result["stopped"] = json!(stopped);
+        result["functional_restore_error"] = json!(restore_error);
+        result["signals"] = json!(knowledge
+            .signal_catalog(|_, definition| { !definition.requires_extended_session() })?);
+        self.knowledge = Some(knowledge);
+        Ok(result)
+    }
+
+    fn learn_knowledge(&mut self, limit: Duration) -> Result<Value, String> {
+        let started = Instant::now();
+        self.disable_uds()?;
+        SafetyPolicy::read_only()
+            .authorize_activity(Activity::Diagnose, OperationRequest::KnowledgeLearning)
+            .map_err(|error| error.to_string())?;
+        let knowledge = self
+            .knowledge
+            .as_ref()
+            .ok_or("discover ECU targets before starting Knowledge learning")?;
+        let candidates = knowledge.learning_candidates()?;
+        if candidates.is_empty() {
+            return Err(
+                "no applicable session-flagged Knowledge definitions for identified ECUs".into(),
+            );
+        }
+        let repository = knowledge.catalog.pin().repository().to_owned();
+        let revision = knowledge.catalog.pin().revision().to_owned();
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis();
+        let mut results = Vec::new();
+        let mut stopped = false;
+        let mut truncated = false;
+        for candidate in candidates {
+            // A cold targeted read can take 2 * 3 s to set AT headers plus a
+            // 5 s ECU read. Reserve that entire worst case to keep the job
+            // within its advertised hard time bound.
+            if started.elapsed().saturating_add(Duration::from_secs(11)) > limit {
+                truncated = true;
+                break;
+            }
+            SafetyPolicy::read_only()
+                .authorize_activity(
+                    Activity::Diagnose,
+                    OperationRequest::knowledge_learning_read(&candidate.definition)
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+            let result = self.runtime.block_on(
+                self.session
+                    .as_mut()
+                    .ok_or("session unavailable")?
+                    .read_knowledge_with_evidence(
+                        &candidate.definition,
+                        &candidate.candidate.target,
+                        &candidate.candidate.elm_responder(),
+                    ),
+            );
+            let fatal = result
+                .as_ref()
+                .err()
+                .is_some_and(|error| crate::scheduler::is_fatal_runtime_error(&error.error));
+            results.push(knowledge::learning_result(
+                &knowledge.catalog,
+                &candidate,
+                result,
+            ));
+            if fatal {
+                stopped = true;
+                break;
+            }
+        }
+        let restore_error = self.restore_functional_addressing().err();
+        let elapsed_ms = started.elapsed().as_millis();
+        Ok(json!({
+            "knowledge_repository":repository,
+            "knowledge_revision":revision,
+            "started_at_ms":started_at,
+            "elapsed_ms":elapsed_ms,
+            "limit_s":limit.as_secs(),
+            "stopped":stopped,
+            "truncated":truncated,
+            "functional_restore_error":restore_error,
+            "results":results
+        }))
+    }
+
+    fn catalog(&self) -> Value {
+        let mut value = catalog();
+        if let Some(knowledge) = &self.knowledge {
+            let active = self.uds.snapshot();
+            let knowledge_signals = knowledge.signal_catalog(|target, definition| {
+                self.uds.can_read(definition)
+                    && active.target.as_deref() == Some(target.header().as_str())
+                    && active.responder.as_deref() == Some(target.response_header().as_str())
+            });
+            if let Ok(knowledge_signals) = knowledge_signals {
+                let signals = value["signals"].as_array_mut();
+                if let Some(signals) = signals {
+                    signals.extend(knowledge_signals);
+                }
+            }
+            value["knowledge_repository"] = json!(knowledge.catalog.pin().repository());
+            value["knowledge_revision"] = json!(knowledge.catalog.pin().revision());
+            value["uds_candidates"] = json!(self
+                .knowledge_engine_target_id(knowledge)
+                .and_then(|target_id| knowledge.learning_candidate_count_for(&target_id).ok())
+                .unwrap_or(0));
+        } else {
+            value["uds_candidates"] = json!(0);
+        }
+        value["uds"] = self.uds_snapshot();
+        value
+    }
+
+    fn uds_snapshot(&self) -> Value {
+        let outcome = self.uds.snapshot();
+        json!({
+            "state":outcome.status.as_str(),
+            "active":outcome.active,
+            "target":outcome.target,
+            "responder":outcome.responder,
+            "signals":outcome.signals,
+            "observations":response_observations_json(&outcome.observations),
+            "error":self.uds_error,
+            "active_signal_count":self.uds.candidate_count(),
+            "remaining_ms":self.uds.remaining_ms(Instant::now())
+        })
+    }
+
+    fn uds_outcome(&mut self, outcome: uds::UdsSessionOutcome) -> Value {
+        self.uds_error = outcome.error.clone();
+        json!({
+            "state":outcome.status.as_str(),
+            "active":outcome.active,
+            "target":outcome.target,
+            "responder":outcome.responder,
+            "signals":outcome.signals,
+            "observations":response_observations_json(&outcome.observations),
+            "error":outcome.error,
+            "remaining_ms":self.uds.remaining_ms(Instant::now())
+        })
+    }
+
+    fn uds_can_read(
+        &self,
+        target: &knowledge::CandidateTarget,
+        definition: &crate::knowledge_db::KnowledgeDefinition,
+    ) -> bool {
+        let active = self.uds.snapshot();
+        self.uds.can_read(definition)
+            && target.role == "engine"
+            && active.target.as_deref() == Some(target.header().as_str())
+            && active.responder.as_deref() == Some(target.response_header().as_str())
+    }
+
+    fn uds_target_matches(&self, target: &knowledge::CandidateTarget) -> bool {
+        let active = self.uds.snapshot();
+        target.role == "engine"
+            && active.target.as_deref() == Some(target.header().as_str())
+            && active.responder.as_deref() == Some(target.response_header().as_str())
+    }
+
+    fn knowledge_engine_target_id(&self, knowledge: &knowledge::MobileKnowledge) -> Option<String> {
+        let (engine_target, engine_responder) = self.engine_target().ok()?;
+        let request = engine_target.address()?.value();
+        let responder = engine_responder.as_str();
+        knowledge
+            .present_targets()
+            .find(|target| {
+                target.candidate.role == "engine"
+                    && target.candidate.header().eq_ignore_ascii_case(request)
+                    && target
+                        .candidate
+                        .response_header()
+                        .eq_ignore_ascii_case(responder)
+            })
+            .map(|target| target.candidate.id.clone())
+    }
+
+    fn enable_uds(&mut self) -> Result<Value, String> {
+        let knowledge = self
+            .knowledge
+            .as_ref()
+            .ok_or("discover an identified engine ECU before enabling UDS")?;
+        let target_id = self
+            .knowledge_engine_target_id(knowledge)
+            .ok_or("UDS extended session requires the validated, identified engine ECU")?;
+        let candidates = knowledge.learning_candidates_for_target(&target_id)?;
+        if candidates.is_empty() {
+            return Err("no applicable session-flagged Knowledge DIDs for the engine ECU".into());
+        }
+        let definitions = candidates
+            .iter()
+            .map(|candidate| &candidate.definition)
+            .collect::<Vec<_>>();
+        let (target, responder) = self.engine_target()?;
+        let mut outcome = self.runtime.block_on(self.uds.enable(
+            self.session.as_mut().ok_or("session unavailable")?,
+            target,
+            responder,
+            &definitions,
+            Instant::now(),
+        ));
+        if !outcome.active && outcome.status == uds::UdsSessionStatus::Inactive {
+            if let Err(error) = self.restore_functional_addressing() {
+                outcome.error = Some(match outcome.error {
+                    Some(original) => format!("{original}; {error}"),
+                    None => error,
+                });
+            }
+        }
+        Ok(self.uds_outcome(outcome))
+    }
+
+    fn disable_uds_outcome(&mut self) -> Value {
+        let was_active = self.uds.is_active();
+        let mut result = if let Some(session) = self.session.as_mut() {
+            self.runtime
+                .block_on(self.uds.disable(session, Instant::now()))
+        } else {
+            self.uds.snapshot()
+        };
+        if was_active && result.status == uds::UdsSessionStatus::Inactive {
+            if let Err(error) = self.restore_functional_addressing() {
+                result.error = Some(match result.error {
+                    Some(original) => format!("{original}; {error}"),
+                    None => error,
+                });
+            }
+        }
+        self.uds_outcome(result)
+    }
+
+    fn disable_uds(&mut self) -> Result<(), String> {
+        let state = self.disable_uds_outcome();
+        if state["state"] == "indeterminate" || !state["error"].is_null() {
+            return Err(state["error"]
+                .as_str()
+                .unwrap_or("UDS session state is indeterminate; reconnect before diagnostics")
+                .to_owned());
+        }
+        Ok(())
+    }
+
+    fn tick_uds(&mut self) -> Value {
+        let was_active = self.uds.is_active();
+        let mut result = if let Some(session) = self.session.as_mut() {
+            self.runtime
+                .block_on(self.uds.tick(session, Instant::now()))
+        } else {
+            self.uds.snapshot()
+        };
+        if was_active && !result.active && result.status == uds::UdsSessionStatus::Inactive {
+            if let Err(error) = self.restore_functional_addressing() {
+                result.error = Some(match result.error {
+                    Some(original) => format!("{original}; {error}"),
+                    None => error,
+                });
+            }
+        }
+        self.uds_outcome(result)
+    }
+
+    fn restore_functional_addressing(&mut self) -> Result<(), String> {
+        let session = self.session.as_mut().ok_or("session unavailable")?;
+        self.runtime
+            .block_on(session.restore_functional_addressing())
     }
 
     fn engine_target(&self) -> Result<(RequestTarget, crate::elm::ResponderIdentity), String> {
@@ -217,6 +792,7 @@ impl<E: Exchange> MobileCore<E> {
     /// stop/disconnect closes the transport, which fails the pending read and
     /// ends the job with a partial recording.
     fn adapter_throughput(&mut self, limit: Duration) -> Result<Value, String> {
+        self.disable_uds()?;
         SafetyPolicy::read_only()
             .authorize_activity(Activity::Diagnose, OperationRequest::AdapterThroughput)
             .map_err(|error| error.to_string())?;
@@ -336,9 +912,12 @@ impl<E: Exchange> MobileCore<E> {
     }
 
     fn inventory(&mut self) -> Result<Value, String> {
+        self.disable_uds()?;
         // Do not retain target evidence from an earlier inventory if this
         // discovery no longer observes the expected engine responder.
         self.engine = None;
+        self.vehicle_manufacturer = None;
+        self.knowledge = None;
         let identity = self
             .runtime
             .block_on(self.session.as_mut().unwrap().identify());
@@ -347,6 +926,8 @@ impl<E: Exchange> MobileCore<E> {
             Ok(identity) => {
                 data["vin"] = json!(identity.vin().as_str());
                 data["vin_identity"] = crate::vin_identity::describe(identity.vin().as_str());
+                self.vehicle_manufacturer =
+                    knowledge::manufacturer_from_vin(identity.vin().as_str());
             }
             Err(error) => data["identity_error"] = json!(error),
         }
@@ -509,7 +1090,7 @@ fn catalog() -> Value {
     json!({"signals":crate::supported_signals().iter().map(|s| {let m=s.metadata();json!({
         "semantic":m.semantic,"title":m.description,"unit":m.unit,"description":m.description,
         "minimum":m.minimum,"maximum":m.maximum,"subsystem":m.subsystem,"profile":m.profile,
-        "hardware_validation":m.hardware_validation
+        "hardware_validation":m.hardware_validation,"protocol":"OBD2"
     })}).collect::<Vec<_>>(),"profiles":profiles})
 }
 
@@ -806,6 +1387,121 @@ mod tests {
             )["ok"],
             false
         );
+    }
+
+    #[test]
+    fn req_023_6_replay_ecu_discovery_rebuilds_present_targets_from_responses() {
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let revision = crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+            .unwrap()
+            .pin()
+            .revision()
+            .to_owned();
+        let recording = json!({
+            "knowledge_repository": "frankherchet/obdentic-knowledge",
+            "knowledge_revision": revision,
+            "targets": [
+                {"target_id":"vag.ecu_target.7e0","observations":[
+                    {"semantic":"ecu.manufacturer_spare_part_number","definition_id":"uds.f187.manufacturer_spare_part_number","request":[34,241,135],"responses":[{"responder":"7E8","payload":[98,241,135,49,50,51]}]}
+                ]},
+                {"target_id":"vag.ecu_target.7e1","observations":[
+                    {"semantic":"ecu.manufacturer_spare_part_number","definition_id":"uds.f187.manufacturer_spare_part_number","request":[34,241,135],"responses":[{"responder":"7E9","payload":[127,34,49]}]}
+                ]},
+                {"target_id":"vag.ecu_target.714","observations":[]}
+            ]
+        });
+
+        let replay = run(&mut core, "replay.ecu.discover", &recording.to_string());
+
+        assert_eq!(replay["ok"], true, "{replay}");
+        let targets = replay["data"]["targets"].as_array().unwrap();
+        assert_eq!(targets[0]["status"], "present");
+        assert_eq!(
+            targets[0]["identity"][0]["semantic"],
+            "ecu.manufacturer_spare_part_number"
+        );
+        assert_eq!(targets[1]["status"], "present");
+        assert_eq!(targets[1]["identity"].as_array().unwrap().len(), 0);
+        assert_eq!(targets[1]["observations"][0]["nrc"], 49);
+        assert_eq!(targets[2]["status"], "not_observed");
+        assert_eq!(targets[2]["absent"], false);
+    }
+
+    #[test]
+    fn req_024_4_replay_read_redecodes_pinned_did_response_without_transport() {
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let revision = crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+            .unwrap()
+            .pin()
+            .revision()
+            .to_owned();
+        let recording = json!({
+            "knowledge_repository":"frankherchet/obdentic-knowledge",
+            "knowledge_revision":revision,
+            "semantic":"air.charge_limit_overcharge",
+            "definition_id":"vag.ea189.air.charge_limit_overcharge",
+            "target_id":"vag.ecu_target.7e0",
+            "request":[34,19,86],
+            "response":[98,19,86,0,100],
+            "observations":[{"selected_responder":"7E8","responses":[{"responder":"7E8","payload":[98,19,86,0,100]}]}],
+            "value":999,
+            "unit":"wrong"
+        });
+
+        let replay = run(&mut core, "replay.read", &recording.to_string());
+
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["data"]["value"], 1.0);
+        assert_eq!(replay["data"]["unit"], "g");
+        assert_eq!(replay["data"]["validation"], "not_validated");
+        assert_eq!(replay["data"]["replay"], true);
+        let rejected_recording = json!({
+            "knowledge_repository":"frankherchet/obdentic-knowledge",
+            "knowledge_revision":revision,
+            "semantic":"air.charge_limit_overcharge",
+            "definition_id":"vag.ea189.air.charge_limit_overcharge",
+            "target_id":"vag.ecu_target.7e0",
+            "request":[34,19,86],
+            "response":[127,34,49],
+            "observations":[{"selected_responder":"7E8","responses":[{"responder":"7E8","payload":[127,34,49]}]}]
+        });
+        let rejected = run(&mut core, "replay.read", &rejected_recording.to_string());
+        assert_eq!(rejected["ok"], true, "{rejected}");
+        assert_eq!(rejected["data"]["status"], "unavailable");
+        assert_eq!(rejected["data"]["nrc"], 49);
+        assert!(rejected["data"]["value"].is_null());
+    }
+
+    #[test]
+    fn req_026_2_replay_learning_reclassifies_answered_rejected_and_unanswered() {
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let revision = crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+            .unwrap()
+            .pin()
+            .revision()
+            .to_owned();
+        let recording = json!({
+            "knowledge_repository":"frankherchet/obdentic-knowledge",
+            "knowledge_revision":revision,
+            "results":[
+                {"knowledge_repository":"frankherchet/obdentic-knowledge","knowledge_revision":revision,"target_id":"vag.ecu_target.7e0","definition_id":"vag.ea189_session.air.intercooler_outlet_temperature","semantic":"air.intercooler_outlet_temperature","request":[34,22,40],"response":[98,22,40,14,153],"observations":[{"selected_responder":"7E8","responses":[{"responder":"7E8","payload":[98,22,40,14,153]}]}],"value":-1},
+                {"knowledge_repository":"frankherchet/obdentic-knowledge","knowledge_revision":revision,"target_id":"vag.ecu_target.7e0","definition_id":"vag.ea189_session.air.intercooler_outlet_temperature","semantic":"air.intercooler_outlet_temperature","request":[34,22,40],"response":[127,34,49],"observations":[{"selected_responder":"7E8","responses":[{"responder":"7E8","payload":[127,34,49]}]}]},
+                {"knowledge_repository":"frankherchet/obdentic-knowledge","knowledge_revision":revision,"target_id":"vag.ecu_target.7e0","definition_id":"vag.ea189_session.air.intercooler_outlet_temperature","semantic":"air.intercooler_outlet_temperature","request":[34,22,40],"response":null,"observations":[]}
+            ]
+        });
+
+        let replay = run(&mut core, "replay.knowledge.learn", &recording.to_string());
+
+        assert_eq!(replay["ok"], true, "{replay}");
+        let results = replay["data"]["results"].as_array().unwrap();
+        assert_eq!(results[0]["status"], "answered");
+        assert!((results[0]["value"].as_f64().unwrap() - 100.6).abs() < 1e-9);
+        assert_eq!(results[0]["validation"], "unconfirmed");
+        assert_eq!(results[0]["validation_state"], "not_validated");
+        assert_eq!(results[1]["status"], "rejected");
+        assert_eq!(results[1]["nrc"], 49);
+        assert_eq!(results[2]["status"], "not_answered");
+        assert!(results[2]["value"].is_null());
     }
 
     #[test]

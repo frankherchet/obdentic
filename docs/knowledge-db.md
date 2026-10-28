@@ -76,7 +76,7 @@ CI verifies that the initialized submodule HEAD matches `knowledge.lock`.
 `knowledge_db::KnowledgeCatalog` is transport-free. It:
 
 - reads only local files;
-- accepts schema version 2 only;
+- accepts schema version 2 definitions/sets and schema version 3 `ecu_targets` documents;
 - enumerates canonical YAML files deterministically;
 - rejects symlinked canonical entries;
 - uses strict `serde(deny_unknown_fields)` input structs;
@@ -85,6 +85,18 @@ CI verifies that the initialized submodule HEAD matches `knowledge.lock`.
 - turns accepted UDS DID definitions into the existing closed `ReadOperation::UdsReadDataByIdentifier` core primitive;
 - reuses the existing core UDS response validation (`0x62`, DID echo, NRC preservation);
 - exposes repository revision, schema version and definition provenance to later resolver/capture layers.
+
+The lock's schema version remains 2 for the definitions. Schema 3 is accepted
+only for ECU target documents: bounded 11-bit request/response addresses, a
+validated response-address rule, role, applicability and provenance. A candidate
+does not establish presence; discovery must observe its expected responder.
+
+Android uses `KnowledgeCatalog::embedded_pinned()` to bundle the same validated
+documents and lock at compile time, without runtime filesystem or network access.
+The session-candidate file and ID prefix mark the 18 extended-session candidates;
+they stay separate from ordinary live definitions and are read in the default
+session only by the explicit learning job. Promoting them requires a Knowledge
+change, never a live result or UI choice.
 
 The schema already reserves an `obd2.mode01.pid` descriptor for staged migration, but the first core loader deliberately rejects it until its full response-length/decoder contract is represented safely. Schema support does not automatically grant executable core support.
 

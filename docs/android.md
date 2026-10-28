@@ -25,10 +25,10 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 - Demo responses pass through the real Rust parser; the mode is always visible.
 
 Pending/permanent DTCs, freeze frames, full OEM fault-memory scans and DTC clearing
-are not implemented by this app. Experimental and manufacturer-specific reads were
-removed (#230): the app keeps only standards-based functions. Old recordings that
-contain removed actions still open in replay; those actions are skipped, never
-decoded and never sent.
+are not implemented by this app. The old experimental hard-coded manufacturer
+jobs were removed (#230). Manufacturer DID signals now come from pinned Knowledge
+and require an identified, applicable ECU. Old recordings containing removed
+actions still open in replay; those actions are skipped and never sent.
 
 For a targeted read, selection uses the explicitly expected responder, never
 the decoded value. Additional responders remain in the evidence. A missing
@@ -120,6 +120,36 @@ and the button is usable again; a late result still updates the display. The pen
 (`PendingActions`) live in `ObdService`, so they survive tab switches and Activity recreation; the pending
 text is the button's content description and is announced, as is the final state. The mapping from action to
 target state is the comment above the specs in `MainActivity`.
+
+## Knowledge ECU discovery and live signals
+
+"Steuergeräte erkennen" probes the bounded manufacturer target list from pinned
+Knowledge once with F187, then reads the standard identity plan of responding
+targets. Responses from the expected identifier establish presence; a timeout
+means "nicht beobachtet", never absent. The list and identity evidence stay in
+the private vehicle record. The discovery has its own raw recording and offline
+replay/report path. It does not change diagnostic sessions.
+
+Applicable normal-session Knowledge values become selectable alongside standard
+OBD2 measurements. The full-screen selector groups by ECU and signal group, searches
+names/groups/units, limits selection to 32 and saves named vehicle-local presets.
+Unconfirmed values show "nicht abgeglichen". Replay re-decodes raw DID responses
+using the pinned Knowledge decoder and rejects mismatched Knowledge provenance.
+
+"Sitzungs-Kandidaten lernen" reads each applicable session candidate once in the
+default session, bounded to 120 seconds. Answered, NRC-rejected and unanswered
+results stay distinct and are stored locally. Stopping a running native job
+disconnects the adapter to interrupt the pending exchange and keeps a partial
+recording; reconnect before starting another job.
+
+"UDS: erweiterte Sitzung" explicitly activates the closed engine-ECU session
+described in ADR 0003. The persistent indicator shows when it is active; OBD2
+polling pauses while Knowledge DID reads remain available. Session candidates
+are marked UDS and disappear when it ends. The core sends tester present while
+active and ends the session after ten minutes, before ordinary functional
+operations or on errors. On normal disconnect it attempts `10 01`; link loss
+stops keepalive. An unconfirmed return blocks operations until reconnect. First
+vehicle use is stationary, with engine off or idling, under the separate #178 gate.
 
 ## Adapter throughput (Diagnose)
 

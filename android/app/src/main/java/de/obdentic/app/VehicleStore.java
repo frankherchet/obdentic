@@ -160,6 +160,58 @@ public final class VehicleStore {
         JSONObject row = find(data, vin);
         return row == null || row.optJSONArray("selection") == null ? null : copyArray(row.optJSONArray("selection"));
     }
+    /** REQ-025.4: saves a named selection on its vehicle record; a repeated name replaces that preset. */
+    public synchronized String savePreset(String vin, String name, JSONArray semantics) {
+        String trimmed = name == null ? "" : name.trim();
+        if (trimmed.isEmpty() || trimmed.length() > 40) return "Der Presetname muss 1 bis 40 Zeichen lang sein";
+        if (semantics == null || semantics.length() > 32) return "Ein Preset darf höchstens 32 Messwerte enthalten";
+        JSONArray signals = new JSONArray();
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
+        for (int i = 0; i < semantics.length(); i++) {
+            Object value = semantics.opt(i);
+            if (!(value instanceof String) || ((String) value).isEmpty()) return "Preset enthält einen ungültigen Messwert";
+            if (seen.add((String) value)) signals.put(value);
+        }
+        return mutate(vin, next -> {
+            JSONObject row = find(next, vin);
+            JSONArray presets = row.optJSONArray("presets");
+            JSONArray kept = new JSONArray();
+            for (int i = 0; presets != null && i < presets.length(); i++) {
+                JSONObject item = presets.optJSONObject(i);
+                if (item != null && !trimmed.equals(item.optString("name"))) kept.put(item);
+            }
+            JSONObject preset = new JSONObject();
+            put(preset, "name", trimmed);
+            put(preset, "signals", signals);
+            kept.put(preset);
+            put(row, "presets", kept);
+        });
+    }
+    /** REQ-025.4: returns the named presets for a vehicle, in saved order. */
+    public synchronized JSONArray presets(String vin) {
+        JSONObject row = find(data, vin);
+        JSONArray saved = row == null ? null : row.optJSONArray("presets");
+        return saved == null ? new JSONArray() : copyArray(saved);
+    }
+    /** REQ-025.4: returns a copy of the named preset's semantics, or null when it does not exist. */
+    public synchronized JSONArray preset(String vin, String name) {
+        JSONArray saved = presets(vin);
+        for (int i = 0; i < saved.length(); i++) {
+            JSONObject item = saved.optJSONObject(i);
+            if (item != null && name != null && name.equals(item.optString("name"))) {
+                JSONArray signals = item.optJSONArray("signals");
+                return signals == null ? new JSONArray() : copyArray(signals);
+            }
+        }
+        return null;
+    }
+    /** REQ-023.5/REQ-026.2: persists only the two closed diagnostic result types on their vehicle. */
+    public synchronized String setDiagnostic(String vin, String key, JSONObject result) {
+        if (!"ecu_discovery".equals(key) && !"knowledge_learning".equals(key)) return "Unbekanntes Diagnoseergebnis";
+        if (result == null) return "Diagnoseergebnis fehlt";
+        JSONObject saved = copy(result);
+        return mutate(vin, next -> put(find(next, vin), key, saved));
+    }
     public synchronized String select(String vin) { return mutate(vin, next -> put(next, "selected", vin)); }
     public synchronized String rename(String vin, String name) {
         String trimmed = name == null ? "" : name.trim();

@@ -39,6 +39,8 @@ public final class ObdService extends Service {
         public void onReceive(Context context, Intent intent) { if (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) == BluetoothAdapter.STATE_ON) resumeIfBlocked(); }
     };
     private volatile boolean busy;
+    private volatile boolean knowledgeJob;
+    private volatile boolean udsJob;
     private long core;
     private BluetoothLeScanner scanner;
     private ScanCallback scanCallback;
@@ -240,8 +242,9 @@ public final class ObdService extends Service {
     private void resetSessionData() {
         replayFilename="";
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
+            put(state,"uds",new JSONObject()); put(state,"udsCandidates",0);
             put(state,"replayFile","");
-            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"replayPartial",false);
+            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"replayPartial",false);
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
         synchronized(due) { due.clear(); }
@@ -339,10 +342,17 @@ public final class ObdService extends Service {
         }
     }
     private void releaseWakeLock() { if(wakeLock != null && wakeLock.isHeld()) wakeLock.release(); }
-    private void destroyCore() { if(core!=0) { NativeCore.destroy(core); core=0; } }
+    private void destroyCore() { if(core!=0) { NativeCore.destroy(core); core=0; } set("uds",new JSONObject()); }
     public void disconnect() {
         policy.stop(); main.removeCallbacks(retryTick); pendingProfile=""; sessionAddress=""; // REQ-020.4
-        ++generation; stopScan(); Link active=transport; transport=null; if(active!=null) active.close();
+        ++generation; stopScan(); Link active=transport; transport=null;
+        boolean leave;
+        synchronized(stateLock) { JSONObject uds=state.optJSONObject("uds"); leave=!knowledgeJob && (udsJob || (uds!=null && uds.optBoolean("active"))); }
+        if(!leave && active!=null) active.close();
+        if(leave) worker.execute(() -> {
+            try { if(core!=0) execute("uds.disable",""); } catch(Exception ignored) { /* a lost link stops tester present */ }
+            finally { if(active!=null) active.close(); }
+        });
         busy=false; worker.execute(() -> closeRecording("disconnected","Verbindung getrennt")); set("phase","disconnected"); message("Getrennt"); stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock();
         worker.execute(this::destroyCore);
     }
@@ -363,19 +373,80 @@ public final class ObdService extends Service {
     }
     private JSONObject execute(String action,String argument) throws Exception {
         JSONObject result=new JSONObject(NativeCore.execute(core,action,argument));
+        JSONObject uds=result.optJSONObject("uds");
+        if(uds!=null) {
+            boolean wasActive; synchronized(stateLock) { JSONObject old=state.optJSONObject("uds"); wasActive=old!=null && old.optBoolean("active"); }
+            set("uds",uds);
+            if(wasActive!=uds.optBoolean("active")) {
+                applyCatalog(new JSONObject(NativeCore.execute(core,"catalog","")));
+                JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
+                selectSignals(selected);
+            }
+        }
         JSONObject event=new JSONObject(); put(event,"type","action"); put(event,"action",action); put(event,"argument",argument); put(event,"result",result); record(event);
         Link active = transport; if(mode.equals("live") && active != null && !active.isOpen()) throw new IOException("BLE-Verbindung beendet; bitte neu verbinden");
         return result;
     }
     private void applyCatalog(JSONObject result) {
         JSONObject data=result.optJSONObject("data"); if(data==null) return;
-        set("signals",data.optJSONArray("signals") == null ? new JSONArray() : data.optJSONArray("signals"));
+        JSONArray next=data.optJSONArray("signals") == null ? new JSONArray() : data.optJSONArray("signals");
+        synchronized(stateLock) {
+            JSONArray previous=state.optJSONArray("signals");
+            for(int i=0;i<next.length();i++) {
+                JSONObject signal=next.optJSONObject(i);
+                if(signal.has("status")) continue;
+                for(int j=0;j<previous.length();j++) {
+                    JSONObject old=previous.optJSONObject(j);
+                    if(signal.optString("semantic").equals(old.optString("semantic")) && old.has("status")) put(signal,"status",old.optString("status"));
+                }
+            }
+            Set<String> available=new HashSet<>();
+            for(int i=0;i<next.length();i++) available.add(next.optJSONObject(i).optString("semantic"));
+            values.keySet().retainAll(available);
+            put(state,"values",new JSONArray(values.values()));
+        }
+        set("signals",next);
+        set("udsCandidates",data.optInt("uds_candidates"));
         set("profiles",data.optJSONArray("profiles") == null ? new JSONArray() : data.optJSONArray("profiles"));
+        JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
+        selectSignals(selected);
     }
     public void setSignals(JSONArray semantics) {
         synchronized(stateLock) { if(!state.optString("recording").isEmpty()) { message("Messwertauswahl während Aufnahme gesperrt"); return; } }
         selectSignals(semantics);
         storeSelection();
+    }
+    /** REQ-025.4: presets stay in the selected private vehicle record. */
+    public void saveSignalPreset(String name, JSONArray semantics) {
+        final String vin=selectedVin();
+        final JSONArray draft;
+        try { draft=new JSONArray(semantics.toString()); } catch(JSONException e) { message("Ungültige Messwertauswahl"); return; }
+        vehicleAction(() -> {
+            if(!mode.equals("live") || vin.isEmpty()) return "Zuerst ein Fahrzeug wählen";
+            String error=vehicles.savePreset(vin,name,draft);
+            return error==null ? "Vorlage gespeichert: "+name : error;
+        });
+    }
+    public void applySignalPreset(String name) {
+        vehicleAction(() -> {
+            if(!mode.equals("live") || selectedVin().isEmpty()) return "Zuerst ein Fahrzeug wählen";
+            synchronized(stateLock) { if(!state.optString("recording").isEmpty()) return "Messwertauswahl während Aufnahme gesperrt"; }
+            JSONArray preset=vehicles.preset(selectedVin(),name);
+            if(preset==null) return "Vorlage nicht gefunden";
+            JSONArray available=new JSONArray();
+            synchronized(stateLock) {
+                JSONArray catalog=state.optJSONArray("signals");
+                for(int i=0;i<preset.length();i++) {
+                    String wanted=preset.optString(i);
+                    for(int j=0;j<catalog.length();j++) {
+                        JSONObject signal=catalog.optJSONObject(j);
+                        if(wanted.equals(signal.optString("semantic")) && !signal.optString("status").equals("unsupported")) { available.put(wanted); break; }
+                    }
+                }
+            }
+            selectSignals(available); storeSelection();
+            return "Vorlage angewendet · "+(preset.length()-available.length())+" nicht verfügbare Messwerte übersprungen";
+        });
     }
     private void selectSignals(JSONArray semantics) {
         JSONArray checked=new JSONArray(); synchronized(stateLock) {
@@ -388,24 +459,49 @@ public final class ObdService extends Service {
     }
     public void runJob(String action) {
         if(busy || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
-        if(!action.equals("inventory") && !action.equals("dtc.scan") && !action.equals(THROUGHPUT) && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
-        if(action.equals(THROUGHPUT)) { String blocked=throughputBlocker(); if(blocked!=null) { message(blocked); return; } }
-        busy=true; changed(); int token=generation;
+        boolean knowledge=action.equals("ecu.discover") || action.equals("knowledge.learn");
+        boolean uds=action.equals("uds.enable") || action.equals("uds.disable");
+        if(!action.equals("inventory") && !action.equals("dtc.scan") && !action.equals(THROUGHPUT) && !knowledge && !uds && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
+        if(action.equals(THROUGHPUT) || knowledge) { String blocked=throughputBlocker(); if(blocked!=null) { message(blocked); return; } }
+        if(uds && (!mode.equals("live") || (action.equals("uds.enable") && !snapshot().optString("recording").isEmpty()))) { message("UDS nur mit echtem Adapter; vor dem Einschalten Aufnahme stoppen"); return; }
+        final String diagnosticVin;
+        synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); diagnosticVin=vehicle==null?"":vehicle.optString("vin"); }
+        busy=true; udsJob=uds; changed(); int token=generation;
         worker.execute(() -> { try {
             if(token!=generation) return;
             String argument=action.startsWith("read:") ? action.substring(5) : "";
-            boolean own=action.equals(THROUGHPUT); // REQ-022.5: its own recording; a stop or loss leaves it partial
-            if(own && !beginRecording(THROUGHPUT_PROFILE,new JSONArray())) return;
+            if(knowledge) execute("uds.disable","");
+            boolean own=action.equals(THROUGHPUT) || knowledge;
+            if(own && !beginRecording(action.equals(THROUGHPUT)?THROUGHPUT_PROFILE:action.replace('.','-'),new JSONArray())) return;
+            knowledgeJob=knowledge;
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
+            if(knowledge && result.optBoolean("ok") && result.optJSONObject("data")!=null && !diagnosticVin.isEmpty()) {
+                String error=vehicles.setDiagnostic(diagnosticVin,action.equals("ecu.discover")?"ecu_discovery":"knowledge_learning",result.optJSONObject("data"));
+                if(error!=null && token==generation) message(error);
+            }
             if(token!=generation) return;
             set("jobResult",result);
-            if(own) { if(result.optBoolean("ok")) set("throughput",result.opt("data")); closeRecording(result.optBoolean("ok")?"completed":"error",result.optString("error")); }
+            if(own) {
+                if(result.optBoolean("ok")) {
+                    if(action.equals(THROUGHPUT)) set("throughput",result.opt("data"));
+                    if(knowledge) {
+                        String key=action.equals("ecu.discover")?"ecuDiscovery":"knowledgeLearning";
+                        set(key,result.opt("data"));
+                        applyCatalog(execute("catalog",""));
+                    }
+                }
+                JSONObject data=result.optJSONObject("data");
+                String reason=!result.optBoolean("ok") || (data!=null && data.optBoolean("stopped")) ? "error"
+                    : data!=null && data.optBoolean("truncated") ? "truncated" : "completed";
+                closeRecording(reason,result.optString("error"));
+            }
             if(action.equals("inventory")) { set("vehicle",result.opt("data")); if(result.optJSONObject("data") != null) applySupport(result.optJSONObject("data")); }
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
+            if(uds) applyCatalog(execute("catalog",""));
             if(!argument.isEmpty()) updateValue(argument,result);
             String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
-        } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
+        } catch(Throwable e) { fail(token,e); } finally { knowledgeJob=false; udsJob=false; if(token==generation) { busy=false; changed(); } } });
     }
     /** REQ-022: action name and recording profile of the adapter throughput job (not a polling profile). */
     public static final String THROUGHPUT="adapter.throughput", THROUGHPUT_PROFILE="adapter-throughput";
@@ -427,15 +523,20 @@ public final class ObdService extends Service {
         if(busy || !phase().equals("ready") || core==0) return;
         Link active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
-        if(selected.length()==0) return;
         int token=generation;
         try {
+            JSONObject uds; synchronized(stateLock) { uds=state.optJSONObject("uds"); }
+            if(uds!=null && uds.optBoolean("active")) execute("uds.tick","");
+            if(selected.length()==0) return;
             long now=SystemClock.elapsedRealtime(); String semantic; long wait;
             synchronized(due) {
                 java.util.List<String> eligible=new java.util.ArrayList<>();
                 for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i);
                     boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
-                        for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j); if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true; }
+                        for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j);
+                            if(candidate.equals(signal.optString("semantic")) && (signal.optString("status").equals("unsupported")
+                                || (uds!=null && uds.optBoolean("active") && !signal.has("definition_id")))) unsupported=true;
+                        }
                     }
                     if(!unsupported) eligible.add(candidate);
                 }
@@ -455,6 +556,9 @@ public final class ObdService extends Service {
         Object data=result.opt("data"); if(data instanceof JSONObject) { JSONObject object=(JSONObject)data;
             Iterator<String> keys=object.keys(); while(keys.hasNext()) { String key=keys.next(); put(row,key,object.opt(key)); }
         } else put(row,"value",data);
+        if(row.isNull("error")) row.remove("error");
+        if(row.isNull("value")) row.remove("value");
+        if(row.optString("status").equals("unavailable") && !row.has("error")) put(row,"error","Messwert nicht verfügbar");
         if(!result.optBoolean("ok")) put(row,"error",result.optString("error"));
         synchronized(stateLock) {
             JSONArray catalog=state.optJSONArray("signals"); for(int i=0;i<catalog.length();i++) { JSONObject s=catalog.optJSONObject(i);
@@ -475,6 +579,11 @@ public final class ObdService extends Service {
         if(busy) { message("Zuerst laufenden Auftrag beenden"); return; }
         JSONArray signals=null, periods=null; synchronized(stateLock) { JSONArray profiles=state.optJSONArray("profiles");
             for(int i=0;i<profiles.length();i++) if(profileId.equals(profiles.optJSONObject(i).optString("id"))) { signals=profiles.optJSONObject(i).optJSONArray("signals"); periods=profiles.optJSONObject(i).optJSONArray("intervals_ms"); } }
+        if(profileId.equals("live-selection")) synchronized(stateLock) {
+            try { signals=new JSONArray(state.optJSONArray("selected").toString()); }
+            catch(JSONException e) { message("Ungültige Messwertauswahl"); return; }
+            if(signals.length()==0) { message("Zuerst Messwerte wählen"); return; }
+        }
         if(signals==null) { message("Unbekanntes Aufnahmeprofil"); return; }
         stopRecordingNow();
         if(!beginRecording(profileId,signals)) return;
@@ -500,7 +609,11 @@ public final class ObdService extends Service {
             return true;
         } catch(IOException e) { message(e.getMessage()); return false; }
     }
-    public void stopRecording() { if(!worker.isShutdown()) worker.execute(this::stopRecordingNow); }
+    public void stopRecording() {
+        // A bounded native job owns the worker until it returns; closing its link cancels the pending exchange.
+        if(knowledgeJob) { disconnect(); return; }
+        if(!worker.isShutdown()) worker.execute(this::stopRecordingNow);
+    }
     private void stopRecordingNow() { closeRecording("stopped",""); }
     private void closeRecording(String reason,String detail) {
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
@@ -600,10 +713,20 @@ public final class ObdService extends Service {
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
                         else if(action.equals("inventory")) restoreVehicle(result.optJSONObject("data"));
-                        else if(action.equals(THROUGHPUT)) {
+                        else if(action.equals(THROUGHPUT) || action.equals("ecu.discover") || action.equals("knowledge.learn")) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));
-                            if(decoded.optBoolean("ok")) set("throughput",decoded.opt("data"));
+                            if(decoded.optBoolean("ok")) set(action.equals(THROUGHPUT)?"throughput":action.equals("ecu.discover")?"ecuDiscovery":"knowledgeLearning",decoded.opt("data"));
+                            if(action.equals("ecu.discover") && decoded.optBoolean("ok")) {
+                                JSONArray extra=decoded.optJSONObject("data").optJSONArray("signals");
+                                if(extra!=null) synchronized(stateLock) {
+                                    JSONArray catalog=state.optJSONArray("signals");
+                                    for(int i=0;i<extra.length();i++) { JSONObject signal=extra.optJSONObject(i); boolean found=false;
+                                        for(int j=0;j<catalog.length();j++) if(signal.optString("semantic").equals(catalog.optJSONObject(j).optString("semantic"))) found=true;
+                                        if(!found) catalog.put(signal);
+                                    }
+                                }
+                            }
                             result=decoded;
                         }
                         else if(action.equals("dtc.scan")) {
@@ -614,6 +737,8 @@ public final class ObdService extends Service {
                         }
                         set("jobResult",result);
                     } else if(event.optString("type").equals("session")) {
+                        if(event.optJSONArray("catalog")!=null) set("signals",event.optJSONArray("catalog"));
+                        if(event.optJSONArray("profiles")!=null) set("profiles",event.optJSONArray("profiles"));
                         selectSignals(event.optJSONArray("selected")==null?new JSONArray():event.optJSONArray("selected"));
                         if(event.optJSONObject("vehicle")!=null) restoreVehicle(event.optJSONObject("vehicle"));
                         if(event.optJSONObject("diagnostics")!=null && event.optJSONObject("diagnostics").has("raw_response")) { JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay.dtc.scan",event.optJSONObject("diagnostics").toString())); set("diagnostics",decoded.opt("data")); }

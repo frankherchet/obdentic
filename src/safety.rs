@@ -6,7 +6,8 @@
 //! request cannot be passed to a transport by accident.
 
 use crate::{
-    ecu_identification::IdentificationCandidate, prepare_read, runtime_state::Activity, ReadRequest,
+    ecu_identification::IdentificationCandidate, knowledge_db::KnowledgeDefinition, prepare_read,
+    runtime_state::Activity, ReadRequest,
 };
 use std::fmt;
 
@@ -66,6 +67,10 @@ pub enum OperationKind {
     SignalRead,
     DtcRead,
     EcuIdentification,
+    KnowledgeRead,
+    KnowledgeLearning,
+    KnowledgeLearningRead,
+    ExtendedSessionRead,
     /// Closed adapter throughput analysis job: Mode 01 reads of advertised catalog PIDs.
     AdapterThroughput,
     DtcClear,
@@ -83,6 +88,55 @@ pub enum OperationKind {
     RawElmInjection,
 }
 
+/// Validated Knowledge entry allowed for the narrow extended-session read job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtendedSessionReadRequest {
+    definition_id: String,
+    did: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KnowledgeReadRequest {
+    definition_id: String,
+    did: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KnowledgeLearningReadRequest {
+    definition_id: String,
+    did: u16,
+}
+
+impl KnowledgeLearningReadRequest {
+    pub fn definition_id(&self) -> &str {
+        &self.definition_id
+    }
+
+    pub const fn did(&self) -> u16 {
+        self.did
+    }
+}
+
+impl KnowledgeReadRequest {
+    pub fn definition_id(&self) -> &str {
+        &self.definition_id
+    }
+
+    pub const fn did(&self) -> u16 {
+        self.did
+    }
+}
+
+impl ExtendedSessionReadRequest {
+    pub fn definition_id(&self) -> &str {
+        &self.definition_id
+    }
+
+    pub const fn did(&self) -> u16 {
+        self.did
+    }
+}
+
 /// Explicitly typed requests accepted at the safety boundary.
 ///
 /// The blocked variants are request vocabulary only.  They can never become
@@ -92,6 +146,12 @@ pub enum OperationRequest {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
     EcuIdentification(IdentificationCandidate),
+    KnowledgeRead(KnowledgeReadRequest),
+    /// Bounded offline-independent job for default-session Knowledge candidates.
+    KnowledgeLearning,
+    KnowledgeLearningRead(KnowledgeLearningReadRequest),
+    /// Closed reads of Knowledge DIDs flagged for the extended session.
+    ExtendedSessionRead(ExtendedSessionReadRequest),
     AdapterThroughput,
     ClearDtcs,
     SecurityAccess,
@@ -130,11 +190,49 @@ impl OperationRequest {
         Self::ReadDtcs(kind)
     }
 
+    pub fn extended_session_read(definition: &KnowledgeDefinition) -> Result<Self, SafetyError> {
+        if !definition.requires_extended_session() {
+            return Err(SafetyError::OperationBlocked(
+                OperationKind::ExtendedSessionRead,
+            ));
+        }
+        Ok(Self::ExtendedSessionRead(ExtendedSessionReadRequest {
+            definition_id: definition.id().to_owned(),
+            did: definition.operation().did(),
+        }))
+    }
+
+    pub fn knowledge_read(definition: &KnowledgeDefinition) -> Result<Self, SafetyError> {
+        if definition.requires_extended_session() {
+            return Err(SafetyError::OperationBlocked(OperationKind::KnowledgeRead));
+        }
+        Ok(Self::KnowledgeRead(KnowledgeReadRequest {
+            definition_id: definition.id().to_owned(),
+            did: definition.operation().did(),
+        }))
+    }
+
+    pub fn knowledge_learning_read(definition: &KnowledgeDefinition) -> Result<Self, SafetyError> {
+        if !definition.requires_extended_session() {
+            return Err(SafetyError::OperationBlocked(
+                OperationKind::KnowledgeLearningRead,
+            ));
+        }
+        Ok(Self::KnowledgeLearningRead(KnowledgeLearningReadRequest {
+            definition_id: definition.id().to_owned(),
+            did: definition.operation().did(),
+        }))
+    }
+
     pub const fn kind(&self) -> OperationKind {
         match self {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
+            Self::KnowledgeRead(_) => OperationKind::KnowledgeRead,
+            Self::KnowledgeLearning => OperationKind::KnowledgeLearning,
+            Self::KnowledgeLearningRead(_) => OperationKind::KnowledgeLearningRead,
+            Self::ExtendedSessionRead(_) => OperationKind::ExtendedSessionRead,
             Self::AdapterThroughput => OperationKind::AdapterThroughput,
             Self::ClearDtcs => OperationKind::DtcClear,
             Self::SecurityAccess => OperationKind::SecurityAccess,
@@ -159,6 +257,10 @@ pub enum Operation {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
     EcuIdentification(IdentificationCandidate),
+    KnowledgeRead(KnowledgeReadRequest),
+    KnowledgeLearning,
+    KnowledgeLearningRead(KnowledgeLearningReadRequest),
+    ExtendedSessionRead(ExtendedSessionReadRequest),
     AdapterThroughput,
 }
 
@@ -168,6 +270,10 @@ impl Operation {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
+            Self::KnowledgeRead(_) => OperationKind::KnowledgeRead,
+            Self::KnowledgeLearning => OperationKind::KnowledgeLearning,
+            Self::KnowledgeLearningRead(_) => OperationKind::KnowledgeLearningRead,
+            Self::ExtendedSessionRead(_) => OperationKind::ExtendedSessionRead,
             Self::AdapterThroughput => OperationKind::AdapterThroughput,
         }
     }
@@ -214,6 +320,10 @@ impl Capability {
                 OperationKind::SignalRead
                     | OperationKind::DtcRead
                     | OperationKind::EcuIdentification
+                    | OperationKind::KnowledgeRead
+                    | OperationKind::KnowledgeLearning
+                    | OperationKind::KnowledgeLearningRead
+                    | OperationKind::ExtendedSessionRead
                     | OperationKind::AdapterThroughput
             ),
         }
@@ -294,6 +404,18 @@ impl SafetyPolicy {
             OperationRequest::EcuIdentification(candidate) => {
                 self.authorize_operation(Operation::EcuIdentification(candidate))
             }
+            OperationRequest::KnowledgeRead(candidate) => {
+                self.authorize_operation(Operation::KnowledgeRead(candidate))
+            }
+            OperationRequest::KnowledgeLearning => {
+                self.authorize_operation(Operation::KnowledgeLearning)
+            }
+            OperationRequest::KnowledgeLearningRead(candidate) => {
+                self.authorize_operation(Operation::KnowledgeLearningRead(candidate))
+            }
+            OperationRequest::ExtendedSessionRead(candidate) => {
+                self.authorize_operation(Operation::ExtendedSessionRead(candidate))
+            }
             OperationRequest::AdapterThroughput => {
                 self.authorize_operation(Operation::AdapterThroughput)
             }
@@ -355,13 +477,20 @@ impl SafetyPolicy {
         let executable = self.authorize(request)?;
         let activity_allows = match activity {
             Activity::Read | Activity::Observe => {
-                matches!(operation, OperationKind::SignalRead)
+                matches!(
+                    operation,
+                    OperationKind::SignalRead | OperationKind::KnowledgeRead
+                )
             }
             Activity::Diagnose => {
                 matches!(
                     operation,
                     OperationKind::DtcRead
                         | OperationKind::EcuIdentification
+                        | OperationKind::KnowledgeRead
+                        | OperationKind::KnowledgeLearning
+                        | OperationKind::KnowledgeLearningRead
+                        | OperationKind::ExtendedSessionRead
                         | OperationKind::AdapterThroughput
                 )
             }
@@ -452,6 +581,145 @@ mod tests {
                 OperationRequest::EcuIdentification(plan.candidates()[0].clone())
             )
             .is_err());
+    }
+
+    #[test]
+    fn req_027_4_extended_session_reads_are_closed_and_diagnose_only() {
+        let catalog = crate::knowledge_db::KnowledgeCatalog::embedded_pinned().unwrap();
+        let candidate = catalog
+            .definitions()
+            .find(|definition| definition.requires_extended_session())
+            .unwrap();
+        let request = OperationRequest::extended_session_read(candidate).unwrap();
+        let OperationRequest::ExtendedSessionRead(token) = &request else {
+            panic!("extended-session helper must create the closed typed request");
+        };
+        let token = token.clone();
+        assert!(token.definition_id().starts_with("vag.ea189_session."));
+        assert_eq!(token.did(), candidate.operation().did());
+        assert_eq!(
+            SafetyPolicy::read_only().authorize_activity(Activity::Diagnose, request),
+            Ok(Operation::ExtendedSessionRead(token))
+        );
+        for activity in [
+            Activity::Read,
+            Activity::Observe,
+            Activity::Idle,
+            Activity::Write,
+        ] {
+            assert!(SafetyPolicy::read_only()
+                .authorize_activity(
+                    activity,
+                    OperationRequest::extended_session_read(candidate).unwrap()
+                )
+                .is_err());
+        }
+        let regular = catalog
+            .definitions()
+            .find(|definition| !definition.requires_extended_session())
+            .unwrap();
+        assert_eq!(
+            OperationRequest::extended_session_read(regular),
+            Err(SafetyError::OperationBlocked(
+                OperationKind::ExtendedSessionRead
+            ))
+        );
+        assert_eq!(
+            SafetyPolicy::read_only().authorize(OperationRequest::DiagnosticSessionControl),
+            Err(SafetyError::OperationBlocked(
+                OperationKind::DiagnosticSessionControl
+            ))
+        );
+    }
+
+    #[test]
+    fn req_024_2_knowledge_read_is_closed_and_rejects_session_candidates() {
+        let catalog = crate::knowledge_db::KnowledgeCatalog::embedded_pinned().unwrap();
+        let definition = catalog
+            .definitions()
+            .find(|definition| !definition.requires_extended_session())
+            .unwrap();
+        let request = OperationRequest::knowledge_read(definition).unwrap();
+        let OperationRequest::KnowledgeRead(token) = &request else {
+            panic!("knowledge-read helper must create the closed typed request");
+        };
+        let token = token.clone();
+        assert_eq!(token.definition_id(), definition.id());
+        assert_eq!(token.did(), definition.operation().did());
+        for activity in [Activity::Read, Activity::Observe, Activity::Diagnose] {
+            assert_eq!(
+                SafetyPolicy::read_only().authorize_activity(activity, request.clone()),
+                Ok(Operation::KnowledgeRead(token.clone()))
+            );
+        }
+        let extended = catalog
+            .definitions()
+            .find(|definition| definition.requires_extended_session())
+            .unwrap();
+        assert_eq!(
+            OperationRequest::knowledge_read(extended),
+            Err(SafetyError::OperationBlocked(OperationKind::KnowledgeRead))
+        );
+    }
+
+    #[test]
+    fn req_026_1_learning_is_a_bounded_diagnose_job_only() {
+        let policy = SafetyPolicy::read_only();
+        assert_eq!(
+            policy.authorize_activity(Activity::Diagnose, OperationRequest::KnowledgeLearning),
+            Ok(Operation::KnowledgeLearning)
+        );
+        for activity in [
+            Activity::Read,
+            Activity::Observe,
+            Activity::Idle,
+            Activity::Write,
+        ] {
+            assert!(policy
+                .authorize_activity(activity, OperationRequest::KnowledgeLearning)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn req_026_1_learning_read_is_session_candidate_only_and_diagnose_only() {
+        let catalog = crate::knowledge_db::KnowledgeCatalog::embedded_pinned().unwrap();
+        let candidate = catalog
+            .definitions()
+            .find(|definition| definition.requires_extended_session())
+            .unwrap();
+        let request = OperationRequest::knowledge_learning_read(candidate).unwrap();
+        let OperationRequest::KnowledgeLearningRead(token) = &request else {
+            panic!("learning-read helper must create the closed typed request");
+        };
+        let token = token.clone();
+        assert_eq!(
+            SafetyPolicy::read_only().authorize_activity(Activity::Diagnose, request),
+            Ok(Operation::KnowledgeLearningRead(token))
+        );
+        for activity in [
+            Activity::Read,
+            Activity::Observe,
+            Activity::Idle,
+            Activity::Write,
+        ] {
+            assert!(SafetyPolicy::read_only()
+                .authorize_activity(
+                    activity,
+                    OperationRequest::knowledge_learning_read(candidate).unwrap()
+                )
+                .is_err());
+        }
+        let regular = catalog
+            .definitions()
+            .find(|definition| !definition.requires_extended_session())
+            .unwrap();
+        assert_eq!(
+            OperationRequest::knowledge_learning_read(regular),
+            Err(SafetyError::OperationBlocked(
+                OperationKind::KnowledgeLearningRead
+            ))
+        );
     }
 
     #[test]

@@ -527,7 +527,7 @@ requirements:
       - id: REQ-024.4
         text: Recordings contain the raw request and response of Knowledge signal reads with the Knowledge revision, and replay re-decodes them offline with the same decoder.
       - id: REQ-024.5
-        text: Definitions with a session requirement other than the default session are never polled as live signals.
+        text: Definitions with a session requirement other than the default session are never polled as ordinary live signals; only the explicitly activated, ECU-scoped REQ-027 session may offer them.
 
   - id: REQ-025
     title: Select live signals in a selector structured by ECU and group
@@ -567,3 +567,25 @@ requirements:
         text: Each definition is reported as answered (with the decoded value marked unconfirmed), rejected with its negative response code, or not answered, and the result is stored in the vehicle record and its own recording.
       - id: REQ-026.3
         text: The run is bounded to 120 seconds, can be stopped, keeps a partial recording on stop or connection loss, and its result can be re-derived offline from the recording.
+  - id: REQ-027
+    title: Read UDS session-flagged DIDs in an explicitly activated extended session
+    type: functional
+    priority: should
+    status: accepted
+    source: "ADR 0003, decision by @frankherchet 2026-10-28"
+    description: >
+      On explicit user action in the Diagnose tab, the app switches one identified ECU
+      into the UDS extended diagnostic session, keeps it alive with tester present,
+      offers that ECU's session-flagged Knowledge DIDs as UDS-marked read-only signals,
+      and always returns to the default session.
+    acceptance:
+      - id: REQ-027.1
+        text: The switch is offered only in a ready live session for an identified ECU with session-flagged Knowledge DIDs; activating it sends exactly 10 03 to that ECU's validated target and shows a persistent "UDS erweiterte Sitzung aktiv" indicator.
+      - id: REQ-027.2
+        text: While active, tester present 3E 80 is sent to that target at most every 2 seconds and only then; session-flagged DIDs of that ECU become selectable and are marked UDS, distinct from OBD2 signals.
+      - id: REQ-027.3
+        text: The app sends 10 01 and removes the UDS signals when the user switches off, on disconnect, demo or replay, after 10 minutes, before any functional operation, and on any error; a lost link stops tester present.
+      - id: REQ-027.4
+        text: In extended session the app sends to the vehicle only 10 03, 10 01, 3E 80 and 0x22 reads of Knowledge-listed DIDs; SecurityAccess, RoutineControl, InputOutputControl, WriteDataByIdentifier, ECUReset, communication or DTC control and caller-provided services, addresses or DIDs are impossible.
+      - id: REQ-027.5
+        text: A negative response to 10 03 leaves the ECU in the default session, shows the response code and offers no UDS signals; recordings mark the session state of every read and replay re-decodes them offline.
