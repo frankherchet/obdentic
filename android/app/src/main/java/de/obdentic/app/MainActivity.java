@@ -68,6 +68,7 @@ public class MainActivity extends Activity {
     private final Map<String,TextView> valueViews=new HashMap<>();
     private final Map<String,TextView> freshnessViews=new HashMap<>();
     private final Map<String,SparklineView> graphViews=new HashMap<>();
+    private final Map<String,TextView> rangeViews=new HashMap<>();
     private final Map<String,ArrayList<Float>> histories=new HashMap<>();
     private final Map<String,String> lastSamples=new HashMap<>();
     private JSONObject state=new JSONObject();
@@ -161,7 +162,7 @@ public class MainActivity extends Activity {
     }
     private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
     private void buildNav(){nav.removeAllViews();nav.setWeightSum(5);String[] titles={"Live","Diagnose","Aufnahmen","Debug","Adapter"};for(int i=0;i<titles.length;i++){final int next=i;Button b=button(titles[i],()->{tab=next;structure="";scroll.scrollTo(0,0);buildNav();refresh();});b.setTextSize(12);b.setMinWidth(0);b.setMinimumWidth(0);b.setPadding(dp(2),dp(4),dp(2),dp(4));b.setTextColor(tab==i?BG:MUTED);b.setBackground(surface(tab==i?ACCENT:CARD,12));b.setBackgroundTintList(null);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(48),1);p.setMargins(dp(2),0,dp(2),0);nav.addView(b,p);}}
-    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();debugLog=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;default:connection();}}
+    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;default:connection();}}
     private void live(){
         title("Live-Messwerte","Werte und Verlauf auf einen Blick");
         addButton(body,"Messwerte auswählen",this::chooseSignals).setEnabled(state.optString("recording").isEmpty());
@@ -171,12 +172,20 @@ public class MainActivity extends Activity {
         for(int i=0;i<selected.length();i++){String s=selected.optString(i);shown.put(s,signal(s));}
         for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v!=null&&selected.length()==0)shown.put(v.optString("semantic"),v);}
         if(shown.isEmpty())empty("Noch keine Messwerte","Wähle Messwerte aus und verbinde deinen Adapter. Mit „Demo starten“ unter Adapter kannst du die Oberfläche ohne Auto testen.");
+        int columns=getResources().getConfiguration().orientation==android.content.res.Configuration.ORIENTATION_LANDSCAPE?3:2,col=0;LinearLayout row=null;
         for(Map.Entry<String,JSONObject> entry:shown.entrySet()){
-            String id=entry.getKey();JSONObject s=entry.getValue();LinearLayout card=card();
-            note(card,signalLabel(id,s),TEXT);TextView number=text("—",32,TEXT);number.setTypeface(Typeface.MONOSPACE);number.setFontFeatureSettings("tnum");card.addView(number);valueViews.put(id,number);
-            SparklineView graph=new SparklineView(this,ACCENT);card.addView(graph,new LinearLayout.LayoutParams(-1,dp(56)));graphViews.put(id,graph);
-            TextView freshness=text("Warte auf erste Antwort …",12,MUTED);card.addView(freshness);freshnessViews.put(id,freshness);
+            String id=entry.getKey();JSONObject s=entry.getValue();
+            if(col==0){row=new LinearLayout(this);row.setOrientation(LinearLayout.HORIZONTAL);LinearLayout.LayoutParams rp=new LinearLayout.LayoutParams(-1,-2);rp.setMargins(0,dp(6),0,0);body.addView(row,rp);}
+            LinearLayout tile=new LinearLayout(this);tile.setOrientation(LinearLayout.VERTICAL);tile.setPadding(dp(10),dp(10),dp(10),dp(10));tile.setBackground(surface(CARD,20));tile.setTag("live-tile");
+            LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(0,-2,1);tp.setMargins(col==0?0:dp(3),0,col==columns-1?0:dp(3),0);row.addView(tile,tp);
+            TextView name=text(signalLabel(id,s),13,MUTED);name.setSingleLine(true);name.setEllipsize(android.text.TextUtils.TruncateAt.END);tile.addView(name);
+            TextView number=text("—",24,TEXT);number.setTypeface(Typeface.MONOSPACE);number.setFontFeatureSettings("tnum");number.setSingleLine(true);number.setEllipsize(android.text.TextUtils.TruncateAt.END);tile.addView(number);valueViews.put(id,number);
+            SparklineView graph=new SparklineView(this,ACCENT);tile.addView(graph,new LinearLayout.LayoutParams(-1,dp(28)));graphViews.put(id,graph);
+            TextView range=text("",11,MUTED);range.setSingleLine(true);range.setEllipsize(android.text.TextUtils.TruncateAt.END);range.setTag("live-range");tile.addView(range);rangeViews.put(id,range);
+            TextView freshness=text("",11,0xffffca75);freshness.setVisibility(View.GONE);tile.addView(freshness);freshnessViews.put(id,freshness);
+            col=(col+1)%columns;
         }
+        while(col!=0&&col<columns){row.addView(new View(this),new LinearLayout.LayoutParams(0,1,1));col++;}
         JSONObject vehicle=state.optJSONObject("vehicle");if(vehicle!=null&&vehicle.length()>0){LinearLayout c=card();note(c,"FAHRZEUG",ACCENT);note(c,vehicle.optString("vin","Fahrzeug erfasst"),TEXT);JSONArray responders=vehicle.optJSONArray("responders");if(responders!=null)note(c,responders.length()+" Responder · Details unter Diagnose",MUTED);}
     }
     private void diagnose(){
@@ -414,7 +423,11 @@ public class MainActivity extends Activity {
         },"obdentic-export").start();
     }
     private void collectHistory(){JSONArray values=array("values");String mode=state.optString("mode");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic"),stamp=mode+v.optString("updatedAt")+v.optString("value");if(stamp.equals(lastSamples.get(id)))continue;lastSamples.put(id,stamp);JSONArray recordedHistory=v.optJSONArray("history");if(recordedHistory!=null){ArrayList<Float> restored=new ArrayList<>();for(int j=0;j<recordedHistory.length();j++){JSONObject sample=recordedHistory.optJSONObject(j);if(sample!=null&&Double.isFinite(sample.optDouble("value",Double.NaN)))restored.add((float)sample.optDouble("value"));}histories.put(id,restored);continue;}double number=v.optDouble("value",Double.NaN);if(!Double.isFinite(number))continue;ArrayList<Float> h=histories.get(id);if(h==null){h=new ArrayList<>();histories.put(id,h);}h.add((float)number);while(h.size()>90)h.remove(0);}}
-    private void updateValues(){JSONArray values=array("values");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic");TextView target=valueViews.get(id);if(target==null)continue;String error=v.optString("error","");String value=v.has("value")?MeasurementFormat.formatReading(v):MeasurementFormat.formatMeasurement(v.optString("text","—"),v.optString("unit"));long age=Math.max(0,(System.currentTimeMillis()-v.optLong("updatedAt",System.currentTimeMillis()))/1000);boolean replay=state.optString("mode").equals("replay"),stale=age>10&&!replay;target.setText(error.isEmpty()?value:"Nicht verfügbar");target.setTextColor(error.isEmpty()&&!stale?TEXT:0xffffca75);target.setContentDescription(signalLabel(id,signal(id))+": "+target.getText()+(error.isEmpty()?"":". "+error));TextView freshness=freshnessViews.get(id);if(freshness!=null)freshness.setText(!error.isEmpty()?error:replay?"Aus gespeicherter Aufnahme":age<2?"Gerade aktualisiert":(stale?"Letzter Wert · ":"Aktualisiert · ")+"vor "+age+" s");SparklineView graph=graphViews.get(id);if(graph!=null)graph.setValues(histories.get(id));}}
+    /** #239: freshness text shown on a tile only when a live value is stale (> 10 s); empty otherwise. */
+    public static String staleText(long ageSeconds,boolean replay){return ageSeconds>10&&!replay?"vor "+ageSeconds+" s":"";}
+    /** #239: "min … · max …" over a signal's session history. */
+    public static String rangeText(ArrayList<Float> h,String unit){if(h==null||h.isEmpty())return "";float lo=h.get(0),hi=lo;for(float f:h){lo=Math.min(lo,f);hi=Math.max(hi,f);}return "min "+MeasurementFormat.formatMeasurement(lo,unit)+" · max "+MeasurementFormat.formatMeasurement(hi,unit);}
+    private void updateValues(){JSONArray values=array("values");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic");TextView target=valueViews.get(id);if(target==null)continue;String error=v.optString("error","");String value=v.has("value")?MeasurementFormat.formatReading(v):MeasurementFormat.formatMeasurement(v.optString("text","—"),v.optString("unit"));long age=Math.max(0,(System.currentTimeMillis()-v.optLong("updatedAt",System.currentTimeMillis()))/1000);boolean replay=state.optString("mode").equals("replay"),stale=age>10&&!replay;String stateText=staleText(age,replay);target.setText(error.isEmpty()?value:"Nicht verfügbar");target.setTextColor(error.isEmpty()&&!stale?TEXT:0xffffca75);target.setContentDescription(signalLabel(id,signal(id))+": "+target.getText()+(error.isEmpty()?(stale?". Veraltet, "+stateText:""):". Nicht verfügbar. "+error));TextView freshness=freshnessViews.get(id);if(freshness!=null){freshness.setText(stateText);freshness.setVisibility(error.isEmpty()&&stale?View.VISIBLE:View.GONE);}TextView range=rangeViews.get(id);if(range!=null)range.setText(rangeText(histories.get(id),v.optString("unit")));SparklineView graph=graphViews.get(id);if(graph!=null)graph.setValues(histories.get(id));}}
     private JSONObject signal(String id){JSONArray signals=array("signals");for(int i=0;i<signals.length();i++){JSONObject s=signals.optJSONObject(i);if(s!=null&&s.optString("semantic").equals(id))return s;}JSONObject fallback=new JSONObject();try{fallback.put("semantic",id);fallback.put("title",id);}catch(Exception ignored){}return fallback;}
     private String signalLabel(String id,JSONObject signal){return SignalNames.shortName(id,signal.optString("title",""));}
     private JSONArray array(String key){JSONArray a=state.optJSONArray(key);return a==null?new JSONArray():a;}
