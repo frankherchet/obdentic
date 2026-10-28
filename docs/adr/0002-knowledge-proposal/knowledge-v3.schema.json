@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/frankherchet/obdentic-knowledge/schema/knowledge-v3.schema.json",
+  "title": "OBDentic canonical knowledge document v3 (ECU request targets)",
+  "description": "Proposal for ADR 0002. v1/v2 stay immutable; v3 is a separate document kind that carries only ecu_targets. It contains no operation, payload, session or write vocabulary: targets are candidates for the core's existing closed identification plan.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "namespace", "ecu_targets"],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "namespace": { "type": "string", "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$" },
+    "description": { "type": "string", "minLength": 1 },
+    "ecu_targets": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/ecuTarget" } }
+  },
+  "$defs": {
+    "stableId": { "type": "string", "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$" },
+    "confidence": { "enum": ["high", "medium", "low"] },
+    "ecuTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "addressing", "transport", "logical_role", "applicability", "provenance", "hardware_validation"],
+      "properties": {
+        "id": { "$ref": "#/$defs/stableId" },
+        "addressing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["family", "request_id", "response_id", "response_id_rule", "response_id_stated_in_source"],
+          "properties": {
+            "family": { "const": "can_11bit" },
+            "request_id": { "type": "string", "pattern": "^7[0-9A-F]{2}$" },
+            "response_id": { "type": "string", "pattern": "^7[0-9A-F]{2}$" },
+            "response_id_rule": { "enum": ["iso15765_plus_8", "vag_plus_0x6a"] },
+            "response_id_stated_in_source": { "type": "boolean" }
+          }
+        },
+        "transport": { "const": "iso_tp_can" },
+        "logical_role": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["value", "confidence"],
+          "properties": {
+            "value": {
+              "enum": ["engine", "transmission", "gateway", "abs_esp", "instrument_cluster", "airbag", "climate", "tpms", "body_control", "all_wheel_drive", "steering", "driver_assistance", "emergency_call", "infotainment", "battery_management", "electric_drive", "hv_charger", "differential_lock", "ptc_heater"]
+            },
+            "confidence": { "$ref": "#/$defs/confidence" }
+          }
+        },
+        "applicability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vehicle_manufacturer"],
+          "properties": {
+            "vehicle_manufacturer": { "$ref": "#/$defs/stableId" },
+            "platforms": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/stableId" } }
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["classification", "confidence", "sources"],
+          "properties": {
+            "classification": { "enum": ["VERIFIED", "COMMUNITY", "INFERRED", "EXPERIMENTAL"] },
+            "confidence": { "$ref": "#/$defs/confidence" },
+            "sources": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/source" } }
+          }
+        },
+        "hardware_validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "enum": ["not_validated", "validated"] },
+            "reference": { "type": "string", "minLength": 1 },
+            "note": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "citation"],
+      "properties": {
+        "kind": { "enum": ["standard", "manufacturer_document", "community_archive", "research", "hardware_evidence"] },
+        "citation": { "type": "string", "minLength": 1 },
+        "archive_version": { "type": "string", "minLength": 1 },
+        "profile_count": { "type": "integer", "minimum": 1 },
+        "profile_total": { "type": "integer", "minimum": 1 },
+        "plain_read_profile_count": { "type": "integer", "minimum": 0 },
+        "note": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

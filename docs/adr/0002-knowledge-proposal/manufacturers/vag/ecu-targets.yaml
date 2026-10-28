@@ -1,0 +1,305 @@
+schema_version: 3
+namespace: manufacturers.vag.ecu_targets
+description: >-
+  Candidate 11-bit ISO-TP CAN request targets for VAG-group vehicles, derived from a
+  local community profile archive. Candidates only: they grant no capability and are
+  never proof that an ECU is installed or reachable.
+
+ecu_targets:
+  - id: vag.ecu_target.7e0
+    addressing: { family: can_11bit, request_id: "7E0", response_id: "7E8", response_id_rule: iso15765_plus_8, response_id_stated_in_source: false }
+    transport: iso_tp_can
+    logical_role: { value: engine, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 53
+          profile_total: 68
+          plain_read_profile_count: 51
+          note: "OBD-II physical engine address; response id by ISO 15765 convention, no explicit filter in the source."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.714
+    addressing: { family: can_11bit, request_id: "714", response_id: "77E", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: instrument_cluster, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 43
+          profile_total: 68
+          plain_read_profile_count: 30
+          note: "Instrument cluster; also the target of the ADR 0001 odometer job."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.7e1
+    addressing: { family: can_11bit, request_id: "7E1", response_id: "7E9", response_id_rule: iso15765_plus_8, response_id_stated_in_source: false }
+    transport: iso_tp_can
+    logical_role: { value: transmission, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 42
+          profile_total: 68
+          plain_read_profile_count: 42
+          note: "OBD-II physical transmission address; response id by ISO 15765 convention."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.710
+    addressing: { family: can_11bit, request_id: "710", response_id: "77A", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: gateway, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 38
+          profile_total: 68
+          plain_read_profile_count: 37
+          note: "Gateway role from name tags only; reaching it says nothing about the installation list or routing."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.713
+    addressing: { family: can_11bit, request_id: "713", response_id: "77D", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: abs_esp, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 37
+          profile_total: 68
+          plain_read_profile_count: 36
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.746
+    addressing: { family: can_11bit, request_id: "746", response_id: "7B0", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: climate, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 27
+          profile_total: 68
+          plain_read_profile_count: 24
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.70b
+    addressing: { family: can_11bit, request_id: "70B", response_id: "775", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: tpms, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 25
+          profile_total: 68
+          plain_read_profile_count: 25
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.715
+    addressing: { family: can_11bit, request_id: "715", response_id: "77F", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: airbag, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 23
+          profile_total: 68
+          plain_read_profile_count: 23
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.70e
+    addressing: { family: can_11bit, request_id: "70E", response_id: "778", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: body_control, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 19
+          profile_total: 68
+          plain_read_profile_count: 10
+          note: "9 of 19 profiles prepend an extended session for other identifiers; not needed for standard identification."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.70f
+    addressing: { family: can_11bit, request_id: "70F", response_id: "779", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: all_wheel_drive, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 18
+          profile_total: 68
+          plain_read_profile_count: 18
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.712
+    addressing: { family: can_11bit, request_id: "712", response_id: "77C", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: steering, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 14
+          profile_total: 68
+          plain_read_profile_count: 14
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.74f
+    addressing: { family: can_11bit, request_id: "74F", response_id: "7B9", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: driver_assistance, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 12
+          profile_total: 68
+          plain_read_profile_count: 12
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.767
+    addressing: { family: can_11bit, request_id: "767", response_id: "7D1", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: emergency_call, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 11
+          profile_total: 68
+          plain_read_profile_count: 11
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.7e5
+    addressing: { family: can_11bit, request_id: "7E5", response_id: "7ED", response_id_rule: iso15765_plus_8, response_id_stated_in_source: false }
+    transport: iso_tp_can
+    logical_role: { value: battery_management, confidence: low }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: low
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 8
+          profile_total: 68
+          plain_read_profile_count: 7
+          note: "Hybrid/battery management; response id by ISO 15765 convention, no explicit filter in the source."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.773
+    addressing: { family: can_11bit, request_id: "773", response_id: "7DD", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: infotainment, confidence: low }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: low
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 6
+          profile_total: 68
+          plain_read_profile_count: 6
+          note: "The source also issues a reset service on this address; out of scope here and never imported."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.7e6
+    addressing: { family: can_11bit, request_id: "7E6", response_id: "7EE", response_id_rule: iso15765_plus_8, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: electric_drive, confidence: low }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: low
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 4
+          profile_total: 68
+          plain_read_profile_count: 4
+          note: "Role tag present on 24 of 168 entries only; response id +8 stated in source."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.744
+    addressing: { family: can_11bit, request_id: "744", response_id: "7AE", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: hv_charger, confidence: low }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: low
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 3
+          profile_total: 68
+          plain_read_profile_count: 1
+          note: "Only 1 of 3 profiles reads without an extended session."
+    hardware_validation: { status: not_validated }
+  - id: vag.ecu_target.742
+    addressing: { family: can_11bit, request_id: "742", response_id: "7AC", response_id_rule: vag_plus_0x6a, response_id_stated_in_source: true }
+    transport: iso_tp_can
+    logical_role: { value: ptc_heater, confidence: low }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: low
+      sources:
+        - kind: community_archive
+          citation: "Car Scanner (com.ovz.carscanner) embedded profiles, local unpublished archive"
+          archive_version: "2.1.50"
+          profile_count: 2
+          profile_total: 68
+          plain_read_profile_count: 2
+    hardware_validation: { status: not_validated }
