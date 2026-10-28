@@ -483,3 +483,87 @@ requirements:
         text: The summary is shown in the Diagnose tab, and the desktop mobile report re-derives the same statistics offline from the recording without adapter traffic.
       - id: REQ-022.7
         text: Multi-PID responses are decoded per PID with the existing catalog decoders; a missing or malformed PID in the response is reported for that PID and never fills in a value.
+  - id: REQ-023
+    title: Discover present ECUs from evidence-backed Knowledge targets
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-28: epic #244, decisions by @frankherchet"
+    description: >
+      A user-started, closed discovery probes each applicable candidate ECU target
+      from the Knowledge DB once with a standard identification read and identifies
+      the targets that respond, without blind address sweeps or session changes.
+    acceptance:
+      - id: REQ-023.1
+        text: In a ready live session, the discovery sends exactly one ReadDataByIdentifier 0x22 for DID 0xF187 to each candidate target listed in the pinned Knowledge DB for the vehicle's manufacturer, in the default session, and to no other address.
+      - id: REQ-023.2
+        text: A positive or negative response from the target's expected response identifier marks that ECU as present with its role and evidence; no response within the timeout marks it as not observed, never as absent.
+      - id: REQ-023.3
+        text: For each present ECU, the discovery reads the existing standard identification identifiers once each and stores the decoded identity (spare part, software, hardware numbers where answered) in the vehicle record with evidence; negative responses are kept as evidence.
+      - id: REQ-023.4
+        text: The discovery sends no session change, SecurityAccess, RoutineControl or write service, accepts no caller-provided address or identifier, and restores functional addressing before any later functional request.
+      - id: REQ-023.5
+        text: The Diagnose tab lists present ECUs with role, address and identity, and shows not-observed targets separately; the result survives app restarts in the vehicle record and is not exported or shared.
+      - id: REQ-023.6
+        text: The discovery writes its own recording with all TX/RX; replay and the desktop mobile report re-derive the same ECU list offline without adapter traffic.
+
+  - id: REQ-024
+    title: Offer Knowledge-defined DID signals of identified ECUs as live signals
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-28: epic #244, decisions by @frankherchet"
+    description: >
+      Signals defined in the Knowledge DB for an identified, applicable ECU are
+      selectable and polled like standard PIDs, decoded by their Knowledge decoder,
+      recorded, replayable and labelled with their validation state.
+    acceptance:
+      - id: REQ-024.1
+        text: When an ECU present in the vehicle record matches a Knowledge definition's applicability, every definition of that ECU without a session requirement becomes a selectable signal with its short name, unit and group.
+      - id: REQ-024.2
+        text: A selected Knowledge signal is polled through the targeted read path to its ECU target with one request per read and decoded only with its Knowledge decoder; a negative response or malformed payload shows the signal as unavailable and never invents a value.
+      - id: REQ-024.3
+        text: Every Knowledge signal value shows its validation state; definitions with hardware validation not_validated are labelled "nicht abgeglichen".
+      - id: REQ-024.4
+        text: Recordings contain the raw request and response of Knowledge signal reads with the Knowledge revision, and replay re-decodes them offline with the same decoder.
+      - id: REQ-024.5
+        text: Definitions with a session requirement other than the default session are never polled as live signals.
+
+  - id: REQ-025
+    title: Select live signals in a selector structured by ECU and group
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-28: epic #244, decisions by @frankherchet"
+    description: >
+      A full-screen selector replaces the flat signal dialog and organises standard
+      and Knowledge signals by ECU and group, with search, limits and presets.
+    acceptance:
+      - id: REQ-025.1
+        text: The selector shows a section for OBD standard signals and one section per present ECU with Knowledge signals, each divided into groups, and lists every selectable signal with short name, unit, support state and validation state.
+      - id: REQ-025.2
+        text: A search field filters signals across all sections by short name, group and unit.
+      - id: REQ-025.3
+        text: The selector shows "x / 32 gewählt", refuses a 33rd selection with a visible message, and offers all/none per group within that limit.
+      - id: REQ-025.4
+        text: The user can save the current selection as a named preset in the vehicle record and apply it later; applying ignores signals that are not selectable for the current vehicle and reports how many were skipped.
+      - id: REQ-025.5
+        text: The selection cannot be changed while a recording runs, as before.
+
+  - id: REQ-026
+    title: Learn which session-flagged DIDs answer in the default session
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-28: epic #244, decisions by @frankherchet"
+    description: >
+      A user-started, closed learning run reads each Knowledge DID whose source uses a
+      session change once in the default session and records whether it answers,
+      without sending any session change.
+    acceptance:
+      - id: REQ-026.1
+        text: In a ready live session with an identified applicable ECU, the learning run sends exactly one 0x22 request per session-flagged definition of that ECU to its target, in the default session, and never sends a session change, SecurityAccess or other service.
+      - id: REQ-026.2
+        text: Each definition is reported as answered (with the decoded value marked unconfirmed), rejected with its negative response code, or not answered, and the result is stored in the vehicle record and its own recording.
+      - id: REQ-026.3
+        text: The run is bounded to 120 seconds, can be stopped, keeps a partial recording on stop or connection loss, and its result can be re-derived offline from the recording.
