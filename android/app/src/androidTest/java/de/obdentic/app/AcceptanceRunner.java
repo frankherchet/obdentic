@@ -103,6 +103,7 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Recording deletion rejects active files, malformed paths and missing files with clear errors");
             capture(activity,"Diagnose","acceptance-diagnose.png");
             FormatAcceptance.run();passed("#216 decoded values render rounded, German and with display units");
+            PollScheduleAcceptance.run();passed("#231 live polling reads back-to-back at the 500 ms period");
             getUiAutomation().executeShellCommand("input keyevent 3").close();
             waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) == 0,"Activity clears keep-screen-on when paused");
             long backgrounded=file.length();

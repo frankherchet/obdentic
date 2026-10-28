@@ -124,7 +124,7 @@ impl AdapterLink for ScriptedExchange {
 pub(crate) type CommandLog = Arc<Mutex<Vec<String>>>;
 
 /// Carly model (#215, #221): after an explicit `ATSH 7DF` + bare `ATCRA`
-/// restore, functional `0100`/`0902` answer `NO DATA` until the next `ATZ`.
+/// restore or a targeted `ATSH`, functional `0100`/`0902` answer `NO DATA` until the next `ATZ`.
 pub(crate) struct NoFunctionalAfterRestore {
     log: CommandLog,
     broken: bool,
@@ -161,7 +161,9 @@ impl NoFunctionalAfterRestore {
                 self.searching = true;
                 "OK\r>".into()
             }
-            "ATCRA" => {
+            // Any targeted header (not only the bare restore) leaves
+            // functional addressing broken until the next `ATZ` (#231).
+            "ATCRA" | "ATSH 7E0" => {
                 self.broken = true;
                 "OK\r>".into()
             }
@@ -174,6 +176,8 @@ impl NoFunctionalAfterRestore {
             "0100" => "7E8 06 41 00 98 3B A0 12 00\r>".into(),
             "0902" => "7E8 10 14 49 02 01 57 56 57\r7E8 21 5A 5A 5A 31 4B 5A 41\r7E8 22 4D 31 32 33 34 35 36\r>".into(),
             "010C" => "7E8 04 41 0C 1F 40\r>".into(),
+            "0105" => "7E8 03 41 05 5A\r>".into(),
+            "010D" => "7E8 03 41 0D 32\r>".into(),
             other => panic!("unexpected command {other}"),
         }
     }
