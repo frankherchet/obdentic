@@ -75,6 +75,7 @@ public final class AcceptanceRunner extends Instrumentation {
             final Activity liveActivity=activity;
             require(onMain(() -> hasText(liveActivity.getWindow().getDecorView(),"Drehzahl",true)),"#232 live card shows the short name Drehzahl");
             runOnMainSync(() -> FormatAcceptance.noSemanticIds(liveActivity.getWindow().getDecorView()));
+            LiveGridAcceptance.run(this::onMain, service, liveActivity);
             service.setSignals(new JSONArray());
             waitIdle();
             passed("Live RPM/coolant readings and changing observation selection");

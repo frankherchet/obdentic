@@ -9,6 +9,7 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 
 - Carly BLE scan, explicit connect/disconnect and recoverable permission errors.
 - 50 standard semantic measurements, vehicle-advertised support, live trends and sample age.
+- The Live tab shows signals as compact tiles (2 columns portrait, 3 landscape) with short name, value, sparkline and session min/max; a stale age ("vor N s") appears only after 10 s.
 - VIN where readable and a **partial** functional responder inventory; this is not
   a full manufacturer installation list.
 - Stored Mode 03 DTCs, scoped by responder.
