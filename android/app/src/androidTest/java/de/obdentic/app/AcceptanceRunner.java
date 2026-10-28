@@ -71,6 +71,10 @@ public final class AcceptanceRunner extends Instrumentation {
             }
             require(numeric, "RPM decoded from raw adapter response");
             capture(activity,"Live","acceptance-live.png");
+            FormatAcceptance.names(service.snapshot().getJSONArray("signals"));
+            final Activity liveActivity=activity;
+            require(onMain(() -> hasText(liveActivity.getWindow().getDecorView(),"Drehzahl",true)),"#232 live card shows the short name Drehzahl");
+            runOnMainSync(() -> FormatAcceptance.noSemanticIds(liveActivity.getWindow().getDecorView()));
             service.setSignals(new JSONArray());
             waitIdle();
             passed("Live RPM/coolant readings and changing observation selection");
