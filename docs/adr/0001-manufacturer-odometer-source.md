@@ -95,3 +95,6 @@ require identifying the cluster. The definition carries its source, COMMUNITY
 classification and pending hardware validation (REQ-016.8). Promotion into the
 Knowledge DB is reconsidered after the vehicle check, together with target
 modelling (#85/#86). All other decisions above stand.
+
+## Note (2026-10-28)
+2026-10-28: the follow-up feature (REQ-016, #198) was removed with all experimental capabilities (#230); REQ-016 is obsolete.

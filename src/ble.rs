@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 pub use crate::adapter::AdapterCandidate;
+use crate::elm::ElmSession;
 #[cfg(test)]
 pub(crate) use crate::elm::{
     discover_pid_support as discover_pid_support_with_limit, establish_elm_protocol,
@@ -23,7 +24,6 @@ pub use crate::elm::{
     TargetedReadRequest,
 };
 use crate::elm::{AdapterLink, ElmExchange, ExchangeError, TransportFailure};
-use crate::elm::{ElmSession, TargetedDpfProbeRequest};
 pub(crate) use crate::elm::{ReadEvidenceError, ResponseObservation};
 
 // Two consecutive transport failures stop a live session; data failures reset the count.
@@ -54,19 +54,6 @@ impl PreparedDiagnosticSession {
             .read_targeted_with_evidence(request)
             .await
             .map(TargetedReadOutcome::from_internal)
-    }
-
-    /// Execute one closed EA189 candidate probe while retaining this session.
-    pub async fn read_dpf_probe(
-        &self,
-        probe: crate::ea189::Ea189DpfProbe,
-        mapping: &crate::vehicle_knowledge::EcuTargetMapping,
-    ) -> Result<DiagnosticResponses, String> {
-        self.session
-            .read_dpf_probe(crate::elm::TargetedDpfProbeRequest::from_mapping(
-                probe, mapping,
-            )?)
-            .await
     }
 
     /// Execute the one bounded stored-DTC request and deterministically close
@@ -169,27 +156,6 @@ impl ReadOutcome {
     fn into_transaction(self) -> Result<Transaction, String> {
         match self {
             Self::Succeeded { transaction, .. } => Ok(transaction),
-            Self::Failed { error, .. } => Err(error),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum DpfProbeOutcome {
-    Succeeded {
-        responses: DiagnosticResponses,
-        observations: Vec<ResponseObservation>,
-    },
-    Failed {
-        error: String,
-        observations: Vec<ResponseObservation>,
-    },
-}
-
-impl DpfProbeOutcome {
-    fn into_result(self) -> Result<DiagnosticResponses, String> {
-        match self {
-            Self::Succeeded { responses, .. } => Ok(responses),
             Self::Failed { error, .. } => Err(error),
         }
     }
@@ -405,32 +371,6 @@ impl SessionClient {
             .map_err(|_| "diagnostic session stopped before responding".to_string())?
     }
 
-    /// Execute the closed EA189 DPF UDS probe and return its raw normalized
-    /// responses.  Negative or malformed responses are returned as errors,
-    /// while the crate-visible evidence variant retains responder payloads.
-    pub(crate) async fn read_dpf_probe(
-        &self,
-        request: TargetedDpfProbeRequest,
-    ) -> Result<DiagnosticResponses, String> {
-        self.read_dpf_probe_with_evidence(request)
-            .await?
-            .into_result()
-    }
-
-    pub(crate) async fn read_dpf_probe_with_evidence(
-        &self,
-        request: TargetedDpfProbeRequest,
-    ) -> Result<DpfProbeOutcome, String> {
-        let (reply, result) = oneshot::channel();
-        self.sender
-            .send(SessionCommand::ReadDpfProbe { request, reply })
-            .await
-            .map_err(|_| "diagnostic session is closed".to_string())?;
-        result
-            .await
-            .map_err(|_| "diagnostic session stopped before responding".to_string())?
-    }
-
     pub async fn read_ecu_identification(
         &self,
         request: TargetedEcuIdentificationRequest,
@@ -529,10 +469,6 @@ enum SessionCommand {
     ReadMode09 {
         request: TargetedMode09Request,
         reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
-    },
-    ReadDpfProbe {
-        request: TargetedDpfProbeRequest,
-        reply: oneshot::Sender<Result<DpfProbeOutcome, String>>,
     },
     ReadEcuIdentification {
         request: TargetedEcuIdentificationRequest,
@@ -665,24 +601,6 @@ async fn session_actor<E: AdapterLink + 'static>(
                     }
                 }
             }
-            SessionCommand::ReadDpfProbe { request, reply } => {
-                if let Some(error) = health.unhealthy() {
-                    let _ = reply.send(Err(error.to_owned()));
-                    continue;
-                }
-                let started = Instant::now();
-                let outcome = session.read_dpf_probe_with_evidence(request).await;
-                process_dpf_probe_outcome(
-                    &mut session,
-                    &mut health,
-                    &mut service,
-                    &mut disconnect_done,
-                    outcome,
-                    started.elapsed(),
-                    reply,
-                )
-                .await;
-            }
             SessionCommand::ReadEcuIdentification { request, reply } => {
                 if let Some(error) = health.unhealthy() {
                     let _ = reply.send(Err(error.to_owned()));
@@ -809,48 +727,6 @@ async fn process_read_outcome<E: AdapterLink>(
             } else {
                 service.observe(service_time);
                 let _ = reply.send(Ok(ReadOutcome::Failed {
-                    error,
-                    observations,
-                }));
-            }
-        }
-    }
-}
-
-async fn process_dpf_probe_outcome<E: AdapterLink>(
-    session: &mut DiagnosticSession<E>,
-    health: &mut SessionHealth,
-    service: &mut RequestServiceEstimator,
-    disconnect_done: &mut bool,
-    outcome: DpfProbeOutcome,
-    service_time: Duration,
-    reply: oneshot::Sender<Result<DpfProbeOutcome, String>>,
-) {
-    if let Some(error) = health.unhealthy() {
-        let _ = reply.send(Err(error.to_owned()));
-        return;
-    }
-    match outcome {
-        DpfProbeOutcome::Succeeded { .. } => {
-            service.observe(service_time);
-            health.success();
-            let _ = reply.send(Ok(outcome));
-        }
-        DpfProbeOutcome::Failed {
-            error,
-            observations,
-        } => {
-            if health.observe(session.take_transport_failure(), &error) {
-                let fatal = health.unhealthy().unwrap().to_owned();
-                session.disconnect_best_effort().await;
-                *disconnect_done = true;
-                let _ = reply.send(Ok(DpfProbeOutcome::Failed {
-                    error: fatal,
-                    observations,
-                }));
-            } else {
-                service.observe(service_time);
-                let _ = reply.send(Ok(DpfProbeOutcome::Failed {
                     error,
                     observations,
                 }));
@@ -1077,29 +953,6 @@ impl<E: AdapterLink> DiagnosticSession<E> {
         request: TargetedMode09Request,
     ) -> Result<DiagnosticResponses, String> {
         self.elm_mut()?.read_mode09(&request).await
-    }
-
-    async fn read_dpf_probe_with_evidence(
-        &mut self,
-        request: TargetedDpfProbeRequest,
-    ) -> DpfProbeOutcome {
-        let read = match self.elm_mut() {
-            Ok(session) => session.read_dpf_probe_with_evidence(&request).await,
-            Err(error) => Err(ReadEvidenceError {
-                error,
-                observations: Vec::new(),
-            }),
-        };
-        match read {
-            Ok(read) => DpfProbeOutcome::Succeeded {
-                responses: read.responses,
-                observations: read.observations,
-            },
-            Err(error) => DpfProbeOutcome::Failed {
-                error: error.error,
-                observations: error.observations,
-            },
-        }
     }
 
     async fn read_ecu_identification_with_evidence(
@@ -1334,9 +1187,6 @@ mod tests {
                     }
                     SessionCommand::ReadMode09 { reply, .. } => {
                         let _ = reply.send(Err("Mode 09 test request not scripted".into()));
-                    }
-                    SessionCommand::ReadDpfProbe { reply, .. } => {
-                        let _ = reply.send(Err("DPF probe test request not scripted".into()));
                     }
                     SessionCommand::ReadEcuIdentification { reply, .. } => {
                         let _ =

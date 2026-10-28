@@ -8,10 +8,8 @@
 use crate::{
     capture_events::{
         CaptureDefinitionReference, CaptureEvent, CaptureKnowledgeContext, CaptureValue,
-        ResponderEvidence,
     },
     capture_format::ParsedCapture,
-    ea189::{decode_experimental_dpf, Ea189DpfProbe, Ea189ExperimentalDpfReading},
     knowledge_db::KnowledgePin,
     prepare_read,
     telemetry::TelemetryState,
@@ -24,9 +22,6 @@ pub enum ReplayIssueKind {
     RequestChanged,
     DecodeFailed,
     RecordedDecodeChanged,
-    UnsupportedDpfCandidate,
-    MalformedDpfEvidence,
-    NegativeDpfResponse,
     WrongResponderSelection,
 }
 
@@ -53,31 +48,6 @@ impl ReplayIssue {
 
     pub fn detail(&self) -> &str {
         &self.detail
-    }
-}
-
-/// A successful experimental DPF decode kept separate from generic telemetry.
-/// Gate-B candidates are not part of the production signal catalog yet.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DpfReplayReading {
-    reading: Ea189ExperimentalDpfReading,
-    responder: String,
-    offset_us: Option<u64>,
-}
-
-impl DpfReplayReading {
-    pub const fn reading(&self) -> Ea189ExperimentalDpfReading {
-        self.reading
-    }
-
-    pub fn responder(&self) -> &str {
-        &self.responder
-    }
-
-    /// Monotonic session offset when recorded by a new capture. `None` is
-    /// preserved for legacy response evidence without timing metadata.
-    pub const fn offset_us(&self) -> Option<u64> {
-        self.offset_us
     }
 }
 
@@ -130,7 +100,6 @@ pub struct CaptureReplay {
     offsets_us: Vec<u64>,
     transactions: Vec<Transaction>,
     recorded_interpretations: Vec<RecordedReadInterpretation>,
-    dpf_readings: Vec<DpfReplayReading>,
     issues: Vec<ReplayIssue>,
 }
 
@@ -148,7 +117,6 @@ impl CaptureReplay {
         });
         let mut decoded = Vec::<(u64, Transaction)>::new();
         let mut recorded_interpretations = Vec::new();
-        let mut dpf_readings = Vec::new();
         let mut issues = Vec::new();
 
         for event in &capture.events {
@@ -238,31 +206,12 @@ impl CaptureReplay {
                     duration_us = duration_us.max(timing.finished_us);
                 }
                 CaptureEvent::ReadFailed { .. } => {}
+                // Evidence of removed probes stays parseable but is never replayed.
                 CaptureEvent::ResponsesObserved {
-                    offset_us,
-                    semantic,
-                    request_payload,
-                    responses,
-                    selected_responder,
-                    selection_error,
+                    offset_us: Some(offset_us),
+                    ..
                 } => {
-                    if let Some(offset_us) = offset_us {
-                        duration_us = duration_us.max(*offset_us);
-                    }
-                    let mut state = DpfReplayState {
-                        readings: &mut dpf_readings,
-                        issues: &mut issues,
-                        at_us: offset_us.unwrap_or(duration_us),
-                    };
-                    replay_dpf_responses(
-                        semantic,
-                        request_payload,
-                        responses,
-                        selected_responder,
-                        selection_error,
-                        *offset_us,
-                        &mut state,
-                    );
+                    duration_us = duration_us.max(*offset_us);
                 }
                 CaptureEvent::SlotsSkipped { last_due_us, .. } => {
                     duration_us = duration_us.max(*last_due_us);
@@ -283,7 +232,6 @@ impl CaptureReplay {
             offsets_us,
             transactions,
             recorded_interpretations,
-            dpf_readings,
             issues,
         }
     }
@@ -321,12 +269,6 @@ impl CaptureReplay {
         &self.recorded_interpretations
     }
 
-    /// Successful Gate-B DPF decodes. These remain outside [`TelemetryState`]
-    /// until their hypotheses are promoted into the vehicle signal catalog.
-    pub fn dpf_readings(&self) -> &[DpfReplayReading] {
-        &self.dpf_readings
-    }
-
     pub fn issues(&self) -> &[ReplayIssue] {
         &self.issues
     }
@@ -347,164 +289,6 @@ impl CaptureReplay {
     pub fn telemetry_full(&self, capacity: usize) -> Result<TelemetryState, String> {
         self.telemetry_at(self.duration_us, capacity)
     }
-}
-
-fn is_dpf_semantic(semantic: &str) -> bool {
-    semantic.starts_with("dpf.") || semantic.starts_with("exhaust.temperature.")
-}
-
-fn dpf_probe(semantic: &str) -> Option<Ea189DpfProbe> {
-    Ea189DpfProbe::ALL
-        .into_iter()
-        .find(|probe| probe.semantic() == semantic)
-}
-
-struct DpfReplayState<'a> {
-    readings: &'a mut Vec<DpfReplayReading>,
-    issues: &'a mut Vec<ReplayIssue>,
-    at_us: u64,
-}
-
-fn replay_dpf_responses(
-    semantic: &str,
-    request_payload: &[u8],
-    responses: &[ResponderEvidence],
-    selected_responder: &Option<String>,
-    selection_error: &Option<String>,
-    offset_us: Option<u64>,
-    state: &mut DpfReplayState<'_>,
-) {
-    if !is_dpf_semantic(semantic) {
-        return;
-    }
-
-    let Some(probe) = dpf_probe(semantic) else {
-        dpf_issue(
-            state.issues,
-            state.at_us,
-            semantic,
-            ReplayIssueKind::UnsupportedDpfCandidate,
-            "semantic is not in the closed EA189 DPF candidate set",
-        );
-        return;
-    };
-
-    if request_payload != probe.request_bytes() {
-        dpf_issue(
-            state.issues,
-            state.at_us,
-            semantic,
-            ReplayIssueKind::MalformedDpfEvidence,
-            format!(
-                "recorded request {:?} does not match closed DPF request {:?}",
-                request_payload,
-                probe.request_bytes()
-            ),
-        );
-        return;
-    }
-
-    if responses.is_empty() {
-        dpf_issue(
-            state.issues,
-            state.at_us,
-            semantic,
-            ReplayIssueKind::MalformedDpfEvidence,
-            "DPF response evidence is empty",
-        );
-        return;
-    }
-
-    if let Some(error) = selection_error {
-        dpf_issue(
-            state.issues,
-            state.at_us,
-            semantic,
-            ReplayIssueKind::WrongResponderSelection,
-            format!("recorded responder selection failed: {error}"),
-        );
-        return;
-    }
-
-    let Some(selected_responder) = selected_responder.as_deref() else {
-        dpf_issue(
-            state.issues,
-            state.at_us,
-            semantic,
-            ReplayIssueKind::WrongResponderSelection,
-            "DPF evidence has no selected responder",
-        );
-        return;
-    };
-
-    let selected = responses
-        .iter()
-        .filter(|response| response.responder.as_deref() == Some(selected_responder));
-    let selected_matches = selected.collect::<Vec<_>>();
-    if selected_matches.len() != 1 {
-        dpf_issue(
-            state.issues,
-            state.at_us,
-            semantic,
-            ReplayIssueKind::WrongResponderSelection,
-            format!(
-                "selected responder {selected_responder} matches {} evidence entries",
-                selected_matches.len()
-            ),
-        );
-        return;
-    }
-
-    let response = &selected_matches[0].payload;
-    if let [0x7f, 0x22, nrc] = response.as_slice() {
-        dpf_issue(
-            state.issues,
-            state.at_us,
-            semantic,
-            ReplayIssueKind::NegativeDpfResponse,
-            format!("recorded UDS negative response NRC {nrc:02X}"),
-        );
-        return;
-    }
-    match decode_experimental_dpf(probe, response) {
-        Ok(reading) => state.readings.push(DpfReplayReading {
-            reading,
-            responder: selected_responder.to_owned(),
-            offset_us,
-        }),
-        Err(error) => {
-            let alternate_decodes = responses.iter().any(|candidate| {
-                candidate.responder.as_deref() != Some(selected_responder)
-                    && decode_experimental_dpf(probe, &candidate.payload).is_ok()
-            });
-            let kind = if alternate_decodes {
-                ReplayIssueKind::WrongResponderSelection
-            } else if matches!(
-                error,
-                crate::ea189::Ea189DpfDecodeError::UnsupportedProbe(_)
-            ) {
-                ReplayIssueKind::UnsupportedDpfCandidate
-            } else {
-                ReplayIssueKind::MalformedDpfEvidence
-            };
-            dpf_issue(state.issues, state.at_us, semantic, kind, error.to_string());
-        }
-    }
-}
-
-fn dpf_issue(
-    issues: &mut Vec<ReplayIssue>,
-    at_us: u64,
-    semantic: &str,
-    kind: ReplayIssueKind,
-    detail: impl Into<String>,
-) {
-    issues.push(ReplayIssue {
-        at_us,
-        semantic: semantic.into(),
-        kind,
-        detail: detail.into(),
-    });
 }
 
 fn recorded_decode_changed(value: &CaptureValue, unit: &str, transaction: &Transaction) -> bool {
@@ -565,44 +349,6 @@ mod tests {
         ParsedCapture {
             events,
             status: CaptureStatus::Complete,
-        }
-    }
-
-    fn dpf_response(
-        semantic: &str,
-        request: Vec<u8>,
-        responder: Option<&str>,
-        payload: Vec<u8>,
-        selected_responder: Option<&str>,
-    ) -> CaptureEvent {
-        dpf_response_at(
-            semantic,
-            request,
-            responder,
-            payload,
-            selected_responder,
-            None,
-        )
-    }
-
-    fn dpf_response_at(
-        semantic: &str,
-        request: Vec<u8>,
-        responder: Option<&str>,
-        payload: Vec<u8>,
-        selected_responder: Option<&str>,
-        offset_us: Option<u64>,
-    ) -> CaptureEvent {
-        CaptureEvent::ResponsesObserved {
-            offset_us,
-            semantic: semantic.into(),
-            request_payload: request,
-            responses: vec![ResponderEvidence {
-                responder: responder.map(str::to_owned),
-                payload,
-            }],
-            selected_responder: selected_responder.map(str::to_owned),
-            selection_error: None,
         }
     }
 
@@ -779,143 +525,21 @@ mod tests {
     }
 
     #[test]
-    fn dpf_replay_decodes_experimental_reading_without_generic_telemetry() {
-        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
-            "dpf.soot_mass_calculated",
-            vec![0x22, 0x11, 0x4f],
-            Some("7E8"),
-            vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
-            Some("7E8"),
-        )]));
+    fn evidence_of_removed_probes_is_skipped_without_issues_but_keeps_duration() {
+        let replay = CaptureReplay::from_capture(&capture(vec![CaptureEvent::ResponsesObserved {
+            offset_us: Some(4_000_001),
+            semantic: "dpf.soot_mass_calculated".into(),
+            request_payload: vec![0x22, 0x11, 0x4f],
+            responses: vec![ResponderEvidence {
+                responder: Some("7E8".into()),
+                payload: vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
+            }],
+            selected_responder: Some("7E8".into()),
+            selection_error: None,
+        }]));
 
-        assert_eq!(replay.transactions().len(), 0);
-        assert_eq!(replay.dpf_readings().len(), 1);
-        assert_eq!(replay.dpf_readings()[0].responder(), "7E8");
-        assert_eq!(replay.dpf_readings()[0].reading().value(), 12.72);
-        assert_eq!(replay.dpf_readings()[0].reading().unit(), "g");
-        assert!(replay.telemetry_full(8).unwrap().signals().next().is_none());
+        assert!(replay.transactions().is_empty());
         assert!(replay.issues().is_empty());
-    }
-
-    #[test]
-    fn dpf_replay_preserves_response_offset_and_uses_it_for_duration() {
-        let replay = CaptureReplay::from_capture(&capture(vec![
-            dpf_response_at(
-                "dpf.soot_mass_calculated",
-                vec![0x22, 0x11, 0x4f],
-                Some("7E8"),
-                vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
-                Some("7E8"),
-                Some(4_000_001),
-            ),
-            CaptureEvent::SessionStopped {
-                offset_us: 5_000_000,
-            },
-        ]));
-
-        assert_eq!(replay.dpf_readings().len(), 1);
-        assert_eq!(replay.dpf_readings()[0].offset_us(), Some(4_000_001));
-        assert_eq!(replay.duration_us(), 5_000_000);
-    }
-
-    #[test]
-    fn legacy_dpf_replay_keeps_missing_response_offset() {
-        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
-            "dpf.soot_mass_calculated",
-            vec![0x22, 0x11, 0x4f],
-            Some("7E8"),
-            vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
-            Some("7E8"),
-        )]));
-
-        assert_eq!(replay.dpf_readings()[0].offset_us(), None);
-    }
-
-    #[test]
-    fn dpf_replay_decodes_validated_distance_without_generic_telemetry() {
-        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
-            "dpf.distance_since_regeneration",
-            vec![0x22, 0x11, 0x56],
-            Some("7E8"),
-            vec![0x62, 0x11, 0x56, 0x00, 0x00, 0x03, 0xe8],
-            Some("7E8"),
-        )]));
-
-        assert_eq!(replay.dpf_readings().len(), 1);
-        assert_eq!(replay.dpf_readings()[0].reading().value(), 1.0);
-        assert_eq!(replay.dpf_readings()[0].reading().unit(), "km");
-        assert!(replay.issues().is_empty());
-        assert!(replay.telemetry_full(8).unwrap().signals().next().is_none());
-    }
-
-    #[test]
-    fn dpf_replay_rejects_malformed_raw_evidence() {
-        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
-            "dpf.soot_mass_calculated",
-            vec![0x22, 0x11, 0x4f],
-            Some("7E8"),
-            vec![0x62, 0x11, 0x4f, 0x04],
-            Some("7E8"),
-        )]));
-
-        assert!(replay.dpf_readings().is_empty());
-        assert!(replay
-            .issues()
-            .iter()
-            .any(|issue| issue.kind() == ReplayIssueKind::MalformedDpfEvidence));
-        assert!(replay.telemetry_full(8).unwrap().signals().next().is_none());
-    }
-
-    #[test]
-    fn dpf_replay_keeps_a_negative_uds_response_distinct_from_malformed_evidence() {
-        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
-            "dpf.soot_mass_calculated",
-            vec![0x22, 0x11, 0x4f],
-            Some("7E8"),
-            vec![0x7f, 0x22, 0x31],
-            Some("7E8"),
-        )]));
-
-        assert!(replay.dpf_readings().is_empty());
-        assert!(replay
-            .issues()
-            .iter()
-            .any(|issue| issue.kind() == ReplayIssueKind::NegativeDpfResponse));
-        assert!(replay.telemetry_full(8).unwrap().signals().next().is_none());
-    }
-
-    #[test]
-    fn dpf_replay_rejects_responder_selection_not_in_evidence() {
-        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
-            "dpf.soot_mass_calculated",
-            vec![0x22, 0x11, 0x4f],
-            Some("7E8"),
-            vec![0x62, 0x11, 0x4f, 0x04, 0xf8],
-            Some("7E9"),
-        )]));
-
-        assert!(replay.dpf_readings().is_empty());
-        assert!(replay
-            .issues()
-            .iter()
-            .any(|issue| issue.kind() == ReplayIssueKind::WrongResponderSelection));
-        assert!(replay.telemetry_full(8).unwrap().signals().next().is_none());
-    }
-
-    #[test]
-    fn unknown_dpf_semantic_is_not_replayed() {
-        let replay = CaptureReplay::from_capture(&capture(vec![dpf_response(
-            "dpf.ash_mass",
-            vec![0x22, 0x17, 0x8c],
-            Some("7E8"),
-            vec![0x62, 0x17, 0x8c, 0x00, 0x01],
-            Some("7E8"),
-        )]));
-
-        assert!(replay.dpf_readings().is_empty());
-        assert!(replay
-            .issues()
-            .iter()
-            .any(|issue| issue.kind() == ReplayIssueKind::UnsupportedDpfCandidate));
+        assert_eq!(replay.duration_us(), 4_000_001);
     }
 }

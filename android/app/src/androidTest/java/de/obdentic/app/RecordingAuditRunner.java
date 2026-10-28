@@ -35,7 +35,7 @@ public final class RecordingAuditRunner extends Instrumentation {
                         if(type.equals("action")) {
                             String action=event.optString("action");JSONObject envelope=event.optJSONObject("result");if(envelope==null) {invalid=true;continue;}
                             if(!envelope.optBoolean("ok")) {failures++;continue;}
-                            if(action.equals("read")||action.equals("dtc.scan")||action.equals("ea189.dpf.probe")||action.equals("ea189.extended.probe")||action.equals("ea189.ash.probe")||action.equals("vw.cluster.odometer")) {
+                            if(action.equals("read")||action.equals("dtc.scan")) {
                                 JSONObject data=envelope.optJSONObject("data");JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay."+action,data==null?"{}":data.toString()));
                                 if(!decoded.optBoolean("ok"))decodeErrors++;
                                 else if(action.equals("read")) {reads++;if(data==null||!Double.isFinite(data.optDouble("value",Double.NaN))||Math.abs(data.optDouble("value")-decoded.getJSONObject("data").optDouble("value"))>1e-9)mismatches++;}
@@ -47,7 +47,7 @@ public final class RecordingAuditRunner extends Instrumentation {
                 report.put("mode",mode);report.put("header",header);report.put("complete",complete&&!invalid);report.put("invalid",invalid);report.put("end_reason",reason);
                 report.put("tx",tx);report.put("rx",rx);report.put("decoded_reads",reads);report.put("recorded_errors",failures);report.put("decode_errors",decodeErrors);report.put("value_mismatches",mismatches);report.put("diagnostic_jobs",jobs);
                 reports.put(report);
-                if(mode.equals("live")||(mode.equals("demo")&&profile.equals(TestSequence.PROFILE)&&complete&&!invalid))emit(file);
+                if(mode.equals("live"))emit(file);
             }
             result.putString("stream",reports.toString(2));finish(Activity.RESULT_OK,result);
         } catch(Throwable error) {result.putString("stream","AUDIT FAILED: "+error.getClass().getSimpleName());finish(Activity.RESULT_CANCELED,result);}

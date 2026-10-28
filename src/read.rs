@@ -646,18 +646,14 @@ mod tests {
     }
 
     #[test]
-    fn profile_catalog_keeps_ea189_empty_until_evidence_exists() {
+    fn profile_catalog_holds_only_the_standard_profile() {
         assert_eq!(
             crate::supported_profiles()
                 .iter()
                 .map(|profile| profile.id)
                 .collect::<Vec<_>>(),
-            ["obd2-v1", "vw-ea189-v1"]
+            ["obd2-v1"]
         );
-        let ea189 = &crate::supported_profiles()[1];
-        assert_eq!(ea189.confidence, "experimental");
-        assert_eq!(ea189.hardware_validation, "hardware-evidence-required");
-        assert!(prepare_read("dpf.diff_pressure").is_err());
     }
 
     #[test]

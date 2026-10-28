@@ -12,33 +12,29 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 - VIN where readable and a **partial** functional responder inventory; this is not
   a full manufacturer installation list.
 - Stored Mode 03 DTCs, scoped by responder.
-- Seven experimental EA189 DPF probes, gated on validated engine targeting.
-- A separate, explicitly selected 15-value experimental EA189 additional-read job
-  and recording profile, including oil/boost/fuel data and uninterpreted regeneration
-  status numbers. These new interpretations are not hardware-validated.
-- The existing engine baseline, drive and OBD expansion capture profiles, plus
-  repeated experimental DPF capture.
+- The engine baseline, drive and OBD expansion capture profiles.
 - The `obd2-extended-validation` profile records additional standard scalars
   conservatively; unavailable optional values are not assumed supported.
 - Private recording, foreground connected-device service, screen-off operation,
   explicit export, offline replay and timestamped raw TX/RX.
-- A finite EA189 ash learning sequence under **Aufnahmeprofil / Testsequenz**, with
-  operator-reported operating context, visible progress and automatic recording stop.
 - Confirmed deletion of completed internal recordings; active recordings and loaded
   replays are protected. Exported copies remain separate.
 - The display stays awake while the app is visible; background operation and manual
   locking remain available.
 - Demo responses pass through the real Rust parser; the mode is always visible.
 
-DPF interpretations remain experimental. Pending/permanent DTCs, freeze frames,
-full OEM fault-memory scans and DTC clearing are not implemented by this app.
+Pending/permanent DTCs, freeze frames, full OEM fault-memory scans and DTC clearing
+are not implemented by this app. Experimental and manufacturer-specific reads were
+removed (#230): the app keeps only standards-based functions. Old recordings that
+contain removed actions still open in replay; those actions are skipped, never
+decoded and never sent.
 
 For a targeted read, selection uses the explicitly expected responder, never
 the decoded value. Additional responders remain in the evidence. A missing
 expected response or conflicting payloads from that same responder still fail;
 an untargeted functional read remains ambiguous when responders disagree.
 
-## Vehicle identity and additional reads
+## Vehicle identity
 
 Inventory includes an offline, partial WMI manufacturer hint derived from a
 format-checked VIN. No VIN is sent to an external decoder. The initial sourced
@@ -46,20 +42,6 @@ snapshot uses NHTSA vPIC records; [source details and KBA limitations](research/
 explain its incomplete European coverage. Model, engine and ECU compatibility
 remain unresolved; the first three VIN characters never select an OEM profile.
 
-`ea189.extended.probe` is a closed set of 15 fixed, engine-targeted `0x22` reads.
-The user must explicitly choose the EA189 job or its recording profile. It reuses
-validated `7E0`/`7E8` routing, preserves raw responder evidence and negative answers,
-and redecodes recordings offline. The candidates were checked against the locally
-extracted Car Scanner 2.1.50 EA189 profile and remain experimental with source
-metadata; their original upstream source is unknown. No executable vendor database,
-arbitrary formula, address or preparation sequence is imported.
-
-The `178C` ash-mass candidate is omitted from the 15-value extended job: the source
-includes `10 03` preparation (UDS extended diagnostic session). A separate closed
-`ea189.ash.probe` learning job reads only `1153` and `178C`, once each, without that
-preparation or any fallback. It requires validated engine targeting and retains
-uninterpreted responses/NRCs rather than manufacturing ash telemetry. No session-start
-traffic is added. The existing seven-value DPF job and its replay remain separate.
 Support discovery follows advertised continuation bits only, bounded by the highest page
 the catalog needs (currently `0xA0`, for the odometer PID `A6`).
 
@@ -84,24 +66,6 @@ request is sent. A failed read keeps the stored value and date and is shown in t
 details, as is a value lower than the stored one (the new value is stored, neither is
 corrected). Without a stored value the page shows "km-Stand nicht verfügbar". Covered
 by `VehicleRecordsAcceptance` (REQ-013, REQ-014, REQ-015) and the demo read in `AcceptanceRunner`.
-
-The Diagnose tab has an experimental, user-started card "EXPERIMENTELL · VW KOMBIINSTRUMENT"
-(REQ-016, [ADR 0001](adr/0001-manufacturer-odometer-source.md) amendment, #198). One job
-action, `vw.cluster.odometer` (no argument), sends a single `22 2203` to request header
-`714` and accepts only a positive answer from `77E`, then restores functional
-addressing; there is no session change, SecurityAccess, RoutineControl, retry or other
-target, and it is never part of automatic connection traffic. It needs a live ready
-session, a stored vehicle selected for the current VIN and a VW Group manufacturer hint;
-otherwise the button is disabled with the reason and the core refuses without sending
-anything. A 2-byte answer is stored as `cluster_odometer` ((A·256+B)·10 km, with date,
-source "VW Kombiinstrument DID 2203 (experimentell)", classification COMMUNITY and
-hardware validation "pending"), separate from the PID `A6` value and never merged with it.
-The list shows the `A6` value when stored, otherwise the cluster value marked
-"Kombiinstrument · experimentell". Failures (no response, other responder, negative
-response with its NRC) are stored as `cluster_odometer_error` and keep stored values;
-other payload lengths stay raw and are shown as "nicht auswertbar". Recordings re-decode
-the action offline through `replay.vw.cluster.odometer`. The scaling and the default-session
-behaviour are unconfirmed until the vehicle check bundled into #178.
 
 A changed live signal selection is stored in the selected record (`selection`) and restored
 when that record is selected again (and after a process restart), without adapter traffic;
@@ -128,8 +92,20 @@ attempts resume when Bluetooth turns on (or when the app returns to the foregrou
 After an automatic connection only the existing initialization and inventory run, with the normal
 vehicle-record handling; no earlier job is repeated. A recording interrupted by the loss stays
 saved as a partial recording (`session_end` reason `error`); after the reconnection a new recording
-with the same profile starts. A test sequence is never restarted: its operating context must be
-stated again by the user.
+with the same profile starts.
+
+## Pending feedback
+
+Buttons whose action finishes asynchronously (recording start/stop, search, connect,
+disconnect, Diagnose jobs, export all, automatic export and connection, vehicle select/rename/delete)
+react at once (REQ-021): the button is disabled, shows a pending text ("Aufzeichnung wird gestartet …")
+with a progress indicator, and repeated taps start nothing. The state ends when the service snapshot
+shows the target state or a message for the action arrives; without either after the limit (connect 30 s,
+search 15 s, Diagnose jobs and export 60 s, everything else 10 s) the status line says "Keine Rückmeldung · <Aktion>"
+and the button is usable again; a late result still updates the display. The pending entries
+(`PendingActions`) live in `ObdService`, so they survive tab switches and Activity recreation; the pending
+text is the button's content description and is announced, as is the final state. The mapping from action to
+target state is the comment above the specs in `MainActivity`.
 
 ## Pending feedback
 
@@ -180,18 +156,6 @@ recreating the Activity or locking the screen. Reopening after process death
 requires a new connection; existing files remain available as partial recordings.
 
 ## Recording, privacy and desktop inspection
-
-Under **Aufnahmeprofil / Testsequenz**, select **Testlauf: EA189 Asche (ohne
-Sitzungswechsel)**. Choose either ignition on/engine off or idle and keep that state
-throughout the run. This is an operator report, not ECU-confirmed context. The fixed
-sequence records validated engine inventory, both ash candidate reads, the seven-value
-DPF comparison and a final normal RPM read. It then closes the recording automatically.
-Generic polling and manual jobs cannot interleave. Negative candidate replies are
-valid learning evidence, not proof that a session change is necessary. Manual stop,
-disconnect and errors remain distinct from completed execution; completion does not
-mean that the candidates or their units have been validated. Export and replay retain
-the context, progress and raw candidate evidence. The live learning gate remains
-[#182](https://github.com/frankherchet/obdentic/issues/182).
 
 Each saved recording has **Aufnahme löschen …**. Confirmation permanently deletes
 only the phone's internal file; exported copies remain. Stop an active recording
@@ -379,8 +343,7 @@ outputs private and publish only sanitized acceptance summaries.
 
 1. Search for Carly, connect, inspect initialization TX/RX and supported signals.
 2. Read real measurements, inventory and stored DTCs; verify responder attribution.
-3. Run the EA189 DPF job only on the intended vehicle; retain unsupported/negative
-   answers explicitly rather than treating them as zero values.
+3. Retain unsupported/negative answers explicitly rather than treating them as zero values.
 4. Record the drive profile while locked for at least five minutes. Stop it,
    export locally, replay on the phone and inspect the same file on the Mac.
 5. Disconnect, reconnect and test adapter power loss. The UI must not retain old

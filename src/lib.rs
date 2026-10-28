@@ -10,9 +10,7 @@ pub mod capture_replay;
 pub mod capture_report;
 pub mod capture_tui;
 pub mod diagnostic_job;
-pub mod dpf_report;
 pub mod dtc;
-pub mod ea189;
 pub mod ecu_identification;
 pub mod ecu_identification_discovery;
 pub mod effective_knowledge;
@@ -44,7 +42,6 @@ pub mod vehicle;
 pub mod vehicle_cache;
 pub mod vehicle_knowledge;
 pub mod vin_identity;
-pub(crate) mod vw_cluster;
 
 pub use identity::{
     decode_mode09_pid02, IdentityDecodeError, IdentitySource, Provenance, VehicleIdentity, Vin,

@@ -15,13 +15,12 @@ use obdentic::{
     capability::HardwareCapability,
     capture,
     capture_events::{
-        CaptureEvent, CaptureSubscription, DiagnosticJobStepStatus, DtcObservationFact,
-        DtcTransportOutcome, ReadTiming, SubscriptionFilterOutcome,
+        CaptureEvent, DiagnosticJobStepStatus, DtcObservationFact, DtcTransportOutcome,
+        SubscriptionFilterOutcome,
     },
     capture_format::{self, CaptureSender, CaptureSink},
-    capture_replay::CaptureReplay,
     capture_report, capture_tui,
-    diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus, KnownTarget},
+    diagnostic_job::{DiagnosticJob, DiagnosticScope, JobStatus},
     dtc,
     ecu_identification::EcuIdentificationPlan,
     ecu_identification_discovery, hex,
@@ -37,7 +36,7 @@ use obdentic::{
     },
     safety::{DtcReadKind, Operation, OperationRequest, SafetyPolicy},
     scheduler::{apply_runtime_event, ObservationPlan, Subscription, TelemetryScheduler},
-    subscription_policy::{ObservationRequest, PlanStatus, SubscriptionPolicy},
+    subscription_policy::SubscriptionPolicy,
     supported_signals,
     telemetry::TelemetryState,
     topology::EcuRole,
@@ -47,52 +46,10 @@ use std::{
     env,
     path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic diagnose ea189.dpf.probe --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle scan --adapter <CoreBluetooth UUID> | obdentic vehicle mode09 --adapter <CoreBluetooth UUID> | obdentic vehicle ecu-serials --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture --adapter <CoreBluetooth UUID> --profile <ea189-dpf|ea189-dpf-longitudinal> --record <capture.jsonl> --cycles <1..=1440> --interval-seconds <>=30> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic capture dpf-report <capture.jsonl>... | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
-
-const EA189_DPF_LONGITUDINAL_CONTEXT: [&str; 5] = [
-    "engine.rpm",
-    "vehicle.speed",
-    "engine.load",
-    "engine.maf",
-    "engine.coolant_temperature",
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ea189DpfTraceProfile {
-    DpfOnly,
-    Longitudinal,
-}
-
-impl Ea189DpfTraceProfile {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "ea189-dpf" => Some(Self::DpfOnly),
-            "ea189-dpf-longitudinal" => Some(Self::Longitudinal),
-            _ => None,
-        }
-    }
-
-    const fn cli_name(self) -> &'static str {
-        match self {
-            Self::DpfOnly => "ea189-dpf",
-            Self::Longitudinal => "ea189-dpf-longitudinal",
-        }
-    }
-
-    const fn capture_profile(self) -> &'static str {
-        match self {
-            Self::DpfOnly => "ea189.dpf.trace",
-            Self::Longitudinal => "ea189-dpf-longitudinal",
-        }
-    }
-
-    const fn includes_drive_context(self) -> bool {
-        matches!(self, Self::Longitudinal)
-    }
-}
+const USAGE: &str = "usage: obdentic signals | obdentic signals --adapter <CoreBluetooth UUID> --supported | obdentic scan | obdentic diagnose dtc.scan --adapter <CoreBluetooth UUID> [--record capture.jsonl] | obdentic vehicle identify --adapter <CoreBluetooth UUID> | obdentic vehicle discover --adapter <CoreBluetooth UUID> | obdentic vehicle refresh --adapter <CoreBluetooth UUID> | obdentic vehicle scan --adapter <CoreBluetooth UUID> | obdentic vehicle mode09 --adapter <CoreBluetooth UUID> | obdentic vehicle ecu-serials --adapter <CoreBluetooth UUID> | obdentic vehicle show | obdentic read <signal> --adapter <CoreBluetooth UUID> [--record recording.tsv] | obdentic capture --adapter <CoreBluetooth UUID> --profile <profile> --record <capture.jsonl> | obdentic capture inspect <capture.jsonl> | obdentic capture capability <capture.jsonl> | obdentic demo | obdentic replay <recording.tsv> | obdentic layout save engine-overview <layout.tsv> | obdentic tui demo [--layout layout.tsv] | obdentic tui replay <recording.tsv> [--layout layout.tsv] | obdentic tui capture <capture.jsonl> [--layout layout.tsv] | obdentic tui live --adapter <CoreBluetooth UUID> [--layout layout.tsv] [--record capture.jsonl]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -102,10 +59,6 @@ enum Command {
     },
     Scan,
     DiagnoseDtcScan {
-        adapter_id: String,
-        recording: Option<String>,
-    },
-    DiagnoseEa189DpfProbe {
         adapter_id: String,
         recording: Option<String>,
     },
@@ -136,14 +89,6 @@ enum Command {
     },
     CaptureInspect(String),
     CaptureCapability(String),
-    CaptureDpfReport(Vec<String>),
-    CaptureEa189DpfTrace {
-        adapter_id: String,
-        profile: Ea189DpfTraceProfile,
-        recording: String,
-        cycles: u16,
-        interval: Duration,
-    },
     Read {
         request: ReadRequest,
         adapter_id: String,
@@ -226,18 +171,6 @@ async fn run() -> Result<(), String> {
                 )
                 .await
             }
-            Command::DiagnoseEa189DpfProbe {
-                adapter_id,
-                recording,
-            } => {
-                run_diagnose_ea189_dpf_probe(
-                    &adapter_id,
-                    recording.as_deref().map(Path::new),
-                    &runtime,
-                    &mut runtime_state,
-                )
-                .await
-            }
             Command::VehicleIdentify { adapter_id } => {
                 run_vehicle_identify(&adapter_id, &runtime, &mut runtime_state).await
             }
@@ -280,25 +213,6 @@ async fn run() -> Result<(), String> {
                 let capture = capture_format::read(Path::new(&path))?;
                 print!("{}", capture_report::render_capability(&path, &capture));
                 Ok(())
-            }
-            Command::CaptureDpfReport(paths) => run_capture_dpf_report(&paths),
-            Command::CaptureEa189DpfTrace {
-                adapter_id,
-                profile,
-                recording,
-                cycles,
-                interval,
-            } => {
-                run_capture_ea189_dpf_trace(
-                    &adapter_id,
-                    profile,
-                    Path::new(&recording),
-                    cycles,
-                    interval,
-                    &runtime,
-                    &mut runtime_state,
-                )
-                .await
             }
             Command::Demo => {
                 show(&demo().await?);
@@ -1362,806 +1276,15 @@ async fn run_diagnose_dtc_scan_inner(
     }
 }
 
-#[derive(Clone, Copy)]
-struct Ea189DpfCaptureConfig<'a> {
-    profile: &'a str,
-    cycles: u16,
-    interval: Option<Duration>,
-    include_drive_context: bool,
-}
-
-async fn run_diagnose_ea189_dpf_probe(
-    adapter_id: &str,
-    recording: Option<&Path>,
-    runtime: &RuntimeClient,
-    state: &mut RuntimeState,
-) -> Result<(), String> {
-    run_ea189_dpf_capture(
-        adapter_id,
-        recording,
-        Ea189DpfCaptureConfig {
-            profile: "ea189.dpf.probe",
-            cycles: 1,
-            interval: None,
-            include_drive_context: false,
-        },
-        runtime,
-        state,
-    )
-    .await
-}
-
-async fn run_capture_ea189_dpf_trace(
-    adapter_id: &str,
-    trace_profile: Ea189DpfTraceProfile,
-    recording: &Path,
-    cycles: u16,
-    interval: Duration,
-    runtime: &RuntimeClient,
-    state: &mut RuntimeState,
-) -> Result<(), String> {
-    println!("capture profile  {}", trace_profile.cli_name());
-    println!("capture cycles   {cycles}");
-    println!("capture interval {} s after each cycle", interval.as_secs());
-    if trace_profile.includes_drive_context() {
-        println!(
-            "capture context  {}",
-            EA189_DPF_LONGITUDINAL_CONTEXT.join(", "),
-        );
-    }
-    println!("capture record   {}", recording.display());
-    println!("capture running  press Ctrl-C to stop after the active read");
-    run_ea189_dpf_capture(
-        adapter_id,
-        Some(recording),
-        Ea189DpfCaptureConfig {
-            profile: trace_profile.capture_profile(),
-            cycles,
-            interval: Some(interval),
-            include_drive_context: trace_profile.includes_drive_context(),
-        },
-        runtime,
-        state,
-    )
-    .await
-}
-
-async fn run_ea189_dpf_capture(
-    adapter_id: &str,
-    recording: Option<&Path>,
-    config: Ea189DpfCaptureConfig<'_>,
-    runtime: &RuntimeClient,
-    state: &mut RuntimeState,
-) -> Result<(), String> {
-    let profile = config.profile;
-    let started = Instant::now();
-    let recorder = recording.map(CaptureSink::open).transpose()?;
-    let sender = recorder.as_ref().map(CaptureSink::sender);
-    let result = async {
-        if sender.is_some() {
-            emit_capture_started(sender, Some(profile.into())).await?;
-            apply_runtime_event(
-                runtime,
-                state,
-                sender,
-                RuntimeEvent::recording(RecordingState::Active),
-            )
-            .await?;
-        }
-        run_diagnose_ea189_dpf_probe_inner(adapter_id, runtime, state, sender, started, config)
-            .await
-    }
-    .await;
-    let inactive = if sender.is_some() {
-        apply_runtime_event(
-            runtime,
-            state,
-            sender,
-            RuntimeEvent::recording(RecordingState::Inactive),
-        )
-        .await
-    } else {
-        Ok(())
-    };
-    let shutdown = finish_runtime(runtime, state, sender).await;
-    let stopped = emit_capture_event(
-        sender,
-        CaptureEvent::SessionStopped {
-            offset_us: started
-                .elapsed()
-                .as_micros()
-                .try_into()
-                .map_err(|_| "EA189 DPF capture duration exceeds supported range")?,
-        },
-    )
-    .await;
-    let recorded = match recorder {
-        Some(recorder) => recorder.close().await,
-        None => Ok(()),
-    };
-    result
-        .and(inactive)
-        .and(shutdown)
-        .and(stopped)
-        .and(recorded)
-}
-
-async fn run_diagnose_ea189_dpf_probe_inner(
-    adapter_id: &str,
-    runtime: &RuntimeClient,
-    state: &mut RuntimeState,
-    recorder: Option<&CaptureSender>,
-    started: Instant,
-    config: Ea189DpfCaptureConfig<'_>,
-) -> Result<(), String> {
-    let Ea189DpfCaptureConfig {
-        cycles,
-        interval,
-        include_drive_context,
-        ..
-    } = config;
-    let mapping = cached_engine_mapping(adapter_id).await?;
-    let target = mapping
-        .target()
-        .target()
-        .address()
-        .ok_or_else(|| "validated engine target is missing a concrete address".to_string())?;
-    let job = DiagnosticJob::ea189_dpf_probe(
-        KnownTarget::new(target.value()).map_err(|error| error.to_string())?,
-    );
-    let plan = job.plan();
-    let context = if include_drive_context {
-        longitudinal_context_plan(
-            &mapping,
-            interval.expect("longitudinal traces require an interval"),
-        )?
-    } else {
-        Vec::new()
-    };
-
-    for context_read in &context {
-        emit_capture_event(
-            recorder,
-            CaptureSubscription::new(
-                context_read.semantic,
-                context_read.requested_interval_us,
-                SubscriptionFilterOutcome::Scheduled,
-            )
-            .into_event(),
-        )
-        .await?;
-    }
-
-    apply_runtime_event(
-        runtime,
-        state,
-        recorder,
-        RuntimeEvent::source(SourceState::Live),
-    )
-    .await?;
-    apply_runtime_event(
-        runtime,
-        state,
-        recorder,
-        RuntimeEvent::vehicle(VehicleState::Identified),
-    )
-    .await?;
-    apply_runtime_event(
-        runtime,
-        state,
-        recorder,
-        RuntimeEvent::topology(TopologyState::Validated),
-    )
-    .await?;
-    apply_runtime_event(
-        runtime,
-        state,
-        recorder,
-        RuntimeEvent::transport(TransportState::Connecting),
-    )
-    .await?;
-    let prepared = ble::prepare_diagnostic_session(adapter_id).await?;
-    record_protocol_negotiation(recorder, prepared.negotiation()).await?;
-    apply_runtime_event(
-        runtime,
-        state,
-        recorder,
-        RuntimeEvent::transport(TransportState::Connected),
-    )
-    .await?;
-
-    if !include_drive_context {
-        apply_runtime_event(runtime, state, recorder, RuntimeEvent::DiagnosticJobStarted).await?;
-        emit_capture_event(recorder, CaptureEvent::diagnostic_job_started(&job)).await?;
-    }
-
-    let run_result = async {
-        let mut recoverable = false;
-        let mut completed_cycles = 0_u16;
-        let mut cancelled = false;
-        let mut cancellation = interval.map(|_| {
-            tokio::spawn(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-        });
-
-        while completed_cycles < cycles {
-            if cancellation
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
-            {
-                cancelled = true;
-                break;
-            }
-            if completed_cycles > 0 {
-                let delay = interval.expect("trace cycles require an interval");
-                println!("capture pause  {} s", delay.as_secs());
-                if let Some(cancellation) = &mut cancellation {
-                    cancelled = tokio::select! {
-                        _ = tokio::time::sleep(delay) => false,
-                        _ = cancellation => true,
-                    };
-                } else {
-                    tokio::time::sleep(delay).await;
-                }
-                if cancelled {
-                    break;
-                }
-            }
-            if cycles > 1 {
-                println!("capture cycle  {}/{}", completed_cycles + 1, cycles);
-            }
-
-            if include_drive_context {
-                let due_us = capture_offset_us(started)?;
-                cancelled = capture_longitudinal_context_cycle(
-                    &prepared,
-                    runtime,
-                    state,
-                    LongitudinalCycleContext {
-                        recorder,
-                        started,
-                        due_us,
-                        reads: &context,
-                        cancellation: cancellation.as_ref(),
-                    },
-                )
-                .await?;
-                if cancelled {
-                    break;
-                }
-                apply_runtime_event(runtime, state, recorder, RuntimeEvent::DiagnosticJobStarted)
-                    .await?;
-                emit_capture_event(recorder, CaptureEvent::diagnostic_job_started(&job)).await?;
-            }
-
-            let mut cycle_recoverable = false;
-            for step in plan.steps() {
-                if cancellation
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-                {
-                    cancelled = true;
-                    break;
-                }
-                let probe = step
-                    .dpf_probe()
-                    .ok_or_else(|| "EA189 DPF plan contains a non-probe step".to_string())?;
-                match SafetyPolicy::read_only().authorize_activity(
-                    Activity::Diagnose,
-                    OperationRequest::ea189_dpf_probe(probe, job_target(&job)?),
-                ) {
-                    Ok(Operation::Ea189DpfProbe(_)) => {}
-                    Ok(_) => {
-                        return Err(
-                            "read-only safety policy returned the wrong EA189 operation".into()
-                        )
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-                match prepared.read_dpf_probe(probe, &mapping).await {
-                    Ok(responses) => {
-                        let response = responses.as_slice().first().ok_or_else(|| {
-                            format!("{} returned no normalized response", probe.semantic())
-                        })?;
-                        let expected_responder = mapping.expected_responder().value();
-                        let responder_matches =
-                            response.responder.as_ref().is_some_and(|responder| {
-                                Some(responder.as_str()) == expected_responder
-                            });
-                        let status = if response.payload.starts_with(&[
-                            0x62,
-                            probe.request_bytes()[1],
-                            probe.request_bytes()[2],
-                        ]) && responder_matches
-                        {
-                            DiagnosticJobStepStatus::Success
-                        } else {
-                            recoverable = true;
-                            cycle_recoverable = true;
-                            DiagnosticJobStepStatus::Recoverable
-                        };
-                        let selected = responder_matches.then(|| {
-                            response
-                                .responder
-                                .as_ref()
-                                .expect("matching responder is present")
-                                .as_str()
-                                .to_owned()
-                        });
-                        emit_capture_event(
-                            recorder,
-                            CaptureEvent::responses_observed_at(
-                                probe.semantic(),
-                                probe.request_bytes().into(),
-                                responses.capture_evidence(),
-                                selected.clone(),
-                                (status != DiagnosticJobStepStatus::Success)
-                                    .then_some("unexpected_or_negative_uds_response".into()),
-                                capture_offset_us(started)?,
-                            )?,
-                        )
-                        .await?;
-                        emit_capture_event(
-                            recorder,
-                            CaptureEvent::diagnostic_job_step(
-                                job.id().to_string(),
-                                step.sequence()
-                                    .try_into()
-                                    .map_err(|_| "EA189 DPF step index exceeds u64")?,
-                                0x22,
-                                selected.clone(),
-                                status,
-                                (status != DiagnosticJobStepStatus::Success)
-                                    .then_some("negative_or_malformed_response".into()),
-                            )?,
-                        )
-                        .await?;
-                        println!(
-                            "probe\t{}\t{:04X}\t{}\t{}",
-                            probe.semantic(),
-                            probe.id(),
-                            selected.unwrap_or_else(|| "unknown".into()),
-                            hex(&response.payload),
-                        );
-                    }
-                    Err(error)
-                        if include_drive_context
-                            && obdentic::scheduler::is_fatal_runtime_error(&error) =>
-                    {
-                        emit_capture_event(
-                            recorder,
-                            CaptureEvent::diagnostic_job_step(
-                                job.id().to_string(),
-                                step.sequence()
-                                    .try_into()
-                                    .map_err(|_| "EA189 DPF step index exceeds u64")?,
-                                0x22,
-                                None,
-                                DiagnosticJobStepStatus::Fatal,
-                                Some("session_failed".into()),
-                            )?,
-                        )
-                        .await?;
-                        emit_capture_event(
-                            recorder,
-                            CaptureEvent::DiagnosticJobFailed {
-                                job_id: job.id().to_string(),
-                                error: "session_failed".into(),
-                            },
-                        )
-                        .await?;
-                        apply_runtime_event(
-                            runtime,
-                            state,
-                            recorder,
-                            RuntimeEvent::transport(TransportState::Unhealthy),
-                        )
-                        .await?;
-                        apply_runtime_event(
-                            runtime,
-                            state,
-                            recorder,
-                            RuntimeEvent::FatalRuntimeError,
-                        )
-                        .await?;
-                        return Err(error);
-                    }
-                    Err(error) => {
-                        recoverable = true;
-                        cycle_recoverable = true;
-                        emit_capture_event(
-                            recorder,
-                            CaptureEvent::diagnostic_job_step(
-                                job.id().to_string(),
-                                step.sequence()
-                                    .try_into()
-                                    .map_err(|_| "EA189 DPF step index exceeds u64")?,
-                                0x22,
-                                None,
-                                DiagnosticJobStepStatus::Recoverable,
-                                Some(error.clone()),
-                            )?,
-                        )
-                        .await?;
-                        println!(
-                            "probe\t{}\t{:04X}\terror\t{error}",
-                            probe.semantic(),
-                            probe.id()
-                        );
-                    }
-                }
-            }
-
-            if include_drive_context {
-                if cancelled {
-                    emit_capture_event(
-                        recorder,
-                        CaptureEvent::diagnostic_job_cancelled(job.id().to_string()),
-                    )
-                    .await?;
-                } else {
-                    emit_capture_event(
-                        recorder,
-                        CaptureEvent::DiagnosticJobCompleted {
-                            job_id: job.id().to_string(),
-                            status: if cycle_recoverable {
-                                JobStatus::CompletedWithErrors
-                            } else {
-                                JobStatus::Completed
-                            },
-                        },
-                    )
-                    .await?;
-                }
-                apply_runtime_event(
-                    runtime,
-                    state,
-                    recorder,
-                    RuntimeEvent::DiagnosticJobCompleted,
-                )
-                .await?;
-            }
-
-            if cancelled {
-                break;
-            }
-            completed_cycles += 1;
-        }
-
-        if let Some(cancellation) = cancellation {
-            cancellation.abort();
-        }
-
-        if include_drive_context {
-            Ok(())
-        } else {
-            if cancelled {
-                emit_capture_event(
-                    recorder,
-                    CaptureEvent::diagnostic_job_cancelled(job.id().to_string()),
-                )
-                .await?;
-            } else {
-                emit_capture_event(
-                    recorder,
-                    CaptureEvent::DiagnosticJobCompleted {
-                        job_id: job.id().to_string(),
-                        status: if recoverable {
-                            JobStatus::CompletedWithErrors
-                        } else {
-                            JobStatus::Completed
-                        },
-                    },
-                )
-                .await?;
-            }
-            finish_diagnostic(runtime, state, recorder).await
-        }
-    }
-    .await;
-
-    let shutdown = prepared.shutdown().await;
-    let disconnected = if include_drive_context
-        && state.phase() != obdentic::runtime_state::Phase::Fault
-        && state.phase() != obdentic::runtime_state::Phase::Stopped
-    {
-        apply_runtime_event(
-            runtime,
-            state,
-            recorder,
-            RuntimeEvent::transport(TransportState::Disconnected),
-        )
-        .await
-    } else {
-        Ok(())
-    };
-
-    run_result.and(shutdown).and(disconnected)
-}
-
-#[derive(Clone, Debug)]
-struct LongitudinalContextRead {
-    semantic: &'static str,
-    request: ReadRequest,
-    targeted: ble::TargetedReadRequest,
-    requested_interval_us: u64,
-}
-
-fn longitudinal_context_plan(
-    mapping: &EcuTargetMapping,
-    interval: Duration,
-) -> Result<Vec<LongitudinalContextRead>, String> {
-    if mapping.role().role() != &EcuRole::Engine {
-        return Err("EA189 longitudinal context requires a validated engine mapping".into());
-    }
-    let requested = EA189_DPF_LONGITUDINAL_CONTEXT
-        .iter()
-        .map(|semantic| ObservationRequest::new("ea189-dpf-longitudinal", *semantic, interval))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let policy = SubscriptionPolicy::new(HardwareCapability::conservative_default())
-        .plan(&requested, EA189_DPF_LONGITUDINAL_CONTEXT);
-    if policy
-        .entries()
-        .iter()
-        .any(|entry| entry.status() != PlanStatus::Accepted)
-    {
-        return Err("EA189 longitudinal context exceeds the conservative session budget".into());
-    }
-
-    let requested_interval_us = interval
-        .as_micros()
-        .try_into()
-        .map_err(|_| "EA189 longitudinal interval exceeds supported range")?;
-    let responder = mapping.expected_responder().value().ok_or_else(|| {
-        "EA189 longitudinal context requires an expected engine responder".to_string()
-    })?;
-
-    EA189_DPF_LONGITUDINAL_CONTEXT
-        .iter()
-        .map(|semantic| {
-            let request = prepare_read(semantic)?;
-            let request = match SafetyPolicy::read_only().authorize_activity(
-                Activity::Observe,
-                OperationRequest::read_signal_typed(request),
-            ) {
-                Ok(Operation::ReadSignal(request)) => request,
-                Ok(_) => {
-                    return Err(
-                        "read-only safety policy returned the wrong longitudinal operation".into(),
-                    )
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            let targeted = ble::TargetedReadRequest::new(
-                request,
-                mapping.target().target().clone(),
-                ble::ResponderIdentity::ElmHeader(responder.to_owned()),
-            )?;
-            Ok(LongitudinalContextRead {
-                semantic,
-                request,
-                targeted,
-                requested_interval_us,
-            })
-        })
-        .collect()
-}
-
-struct LongitudinalCycleContext<'a> {
-    recorder: Option<&'a CaptureSender>,
-    started: Instant,
-    due_us: u64,
-    reads: &'a [LongitudinalContextRead],
-    cancellation: Option<&'a tokio::task::JoinHandle<()>>,
-}
-
-async fn capture_longitudinal_context_cycle(
-    prepared: &ble::PreparedDiagnosticSession,
-    runtime: &RuntimeClient,
-    state: &mut RuntimeState,
-    cycle: LongitudinalCycleContext<'_>,
-) -> Result<bool, String> {
-    let LongitudinalCycleContext {
-        recorder,
-        started,
-        due_us,
-        reads,
-        cancellation,
-    } = cycle;
-    apply_runtime_event(runtime, state, recorder, RuntimeEvent::ObservationStarted).await?;
-    let mut cancelled = false;
-
-    for context_read in reads {
-        if cancellation.is_some_and(tokio::task::JoinHandle::is_finished) {
-            cancelled = true;
-            break;
-        }
-        apply_runtime_event(
-            runtime,
-            state,
-            recorder,
-            RuntimeEvent::ObservationReadStarted,
-        )
-        .await?;
-        let read_started_us = capture_offset_us(started)?;
-        let outcome = prepared
-            .read_targeted_with_evidence(context_read.targeted.clone())
-            .await;
-        let finished_us = capture_offset_us(started)?;
-        let timing = ReadTiming::new(due_us, read_started_us, finished_us);
-
-        match outcome {
-            Ok(ble::TargetedReadOutcome::Succeeded {
-                transaction,
-                observations,
-            }) => {
-                emit_longitudinal_response_observations(
-                    recorder,
-                    context_read,
-                    &observations,
-                    finished_us,
-                )
-                .await?;
-                emit_capture_event(
-                    recorder,
-                    CaptureEvent::read_succeeded_from_transaction(
-                        &transaction,
-                        context_read.requested_interval_us,
-                        timing,
-                    )?,
-                )
-                .await?;
-                apply_runtime_event(
-                    runtime,
-                    state,
-                    recorder,
-                    RuntimeEvent::ObservationReadCompleted,
-                )
-                .await?;
-                println!(
-                    "context\t{}\t{} {}",
-                    context_read.semantic,
-                    transaction.value(),
-                    transaction.unit()
-                );
-            }
-            Ok(ble::TargetedReadOutcome::Failed {
-                error,
-                observations,
-            }) => {
-                emit_longitudinal_response_observations(
-                    recorder,
-                    context_read,
-                    &observations,
-                    finished_us,
-                )
-                .await?;
-                emit_capture_event(
-                    recorder,
-                    CaptureEvent::read_failed(
-                        context_read.semantic,
-                        context_read.requested_interval_us,
-                        Some(timing),
-                        Some(context_read.request.bytes().into()),
-                        error.clone(),
-                    ),
-                )
-                .await?;
-                println!("context\t{}\terror\t{error}", context_read.semantic);
-                if obdentic::scheduler::is_fatal_runtime_error(&error) {
-                    apply_runtime_event(
-                        runtime,
-                        state,
-                        recorder,
-                        RuntimeEvent::transport(TransportState::Unhealthy),
-                    )
-                    .await?;
-                    apply_runtime_event(runtime, state, recorder, RuntimeEvent::FatalRuntimeError)
-                        .await?;
-                    return Err(error);
-                }
-                apply_runtime_event(
-                    runtime,
-                    state,
-                    recorder,
-                    RuntimeEvent::ObservationReadFailedRecoverable,
-                )
-                .await?;
-            }
-            Err(error) => {
-                emit_capture_event(
-                    recorder,
-                    CaptureEvent::read_failed(
-                        context_read.semantic,
-                        context_read.requested_interval_us,
-                        Some(timing),
-                        Some(context_read.request.bytes().into()),
-                        error.clone(),
-                    ),
-                )
-                .await?;
-                println!("context\t{}\terror\t{error}", context_read.semantic);
-                if obdentic::scheduler::is_fatal_runtime_error(&error) {
-                    apply_runtime_event(
-                        runtime,
-                        state,
-                        recorder,
-                        RuntimeEvent::transport(TransportState::Unhealthy),
-                    )
-                    .await?;
-                    apply_runtime_event(runtime, state, recorder, RuntimeEvent::FatalRuntimeError)
-                        .await?;
-                    return Err(error);
-                }
-                apply_runtime_event(
-                    runtime,
-                    state,
-                    recorder,
-                    RuntimeEvent::ObservationReadFailedRecoverable,
-                )
-                .await?;
-            }
-        }
-    }
-
-    if state.activity() == Activity::Observe {
-        apply_runtime_event(runtime, state, recorder, RuntimeEvent::ObservationStopped).await?;
-    }
-    Ok(cancelled)
-}
-
-async fn emit_longitudinal_response_observations(
-    recorder: Option<&CaptureSender>,
-    context_read: &LongitudinalContextRead,
-    observations: &[ble::TargetedReadObservation],
-    offset_us: u64,
-) -> Result<(), String> {
-    for observation in observations {
-        if observation.responses().is_empty() {
-            continue;
-        }
-        emit_capture_event(
-            recorder,
-            CaptureEvent::responses_observed_at(
-                context_read.semantic,
-                context_read.request.bytes().into(),
-                observation.responses().to_vec(),
-                observation.selected_responder().map(str::to_owned),
-                observation.selection_error().map(str::to_owned),
-                offset_us,
-            )?,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-fn capture_offset_us(started: Instant) -> Result<u64, String> {
-    started
-        .elapsed()
-        .as_micros()
-        .try_into()
-        .map_err(|_| "EA189 DPF capture duration exceeds supported range".into())
-}
-
-fn job_target(job: &DiagnosticJob) -> Result<KnownTarget, String> {
-    match job.scope() {
-        DiagnosticScope::KnownEcu { target, .. } => Ok(target.clone()),
-        _ => Err("EA189 DPF job lost its known engine target".into()),
-    }
-}
-
 async fn cached_engine_mapping(adapter_id: &str) -> Result<EcuTargetMapping, String> {
     let (mappings, cache_valid) = cached_routing_mappings(adapter_id).await;
     if !cache_valid {
-        return Err("EA189 DPF probe requires a validated engine mapping; run `obdentic vehicle discover --adapter <UUID>` first".into());
+        return Err("Mode 09 reads require a validated engine mapping; run `obdentic vehicle discover --adapter <UUID>` first".into());
     }
     mappings
         .into_iter()
         .find(|mapping| mapping.role().role() == &EcuRole::Engine)
-        .ok_or_else(|| "EA189 DPF probe requires a validated engine mapping; run `obdentic vehicle discover --adapter <UUID>` first".into())
+        .ok_or_else(|| "Mode 09 reads require a validated engine mapping; run `obdentic vehicle discover --adapter <UUID>` first".into())
 }
 
 async fn finish_diagnostic(
@@ -2853,83 +1976,6 @@ fn load_layout(path: Option<&str>) -> Result<tui::DashboardLayout, String> {
     )
 }
 
-fn run_capture_dpf_report(paths: &[String]) -> Result<(), String> {
-    let mut replays = Vec::with_capacity(paths.len());
-    for path in paths {
-        replays.push(CaptureReplay::from_capture(&capture_format::read(
-            Path::new(path),
-        )?));
-    }
-
-    for (path, replay) in paths.iter().zip(&replays) {
-        print!(
-            "{}",
-            render_dpf_report(
-                path,
-                &obdentic::dpf_report::DpfReport::from_replay(replay),
-                "Capture duration",
-            )
-        );
-    }
-    if replays.len() > 1 {
-        print!(
-            "{}",
-            render_dpf_report(
-                "across input order",
-                &obdentic::dpf_report::DpfReport::from_replays(&replays),
-                "Accumulated capture duration",
-            )
-        );
-    }
-    Ok(())
-}
-
-fn render_dpf_report(
-    label: &str,
-    report: &obdentic::dpf_report::DpfReport,
-    duration_label: &str,
-) -> String {
-    let mut output = format!(
-        "DPF report: {label}\nStatus: vehicle-specific experimental replay\n{duration_label}: {:.3} s\n",
-        report.duration_us() as f64 / 1_000_000.0,
-    );
-    if report.is_empty() {
-        output.push_str("No decodable experimental DPF readings.\n\n");
-        return output;
-    }
-    output.push_str("Signals\n");
-    for summary in report.summaries() {
-        let offsets = summary
-            .first_offset_us()
-            .zip(summary.last_offset_us())
-            .map(|(first, last)| {
-                format!(
-                    "; offsets: {:.3} s / {:.3} s",
-                    first as f64 / 1_000_000.0,
-                    last as f64 / 1_000_000.0,
-                )
-            })
-            .unwrap_or_default();
-        output.push_str(&format!(
-            "  {}\n    samples: {}; first/last: {:.3} / {:.3} {}; delta: {:+.3}; range: {:.3} .. {:.3}{}\n",
-            summary.semantic(),
-            summary.count(),
-            summary.first_value(),
-            summary.last_value(),
-            summary.unit(),
-            summary.delta(),
-            summary.min(),
-            summary.max(),
-            offsets,
-        ));
-    }
-    if label == "across input order" {
-        output.push_str("Input order compares snapshots; it is not a continuous DPF timeline.\n");
-    }
-    output.push('\n');
-    output
-}
-
 fn parse_command(args: &[String]) -> Result<Command, String> {
     match args {
         [command] if command == "signals" => Ok(Command::Signals),
@@ -2953,15 +1999,6 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 recording: None,
             })
         }
-        [command, job, adapter_flag, adapter_id]
-            if command == "diagnose" && job == "ea189.dpf.probe" && adapter_flag == "--adapter" =>
-        {
-            require_uuid(adapter_id)?;
-            Ok(Command::DiagnoseEa189DpfProbe {
-                adapter_id: adapter_id.clone(),
-                recording: None,
-            })
-        }
         [command, job, adapter_flag, adapter_id, record_flag, path]
             if command == "diagnose"
                 && job == "dtc.scan"
@@ -2970,18 +2007,6 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         {
             require_uuid(adapter_id)?;
             Ok(Command::DiagnoseDtcScan {
-                adapter_id: adapter_id.clone(),
-                recording: Some(path.clone()),
-            })
-        }
-        [command, job, adapter_flag, adapter_id, record_flag, path]
-            if command == "diagnose"
-                && job == "ea189.dpf.probe"
-                && adapter_flag == "--adapter"
-                && record_flag == "--record" =>
-        {
-            require_uuid(adapter_id)?;
-            Ok(Command::DiagnoseEa189DpfProbe {
                 adapter_id: adapter_id.clone(),
                 recording: Some(path.clone()),
             })
@@ -3050,35 +2075,11 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 recording: path.clone(),
             })
         }
-        [command, adapter_flag, adapter_id, profile_flag, profile, record_flag, path, cycles_flag, cycles, interval_flag, interval_seconds]
-            if command == "capture"
-                && Ea189DpfTraceProfile::parse(profile).is_some()
-                && adapter_flag == "--adapter"
-                && profile_flag == "--profile"
-                && record_flag == "--record"
-                && cycles_flag == "--cycles"
-                && interval_flag == "--interval-seconds" =>
-        {
-            require_uuid(adapter_id)?;
-            Ok(Command::CaptureEa189DpfTrace {
-                adapter_id: adapter_id.clone(),
-                profile: Ea189DpfTraceProfile::parse(profile)
-                    .expect("guard accepts only known EA189 trace profiles"),
-                recording: path.clone(),
-                cycles: parse_trace_cycles(cycles)?,
-                interval: Duration::from_secs(parse_trace_interval_seconds(interval_seconds)?),
-            })
-        }
         [command, action, path] if command == "capture" && action == "inspect" => {
             Ok(Command::CaptureInspect(path.clone()))
         }
         [command, action, path] if command == "capture" && action == "capability" => {
             Ok(Command::CaptureCapability(path.clone()))
-        }
-        [command, action, paths @ ..]
-            if command == "capture" && action == "dpf-report" && !paths.is_empty() =>
-        {
-            Ok(Command::CaptureDpfReport(paths.to_vec()))
         }
         [command, path] if command == "replay" => Ok(Command::Replay(path.clone())),
         [command, action, name, path]
@@ -3203,25 +2204,6 @@ fn require_uuid(value: &str) -> Result<(), String> {
     valid
         .then_some(())
         .ok_or_else(|| "adapter must be a CoreBluetooth UUID".into())
-}
-
-fn parse_trace_cycles(value: &str) -> Result<u16, String> {
-    let cycles = value
-        .parse::<u16>()
-        .map_err(|_| "EA189 DPF trace cycles must be an integer from 1 to 1440".to_string())?;
-    if cycles == 0 || cycles > 1_440 {
-        return Err("EA189 DPF trace cycles must be an integer from 1 to 1440".into());
-    }
-    Ok(cycles)
-}
-
-fn parse_trace_interval_seconds(value: &str) -> Result<u64, String> {
-    let seconds = value
-        .parse::<u64>()
-        .map_err(|_| "EA189 DPF trace interval must be at least 30 seconds".to_string())?;
-    (seconds >= 30)
-        .then_some(seconds)
-        .ok_or_else(|| "EA189 DPF trace interval must be at least 30 seconds".into())
 }
 
 fn render_signals() -> String {
@@ -3413,20 +2395,6 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_command(&args(&[
-                "diagnose",
-                "ea189.dpf.probe",
-                "--adapter",
-                uuid,
-                "--record",
-                "dpf.jsonl",
-            ])),
-            Ok(Command::DiagnoseEa189DpfProbe {
-                adapter_id: uuid.into(),
-                recording: Some("dpf.jsonl".into()),
-            })
-        );
-        assert_eq!(
             parse_command(&args(&["vehicle", "identify", "--adapter", uuid,])),
             Ok(Command::VehicleIdentify {
                 adapter_id: uuid.into(),
@@ -3478,18 +2446,6 @@ mod tests {
         assert_eq!(
             parse_command(&args(&[
                 "capture",
-                "dpf-report",
-                "drive.jsonl",
-                "idle.jsonl",
-            ])),
-            Ok(Command::CaptureDpfReport(vec![
-                "drive.jsonl".into(),
-                "idle.jsonl".into(),
-            ]))
-        );
-        assert_eq!(
-            parse_command(&args(&[
-                "capture",
                 "--adapter",
                 uuid,
                 "--profile",
@@ -3501,50 +2457,6 @@ mod tests {
                 adapter_id: uuid.into(),
                 profile: "engine-baseline".into(),
                 recording: "capture.jsonl".into(),
-            })
-        );
-        assert_eq!(
-            parse_command(&args(&[
-                "capture",
-                "--adapter",
-                uuid,
-                "--profile",
-                "ea189-dpf",
-                "--record",
-                "trace.jsonl",
-                "--cycles",
-                "120",
-                "--interval-seconds",
-                "60",
-            ])),
-            Ok(Command::CaptureEa189DpfTrace {
-                adapter_id: uuid.into(),
-                profile: Ea189DpfTraceProfile::DpfOnly,
-                recording: "trace.jsonl".into(),
-                cycles: 120,
-                interval: Duration::from_secs(60),
-            })
-        );
-        assert_eq!(
-            parse_command(&args(&[
-                "capture",
-                "--adapter",
-                uuid,
-                "--profile",
-                "ea189-dpf-longitudinal",
-                "--record",
-                "longitudinal.jsonl",
-                "--cycles",
-                "120",
-                "--interval-seconds",
-                "60",
-            ])),
-            Ok(Command::CaptureEa189DpfTrace {
-                adapter_id: uuid.into(),
-                profile: Ea189DpfTraceProfile::Longitudinal,
-                recording: "longitudinal.jsonl".into(),
-                cycles: 120,
-                interval: Duration::from_secs(60),
             })
         );
         assert_eq!(
@@ -3773,39 +2685,6 @@ mod tests {
         ));
     }
 
-    fn confirmed_engine_target_for_test() -> TargetMappingSnapshot {
-        let context = ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical);
-        let provenance = Provenance::new(
-            "targeted engine.rpm Mode 01 validation",
-            Confidence::Verified,
-        )
-        .unwrap();
-        TargetMappingSnapshot::new(
-            Some(RoleAssignment::new(EcuRole::Engine, provenance.clone())),
-            Some(ResponderIdentity::address(context.clone(), "7E8")),
-            RequestTarget::concrete(context, RequestAddress::new("elm-header", "7E0")),
-            provenance,
-        )
-    }
-
-    #[test]
-    fn longitudinal_context_is_explicit_policy_admitted_and_engine_targeted() {
-        let mapping = confirmed_engine_target_for_test()
-            .to_vehicle_knowledge_mapping()
-            .unwrap();
-        let plan = longitudinal_context_plan(&mapping, Duration::from_secs(30)).unwrap();
-        assert_eq!(
-            plan.iter().map(|entry| entry.semantic).collect::<Vec<_>>(),
-            EA189_DPF_LONGITUDINAL_CONTEXT,
-        );
-        assert!(plan.iter().all(|entry| {
-            entry.targeted.target().address().unwrap().value() == "7E0"
-                && entry.targeted.expected_responder().as_str() == "7E8"
-                && entry.requested_interval_us == 30_000_000
-        }));
-        assert!(longitudinal_context_plan(&mapping, Duration::from_millis(1)).is_err());
-    }
-
     #[test]
     fn rejects_missing_uuid_unknown_signal_and_extra_arguments() {
         assert_eq!(
@@ -3854,12 +2733,6 @@ mod tests {
             parse_command(&args(&["vehicle", "identify", "--adapter", "UUID"])),
             Err("adapter must be a CoreBluetooth UUID".into())
         );
-        for value in ["0", "1441", "not-a-number"] {
-            assert!(parse_trace_cycles(value).is_err());
-        }
-        for value in ["0", "29", "not-a-number"] {
-            assert!(parse_trace_interval_seconds(value).is_err());
-        }
         assert_eq!(
             parse_command(&args(&["vehicle", "identify", "--adapter"])),
             Err(USAGE.into())

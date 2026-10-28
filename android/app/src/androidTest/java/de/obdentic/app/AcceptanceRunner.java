@@ -50,7 +50,7 @@ public final class AcceptanceRunner extends Instrumentation {
             JSONObject state = service.snapshot();
             require("demo".equals(state.optString("mode")), "Demo must be visibly separate from live");
             require(state.getJSONArray("signals").length() == 50, "Expanded semantic catalog");
-            require(state.getJSONArray("profiles").length() >= 6, "Capture profiles and explicit EA189 profiles");
+            require(state.getJSONArray("profiles").length() == 4, "Standard capture profiles only");
             passed("Rust JNI library, real initialization/parser, signal and profile catalogs");
 
             service.setSignals(new JSONArray());waitIdle();
@@ -84,15 +84,10 @@ public final class AcceptanceRunner extends Instrumentation {
             require(vinIdentity.isNull("model")&&vinIdentity.isNull("engine"),"WMI must not guess model or engine");
             job("dtc.scan");
             require(service.snapshot().getJSONObject("diagnostics").toString().contains("P0133"), "Responder-scoped DTC decoding");
-            job("ea189.dpf.probe");
-            require(service.snapshot().getJSONObject("jobResult").optBoolean("ok"), "Seven closed DPF reads");
-            JSONArray dpf = service.snapshot().getJSONObject("jobResult").getJSONObject("data").getJSONArray("readings");
-            require(dpf.length()==7,"All seven DPF readings retained");
-            for(int i=0;i<dpf.length();i++) require(dpf.getJSONObject(i).has("value") && dpf.getJSONObject(i).optBoolean("experimental"),"Demo DPF decoder succeeds and stays experimental");
             capture(activity,"Diagnose","acceptance-diagnose.png");
             capture(activity,"Debug","acceptance-debug.png");
             capture(activity,"Adapter","acceptance-connection.png");
-            passed("Inventory, stored-DTC and bounded experimental DPF jobs");
+            passed("Inventory and stored-DTC jobs");
 
             service.startRecording("engine-drive");
             waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "recording start");
@@ -106,12 +101,8 @@ public final class AcceptanceRunner extends Instrumentation {
             deleteRecording("missing-"+System.nanoTime()+".jsonl","Aufnahme nicht gefunden");
             require(file.isFile(),"Rejected active, malformed and missing deletions preserve recording evidence");
             passed("Recording deletion rejects active files, malformed paths and missing files with clear errors");
-            job("ea189.extended.probe");
-            JSONArray extended=service.snapshot().getJSONObject("jobResult").getJSONObject("data").getJSONArray("readings");
-            require(extended.length()==15,"All closed EA189 additional readings retained");
-            for(int i=0;i<extended.length();i++)require(extended.getJSONObject(i).has("value")&&extended.getJSONObject(i).optBoolean("experimental"),"Additional EA189 decoder succeeds and stays experimental");
             capture(activity,"Diagnose","acceptance-diagnose.png");
-            FormatAcceptance.run(extended);passed("#216 EA189 values render rounded, German, with display units, raw status without unit, cylinders 1-4");
+            FormatAcceptance.run();passed("#216 decoded values render rounded, German and with display units");
             getUiAutomation().executeShellCommand("input keyevent 3").close();
             waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) == 0,"Activity clears keep-screen-on when paused");
             long backgrounded=file.length();
@@ -156,7 +147,6 @@ public final class AcceptanceRunner extends Instrumentation {
             service.openRecording(filename);
             waitFor(() -> "replay".equals(service.snapshot().optString("mode")) && !service.snapshot().optBoolean("busy"), "offline replay");
             require(service.snapshot().getJSONArray("values").length()>0,"Replay restores readings");
-            require(findValue(service.snapshot().getJSONArray("values"),"dpf.oil_ash_volume")!=null,"Replay restores new EA189 values");
             require("Volkswagen".equals(service.snapshot().getJSONObject("vehicle").getJSONObject("vin_identity").optString("make_hint")),"Offline replay derives manufacturer locally");
             deleteRecording(filename,"Im Replay geöffnete Aufzeichnung kann nicht gelöscht werden");
             require(file.isFile()&&filename.equals(service.snapshot().optString("replayFile")),"Loaded replay cannot be deleted");
@@ -166,7 +156,7 @@ public final class AcceptanceRunner extends Instrumentation {
             try {
                 JSONObject identity=new JSONObject(NativeCore.execute(core,"vin.describe","wvw00000000000000"));
                 require(identity.getJSONObject("data").getString("status").equals("identified"),"VIN helper never uses transport");
-                for(String action:new String[]{"dtc.clear","write","ATZ","uds.send"})
+                for(String action:new String[]{"dtc.clear","write","ATZ","uds.send","ea189.dpf.probe","replay.ea189.ash.probe","vw.cluster.odometer"})
                     require(!new JSONObject(NativeCore.execute(core,action,"")).optBoolean("ok"),"Reject " + action);
                 JSONObject stored = new JSONObject().put("semantic","engine.rpm").put("value",999999)
                     .put("response",new JSONArray().put(0x41).put(0x0c).put(0x0c).put(0x80));
@@ -177,26 +167,8 @@ public final class AcceptanceRunner extends Instrumentation {
 
             service.setDemo();
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"),"reconnect demo");
-            service.startRecording("ea189-extended");
-            waitFor(() -> !service.snapshot().optString("recording").isEmpty(),"additional EA189 recording profile");
-            String extendedFilename=service.snapshot().optString("recording");
-            waitFor(() -> findValue(service.snapshot().optJSONArray("values"),"dpf.oil_ash_volume")!=null,"explicit profile schedules additional readings");
-            service.stopRecording();
-            waitFor(() -> service.snapshot().optString("recording").isEmpty(),"additional EA189 recording stop");
-            require(service.snapshot().optJSONArray("selected").length()==0,"Stopping an OEM profile must not schedule OEM semantics as generic reads");
-            service.openRecording(extendedFilename);
-            waitFor(() -> "replay".equals(service.snapshot().optString("mode"))&&!service.snapshot().optBoolean("busy"),"additional profile replay");
-            require(service.snapshot().optJSONArray("selected").length()==0,"Replaying an OEM profile restores no generic polling selection");
-            require(findValue(service.snapshot().optJSONArray("values"),"dpf.oil_ash_volume")!=null,"Additional recording profile replay redecodes its readings");
-            service.setDemo();
-            waitFor(() -> "ready".equals(service.snapshot().optString("phase"))&&!service.snapshot().optBoolean("busy"),"return from OEM replay to demo");
-            JSONArray resumedSelection=service.snapshot().getJSONArray("selected");
-            for(int i=0;i<resumedSelection.length();i++){
-                boolean catalogued=false;
-                for(int j=0;j<catalog.length();j++)catalogued|=resumedSelection.optString(i).equals(catalog.getJSONObject(j).optString("semantic"));
-                require(catalogued,"Returning from OEM replay must retain only catalogued generic semantics");
-            }
-            passed("Explicit EA189 additional recording profile schedules a bounded job and stops cleanly");
+            legacyRecordingWithRemovedActions();
+            passed("#230 an old recording with removed actions opens in replay: unknown actions are skipped, standard readings restored, nothing is sent");
             File exportedCopy=new File(getTargetContext().getExternalFilesDir("acceptance"),"demo-recording.jsonl");
             service.deleteRecording(filename);
             waitFor(() -> ("Aufnahme endgültig gelöscht: "+filename).equals(service.snapshot().optString("message")),"completed recording deletion");
@@ -204,14 +176,12 @@ public final class AcceptanceRunner extends Instrumentation {
             require(exportedCopy.isFile()&&exportedCopy.length()>0,"Deleting an internal recording leaves its exported copy intact");
             require(!containsRecord(filename),"Deleted recording disappears from the listed recordings");
             passed("Completed recording is permanently deleted while its exported copy remains");
-            TestSequenceAcceptance.run(service,getTargetContext().getFilesDir());
-            passed("Finite ash sequence, operator context, raw candidate evidence, automatic completion, replay and manual stop");
             RecordingExportAcceptance.run(service,getTargetContext());
             passed("Recording export (REQ-018): copy/skip/conflict/partial-failure/unavailable-folder logic against a directory target, active recording excluded, byte-identical copies, originals untouched, opt-in automatic export after stop and disconnect, share intent with read-only provider URIs, unchanged permissions (system folder picker itself not driven)");
             VehicleRecordsAcceptance.run(service,(name,listText) -> showVehicles(activity,name,listText));
             passed("Known vehicles: VIN-keyed records, stored odometer, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
             ReconnectAcceptance.run(service,getTargetContext());
-            passed("Automatic connection (REQ-020): policy schedule 2/5/10/30 s and reset, known adapter stored/replaced app-private, retries only to the known address, manual disconnect/stop/demo/replay end attempts, switch default on and persisted, partial recording kept and same-profile continuation, test sequence never restarted, Bluetooth/permission off shows the reason and resumes, no job repeated; fake adapter link, no real BLE (direct GATT connect, engine start/stop and app restart remain for #178)");
+            passed("Automatic connection (REQ-020): policy schedule 2/5/10/30 s and reset, known adapter stored/replaced app-private, retries only to the known address, manual disconnect/stop/demo/replay end attempts, switch default on and persisted, partial recording kept and same-profile continuation, Bluetooth/permission off shows the reason and resumes, no job repeated; fake adapter link, no real BLE (direct GATT connect, engine start/stop and app restart remain for #178)");
             runOnMainSync(activity::recreate);
             SystemClock.sleep(1500);
             require("ready".equals(service.snapshot().optString("phase")),"Activity recreation preserves session");
@@ -240,6 +210,33 @@ public final class AcceptanceRunner extends Instrumentation {
         if (saved.get("known_address") instanceof String) editor.putString("known_address", (String) saved.get("known_address"));
         if (saved.get("auto") instanceof Boolean) editor.putBoolean("auto", (Boolean) saved.get("auto"));
         editor.commit();
+    }
+    /** #230: an old recording holding actions of removed features must open, skip them, restore standard readings and send nothing. */
+    private void legacyRecordingWithRemovedActions() throws Exception {
+        String name="legacy-removed-actions-"+System.nanoTime()+".jsonl";
+        File directory=new File(getTargetContext().getFilesDir(),"recordings"); directory.mkdirs();
+        File legacy=new File(directory,name);
+        String[] lines={
+            "{\"type\":\"session\",\"schema\":\"OBDENTIC-MOBILE\",\"version\":1,\"mode\":\"demo\",\"profile\":\"ea189-ash-test\",\"selected\":[],\"test_sequence\":{\"operator_context\":\"idle\",\"status\":\"running\"}}",
+            "{\"type\":\"test_sequence\",\"progress\":{\"status\":\"running\",\"step\":1}}",
+            "{\"type\":\"action\",\"action\":\"ea189.ash.probe\",\"argument\":\"\",\"result\":{\"ok\":true,\"data\":{\"readings\":[{\"candidate\":\"ash_volume_1153\"}]}}}",
+            "{\"type\":\"action\",\"action\":\"ea189.dpf.probe\",\"argument\":\"\",\"result\":{\"ok\":true,\"data\":{\"readings\":[{\"semantic\":\"dpf.soot_mass_calculated\",\"value\":1}]}}}",
+            "{\"type\":\"action\",\"action\":\"vw.cluster.odometer\",\"argument\":\"\",\"result\":{\"ok\":true,\"data\":{\"outcome\":\"value\",\"value_km\":12345}}}",
+            "{\"type\":\"action\",\"action\":\"read\",\"argument\":\"engine.rpm\",\"result\":{\"ok\":true,\"data\":{\"semantic\":\"engine.rpm\",\"response\":[65,12,12,128],\"value\":99999}}}",
+            "{\"type\":\"session_end\",\"reason\":\"completed\"}"};
+        java.nio.file.Files.write(legacy.toPath(),(String.join("\n",lines)+"\n").getBytes(StandardCharsets.UTF_8));
+        try {
+            service.openRecording(name);
+            waitFor(() -> "replay".equals(service.snapshot().optString("mode")) && !service.snapshot().optBoolean("busy"),"legacy replay");
+            JSONObject state=service.snapshot();
+            require(!state.optBoolean("replayPartial"),"legacy recording is not partial: "+state.optString("message"));
+            JSONObject rpm=findValue(state.optJSONArray("values"),"engine.rpm");
+            require(rpm!=null&&rpm.optDouble("value")==800.0,"standard reading of a legacy recording is re-decoded: "+rpm);
+            require(findValue(state.optJSONArray("values"),"dpf.soot_mass_calculated")==null,"removed readings are not restored");
+            require(state.optJSONArray("selected").length()==0,"legacy profile restores no polling selection");
+        } finally { legacy.delete(); }
+        service.setDemo();
+        waitFor(() -> "ready".equals(service.snapshot().optString("phase"))&&!service.snapshot().optBoolean("busy"),"return from legacy replay to demo");
     }
     private void job(String action) throws Exception {
         waitIdle(); service.runJob(action); waitIdle();

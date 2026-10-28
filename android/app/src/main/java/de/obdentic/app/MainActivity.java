@@ -42,7 +42,7 @@ public class MainActivity extends Activity {
      * REQ-021 action -> how its end is observed in the service snapshot (any service message after the tap, counted by messageSeq, also ends it:
      * that is the error or refusal text). Limits: connect 30 s, search 15 s, jobs and export 60 s, rest 10 s.
      *   rec.start  recording non-empty            rec.stop   recording empty
-     *   test.run   recording non-empty            scan       phase left "scanning" after its message
+     *   scan       phase left "scanning" after its message
      *   connect    phase ready/error, or refusal  disconnect message "Getrennt"
      *   job        busy false after its message   export.all message with the result
      *   auto.export autoExport flipped            auto.connect autoConnect flipped      auto.stop autoPending false
@@ -53,7 +53,6 @@ public class MainActivity extends Activity {
     private static final PendingActions.Spec
         REC_START=new PendingActions.Spec("rec.start","Aufzeichnung starten","Aufzeichnung wird gestartet …",10000,(n,b)->recording(n)||msg(n,b)),
         REC_STOP=new PendingActions.Spec("rec.stop","Aufzeichnung stoppen","Aufzeichnung wird gestoppt …",10000,(n,b)->!recording(n)||msg(n,b)),
-        TEST_RUN=new PendingActions.Spec("test.run","Testlauf starten","Testlauf wird gestartet …",10000,(n,b)->recording(n)||msg(n,b)),
         SCAN=new PendingActions.Spec("scan","Adapter suchen","Suche läuft …",15000,(n,b)->!"scanning".equals(n.optString("phase"))&&msg(n,b)),
         CONNECT=new PendingActions.Spec("connect","Verbinden","Verbinde …",30000,(n,b)->{String p=n.optString("phase");return p.equals("ready")||p.equals("error")||(msg(n,b)&&!n.optBoolean("busy")&&!p.equals("connecting"));}),
         DISCONNECT=new PendingActions.Spec("disconnect","Verbindung trennen","Trenne …",10000,MainActivity::msg),
@@ -153,7 +152,7 @@ public class MainActivity extends Activity {
         String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles");
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle");
-        if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile")+"|"+state.opt("testSequence")+"|"+state.opt("ashEvidence");
+        if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile");
         if(tab==3)key+="|"+(array("debug").length()==0);
         if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
         if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->scroll.scrollTo(0,y));}
@@ -185,24 +184,13 @@ public class MainActivity extends Activity {
         title("Diagnose","Lesende Aufträge · Ergebnisse bleiben lokal");
         LinearLayout c=card();note(c,"FAHRZEUG & FEHLERSPEICHER",ACCENT);
         job(c,"Fahrzeug und Steuergeräte erfassen","inventory");job(c,"Fehlercodes lesen","dtc.scan");
-        LinearLayout d=card();note(d,"EXPERIMENTELL · EA189 / DPF",0xffffca75);note(d,"Vorhandene DPF-Messgrößen abfragen. Verfügbarkeit und Interpretation hängen vom Fahrzeug ab.",MUTED);job(d,"DPF-Diagnose ausführen","ea189.dpf.probe");
-        LinearLayout extra=card();note(extra,"EXPERIMENTELL · EA189 ZUSATZWERTE",0xffffca75);
-        note(extra,"Nur für ein passendes EA189-Motorsteuergerät wählen. Zusätzliche Öl-, Ladedruck-, Kraftstoff- und Regenerationswerte sind noch nicht am Fahrzeug bestätigt. Statuszahlen bleiben ohne gesicherte Bedeutungszuordnung.",MUTED);
-        job(extra,"EA189-Zusatzwerte abfragen","ea189.extended.probe");
-        LinearLayout cluster=card();note(cluster,"EXPERIMENTELL · VW KOMBIINSTRUMENT",0xffffca75);
-        note(cluster,"Liest einmalig den km-Stand aus dem Kombiinstrument (eine Abfrage, ohne Sitzungswechsel). Die Umrechnung ist noch nicht am Fahrzeug bestätigt; der Wert steht getrennt vom OBD-km-Stand.",MUTED);
-        String blocker=ObdService.clusterOdometerBlocker(state);
-        actionButton(cluster,jobSpec("km-Stand aus Kombiinstrument lesen"),":"+ObdService.CLUSTER_ODOMETER,"km-Stand aus Kombiinstrument lesen",blocker==null&&!state.optBoolean("busy"),()->perform(jobSpec("km-Stand aus Kombiinstrument lesen"),":"+ObdService.CLUSTER_ODOMETER,()->service().runJob(ObdService.CLUSTER_ODOMETER)));
-        if(blocker!=null)note(cluster,blocker,0xffffca75);
-        showClusterResult(cluster);
 
         JSONObject vehicle=state.optJSONObject("vehicle");
         if(vehicle!=null&&vehicle.length()>0)showInventory(vehicle);
         JSONObject dtcs=state.optJSONObject("diagnostics");
         if(dtcs!=null&&dtcs.length()>0)showDtcs(dtcs);
-        JSONObject result=state.optJSONObject("jobResult");JSONObject data=result==null?null:result.optJSONObject("data");
-        if(data!=null&&data.optJSONArray("readings")!=null)showDpf(data.optJSONArray("readings"));
-        else if(result!=null&&result.length()>0&&!result.optBoolean("ok",true)&&!result.optString("error").isEmpty()){
+        JSONObject result=state.optJSONObject("jobResult");
+        if(result!=null&&result.length()>0&&!result.optBoolean("ok",true)&&!result.optString("error").isEmpty()){
             LinearLayout error=card();note(error,"AUFTRAG NICHT ABGESCHLOSSEN",0xffffa79c);note(error,result.optString("error"),TEXT);
         }
         if((vehicle==null||vehicle.length()==0)&&(dtcs==null||dtcs.length()==0)&&(result==null||result.length()==0))empty("Bereit für den ersten Auftrag","Verbinde den Adapter oder starte die Demo. Rohdaten und Antworten findest du unter Debug.");
@@ -227,18 +215,6 @@ public class MainActivity extends Activity {
         JSONArray signals=vehicle.optJSONArray("signals");if(signals!=null){int supported=0;for(int i=0;i<signals.length();i++)if("supported".equals(signals.optJSONObject(i).optString("status")))supported++;note(c,"Messwerte unterstützt: "+supported+" von "+signals.length(),MUTED);}
         if(vehicle.optBoolean("engine_target_validated"))note(c,"Motorsteuergerät gezielt geprüft",MUTED);
     }
-    /** REQ-016.4/.5/.8: the last cluster job result, with its source and validation state. */
-    private void showClusterResult(LinearLayout card){
-        JSONObject result=state.optJSONObject("jobResult"),data=result==null?null:result.optJSONObject("data");
-        if(data==null||!"vehicle.odometer.cluster".equals(data.optString("semantic")))return;
-        String outcome=data.optString("outcome");
-        if(outcome.equals("value"))note(card,km(data.optDouble("value_km"))+" · experimentell, ungeprüft",TEXT);
-        else if(outcome.equals("unparseable_length"))note(card,"nicht auswertbar · Rohantwort bleibt in Debug und Aufnahme erhalten",0xffffa79c);
-        else if(outcome.equals("negative_response"))note(card,"Vom Kombiinstrument abgelehnt · "+data.optString("error"),0xffffa79c);
-        else note(card,"Nicht gelesen · "+data.optString("error","Keine Antwort"),0xffffa79c);
-        smallNote(card,data.optString("source")+" · "+data.optString("classification")+" · "+hardwareValidation(data.optString("hardware_validation")),MUTED);
-    }
-    private static String hardwareValidation(String value){return value.equals("pending")?"Hardware-Validierung ausstehend":"Hardware-Validierung: "+value;}
     private void showDtcs(JSONObject dtcs){
         LinearLayout c=card();note(c,"GESPEICHERTE FEHLERCODES",ACCENT);JSONArray observations=dtcs.optJSONArray("observations");
         if(observations==null||observations.length()==0)note(c,"Keine Steuergeräte-Antworten",MUTED);
@@ -250,30 +226,18 @@ public class MainActivity extends Activity {
         }
         JSONArray errors=dtcs.optJSONArray("errors");if(errors!=null)for(int i=0;i<errors.length();i++){JSONObject item=errors.optJSONObject(i);if(item!=null)note(c,displayResponder(item.optString("responder",""))+" · "+item.optString("error","Antwortfehler"),0xffffa79c);}
     }
-    private void showDpf(JSONArray readings){
-        LinearLayout c=card();note(c,"EA189-MESSWERTE · EXPERIMENTELL",0xffffca75);
-        for(JSONObject reading:MeasurementFormat.sortReadings(readings)){String semantic=reading.optString("semantic");note(c,dpfLabel(semantic),MUTED);String error=reading.optString("error","");
-            note(c,error.isEmpty()?MeasurementFormat.formatReading(reading):"Nicht verfügbar · "+error,error.isEmpty()?TEXT:0xffffa79c);
-            if(reading.has("provenance"))smallNote(c,reading.optString("provenance"),0xff8297ad);
-        }
-    }
     private String displayResponder(String responder){return responder.isEmpty()?"Unbekannter Responder":responder;}
-    private String dpfLabel(String semantic){switch(semantic){case "dpf.soot_mass_calculated":return "Berechnete Rußmasse";case "dpf.soot_mass_measured":return "Gemessene Rußmasse";case "dpf.distance_since_regeneration":return "Strecke seit Regeneration";case "dpf.time_since_regeneration":return "Zeit seit Regeneration";case "exhaust.temperature.pre_dpf":return "Abgastemperatur vor DPF (Zuordnung experimentell)";case "exhaust.temperature.post_dpf":return "Abgastemperatur nach DPF (Zuordnung experimentell)";case "dpf.differential_pressure":return "Differenzdruck am DPF";case "dpf.oil_ash_volume":return "Öl-Aschevolumen";case "dpf.fuel_consumption_since_regeneration":return "Kraftstoff seit letzter Regeneration";case "dpf.field_regeneration_request_status":return "Regenerationsanforderung · Rohstatus";case "dpf.service_regeneration_status":return "Service-Regeneration · Rohstatus";case "dpf.field_regeneration_lock_status":return "Regenerationssperre · Rohstatus";case "engine.boost_pressure_actual":return "Ladedruck Ist";case "engine.boost_pressure_commanded":return "Ladedruck Soll";case "engine.oil_temperature":return "Motoröltemperatur";case "engine.fuel_temperature":return "Kraftstofftemperatur";case "engine.rail_pressure_actual":return "Raildruck Ist";case "engine.rail_pressure_commanded":return "Raildruck Soll";case "engine.injector_deviation.cylinder_1":return "Einspritzmengenabweichung Zylinder 1";case "engine.injector_deviation.cylinder_2":return "Einspritzmengenabweichung Zylinder 2";case "engine.injector_deviation.cylinder_3":return "Einspritzmengenabweichung Zylinder 3";case "engine.injector_deviation.cylinder_4":return "Einspritzmengenabweichung Zylinder 4";default:return semantic;}}
     private void job(LinearLayout parent,String label,String action){PendingActions.Spec spec=jobSpec(label);actionButton(parent,spec,":"+action,label,canRun(),()->perform(spec,":"+action,()->service().runJob(action)));}
     private boolean canRun(){String mode=state.optString("mode");return !state.optBoolean("busy")&&!mode.equals("replay")&&(mode.equals("demo")||state.optString("phase").equals("ready"));}
     private void recordings(){
         title("Aufnahmen","Lokal sichern · später ohne Auto untersuchen");
         JSONArray profiles=array("profiles");if(profile.isEmpty()&&profiles.length()>0)profile=profiles.optJSONObject(0).optString("id");
         JSONObject chosen=new JSONObject();for(int i=0;i<profiles.length();i++)if(profile.equals(profiles.optJSONObject(i).optString("id")))chosen=profiles.optJSONObject(i);
-        LinearLayout c=card();note(c,"AUFNAHMEPROFIL / TESTSEQUENZ",ACCENT);addButton(c,profile.isEmpty()?"Profil auswählen":chosen.optString("title",profile),this::chooseProfile);
-        if(profile.equals(TestSequence.PROFILE))note(c,"Einmaliger Test: Motorsteuergerät prüfen → beide Asche-Kandidaten lesen → DPF-Vergleich → Drehzahl prüfen. Stoppt automatisch. Antworten bleiben experimentelle Rohdaten; es erfolgt kein Sitzungswechsel.",MUTED);
+        LinearLayout c=card();note(c,"AUFNAHMEPROFIL",ACCENT);addButton(c,profile.isEmpty()?"Profil auswählen":chosen.optString("title",profile),this::chooseProfile);
         boolean running=!state.optString("recording").isEmpty();
-        boolean test=profile.equals(TestSequence.PROFILE);String selectedProfile=profile;
-        actionButton(c,running?REC_STOP:test?TEST_RUN:REC_START,"",running?"Aufzeichnung stoppen":test?"Testlauf vorbereiten …":"Aufzeichnung starten",running||canRun(),()->{if(running)perform(REC_STOP,"",()->service().stopRecording());else if(test)prepareTestSequence();else perform(REC_START,"",()->service().startRecording(selectedProfile));});
+        String selectedProfile=profile;
+        actionButton(c,running?REC_STOP:REC_START,"",running?"Aufzeichnung stoppen":"Aufzeichnung starten",running||canRun(),()->{if(running)perform(REC_STOP,"",()->service().stopRecording());else perform(REC_START,"",()->service().startRecording(selectedProfile));});
         note(c,running?"● "+state.optString("recording"):"Aufzeichnungen enthalten möglicherweise Fahrzeugkennungen. Export erfolgt nur auf deine ausdrückliche Auswahl.",running?ACCENT:MUTED);
-        JSONObject sequence=state.optJSONObject("testSequence");
-        if(sequence!=null&&sequence.length()>0){note(c,sequence.optString("context_label")+" · selbst angegeben",MUTED);String outcome=sequence.optString("status");note(c,outcome.equals("running")?"Schritt "+sequence.optInt("step")+" / "+sequence.optInt("total")+" · "+sequence.optString("label"):outcome.equals("completed")?"Testlauf aufgezeichnet · Auswertung offen":outcome.equals("incomplete")?"Unvollständige Aufnahme · Testlauf nicht abgeschlossen":"Testlauf abgebrochen · Teilaufnahme gesichert",outcome.equals("aborted")||outcome.equals("incomplete")?0xffffa79c:ACCENT);}
-        JSONObject ash=state.optJSONObject("ashEvidence");if(ash!=null&&ash.optJSONArray("readings")!=null)showAshEvidence(ash.optJSONArray("readings"));
         exportCard();
         JSONArray records=array("records");if(records.length()==0)empty("Noch keine Aufnahmen","Starte eine Aufzeichnung im Live- oder Demomodus. Die Dateien bleiben auf diesem Handy.");
         for(int i=0;i<records.length();i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");LinearLayout item=card();note(item,name,TEXT);note(item,record.optLong("bytes")+" Bytes",MUTED);addButton(item,"Als Replay öffnen",()->act(()->{service().openRecording(name);tab=0;buildNav();structure="";}));addButton(item,"Datei exportieren …",()->export(name));Button delete=addButton(item,"Aufnahme löschen …",()->confirmDeleteRecording(name));delete.setEnabled(!name.equals(state.optString("recording"))&&!name.equals(state.optString("replayFile")));}
@@ -305,23 +269,6 @@ public class MainActivity extends Activity {
         if(names.isEmpty()){toast("Keine abgeschlossenen Aufnahmen");return;}
         try{startActivity(Intent.createChooser(RecordingExporter.share(this,names),"Aufnahmen teilen"));}catch(Exception e){toast("Teilen nicht möglich: "+e.getMessage());}
     }
-    private void showAshEvidence(JSONArray readings){
-        LinearLayout evidence=card();note(evidence,"ASCHE-KANDIDATEN · AUSWERTUNG OFFEN",ACCENT);
-        for(int i=0;i<readings.length();i++){
-            JSONObject reading=readings.optJSONObject(i);if(reading==null)continue;
-            note(evidence,reading.optString("candidate").equals("ash_volume_1153")?"Aschevolumen-Kandidat · 1153":"Aschemassen-Kandidat · 178C",TEXT);
-            String outcome=reading.optString("outcome");
-            note(evidence,outcome.equals("positive_candidate")?"Antwort empfangen · Einheit und Skalierung noch zu prüfen":outcome.equals("negative_response")?"Vom Steuergerät abgelehnt · "+reading.optString("nrc"):"Nicht verfügbar · "+reading.optString("error","Keine auswertbare Antwort"),outcome.equals("positive_candidate")?MUTED:0xffffca75);
-        }
-        smallNote(evidence,"Originalantworten bleiben in der Aufnahme und unter Debug erhalten. Die Kandidaten werden nicht als bestätigte Aschewerte angezeigt.",MUTED);
-    }
-    private void prepareTestSequence(){
-        String[] labels={"Zündung an · Motor aus","Motor im Leerlauf"};String[] contexts={"engine_off","idle"};
-        new AlertDialog.Builder(this).setTitle("Betriebszustand für diesen Testlauf").setItems(labels,(dialog,which)->{
-            String selectedProfile=profile;
-            new AlertDialog.Builder(this).setTitle("Asche-Testlauf starten?").setMessage(labels[which]+"\n\nBitte diesen Zustand während des gesamten Testlaufs beibehalten. Deine Angabe wird zusammen mit den Messantworten gespeichert. Der Test endet automatisch; nicht verfügbare Werte bleiben als Ergebnis erhalten.").setPositiveButton("Testlauf starten",(d,w)->perform(TEST_RUN,"",()->service().startRecording(selectedProfile,contexts[which]))).setNegativeButton("Abbrechen",null).show();
-        }).setNegativeButton("Abbrechen",null).show();
-    }
     private JSONObject vehicleStore(){JSONObject v=state.optJSONObject("vehicles");return v==null?new JSONObject():v;}
     private JSONObject selectedVehicle(){JSONObject store=vehicleStore();JSONArray rows=store.optJSONArray("vehicles");String selected=store.optString("selected");if(rows!=null)for(int i=0;i<rows.length();i++)if(selected.equals(rows.optJSONObject(i).optString("vin")))return rows.optJSONObject(i);return null;}
     private static String formatDate(long millis){return new java.text.SimpleDateFormat("dd.MM.yyyy",java.util.Locale.GERMANY).format(new java.util.Date(millis));}
@@ -342,11 +289,9 @@ public class MainActivity extends Activity {
             addButton(c,"Details",()->showVehicle(row));actionButton(c,VEHICLE_RENAME,":"+vin,"Umbenennen …",true,()->renameVehicle(vin,name));actionButton(c,VEHICLE_DELETE,":"+vin,"Löschen …",true,()->confirmDeleteVehicle(vin,name));
         }
     }
-    /** REQ-016.6: PID A6 wins; otherwise the cluster value marked experimental; never merged or corrected. */
     static String odometerListText(JSONObject row){
-        JSONObject a6=row.optJSONObject("odometer"),cluster=row.optJSONObject("cluster_odometer");
+        JSONObject a6=row.optJSONObject("odometer");
         if(a6!=null)return km(a6.optDouble("km"))+" · "+formatDate(a6.optLong("read_at"));
-        if(cluster!=null)return km(cluster.optDouble("km"))+" · Kombiinstrument · experimentell · "+formatDate(cluster.optLong("read_at"));
         return "km-Stand nicht verfügbar";
     }
     private void showVehicle(JSONObject row){
@@ -363,9 +308,6 @@ public class MainActivity extends Activity {
         m.append("\nkm-Stand: ").append(odometer==null?"nicht verfügbar":km(odometer.optDouble("km"))+" (Quelle: "+odometer.optString("source")+", gelesen "+formatDate(odometer.optLong("read_at"))+")");
         if(failure!=null)m.append("\nLetzter Leseversuch fehlgeschlagen: ").append(failure.optString("error")).append(" (").append(formatDate(failure.optLong("at"))).append(")");
         if(decrease!=null)m.append("\nNiedriger als zuvor gelesen: ").append(km(decrease.optDouble("previous_km"))).append(" am ").append(formatDate(decrease.optLong("previous_at")));
-        JSONObject cluster=row.optJSONObject("cluster_odometer"),clusterFailure=row.optJSONObject("cluster_odometer_error");
-        if(cluster!=null)m.append("\nkm-Stand Kombiinstrument (experimentell): ").append(km(cluster.optDouble("km"))).append(" (Quelle: ").append(cluster.optString("source")).append(" · ").append(cluster.optString("classification")).append(" · ").append(hardwareValidation(cluster.optString("hardware_validation"))).append(", gelesen ").append(formatDate(cluster.optLong("read_at"))).append(")");
-        if(clusterFailure!=null)m.append("\nLetzter Kombiinstrument-Versuch fehlgeschlagen: ").append(clusterFailure.optString("error")).append(clusterFailure.has("raw")?" · Rohdaten: "+clusterFailure.optString("raw"):"").append(" (").append(formatDate(clusterFailure.optLong("at"))).append(")");
         m.append("\nErste Verbindung: ").append(formatDate(row.optLong("first_connected"))).append("\nLetzte Verbindung: ").append(formatDate(row.optLong("last_connected")));
         return m.toString();
     }
@@ -445,7 +387,7 @@ public class MainActivity extends Activity {
     private void collectHistory(){JSONArray values=array("values");String mode=state.optString("mode");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic"),stamp=mode+v.optString("updatedAt")+v.optString("value");if(stamp.equals(lastSamples.get(id)))continue;lastSamples.put(id,stamp);JSONArray recordedHistory=v.optJSONArray("history");if(recordedHistory!=null){ArrayList<Float> restored=new ArrayList<>();for(int j=0;j<recordedHistory.length();j++){JSONObject sample=recordedHistory.optJSONObject(j);if(sample!=null&&Double.isFinite(sample.optDouble("value",Double.NaN)))restored.add((float)sample.optDouble("value"));}histories.put(id,restored);continue;}double number=v.optDouble("value",Double.NaN);if(!Double.isFinite(number))continue;ArrayList<Float> h=histories.get(id);if(h==null){h=new ArrayList<>();histories.put(id,h);}h.add((float)number);while(h.size()>90)h.remove(0);}}
     private void updateValues(){JSONArray values=array("values");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic");TextView target=valueViews.get(id);if(target==null)continue;String error=v.optString("error","");String value=v.has("value")?MeasurementFormat.formatReading(v):MeasurementFormat.formatMeasurement(v.optString("text","—"),v.optString("unit"));long age=Math.max(0,(System.currentTimeMillis()-v.optLong("updatedAt",System.currentTimeMillis()))/1000);boolean replay=state.optString("mode").equals("replay"),stale=age>10&&!replay;target.setText(error.isEmpty()?value:"Nicht verfügbar");target.setTextColor(error.isEmpty()&&!stale?TEXT:0xffffca75);target.setContentDescription(signalLabel(id,signal(id))+": "+target.getText()+(error.isEmpty()?"":". "+error));TextView freshness=freshnessViews.get(id);if(freshness!=null)freshness.setText(!error.isEmpty()?error:replay?"Aus gespeicherter Aufnahme":age<2?"Gerade aktualisiert":(stale?"Letzter Wert · ":"Aktualisiert · ")+"vor "+age+" s");SparklineView graph=graphViews.get(id);if(graph!=null)graph.setValues(histories.get(id));}}
     private JSONObject signal(String id){JSONArray signals=array("signals");for(int i=0;i<signals.length();i++){JSONObject s=signals.optJSONObject(i);if(s!=null&&s.optString("semantic").equals(id))return s;}JSONObject fallback=new JSONObject();try{fallback.put("semantic",id);fallback.put("title",id);}catch(Exception ignored){}return fallback;}
-    private String signalLabel(String id,JSONObject signal){switch(id){case "engine.rpm":return "Motordrehzahl";case "engine.coolant_temperature":return "Kühlmitteltemperatur";case "vehicle.speed":return "Fahrzeuggeschwindigkeit";case "engine.maf":return "Luftmassenstrom";case "engine.load":return "Motorlast";case "engine.intake_manifold_pressure":return "Saugrohrdruck";case "engine.intake_air_temperature":return "Ansauglufttemperatur";case "engine.egr.commanded":return "AGR-Ansteuerung";case "engine.egr.error":return "AGR-Abweichung";case "engine.runtime":return "Motorlaufzeit seit Start";case "vehicle.accelerator_pedal_d":return "Gaspedalstellung D";case "vehicle.accelerator_pedal_e":return "Gaspedalstellung E";case "engine.relative_throttle":return "Relative Drosselklappenstellung";case "engine.barometric_pressure":return "Umgebungsdruck";case "engine.control_module_voltage":return "Steuergerätspannung";case "engine.throttle_position":return "Drosselklappenstellung";case "vehicle.distance_with_mil_on":return "Strecke mit Motorkontrollleuchte";case "engine.fuel_rail_gauge_pressure":return "Kraftstoffrail-Druck";case "vehicle.warmups_since_dtc_clear":return "Warmläufe seit Fehlerlöschung";case "vehicle.distance_since_dtc_clear":return "Strecke seit Fehlerlöschung";case "vehicle.ambient_air_temperature":return "Außentemperatur";case "engine.throttle_actuator.commanded":return "Sollwert Drosselklappensteller";case "engine.short_term_fuel_trim_bank1":return "Kurzzeit-Kraftstoffkorrektur Bank 1";case "engine.long_term_fuel_trim_bank1":return "Langzeit-Kraftstoffkorrektur Bank 1";case "engine.short_term_fuel_trim_bank2":return "Kurzzeit-Kraftstoffkorrektur Bank 2";case "engine.long_term_fuel_trim_bank2":return "Langzeit-Kraftstoffkorrektur Bank 2";case "engine.fuel_rail_gauge_pressure_low":return "Niederdruck-Kraftstoffdruck";case "engine.timing_advance":return "Zündwinkel";case "engine.fuel_rail_pressure_relative":return "Raildruck relativ zum Saugrohr";case "engine.evap_purge_commanded":return "Tankentlüftung Soll";case "vehicle.fuel_tank_level":return "Tankfüllstand";case "engine.catalyst_temperature_b1s1":return "Katalysatortemperatur Bank 1 Sensor 1";case "engine.catalyst_temperature_b2s1":return "Katalysatortemperatur Bank 2 Sensor 1";case "engine.catalyst_temperature_b1s2":return "Katalysatortemperatur Bank 1 Sensor 2";case "engine.catalyst_temperature_b2s2":return "Katalysatortemperatur Bank 2 Sensor 2";case "engine.absolute_load":return "Absolute Motorlast";case "engine.commanded_equivalence_ratio":return "Gemisch-Äquivalenzverhältnis Soll";case "engine.throttle_position_b":return "Drosselklappenstellung B";case "engine.throttle_position_c":return "Drosselklappenstellung C";case "vehicle.accelerator_pedal_f":return "Gaspedalstellung F";case "engine.ethanol_fuel_percentage":return "Ethanolanteil";case "engine.fuel_rail_pressure_absolute":return "Absoluter Kraftstoffrail-Druck";case "vehicle.relative_accelerator_pedal_position":return "Relative Gaspedalstellung";case "engine.oil_temperature":return "Motoröltemperatur";case "engine.fuel_injection_timing":return "Einspritzzeitpunkt";case "engine.fuel_rate":return "Kraftstoffverbrauch pro Stunde";case "engine.driver_demand_torque_percent":return "Fahrerdrehmomentwunsch";case "engine.actual_torque_percent":return "Tatsächliches Motordrehmoment";case "engine.reference_torque":return "Referenzdrehmoment";default:String experimental=dpfLabel(id);if(!experimental.equals(id))return experimental;String label=signal.optString("title","");return label.isEmpty()?"Messwert":label;}}
+    private String signalLabel(String id,JSONObject signal){switch(id){case "engine.rpm":return "Motordrehzahl";case "engine.coolant_temperature":return "Kühlmitteltemperatur";case "vehicle.speed":return "Fahrzeuggeschwindigkeit";case "engine.maf":return "Luftmassenstrom";case "engine.load":return "Motorlast";case "engine.intake_manifold_pressure":return "Saugrohrdruck";case "engine.intake_air_temperature":return "Ansauglufttemperatur";case "engine.egr.commanded":return "AGR-Ansteuerung";case "engine.egr.error":return "AGR-Abweichung";case "engine.runtime":return "Motorlaufzeit seit Start";case "vehicle.accelerator_pedal_d":return "Gaspedalstellung D";case "vehicle.accelerator_pedal_e":return "Gaspedalstellung E";case "engine.relative_throttle":return "Relative Drosselklappenstellung";case "engine.barometric_pressure":return "Umgebungsdruck";case "engine.control_module_voltage":return "Steuergerätspannung";case "engine.throttle_position":return "Drosselklappenstellung";case "vehicle.distance_with_mil_on":return "Strecke mit Motorkontrollleuchte";case "engine.fuel_rail_gauge_pressure":return "Kraftstoffrail-Druck";case "vehicle.warmups_since_dtc_clear":return "Warmläufe seit Fehlerlöschung";case "vehicle.distance_since_dtc_clear":return "Strecke seit Fehlerlöschung";case "vehicle.ambient_air_temperature":return "Außentemperatur";case "engine.throttle_actuator.commanded":return "Sollwert Drosselklappensteller";case "engine.short_term_fuel_trim_bank1":return "Kurzzeit-Kraftstoffkorrektur Bank 1";case "engine.long_term_fuel_trim_bank1":return "Langzeit-Kraftstoffkorrektur Bank 1";case "engine.short_term_fuel_trim_bank2":return "Kurzzeit-Kraftstoffkorrektur Bank 2";case "engine.long_term_fuel_trim_bank2":return "Langzeit-Kraftstoffkorrektur Bank 2";case "engine.fuel_rail_gauge_pressure_low":return "Niederdruck-Kraftstoffdruck";case "engine.timing_advance":return "Zündwinkel";case "engine.fuel_rail_pressure_relative":return "Raildruck relativ zum Saugrohr";case "engine.evap_purge_commanded":return "Tankentlüftung Soll";case "vehicle.fuel_tank_level":return "Tankfüllstand";case "engine.catalyst_temperature_b1s1":return "Katalysatortemperatur Bank 1 Sensor 1";case "engine.catalyst_temperature_b2s1":return "Katalysatortemperatur Bank 2 Sensor 1";case "engine.catalyst_temperature_b1s2":return "Katalysatortemperatur Bank 1 Sensor 2";case "engine.catalyst_temperature_b2s2":return "Katalysatortemperatur Bank 2 Sensor 2";case "engine.absolute_load":return "Absolute Motorlast";case "engine.commanded_equivalence_ratio":return "Gemisch-Äquivalenzverhältnis Soll";case "engine.throttle_position_b":return "Drosselklappenstellung B";case "engine.throttle_position_c":return "Drosselklappenstellung C";case "vehicle.accelerator_pedal_f":return "Gaspedalstellung F";case "engine.ethanol_fuel_percentage":return "Ethanolanteil";case "engine.fuel_rail_pressure_absolute":return "Absoluter Kraftstoffrail-Druck";case "vehicle.relative_accelerator_pedal_position":return "Relative Gaspedalstellung";case "engine.oil_temperature":return "Motoröltemperatur";case "engine.fuel_injection_timing":return "Einspritzzeitpunkt";case "engine.fuel_rate":return "Kraftstoffverbrauch pro Stunde";case "engine.driver_demand_torque_percent":return "Fahrerdrehmomentwunsch";case "engine.actual_torque_percent":return "Tatsächliches Motordrehmoment";case "engine.reference_torque":return "Referenzdrehmoment";default:String label=signal.optString("title","");return label.isEmpty()?"Messwert":label;}}
     private JSONArray array(String key){JSONArray a=state.optJSONArray(key);return a==null?new JSONArray():a;}
     private boolean contains(JSONArray a,String s){for(int i=0;i<a.length();i++)if(s.equals(a.optString(i)))return true;return false;}
     private void title(String title,String subtitle){TextView t=text(title,25,TEXT);t.setTypeface(null,Typeface.BOLD);body.addView(t);note(body,subtitle,MUTED);}

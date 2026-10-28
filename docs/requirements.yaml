@@ -300,7 +300,7 @@ requirements:
     title: Read the odometer explicitly from a VW instrument cluster (experimental)
     type: functional
     priority: could
-    status: accepted
+    status: obsolete
     source: "Conversation 2026-10-23: refinement under ADR 0001 (manufacturer-specific odometer source)"
     description: >
       For VW Group vehicles that do not advertise PID 0xA6, the user can start one
