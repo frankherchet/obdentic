@@ -457,3 +457,29 @@ requirements:
         text: The pending text and the final state are exposed to accessibility services through the button's content description and an announcement.
       - id: REQ-021.6
         text: A pending state stays visible across tab switches and Activity recreation until it ends by REQ-021.2 or REQ-021.3.
+
+  - id: REQ-022
+    title: Measure adapter and vehicle read throughput with a closed analysis job
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-28: adapter throughput question"
+    description: >
+      A user-started, closed, read-only analysis job measures how fast the adapter
+      and vehicle answer standard Mode 01 reads and whether the vehicle answers
+      multi-PID Mode 01 requests, records all evidence and shows a summary.
+    acceptance:
+      - id: REQ-022.1
+        text: The job can only be started in a live session that is ready; in demo, replay or without a session it is unavailable with a reason, and no job is started.
+      - id: REQ-022.2
+        text: The job selects up to 6 Mode 01 PIDs that the vehicle advertises from the catalog, reads each of them 10 times as single requests to the validated engine target, and reports per-PID and overall median and 90th-percentile response time and the achieved reads per second.
+      - id: REQ-022.3
+        text: The job then sends one Mode 01 request each with 2, 3 and 6 of those PIDs (as many as available), and reports per request whether all requested PIDs were answered, partly answered or rejected, with its response time; it never selects PIDs that are not advertised.
+      - id: REQ-022.4
+        text: The job sends only Mode 01 requests built from advertised catalog PIDs plus the existing closed target configuration; no caller-provided bytes, no other service and no write or session command are possible.
+      - id: REQ-022.5
+        text: The job writes its own recording with every TX/RX and the summary; it ends on its own after at most 60 seconds or when the user stops it, and a stop or connection loss leaves a partial recording marked as such.
+      - id: REQ-022.6
+        text: The summary is shown in the Diagnose tab, and the desktop mobile report re-derives the same statistics offline from the recording without adapter traffic.
+      - id: REQ-022.7
+        text: Multi-PID responses are decoded per PID with the existing catalog decoders; a missing or malformed PID in the response is reported for that PID and never fills in a value.
