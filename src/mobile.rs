@@ -1,10 +1,16 @@
 //! Closed mobile facade. Platform code supplies transport, never diagnostic commands.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::{
-    elm::{ElmExchange, ElmSession, ExchangeError, TargetedReadRequest, TransportFailure},
+    elm::{
+        ElmExchange, ElmSession, ExchangeError, TargetedMultiReadRequest, TargetedReadRequest,
+        TransportFailure,
+    },
+    runtime_state::Activity,
+    safety::{OperationRequest, SafetyPolicy},
+    throughput,
     topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
         RequestAddress, RequestTarget, RequestTargetEvidence, ResponderIdentity, RoleAssignment,
@@ -29,6 +35,9 @@ impl<E: Exchange> ElmExchange for PlatformExchange<E> {
             .map_err(|error| TransportFailure::WriteFailed(error).into())
     }
 }
+
+/// Upper bound of the adapter throughput job (REQ-022.5).
+const THROUGHPUT_LIMIT: Duration = Duration::from_secs(60);
 
 /// One persistent, serialized, read-only diagnostic session.
 pub struct MobileCore<E> {
@@ -85,6 +94,9 @@ impl<E: Exchange> MobileCore<E> {
         if action == "replay.dtc.scan" {
             return replay_dtc_scan(argument);
         }
+        if action == "replay.adapter.throughput" {
+            return throughput::replay(argument);
+        }
         if action == "replay.read" {
             let mut recorded: Value = serde_json::from_str(argument).map_err(|e| e.to_string())?;
             let semantic = recorded
@@ -105,7 +117,10 @@ impl<E: Exchange> MobileCore<E> {
             recorded["replay"] = json!(true);
             return Ok(recorded);
         }
-        if !matches!(action, "initialize" | "inventory" | "read" | "dtc.scan") {
+        if !matches!(
+            action,
+            "initialize" | "inventory" | "read" | "dtc.scan" | "adapter.throughput"
+        ) {
             return Err(format!("read-only mobile core rejected action: {action}"));
         }
         if action != "read" && !argument.is_empty() {
@@ -123,7 +138,7 @@ impl<E: Exchange> MobileCore<E> {
         match action {
             "read" => {
                 let request = crate::prepare_read(argument)?;
-                let read = if let Some(mapping) = &self.engine {
+                let read = if self.engine.is_some() {
                     if !self
                         .session
                         .as_ref()
@@ -133,17 +148,7 @@ impl<E: Exchange> MobileCore<E> {
                     {
                         return Err(format!("vehicle does not advertise support for {argument}"));
                     }
-                    let targeted = TargetedReadRequest::new(
-                        request,
-                        mapping.target().target().clone(),
-                        crate::elm::ResponderIdentity::ElmHeader(
-                            mapping
-                                .expected_responder()
-                                .value()
-                                .ok_or("validated engine responder missing")?
-                                .into(),
-                        ),
-                    )?;
+                    let targeted = self.targeted_read(request)?;
                     self.runtime.block_on(
                         self.session
                             .as_mut()
@@ -164,6 +169,7 @@ impl<E: Exchange> MobileCore<E> {
                 )
             }
             "inventory" => self.inventory(),
+            "adapter.throughput" => self.adapter_throughput(THROUGHPUT_LIMIT),
             "dtc.scan" => {
                 let responses = self
                     .runtime
@@ -184,6 +190,141 @@ impl<E: Exchange> MobileCore<E> {
             }
             _ => unreachable!(),
         }
+    }
+
+    fn engine_target(&self) -> Result<(RequestTarget, crate::elm::ResponderIdentity), String> {
+        let mapping = self
+            .engine
+            .as_ref()
+            .ok_or("no validated engine target; run the inventory first")?;
+        let responder = crate::elm::ResponderIdentity::ElmHeader(
+            mapping
+                .expected_responder()
+                .value()
+                .ok_or("validated engine responder missing")?
+                .into(),
+        );
+        Ok((mapping.target().target().clone(), responder))
+    }
+
+    fn targeted_read(&self, request: crate::ReadRequest) -> Result<TargetedReadRequest, String> {
+        let (target, responder) = self.engine_target()?;
+        TargetedReadRequest::new(request, target, responder)
+    }
+
+    /// Closed adapter throughput job (REQ-022). The mobile core has no
+    /// cancellation: the job ends by itself after `limit` (60 s). The platform's
+    /// stop/disconnect closes the transport, which fails the pending read and
+    /// ends the job with a partial recording.
+    fn adapter_throughput(&mut self, limit: Duration) -> Result<Value, String> {
+        SafetyPolicy::read_only()
+            .authorize_activity(Activity::Diagnose, OperationRequest::AdapterThroughput)
+            .map_err(|error| error.to_string())?;
+        let (target, responder) = self.engine_target()?;
+        let support = self.session.as_ref().unwrap().supported();
+        let mut selected: Vec<crate::ReadRequest> = Vec::new();
+        for signal in crate::supported_signals() {
+            let request = crate::prepare_read(signal.metadata().semantic)?;
+            if selected.len() < throughput::MAX_PIDS
+                && request.fixed_length()
+                && support.supports_pid(request.pid())
+                && !selected.iter().any(|known| known.pid() == request.pid())
+            {
+                selected.push(request);
+            }
+        }
+        if selected.is_empty() {
+            return Err("vehicle advertises no catalog PID for the throughput job".into());
+        }
+        let elapsed_ms =
+            |since: Instant| throughput::round1(since.elapsed().as_secs_f64() * 1000.0);
+        let started = Instant::now();
+        let mut truncated = false;
+        let mut reads = Vec::new();
+        'phase1: for request in &selected {
+            let mut consecutive_errors = 0;
+            for _ in 0..throughput::READS_PER_PID {
+                if started.elapsed() >= limit {
+                    truncated = true;
+                    break 'phase1;
+                }
+                let targeted =
+                    TargetedReadRequest::new(*request, target.clone(), responder.clone())?;
+                let at = Instant::now();
+                let result = self.runtime.block_on(
+                    self.session
+                        .as_mut()
+                        .unwrap()
+                        .read_targeted_with_evidence(&targeted),
+                );
+                let elapsed = elapsed_ms(at);
+                let (payload, error, observations) = match result {
+                    Ok(read) => (
+                        Some(read.payload),
+                        None,
+                        response_observations_json(&read.observations),
+                    ),
+                    Err(error) => (
+                        None,
+                        Some(error.error),
+                        response_observations_json(&error.observations),
+                    ),
+                };
+                consecutive_errors = if payload.is_some() {
+                    0
+                } else {
+                    consecutive_errors + 1
+                };
+                reads.push(json!({"semantic":request.semantic(),"elapsed_ms":elapsed,
+                    "response":payload,"error":error,"observations":observations}));
+                if consecutive_errors >= throughput::MAX_CONSECUTIVE_ERRORS {
+                    break;
+                }
+            }
+        }
+        let mut phase2 = Vec::new();
+        let mut note = Value::Null;
+        if selected.len() < 2 {
+            note = json!("fewer than 2 advertised PIDs");
+        } else if !truncated {
+            for size in throughput::phase2_sizes(selected.len()) {
+                if started.elapsed() >= limit {
+                    truncated = true;
+                    break;
+                }
+                let pids = &selected[..size];
+                let multi = TargetedMultiReadRequest::new(pids, target.clone(), responder.clone())?;
+                let at = Instant::now();
+                let result = self.runtime.block_on(
+                    self.session
+                        .as_mut()
+                        .unwrap()
+                        .read_multi_targeted_with_evidence(&multi),
+                );
+                let elapsed = elapsed_ms(at);
+                let (payload, error, observations) = match result {
+                    Ok(read) => (
+                        Some(read.payload),
+                        None,
+                        response_observations_json(&read.observations),
+                    ),
+                    Err(error) => (
+                        None,
+                        Some(error.error),
+                        response_observations_json(&error.observations),
+                    ),
+                };
+                phase2.push(
+                    json!({"semantic":pids.iter().map(|r| r.semantic()).collect::<Vec<_>>(),
+                    "command":multi.command().trim(),"elapsed_ms":elapsed,"payload":payload,
+                    "error":error,"observations":observations}),
+                );
+            }
+        }
+        throughput::with_evidence(&json!({
+            "phase1_reads":reads,"phase2_requests":phase2,"phase2_note":note,
+            "truncated":truncated,"limit_s":limit.as_secs(),"total_elapsed_ms":elapsed_ms(started)
+        }))
     }
 
     fn support(&self) -> Value {
@@ -733,6 +874,251 @@ mod tests {
             ])));
         assert_eq!(run(&mut core, "inventory", "")["ok"], true);
         assert!(core.engine.is_none());
+    }
+
+    // ---- REQ-022: adapter throughput job ----
+
+    const PAGE_ALL: &str = "7E8 06 41 00 18 39 00 00\r>"; // 0C 05 0D 10 04 0B
+    const PAGE_TWO: &str = "7E8 06 41 00 08 10 00 00\r>"; // 0C 05
+    const PAGE_ONE: &str = "7E8 06 41 00 00 10 00 00\r>"; // 0C
+    const PHASE2_FULL: [(&str, &str); 3] = [
+        ("010C05\r", "7E8 06 41 0C 1F 40 05 5A\r>"),
+        (
+            "010C050D\r",
+            "7E8 10 08 41 0C 1F 40 05 5A\r7E8 21 0D 32 00 00 00 00\r>",
+        ),
+        (
+            "010C050D10040B\r",
+            "7E8 10 0F 41 0C 1F 40 05 5A\r7E8 21 0D 32 10 01 F4 04 80\r7E8 22 0B 64 00 00 00 00 00\r>",
+        ),
+    ];
+
+    /// Initialized core with a validated engine target and a scripted throughput run.
+    fn throughput_core(
+        page: &'static str,
+        pids: &[(&'static str, &'static str)],
+        phase2: &[(&'static str, &'static str)],
+    ) -> MobileCore<Script> {
+        let mut extra = vec![
+            ("0100\r", page),
+            ("0902\r", "NO DATA\r>"),
+            ("ATSH 7E0\r", "OK\r>"),
+            ("ATCRA 7E8\r", "OK\r>"),
+            ("010C\r", "7E8 04 41 0C 1F 40\r>"),
+        ];
+        for (command, response) in pids {
+            extra.extend(std::iter::repeat_n((*command, *response), 10));
+        }
+        extra.extend(phase2.iter().copied());
+        let mut core = core_with_pages(&[("0100\r", page)], &extra);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        assert_eq!(
+            run(&mut core, "inventory", "")["data"]["engine_target_validated"],
+            true
+        );
+        core
+    }
+
+    const ALL_PIDS: [(&str, &str); 6] = [
+        ("010C\r", "7E8 04 41 0C 1F 40\r>"),
+        ("0105\r", "7E8 03 41 05 5A\r>"),
+        ("010D\r", "7E8 03 41 0D 32\r>"),
+        ("0110\r", "7E8 04 41 10 01 F4\r>"),
+        ("0104\r", "7E8 03 41 04 80\r>"),
+        ("010B\r", "7E8 03 41 0B 64\r>"),
+    ];
+
+    fn script_remaining(core: &mut MobileCore<Script>) -> usize {
+        core.session.as_mut().unwrap().exchange_mut().0 .0.len()
+    }
+
+    #[test]
+    fn req_022_2_phase1_reads_each_advertised_pid_ten_times_with_one_tx_per_read() {
+        let mut core = throughput_core(PAGE_ALL, &ALL_PIDS, &PHASE2_FULL);
+        let result = run(&mut core, "adapter.throughput", "");
+        assert_eq!(result["ok"], true, "{result}");
+        let data = &result["data"];
+        let pids = data["phase1"]["pids"].as_array().unwrap();
+        let names: Vec<_> = pids
+            .iter()
+            .map(|p| p["semantic"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "engine.rpm",
+                "engine.coolant_temperature",
+                "vehicle.speed",
+                "engine.maf",
+                "engine.load",
+                "engine.intake_manifold_pressure"
+            ]
+        );
+        assert!(pids.iter().all(|p| p["n"] == 10 && p["errors"] == 0));
+        assert_eq!(pids[0]["pid"], "0C");
+        assert_eq!(data["phase1"]["overall"]["n"], 60);
+        assert!(data["phase1"]["overall"]["median_ms"].is_number());
+        assert!(data["phase1"]["overall"]["p90_ms"].is_number());
+        assert_eq!(data["phase1_reads"].as_array().unwrap().len(), 60);
+        assert_eq!(data["phase1_reads"][0]["response"], json!([65, 12, 31, 64]));
+        assert_eq!(data["truncated"], false);
+        // Every scripted TX (60 single reads, 3 multi-PID) was used, none extra.
+        assert_eq!(script_remaining(&mut core), 0);
+    }
+
+    #[test]
+    fn req_022_3_multi_pid_requests_with_two_three_and_six_pids_are_full() {
+        let mut core = throughput_core(PAGE_ALL, &ALL_PIDS, &PHASE2_FULL);
+        let data = run(&mut core, "adapter.throughput", "")["data"].clone();
+        let phase2 = data["phase2"].as_array().unwrap();
+        assert_eq!(phase2.len(), 3);
+        assert_eq!(
+            phase2
+                .iter()
+                .map(|r| r["pids"].as_array().unwrap().len())
+                .collect::<Vec<_>>(),
+            [2, 3, 6]
+        );
+        for request in phase2 {
+            assert_eq!(request["outcome"], "full", "{request}");
+            assert!(request["elapsed_ms"].is_number());
+        }
+        let values = phase2[2]["values"].as_array().unwrap();
+        assert_eq!(values[0]["value"], 2000.0);
+        assert_eq!(values[1]["value"], 50.0);
+        assert_eq!(values[0]["unit"], "rpm");
+        assert!(values.iter().all(|v| v["status"] == "ok"));
+        assert_eq!(script_remaining(&mut core), 0);
+    }
+
+    #[test]
+    fn req_022_3_and_7_partial_rejected_and_malformed_replies_never_invent_values() {
+        let phase2 = [
+            // 05 missing from the reply.
+            ("010C05\r", "7E8 04 41 0C 1F 40\r>"),
+            // Truncated tail: 0D announced without its data byte.
+            (
+                "010C050D\r",
+                "7E8 10 07 41 0C 1F 40 05 5A\r7E8 21 0D 00 00 00 00 00\r>",
+            ),
+            // Rejected by the vehicle.
+            ("010C050D10040B\r", "NO DATA\r>"),
+        ];
+        let mut core = throughput_core(PAGE_ALL, &ALL_PIDS, &phase2);
+        let data = run(&mut core, "adapter.throughput", "")["data"].clone();
+        let phase2 = data["phase2"].as_array().unwrap();
+        assert_eq!(phase2[0]["outcome"], "partial");
+        assert_eq!(phase2[0]["values"][0]["status"], "ok");
+        assert_eq!(phase2[0]["values"][1]["status"], "missing");
+        assert!(phase2[0]["values"][1].get("value").is_none());
+        assert_eq!(phase2[1]["outcome"], "partial");
+        assert_eq!(phase2[1]["values"][1]["value"], 50.0);
+        assert_eq!(phase2[1]["values"][2]["status"], "malformed");
+        assert!(phase2[1]["values"][2].get("value").is_none());
+        assert_eq!(phase2[2]["outcome"], "rejected");
+        assert!(phase2[2]["reason"].as_str().unwrap().contains("NO DATA"));
+        assert!(phase2[2]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["status"] == "missing" && v.get("value").is_none()));
+    }
+
+    #[test]
+    fn req_022_3_negative_response_is_rejected() {
+        let phase2 = [
+            ("010C05\r", "7E8 03 7F 01 12\r>"),
+            ("010C050D\r", "NO DATA\r>"),
+            ("010C050D10040B\r", "NO DATA\r>"),
+        ];
+        let mut core = throughput_core(PAGE_ALL, &ALL_PIDS, &phase2);
+        let data = run(&mut core, "adapter.throughput", "")["data"].clone();
+        assert_eq!(data["phase2"][0]["outcome"], "rejected");
+        assert!(data["phase2"][0]["reason"].as_str().unwrap().contains("7F"));
+    }
+
+    #[test]
+    fn req_022_3_and_4_only_advertised_pids_are_used() {
+        let pids = [ALL_PIDS[0], ALL_PIDS[1]];
+        let mut core = throughput_core(PAGE_TWO, &pids, &PHASE2_FULL[..1]);
+        let data = run(&mut core, "adapter.throughput", "")["data"].clone();
+        assert_eq!(data["phase1"]["pids"].as_array().unwrap().len(), 2);
+        assert_eq!(data["phase2"].as_array().unwrap().len(), 1);
+        assert_eq!(data["phase2"][0]["pids"], json!(["0C", "05"]));
+        // The script has no entry for any other PID; an extra TX would panic.
+        assert_eq!(script_remaining(&mut core), 0);
+    }
+
+    #[test]
+    fn req_022_3_fewer_than_two_advertised_pids_runs_phase_one_only() {
+        let mut core = throughput_core(PAGE_ONE, &ALL_PIDS[..1], &[]);
+        let data = run(&mut core, "adapter.throughput", "")["data"].clone();
+        assert_eq!(data["phase1"]["overall"]["n"], 10);
+        assert_eq!(data["phase2"], json!([]));
+        assert_eq!(data["phase2_note"], "fewer than 2 advertised PIDs");
+        assert_eq!(script_remaining(&mut core), 0);
+    }
+
+    #[test]
+    fn req_022_1_and_4_job_needs_session_and_engine_target_and_accepts_no_argument() {
+        let mut fresh = MobileCore::new(Script(VecDeque::new())).unwrap();
+        assert_eq!(run(&mut fresh, "adapter.throughput", "")["ok"], false);
+
+        // Initialized but no validated engine target: refused, nothing sent.
+        let mut core = core(&[]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let refused = run(&mut core, "adapter.throughput", "");
+        assert_eq!(refused["ok"], false);
+        assert!(refused["error"].as_str().unwrap().contains("engine target"));
+
+        // No caller bytes: any argument is rejected before anything is sent.
+        let mut core = throughput_core(PAGE_ALL, &ALL_PIDS, &PHASE2_FULL);
+        for argument in ["010C", "engine.rpm", "0100"] {
+            assert_eq!(run(&mut core, "adapter.throughput", argument)["ok"], false);
+        }
+        assert_eq!(script_remaining(&mut core), 60 + 3);
+    }
+
+    #[test]
+    fn req_022_6_replay_rederives_the_live_result_without_transport() {
+        let mut core = throughput_core(PAGE_ALL, &ALL_PIDS, &PHASE2_FULL);
+        let live = run(&mut core, "adapter.throughput", "")["data"].clone();
+        let mut offline = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let replay = run(&mut offline, "replay.adapter.throughput", &live.to_string());
+        assert_eq!(replay["ok"], true, "{replay}");
+        let mut replayed = replay["data"].clone();
+        assert_eq!(
+            replayed.as_object_mut().unwrap().remove("replay"),
+            Some(json!(true))
+        );
+        assert_eq!(replayed, live);
+        // A tampered summary is ignored: statistics come from the evidence.
+        let mut tampered = live.clone();
+        tampered["phase1"]["overall"]["n"] = json!(1);
+        tampered["phase2"][0]["outcome"] = json!("rejected");
+        let again = run(
+            &mut offline,
+            "replay.adapter.throughput",
+            &tampered.to_string(),
+        );
+        assert_eq!(again["data"]["phase1"], live["phase1"]);
+        assert_eq!(again["data"]["phase2"], live["phase2"]);
+        assert_eq!(
+            run(&mut offline, "replay.adapter.throughput", "{}")["ok"],
+            false
+        );
+    }
+
+    #[test]
+    fn req_022_5_job_is_time_bounded_and_reports_truncation() {
+        assert_eq!(THROUGHPUT_LIMIT, Duration::from_secs(60));
+        let mut core = throughput_core(PAGE_ALL, &ALL_PIDS, &PHASE2_FULL);
+        let data = core.adapter_throughput(Duration::ZERO).unwrap();
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["phase1_reads"], json!([]));
+        assert_eq!(data["phase2"], json!([]));
+        // Nothing was sent once the bound was reached.
+        assert_eq!(script_remaining(&mut core), 60 + 3);
     }
 
     impl Exchange for crate::test_support::NoFunctionalAfterRestore {

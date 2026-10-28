@@ -34,6 +34,11 @@ impl Mode01 {
         self.data_len
     }
 
+    /// False for PIDs whose reply length varies; they cannot be walked in a multi-PID reply.
+    pub(crate) const fn fixed_length(self) -> bool {
+        !self.optional_data_byte
+    }
+
     pub(crate) fn data<'a>(self, response: &'a [u8], semantic: &str) -> Result<&'a [u8], String> {
         let expected = self.data_len + 2;
         let valid_length = response.len() == expected

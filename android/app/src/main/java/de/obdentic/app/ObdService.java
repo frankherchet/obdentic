@@ -241,7 +241,7 @@ public final class ObdService extends Service {
         replayFilename="";
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
             put(state,"replayFile","");
-            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"replayPartial",false);
+            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"replayPartial",false);
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
         synchronized(due) { due.clear(); }
@@ -388,14 +388,18 @@ public final class ObdService extends Service {
     }
     public void runJob(String action) {
         if(busy || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
-        if(!action.equals("inventory") && !action.equals("dtc.scan") && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
+        if(!action.equals("inventory") && !action.equals("dtc.scan") && !action.equals(THROUGHPUT) && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
+        if(action.equals(THROUGHPUT)) { String blocked=throughputBlocker(); if(blocked!=null) { message(blocked); return; } }
         busy=true; changed(); int token=generation;
         worker.execute(() -> { try {
             if(token!=generation) return;
             String argument=action.startsWith("read:") ? action.substring(5) : "";
+            boolean own=action.equals(THROUGHPUT); // REQ-022.5: its own recording; a stop or loss leaves it partial
+            if(own && !beginRecording(THROUGHPUT_PROFILE,new JSONArray())) return;
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
             if(token!=generation) return;
             set("jobResult",result);
+            if(own) { if(result.optBoolean("ok")) set("throughput",result.opt("data")); closeRecording(result.optBoolean("ok")?"completed":"error",result.optString("error")); }
             if(action.equals("inventory")) { set("vehicle",result.opt("data")); if(result.optJSONObject("data") != null) applySupport(result.optJSONObject("data")); }
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
             if(!argument.isEmpty()) updateValue(argument,result);
@@ -403,6 +407,19 @@ public final class ObdService extends Service {
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
         } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
     }
+    /** REQ-022: action name and recording profile of the adapter throughput job (not a polling profile). */
+    public static final String THROUGHPUT="adapter.throughput", THROUGHPUT_PROFILE="adapter-throughput";
+    /** REQ-022.1: the German reason why the throughput job cannot start now, or null. Live and ready only. */
+    public static String throughputBlocker(JSONObject state) {
+        String mode=state.optString("mode","live"), phase=state.optString("phase","idle");
+        if(mode.equals("replay")) return "Nicht in der Wiedergabe einer Aufnahme";
+        if(!phase.equals("ready")) return "Zuerst den Adapter verbinden";
+        if(mode.equals("demo")) return "Nur mit echtem Adapter, nicht in der Demo";
+        if(!state.optString("recording").isEmpty()) return "Zuerst die laufende Aufzeichnung stoppen";
+        if(state.optBoolean("busy")) return "Ein anderer Auftrag läuft";
+        return null;
+    }
+    private String throughputBlocker() { return throughputBlocker(snapshot()); }
     private void poll() {
         if(wakeLock!=null && SystemClock.elapsedRealtime()-lastWakeRefresh>5*60*1000L && (phase().equals("ready") || phase().equals("connecting") || policy.state()==ReconnectPolicy.State.WAITING)) {
             wakeLock.acquire(10*60*1000L); lastWakeRefresh=SystemClock.elapsedRealtime();
@@ -460,6 +477,12 @@ public final class ObdService extends Service {
             for(int i=0;i<profiles.length();i++) if(profileId.equals(profiles.optJSONObject(i).optString("id"))) { signals=profiles.optJSONObject(i).optJSONArray("signals"); periods=profiles.optJSONObject(i).optJSONArray("intervals_ms"); } }
         if(signals==null) { message("Unbekanntes Aufnahmeprofil"); return; }
         stopRecordingNow();
+        if(!beginRecording(profileId,signals)) return;
+        synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?PollSchedule.DEFAULT_PERIOD_MS:periods.optLong(i,PollSchedule.DEFAULT_PERIOD_MS)); }
+        selectSignals(signals); message("Aufnahme läuft: " + profileId);
+    }
+    /** Opens a new recording file with its header and makes it the active recording; false (after a message) when that failed. */
+    private boolean beginRecording(String profileId,JSONArray signals) {
         try {
             File directory=new File(getFilesDir(),"recordings"); if(!directory.exists() && !directory.mkdirs()) throw new IOException("Aufnahmeordner nicht verfügbar");
             String name=new SimpleDateFormat("yyyyMMdd-HHmmss-SSS",Locale.ROOT).format(new Date())+"-"+mode+".jsonl";
@@ -471,12 +494,11 @@ public final class ObdService extends Service {
                 synchronized(stateLock) { put(header,"vehicle",state.opt("vehicle")); put(header,"diagnostics",state.opt("diagnostics")); put(header,"catalog",state.opt("signals")); put(header,"profiles",state.opt("profiles")); }
                 // Notifications must not precede the header in the new evidence stream.
                 record(header);
-                if(writer==null) return;
+                if(writer==null) return false;
             }
             recordingProfile=profileId;
-            synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?PollSchedule.DEFAULT_PERIOD_MS:periods.optLong(i,PollSchedule.DEFAULT_PERIOD_MS)); }
-            selectSignals(signals); message("Aufnahme läuft: " + profileId);
-        } catch(IOException e) { message(e.getMessage()); }
+            return true;
+        } catch(IOException e) { message(e.getMessage()); return false; }
     }
     public void stopRecording() { if(!worker.isShutdown()) worker.execute(this::stopRecordingNow); }
     private void stopRecordingNow() { closeRecording("stopped",""); }
@@ -488,7 +510,7 @@ public final class ObdService extends Service {
             if(writer!=null) { try { writer.close(); completed=true; } catch(IOException e) { message("Aufnahme konnte nicht abgeschlossen werden: "+e.getMessage()); } writer=null; }
         }
         set("recording","");
-        if(completed) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
+        if(completed) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("completed")?"Messung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
         if(completed && !closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty())) exportNow(closed); // REQ-018.4: any ending reason
     }
     /** Test seam (REQ-018): when set, replaces the stored folder as export destination. */
@@ -578,6 +600,12 @@ public final class ObdService extends Service {
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
                         else if(action.equals("inventory")) restoreVehicle(result.optJSONObject("data"));
+                        else if(action.equals(THROUGHPUT)) {
+                            JSONObject recorded=result.optJSONObject("data");
+                            JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));
+                            if(decoded.optBoolean("ok")) set("throughput",decoded.opt("data"));
+                            result=decoded;
+                        }
                         else if(action.equals("dtc.scan")) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));
@@ -615,7 +643,11 @@ public final class ObdService extends Service {
         public void close() { open=false; }
         public String exchange(String command,long timeoutMs) throws Exception {
             if(!mode.equals(only) || !open) throw new IOException("Demo stopped");
-            debug("TX",command); String c=command.trim().replace(" ","").toUpperCase(Locale.ROOT); String response;
+            debug("TX",command); String response=respond(command.trim().replace(" ","").toUpperCase(Locale.ROOT));
+            debug("RX",response); return response;
+        }
+        private String respond(String c) {
+            String response;
             if(c.equals("ATI") || c.equals("ATZ")) response="ELM327 v1.4 DEMO\r>";
             else if(c.equals("AT@1")) response="CARLY-UNIVERSAL DEMO\r>";
             else if(c.equals("ATRV")) response="12.6V\r>";
@@ -653,8 +685,26 @@ public final class ObdService extends Service {
             else if(c.equals("03")) response="7E8 07 43 01 33 00 00 00 00\r>";
             else if(c.equals("07")) response="7E8 03 47 00 00\r>";
             else if(c.equals("0A")) response="7E8 03 4A 00 00\r>";
-            else {response=additionalDemoResponse(c);if(response==null)response="NO DATA\r>";}
-            debug("RX",response); return response;
+            else {response=additionalDemoResponse(c);if(response==null)response=multiPidResponse(c);if(response==null)response="NO DATA\r>";}
+            return response;
+        }
+        /** REQ-022: a Mode 01 request for 2 or 3 PIDs is answered from the single-PID answers (single frame, or ISO-TP with 3); more PIDs are rejected like a vehicle without multi-PID support. */
+        private String multiPidResponse(String c) {
+            if(!c.matches("01([0-9A-F]{2}){2,3}")) return null;
+            StringBuilder bytes=new StringBuilder("41");
+            for(int i=2;i<c.length();i+=2) {
+                String single=respond("01"+c.substring(i,i+2)); String[] tokens=single.replace(">","").trim().split("\\s+");
+                if(tokens.length<5 || !tokens[2].equals("41")) return null;
+                for(int k=3;k<tokens.length;k++) bytes.append(' ').append(tokens[k]);
+            }
+            String[] payload=bytes.toString().split(" "); StringBuilder out=new StringBuilder();
+            if(payload.length<=7) { out.append(String.format(Locale.ROOT,"7E8 %02X ",payload.length)).append(String.join(" ",payload)); }
+            else {
+                out.append(String.format(Locale.ROOT,"7E8 10 %02X ",payload.length)).append(String.join(" ",Arrays.copyOfRange(payload,0,6)));
+                for(int at=6,seq=1;at<payload.length;at+=7,seq=(seq+1)&0xF) { String[] part=Arrays.copyOfRange(payload,at,Math.min(at+7,payload.length));
+                    out.append("\r7E8 ").append(String.format(Locale.ROOT,"2%X ",seq)).append(String.join(" ",part)); for(int pad=part.length;pad<7;pad++) out.append(" 00"); }
+            }
+            return out.append("\r>").toString();
         }
         private String additionalDemoResponse(String command) {
             String data;

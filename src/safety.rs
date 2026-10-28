@@ -66,6 +66,8 @@ pub enum OperationKind {
     SignalRead,
     DtcRead,
     EcuIdentification,
+    /// Closed adapter throughput analysis job: Mode 01 reads of advertised catalog PIDs.
+    AdapterThroughput,
     DtcClear,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -90,6 +92,7 @@ pub enum OperationRequest {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
     EcuIdentification(IdentificationCandidate),
+    AdapterThroughput,
     ClearDtcs,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -132,6 +135,7 @@ impl OperationRequest {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
+            Self::AdapterThroughput => OperationKind::AdapterThroughput,
             Self::ClearDtcs => OperationKind::DtcClear,
             Self::SecurityAccess => OperationKind::SecurityAccess,
             Self::DiagnosticSessionControl => OperationKind::DiagnosticSessionControl,
@@ -155,6 +159,7 @@ pub enum Operation {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
     EcuIdentification(IdentificationCandidate),
+    AdapterThroughput,
 }
 
 impl Operation {
@@ -163,6 +168,7 @@ impl Operation {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
+            Self::AdapterThroughput => OperationKind::AdapterThroughput,
         }
     }
 
@@ -208,6 +214,7 @@ impl Capability {
                 OperationKind::SignalRead
                     | OperationKind::DtcRead
                     | OperationKind::EcuIdentification
+                    | OperationKind::AdapterThroughput
             ),
         }
     }
@@ -287,6 +294,9 @@ impl SafetyPolicy {
             OperationRequest::EcuIdentification(candidate) => {
                 self.authorize_operation(Operation::EcuIdentification(candidate))
             }
+            OperationRequest::AdapterThroughput => {
+                self.authorize_operation(Operation::AdapterThroughput)
+            }
             OperationRequest::ClearDtcs => {
                 Err(SafetyError::OperationBlocked(OperationKind::DtcClear))
             }
@@ -350,7 +360,9 @@ impl SafetyPolicy {
             Activity::Diagnose => {
                 matches!(
                     operation,
-                    OperationKind::DtcRead | OperationKind::EcuIdentification
+                    OperationKind::DtcRead
+                        | OperationKind::EcuIdentification
+                        | OperationKind::AdapterThroughput
                 )
             }
             Activity::Idle | Activity::Write => false,
@@ -440,6 +452,24 @@ mod tests {
                 OperationRequest::EcuIdentification(plan.candidates()[0].clone())
             )
             .is_err());
+    }
+
+    #[test]
+    fn req_022_4_adapter_throughput_is_diagnose_only_and_read_only() {
+        let policy = SafetyPolicy::default();
+        assert_eq!(
+            policy.authorize_activity(Activity::Diagnose, OperationRequest::AdapterThroughput),
+            Ok(Operation::AdapterThroughput)
+        );
+        for activity in [Activity::Read, Activity::Observe, Activity::Idle] {
+            assert!(policy
+                .authorize_activity(activity, OperationRequest::AdapterThroughput)
+                .is_err());
+        }
+        assert_eq!(
+            policy.authorize_activity(Activity::Write, OperationRequest::AdapterThroughput),
+            Err(SafetyError::WriteUnavailable)
+        );
     }
 
     #[test]

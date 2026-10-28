@@ -151,7 +151,7 @@ public class MainActivity extends Activity {
         collectHistory();
         String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles");
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
-        if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle");
+        if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
         if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile");
         if(tab==3)key+="|"+(array("debug").length()==0);
         if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
@@ -183,6 +183,7 @@ public class MainActivity extends Activity {
         title("Diagnose","Lesende Aufträge · Ergebnisse bleiben lokal");
         LinearLayout c=card();note(c,"FAHRZEUG & FEHLERSPEICHER",ACCENT);
         job(c,"Fahrzeug und Steuergeräte erfassen","inventory");job(c,"Fehlercodes lesen","dtc.scan");
+        throughputCard();
 
         JSONObject vehicle=state.optJSONObject("vehicle");
         if(vehicle!=null&&vehicle.length()>0)showInventory(vehicle);
@@ -194,6 +195,35 @@ public class MainActivity extends Activity {
         }
         if((vehicle==null||vehicle.length()==0)&&(dtcs==null||dtcs.length()==0)&&(result==null||result.length()==0))empty("Bereit für den ersten Auftrag","Verbinde den Adapter oder starte die Demo. Rohdaten und Antworten findest du unter Debug.");
     }
+    /** REQ-022.1/.6: the button (live and ready only, otherwise the reason) and the summary of the last or replayed measurement. */
+    private void throughputCard(){
+        LinearLayout c=card();note(c,"ADAPTER-LEISTUNG",ACCENT);
+        PendingActions.Spec spec=jobSpec("Adapter-Leistung messen");String suffix=":"+ObdService.THROUGHPUT;
+        boolean pend=service()!=null&&service().pending.isPending(spec.key+suffix);String blocked=pend?null:ObdService.throughputBlocker(state);
+        actionButton(c,spec,suffix,"Adapter-Leistung messen",blocked==null,()->perform(spec,suffix,()->service().runJob(ObdService.THROUGHPUT)));
+        if(blocked!=null)note(c,blocked,MUTED);
+        smallNote(c,"Liest bis zu 6 Messwerte je 10-mal einzeln und dann 2, 3 und 6 Werte in einer Anfrage (nur Lesen, höchstens 60 s). Alle Antworten werden in einer eigenen Aufnahme gespeichert.",MUTED);
+        JSONObject t=state.optJSONObject("throughput");if(t==null||t.length()==0)return;
+        showThroughput(c,t);
+    }
+    private void showThroughput(LinearLayout c,JSONObject t){
+        JSONObject overall=t.optJSONObject("phase1")==null?new JSONObject():t.optJSONObject("phase1").optJSONObject("overall");if(overall==null)overall=new JSONObject();
+        note(c,"Gesamt: "+(overall.isNull("reads_per_s")?"—":MeasurementFormat.formatMeasurement(overall.optDouble("reads_per_s"),"Lesungen/s"))+" · Median "+ms(overall,"median_ms")+" · P90 "+ms(overall,"p90_ms")+" ("+overall.optInt("n")+" Lesungen)",TEXT);
+        JSONArray pids=t.optJSONObject("phase1")==null?null:t.optJSONObject("phase1").optJSONArray("pids");
+        for(int i=0;pids!=null&&i<pids.length();i++){JSONObject p=pids.optJSONObject(i);if(p==null)continue;
+            smallNote(c,SignalNames.shortName(p.optString("semantic"),p.optString("semantic"))+" · Median "+ms(p,"median_ms")+" · P90 "+ms(p,"p90_ms")+(p.optInt("errors")>0?" · "+p.optInt("errors")+" Fehler":""),MUTED);}
+        JSONArray multi=t.optJSONArray("phase2");
+        for(int i=0;multi!=null&&i<multi.length();i++){JSONObject r=multi.optJSONObject(i);if(r==null)continue;
+            String outcome=r.optString("outcome");StringBuilder text=new StringBuilder(r.optJSONArray("pids").length()+" Werte: "+(outcome.equals("full")?"vollständig":outcome.equals("partial")?"teilweise":"abgelehnt")+", "+ms(r,"elapsed_ms"));
+            JSONArray values=r.optJSONArray("values");StringBuilder missing=new StringBuilder();
+            for(int j=0;outcome.equals("partial")&&values!=null&&j<values.length();j++){JSONObject v=values.optJSONObject(j);if(v!=null&&!v.optString("status").equals("ok")){if(missing.length()>0)missing.append(", ");missing.append(SignalNames.shortName(v.optString("semantic"),v.optString("semantic")));}}
+            if(missing.length()>0)text.append(" · ohne Antwort: ").append(missing);
+            note(c,text.toString(),outcome.equals("full")?TEXT:0xffffca75);}
+        if(!t.isNull("phase2_note")&&!t.optString("phase2_note").isEmpty())note(c,"Mehrfachanfrage nicht möglich: weniger als 2 unterstützte Messwerte",MUTED);
+        if(t.optBoolean("truncated"))note(c,"Nach 60 s beendet, Messung unvollständig",0xffffca75);
+        if(t.optBoolean("replay"))smallNote(c,"Aus gespeicherter Aufnahme neu berechnet",MUTED);
+    }
+    private static String ms(JSONObject o,String key){return o.isNull(key)||!o.has(key)?"—":MeasurementFormat.formatMeasurement(o.optDouble(key),"ms");}
     private void showInventory(JSONObject vehicle){
         LinearLayout c=card();note(c,"FAHRZEUG · TEILABDECKUNG",ACCENT);note(c,"Funktionale OBD-Erkennung · kein vollständiges Herstellerverzeichnis",MUTED);
         String vin=vehicle.optString("vin","");String identityError=vehicle.optString("identity_error","");

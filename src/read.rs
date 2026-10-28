@@ -32,6 +32,10 @@ impl ReadRequest {
         self.signal.request().data_len()
     }
 
+    pub(crate) fn fixed_length(self) -> bool {
+        self.signal.request().fixed_length()
+    }
+
     pub fn metadata(self) -> &'static vehicle::SignalMetadata {
         self.signal.metadata()
     }

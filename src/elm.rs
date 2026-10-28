@@ -450,6 +450,52 @@ impl TargetedReadRequest {
     }
 }
 
+/// One closed Mode 01 request for 2..=6 catalog PIDs to a validated target
+/// (`01 PID1 PID2 ...`). Only `ReadRequest`s can be added: no caller bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TargetedMultiReadRequest {
+    requests: Vec<ReadRequest>,
+    target: RequestTarget,
+    expected_responder: ResponderIdentity,
+}
+
+impl TargetedMultiReadRequest {
+    pub(crate) fn new(
+        requests: &[ReadRequest],
+        target: RequestTarget,
+        expected_responder: ResponderIdentity,
+    ) -> Result<Self, String> {
+        if !(2..=6).contains(&requests.len()) {
+            return Err("a multi-PID request needs 2 to 6 PIDs".into());
+        }
+        let mut pids = requests
+            .iter()
+            .map(|request| request.pid())
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        if pids.len() != requests.len() {
+            return Err("a multi-PID request must not repeat a PID".into());
+        }
+        // Reuse the single-read validation of target and responder.
+        let single = TargetedReadRequest::new(requests[0], target, expected_responder)?;
+        Ok(Self {
+            requests: requests.to_vec(),
+            target: single.target,
+            expected_responder: single.expected_responder,
+        })
+    }
+
+    pub(crate) fn command(&self) -> String {
+        let mut command = String::from("01");
+        for request in &self.requests {
+            command.push_str(&format!("{:02X}", request.pid()));
+        }
+        command.push('\r');
+        command
+    }
+}
+
 impl ResponderIdentity {
     pub fn as_str(&self) -> &str {
         match self {
@@ -864,6 +910,66 @@ where
         self.functional_dirty = true;
         read_elm_targeted_with_evidence(&mut self.exchange, &mut self.configured_target, request)
             .await
+    }
+
+    /// One multi-PID Mode 01 request to the (already configured) target. The
+    /// returned payload is the raw `41 PID data ...` application payload.
+    pub(crate) async fn read_multi_targeted_with_evidence(
+        &mut self,
+        request: &TargetedMultiReadRequest,
+    ) -> Result<ReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
+        let key = target_key(&request.target, &request.expected_responder);
+        if self.configured_target.as_ref() != Some(&key) {
+            self.configured_target = None;
+            configure_target(
+                &mut self.exchange,
+                &request.target,
+                &request.expected_responder,
+            )
+            .await
+            .map_err(|error| ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })?;
+            self.configured_target = Some(key);
+        }
+        let command = request.command();
+        let response = match self.exchange.exchange(&command, COMMAND_TIMEOUT).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.configured_target = None;
+                return Err(ReadEvidenceError {
+                    error: error.to_string(),
+                    observations: Vec::new(),
+                });
+            }
+        };
+        let responses =
+            normalize_mode01_multi_responses(&response, command.trim()).map_err(|error| {
+                ReadEvidenceError {
+                    error,
+                    observations: Vec::new(),
+                }
+            })?;
+        let expected = &request.expected_responder;
+        match targeted_payload(&responses, expected) {
+            Ok(payload) => Ok(ReadEvidence {
+                payload,
+                observations: vec![responses.observation_for_target(expected, None)],
+            }),
+            Err(error) => {
+                // Surface parser issues (NO DATA, truncation) with the reason.
+                let error = match responses.errors().first() {
+                    Some(issue) if responses.is_empty() => issue.error.clone(),
+                    _ => error,
+                };
+                Err(ReadEvidenceError {
+                    error: error.clone(),
+                    observations: vec![responses.observation_for_target(expected, Some(error))],
+                })
+            }
+        }
     }
 
     pub(crate) async fn read_mode09(
@@ -2399,10 +2505,28 @@ pub(crate) fn normalize_uds_responses(
     response: &str,
     did: u16,
 ) -> Result<DiagnosticResponses, String> {
+    normalize_isotp_responses(response, &format!("22{did:04X}"), "UDS 22", true)
+}
+
+/// Normalize the reply of one closed multi-PID Mode 01 request (`01 PID..`).
+/// Single and ISO-TP multi-frame replies are assembled per responder; the
+/// application payload (`41 PID data ...`) is decoded by the caller.
+pub(crate) fn normalize_mode01_multi_responses(
+    response: &str,
+    command: &str,
+) -> Result<DiagnosticResponses, String> {
+    normalize_isotp_responses(response, command, "Mode 01 multi-PID", false)
+}
+
+fn normalize_isotp_responses(
+    response: &str,
+    request_echo: &str,
+    label: &str,
+    ignore_mode01: bool,
+) -> Result<DiagnosticResponses, String> {
     let mut matches = Vec::new();
     let mut errors = Vec::new();
     let mut assemblies: Vec<(Option<ResponderIdentity>, UdsIsoTpAssembly)> = Vec::new();
-    let request_echo = format!("22{did:04X}");
 
     for raw_line in response.split(['\r', '\n']) {
         let line = raw_line.trim().trim_end_matches('>').trim();
@@ -2423,7 +2547,7 @@ pub(crate) fn normalize_uds_responses(
         {
             errors.push(DiagnosticResponseError {
                 responder: None,
-                error: format!("ELM327 rejected UDS 22 response: {line}"),
+                error: format!("ELM327 rejected {label} response: {line}"),
             });
             continue;
         }
@@ -2490,7 +2614,7 @@ pub(crate) fn normalize_uds_responses(
         // responder; callers can therefore still accept a valid 62 response.
         let is_mode01_response = bytes.first() == Some(&0x41)
             || (bytes.first().is_some_and(|byte| byte >> 4 == 0) && bytes.get(1) == Some(&0x41));
-        if is_mode01_response {
+        if is_mode01_response && ignore_mode01 {
             let observed = responder
                 .as_ref()
                 .map_or("unknown", ResponderIdentity::as_str);
@@ -2672,7 +2796,7 @@ pub(crate) fn normalize_uds_responses(
     if matches.is_empty() && errors.is_empty() {
         errors.push(DiagnosticResponseError {
             responder: None,
-            error: "UDS 22 response not found".into(),
+            error: format!("{label} response not found"),
         });
     }
     Ok(DiagnosticResponses::with_errors(matches, response, errors))
