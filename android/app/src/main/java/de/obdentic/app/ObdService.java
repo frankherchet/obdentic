@@ -45,7 +45,8 @@ public final class ObdService extends Service {
     private volatile String mode = "live";
     private volatile String replayFilename = "";
     private BufferedWriter writer;
-    private long lastPoll, lastWakeRefresh, recordingOriginNanos;
+    private boolean chained; // worker thread only: a back-to-back poll task is already queued (#231)
+    private long lastWakeRefresh, recordingOriginNanos;
     private int scanGeneration;
     private android.os.PowerManager.WakeLock wakeLock;
     private volatile String recordingProfile = "";
@@ -66,7 +67,7 @@ public final class ObdService extends Service {
         }
         NotificationManager manager = getSystemService(NotificationManager.class);
         manager.createNotificationChannel(new NotificationChannel("connection", "OBD-Verbindung", NotificationManager.IMPORTANCE_LOW));
-        worker.scheduleWithFixedDelay(this::poll, 500, 500, TimeUnit.MILLISECONDS);
+        worker.scheduleWithFixedDelay(() -> { if(!chained) poll(); }, 500, 500, TimeUnit.MILLISECONDS);
         worker.execute(() -> { try { long temporary = NativeCore.create((c,t) -> { throw new IOException("Not connected"); });
             try { applyCatalog(new JSONObject(NativeCore.execute(temporary,"catalog",""))); } finally { NativeCore.destroy(temporary); }
             restoreSelection(selectedVin()); // REQ-013.6/REQ-014.1: after the catalog, so unknown semantics are filtered
@@ -409,22 +410,28 @@ public final class ObdService extends Service {
         if(busy || !phase().equals("ready") || core==0) return;
         Link active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
-        if(selected.length()==0 || SystemClock.elapsedRealtime()-lastPoll<500) return;
+        if(selected.length()==0) return;
         int token=generation;
         try {
-            long now=SystemClock.elapsedRealtime(), earliest=Long.MAX_VALUE; String semantic=null;
-            synchronized(due) { for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i); long next=due.getOrDefault(candidate,0L);
-                boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
-                    for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j); if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true; }
+            long now=SystemClock.elapsedRealtime(); String semantic; long wait;
+            synchronized(due) {
+                java.util.List<String> eligible=new java.util.ArrayList<>();
+                for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i);
+                    boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
+                        for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j); if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true; }
+                    }
+                    if(!unsupported) eligible.add(candidate);
                 }
-                if(!unsupported && next<=now && next<earliest) { semantic=candidate; earliest=next; }
-            } }
+                semantic=PollSchedule.next(eligible,due,now); wait=PollSchedule.waitMs(eligible,due,now);
+            }
             if(semantic!=null) {
                 JSONObject result=execute("read",semantic); if(token==generation) updateValue(semantic,result);
-                synchronized(due) { due.put(semantic,SystemClock.elapsedRealtime()+Math.max(1000,intervals.getOrDefault(semantic,2000L))); }
+                synchronized(due) { due.put(semantic,SystemClock.elapsedRealtime()+PollSchedule.period(intervals.get(semantic))); wait=0; }
             }
+            // Next read right behind this one (other queued work runs in between); the 500 ms tick only restarts an idle chain.
+            if(wait>=0 && !worker.isShutdown()) { chained=true; worker.schedule(() -> { chained=false; poll(); },Math.min(wait,500),TimeUnit.MILLISECONDS); }
         } catch(Throwable e) { fail(token,e); }
-        finally { lastPoll=SystemClock.elapsedRealtime(); if(token==generation) changed(); }
+        finally { if(token==generation) changed(); }
     }
     private void updateValue(String semantic,JSONObject result) {
         JSONObject row=new JSONObject(); put(row,"semantic",semantic); put(row,"updatedAt",System.currentTimeMillis());
@@ -467,7 +474,7 @@ public final class ObdService extends Service {
                 if(writer==null) return;
             }
             recordingProfile=profileId;
-            synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?1200L:periods.optLong(i,1200L)); }
+            synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?PollSchedule.DEFAULT_PERIOD_MS:periods.optLong(i,PollSchedule.DEFAULT_PERIOD_MS)); }
             selectSignals(signals); message("Aufnahme läuft: " + profileId);
         } catch(IOException e) { message(e.getMessage()); }
     }

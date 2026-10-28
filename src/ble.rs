@@ -1431,24 +1431,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_data_error_resets_the_transport_failure_streak() {
-        // Call 1: `configure_target`'s first command times out; the ELM
-        // dialect layer still runs `restore_functional`, which succeeds.
-        let first_call_fails_but_restores = scripted_command_timeouts().take(1).chain(
-            ["OK\r>", "OK\r>"]
-                .into_iter()
-                .map(|response| Ok(response.to_string())),
-        );
+        // Call 1: `configure_target`'s first command times out.
+        let first_call_fails_but_restores = scripted_command_timeouts().take(1);
         // Call 2: every exchange succeeds, but the response comes from the
         // wrong responder, so the read fails on data, not on transport.
-        let second_call_is_a_data_error = [
-            "OK\r>",
-            "OK\r>",
-            "7E9 04 41 0C 00 00 00 00\r>",
-            "OK\r>",
-            "OK\r>",
-        ]
-        .into_iter()
-        .map(|response| Ok(response.to_string()));
+        let second_call_is_a_data_error = ["OK\r>", "OK\r>", "7E9 04 41 0C 00 00 00 00\r>"]
+            .into_iter()
+            .map(|response| Ok(response.to_string()));
         // Call 3: another transport failure. If call 2 had not reset the
         // streak, this would be the session's second consecutive one.
         let third_call_fails = scripted_command_timeouts().take(4);
@@ -2009,36 +1998,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_read_configures_expected_headers_and_restores_functional_state() {
+    async fn targeted_read_configures_expected_headers_and_keeps_them_for_the_next_read() {
         let mut exchange = ScriptedExchange::new(vec![
             "OK\r>",
             "OK\r>",
             "7E8 04 41 0C 00 00 00 00\r>",
-            "OK\r>",
-            "OK\r>",
-            "410C0000\r>",
+            "7E8 04 41 0C 00 00 00 00\r>",
         ]);
         let request = targeted_request();
+        let mut configured = None;
 
-        let read = read_elm_targeted_with_evidence(&mut exchange, &request)
-            .await
-            .unwrap();
-        let functional = read_elm(&mut exchange, crate::prepare_read("engine.rpm").unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(read.payload, vec![0x41, 0x0c, 0x00, 0x00]);
-        assert_eq!(functional, vec![0x41, 0x0c, 0x00, 0x00]);
+        for _ in 0..2 {
+            let read = read_elm_targeted_with_evidence(&mut exchange, &mut configured, &request)
+                .await
+                .unwrap();
+            assert_eq!(read.payload, vec![0x41, 0x0c, 0x00, 0x00]);
+        }
         assert_eq!(
             exchange.commands(),
-            [
-                "ATSH 7E0\r",
-                "ATCRA 7E8\r",
-                "010C\r",
-                "ATSH 7DF\r",
-                "ATCRA\r",
-                "010C\r",
-            ]
+            ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r", "010C\r"]
         );
     }
 
@@ -2048,8 +2026,6 @@ mod tests {
             "OK\r>",
             "OK\r>",
             "7E8 04 41 0C 1F 40\r7E9 04 41 0C 0C 80\r>",
-            "OK\r>",
-            "OK\r>",
         ]);
         let spy = exchange.spy();
         let session = start_scripted_session(exchange, false).await.unwrap();
@@ -2087,39 +2063,21 @@ mod tests {
         }
 
         session.shutdown().await.unwrap();
-        assert_eq!(
-            spy.commands(),
-            [
-                "ATSH 7E0\r",
-                "ATCRA 7E8\r",
-                "010C\r",
-                "ATSH 7DF\r",
-                "ATCRA\r",
-            ]
-        );
+        assert_eq!(spy.commands(), ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r"]);
     }
 
     #[tokio::test]
     async fn targeted_read_rejects_an_unexpected_responder() {
-        let mut exchange = ScriptedExchange::new(vec![
-            "OK\r>",
-            "OK\r>",
-            "7E9 04 41 0C 00 00 00 00\r>",
-            "OK\r>",
-            "OK\r>",
-        ]);
+        let mut exchange =
+            ScriptedExchange::new(vec!["OK\r>", "OK\r>", "7E9 04 41 0C 00 00 00 00\r>"]);
 
-        let error = read_elm_targeted_with_evidence(&mut exchange, &targeted_request())
+        let error = read_elm_targeted_with_evidence(&mut exchange, &mut None, &targeted_request())
             .await
             .unwrap_err()
             .error;
 
         assert!(error.contains("unexpected responder 7E9"));
-        assert_eq!(
-            &exchange.commands()[..3],
-            ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r"]
-        );
-        assert_eq!(&exchange.commands()[3..], ["ATSH 7DF\r", "ATCRA\r"]);
+        assert_eq!(exchange.commands(), ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r"]);
     }
 
     #[test]
@@ -2348,5 +2306,99 @@ mod tests {
                 .expect("targeted read");
         }
         assert_eq!(NoFunctionalAfterRestore::atz_count(&log), 0);
+    }
+
+    fn targeted_for(semantic: &str) -> TargetedReadRequest {
+        TargetedReadRequest::new(
+            crate::prepare_read(semantic).unwrap(),
+            crate::topology::RequestTarget::concrete(
+                crate::topology::ProtocolContext::new(
+                    crate::topology::Protocol::Obd2,
+                    crate::topology::AddressingContext::Physical,
+                ),
+                crate::topology::RequestAddress::new("elm-header", "7e0"),
+            ),
+            ResponderIdentity::ElmHeader("7e8".into()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn issue_231_consecutive_targeted_reads_send_one_tx_each_after_one_setup() {
+        let (model, log) = NoFunctionalAfterRestore::new();
+        let mut session = DiagnosticSession::from_exchange(model, false)
+            .await
+            .unwrap();
+        let before = log.lock().unwrap().len();
+        for semantic in [
+            "engine.rpm",
+            "engine.coolant_temperature",
+            "vehicle.speed",
+            "engine.rpm",
+            "vehicle.speed",
+        ] {
+            session
+                .read_targeted(targeted_for(semantic))
+                .await
+                .expect("targeted read");
+        }
+        let sent: Vec<String> = log.lock().unwrap()[before..].to_vec();
+        assert_eq!(
+            sent,
+            [
+                "ATSH 7E0",
+                "ATCRA 7E8",
+                "010C",
+                "0105",
+                "010D",
+                "010C",
+                "010D"
+            ],
+            "one ATSH/ATCRA pair in total, no restore, one TX per further read"
+        );
+
+        // A functional operation re-initializes first.
+        let atz = NoFunctionalAfterRestore::atz_count(&log);
+        session.identify().await.expect("identify after targeted");
+        assert_eq!(NoFunctionalAfterRestore::atz_count(&log), atz + 1);
+    }
+
+    #[tokio::test]
+    async fn issue_231_targeted_read_after_a_transport_error_reconfigures_the_target() {
+        let mut exchange = ScriptedExchange::from_results(vec![
+            Ok("OK\r>".to_string()),
+            Ok("OK\r>".to_string()),
+            Ok("7E8 04 41 0C 00 00 00 00\r>".to_string()),
+            Err(ExchangeError::Transport(TransportFailure::CommandTimedOut(
+                "010C\r".into(),
+            ))),
+            Ok("OK\r>".to_string()),
+            Ok("OK\r>".to_string()),
+            Ok("7E8 04 41 0C 00 00 00 00\r>".to_string()),
+        ]);
+        let request = targeted_request();
+        let mut configured = None;
+
+        read_elm_targeted_with_evidence(&mut exchange, &mut configured, &request)
+            .await
+            .unwrap();
+        read_elm_targeted_with_evidence(&mut exchange, &mut configured, &request)
+            .await
+            .unwrap_err();
+        read_elm_targeted_with_evidence(&mut exchange, &mut configured, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            exchange.commands(),
+            [
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "010C\r",
+                "010C\r",
+                "ATSH 7E0\r",
+                "ATCRA 7E8\r",
+                "010C\r",
+            ]
+        );
     }
 }

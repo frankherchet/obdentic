@@ -758,7 +758,14 @@ pub(crate) struct ElmSession<E> {
     /// responses back on Carly, so functional operations re-initialize first
     /// (#215, #221).
     functional_dirty: bool,
+    /// `(ATSH header, ATCRA filter)` currently configured on the adapter by a
+    /// targeted read, so consecutive reads of one target skip the setup
+    /// (#231). `None` whenever the adapter's headers are unknown or functional.
+    configured_target: Option<TargetKey>,
 }
+
+/// Header and response filter of a configured target.
+pub(crate) type TargetKey = (String, String);
 
 impl<E> ElmSession<E>
 where
@@ -769,6 +776,7 @@ where
             exchange,
             supported: PidSupport::default(),
             functional_dirty: false,
+            configured_target: None,
         }
     }
 
@@ -797,6 +805,7 @@ where
         self.discover_support(crate::vehicle::highest_catalog_page())
             .await?;
         self.functional_dirty = false;
+        self.configured_target = None;
         Ok(())
     }
 
@@ -853,7 +862,8 @@ where
         request: &TargetedReadRequest,
     ) -> Result<ReadEvidence, ReadEvidenceError> {
         self.functional_dirty = true;
-        read_elm_targeted_with_evidence(&mut self.exchange, request).await
+        read_elm_targeted_with_evidence(&mut self.exchange, &mut self.configured_target, request)
+            .await
     }
 
     pub(crate) async fn read_mode09(
@@ -861,6 +871,8 @@ where
         request: &TargetedMode09Request,
     ) -> Result<DiagnosticResponses, String> {
         self.functional_dirty = true;
+        // These operations restore functional addressing themselves.
+        self.configured_target = None;
         if let Err(error) = configure_target(
             &mut self.exchange,
             request.target(),
@@ -903,6 +915,8 @@ where
         request: &TargetedEcuIdentificationRequest,
     ) -> Result<EcuIdentificationReadEvidence, ReadEvidenceError> {
         self.functional_dirty = true;
+        // These operations restore functional addressing themselves.
+        self.configured_target = None;
         if let Err(error) = configure_target(
             &mut self.exchange,
             request.target(),
@@ -1126,24 +1140,30 @@ where
     }
 }
 
+/// Read one targeted request. The target stays configured afterwards (#231):
+/// `configured` remembers it so the next read of the same target sends only
+/// the PID. Functional addressing is re-established lazily by `ElmSession`.
 pub(crate) async fn read_elm_targeted_with_evidence<E>(
     exchange: &mut E,
+    configured: &mut Option<TargetKey>,
     request: &TargetedReadRequest,
 ) -> Result<ReadEvidence, ReadEvidenceError>
 where
     E: ElmExchange,
 {
-    if let Err(error) =
-        configure_target(exchange, request.target(), request.expected_responder()).await
-    {
-        let restore = restore_functional(exchange).await;
-        return Err(ReadEvidenceError {
-            error: combine_setup_errors(error, restore),
-            observations: Vec::new(),
-        });
+    let key = target_key(request.target(), request.expected_responder());
+    if configured.as_ref() != Some(&key) {
+        *configured = None;
+        configure_target(exchange, request.target(), request.expected_responder())
+            .await
+            .map_err(|error| ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })?;
+        *configured = Some(key);
     }
 
-    let read = match read_elm_responses(exchange, request.request()).await {
+    match read_elm_responses(exchange, request.request()).await {
         Ok(responses) => match targeted_payload(&responses, request.expected_responder()) {
             Ok(payload) => Ok(ReadEvidence {
                 payload,
@@ -1158,29 +1178,25 @@ where
                 ],
             }),
         },
-        Err(error) => Err(ReadEvidenceError {
-            error,
-            observations: Vec::new(),
-        }),
-    };
-    let restore = restore_functional(exchange).await;
-    match (read, restore) {
-        (Ok(read), Ok(())) => Ok(read),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(read), Err(error)) => Err(ReadEvidenceError {
-            error: format!(
-                "targeted read succeeded; restoring functional addressing failed: {error}"
-            ),
-            observations: read.observations,
-        }),
-        (Err(mut error), Err(restore)) => {
-            error.error = format!(
-                "{}; restoring functional addressing failed: {restore}",
-                error.error
-            );
-            Err(error)
+        Err(error) => {
+            // Unknown adapter state: reconfigure before the next read.
+            *configured = None;
+            Err(ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })
         }
     }
+}
+
+fn target_key(target: &RequestTarget, expected_responder: &ResponderIdentity) -> TargetKey {
+    let address = target
+        .address()
+        .expect("validated targeted request has a concrete address");
+    (
+        address.value().to_ascii_uppercase(),
+        expected_responder.as_str().to_owned(),
+    )
 }
 
 pub(crate) async fn configure_target<E>(
@@ -1191,11 +1207,7 @@ pub(crate) async fn configure_target<E>(
 where
     E: ElmExchange,
 {
-    let address = target
-        .address()
-        .expect("validated targeted request has a concrete address");
-    let target_header = address.value().to_ascii_uppercase();
-    let expected_header = expected_responder.as_str();
+    let (target_header, expected_header) = target_key(target, expected_responder);
     for (command, error) in [
         (
             format!("ATSH {target_header}\r"),
@@ -2818,7 +2830,7 @@ mod tests {
         .unwrap();
 
         for _ in 0..3 {
-            let read = read_elm_targeted_with_evidence(&mut exchange, &request)
+            let read = read_elm_targeted_with_evidence(&mut exchange, &mut None, &request)
                 .await
                 .unwrap_or_else(|error| panic!("{}", error.error));
             assert_eq!(read.payload, [0x41, 0x0c, 0x1a, 0xf8]);
