@@ -304,6 +304,8 @@ version again. Missing secrets are listed by name in the failing step.
 
 ## Acceptance
 
+Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals); ids stay in the Debug tab.
+
 Build and install the instrumentation APK, then run it with the phone unlocked:
 
 ```sh

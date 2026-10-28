@@ -26,7 +26,7 @@ public final class MeasurementFormat {
         if (value instanceof Number) {
             double number = ((Number) value).doubleValue();
             int decimals = 2;
-            if (resolution > 0 && !Double.isInfinite(resolution)) { decimals = 0; for (double r = resolution; r < 0.999999 && decimals < 6; r *= 10) decimals++; }
+            if (resolution > 0 && !Double.isInfinite(resolution)) { decimals = 0; for (double r = resolution; r < 0.999999 && decimals < 2; r *= 10) decimals++; }
             NumberFormat f = NumberFormat.getNumberInstance(Locale.GERMANY);
             f.setGroupingUsed(false); f.setMaximumFractionDigits(decimals); f.setMinimumFractionDigits(0);
             text = Double.isFinite(number) ? f.format(number) : String.valueOf(value);
