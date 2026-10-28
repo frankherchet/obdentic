@@ -61,8 +61,6 @@ All three generic built-in capture profiles are now versioned YAML files under `
 
 The YAML files are embedded in the binary at build time so named profile loading does not depend on a source checkout being present next to an installed executable. Each migrated profile preserves its previous ordered semantic set and requested intervals exactly.
 
-EA189 DPF/longitudinal orchestration remains a separate temporary bridge tracked by #14/#88 and PR #105.
-
 ## Profile file resolution
 
 `--profile` accepts either an embedded built-in name or an explicit local YAML path:

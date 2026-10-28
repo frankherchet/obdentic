@@ -6,12 +6,7 @@
 //! request cannot be passed to a transport by accident.
 
 use crate::{
-    diagnostic_job::{DiagnosticScope, KnownTarget},
-    ea189::{Ea189DpfProbe, Ea189DpfProbeError, Ea189DpfProbeRequest},
-    ecu_identification::IdentificationCandidate,
-    prepare_read,
-    runtime_state::Activity,
-    ReadRequest,
+    ecu_identification::IdentificationCandidate, prepare_read, runtime_state::Activity, ReadRequest,
 };
 use std::fmt;
 
@@ -70,9 +65,7 @@ pub enum OperationKind {
     Write,
     SignalRead,
     DtcRead,
-    Ea189DpfProbe,
     EcuIdentification,
-    VwClusterOdometer,
     DtcClear,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -96,10 +89,7 @@ pub enum OperationKind {
 pub enum OperationRequest {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
-    Ea189DpfProbe(Ea189DpfProbeRequest),
     EcuIdentification(IdentificationCandidate),
-    /// The closed experimental VW cluster odometer read (ADR 0001); it carries no input.
-    VwClusterOdometer,
     ClearDtcs,
     SecurityAccess,
     DiagnosticSessionControl,
@@ -137,24 +127,11 @@ impl OperationRequest {
         Self::ReadDtcs(kind)
     }
 
-    pub fn ea189_dpf_probe(probe: Ea189DpfProbe, target: KnownTarget) -> Self {
-        Self::Ea189DpfProbe(Ea189DpfProbeRequest::for_engine(probe, target))
-    }
-
-    pub fn ea189_dpf_probe_for_scope(
-        probe: Ea189DpfProbe,
-        scope: DiagnosticScope,
-    ) -> Result<Self, Ea189DpfProbeError> {
-        Ea189DpfProbeRequest::from_scope(probe, scope).map(Self::Ea189DpfProbe)
-    }
-
     pub const fn kind(&self) -> OperationKind {
         match self {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
-            Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
-            Self::VwClusterOdometer => OperationKind::VwClusterOdometer,
             Self::ClearDtcs => OperationKind::DtcClear,
             Self::SecurityAccess => OperationKind::SecurityAccess,
             Self::DiagnosticSessionControl => OperationKind::DiagnosticSessionControl,
@@ -177,9 +154,7 @@ impl OperationRequest {
 pub enum Operation {
     ReadSignal(ReadRequest),
     ReadDtcs(DtcReadKind),
-    Ea189DpfProbe(Ea189DpfProbeRequest),
     EcuIdentification(IdentificationCandidate),
-    VwClusterOdometer,
 }
 
 impl Operation {
@@ -187,9 +162,7 @@ impl Operation {
         match self {
             Self::ReadSignal(_) => OperationKind::SignalRead,
             Self::ReadDtcs(_) => OperationKind::DtcRead,
-            Self::Ea189DpfProbe(_) => OperationKind::Ea189DpfProbe,
             Self::EcuIdentification(_) => OperationKind::EcuIdentification,
-            Self::VwClusterOdometer => OperationKind::VwClusterOdometer,
         }
     }
 
@@ -203,10 +176,6 @@ impl Operation {
 
     pub const fn dtc(kind: DtcReadKind) -> Self {
         Self::ReadDtcs(kind)
-    }
-
-    pub fn ea189_dpf_probe(request: Ea189DpfProbeRequest) -> Self {
-        Self::Ea189DpfProbe(request)
     }
 
     pub fn ecu_identification(candidate: IdentificationCandidate) -> Self {
@@ -238,9 +207,7 @@ impl Capability {
                 operation,
                 OperationKind::SignalRead
                     | OperationKind::DtcRead
-                    | OperationKind::Ea189DpfProbe
                     | OperationKind::EcuIdentification
-                    | OperationKind::VwClusterOdometer
             ),
         }
     }
@@ -317,14 +284,8 @@ impl SafetyPolicy {
         match request {
             OperationRequest::ReadSignal(signal) => self.authorize_read(signal),
             OperationRequest::ReadDtcs(kind) => self.authorize_operation(Operation::ReadDtcs(kind)),
-            OperationRequest::Ea189DpfProbe(probe) => {
-                self.authorize_operation(Operation::Ea189DpfProbe(probe))
-            }
             OperationRequest::EcuIdentification(candidate) => {
                 self.authorize_operation(Operation::EcuIdentification(candidate))
-            }
-            OperationRequest::VwClusterOdometer => {
-                self.authorize_operation(Operation::VwClusterOdometer)
             }
             OperationRequest::ClearDtcs => {
                 Err(SafetyError::OperationBlocked(OperationKind::DtcClear))
@@ -389,10 +350,7 @@ impl SafetyPolicy {
             Activity::Diagnose => {
                 matches!(
                     operation,
-                    OperationKind::DtcRead
-                        | OperationKind::Ea189DpfProbe
-                        | OperationKind::EcuIdentification
-                        | OperationKind::VwClusterOdometer
+                    OperationKind::DtcRead | OperationKind::EcuIdentification
                 )
             }
             Activity::Idle | Activity::Write => false,
@@ -462,28 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn ea189_dpf_probe_is_read_only_and_engine_targeted() {
-        let target = crate::diagnostic_job::KnownTarget::new("validated-engine").unwrap();
-        let request = OperationRequest::ea189_dpf_probe(Ea189DpfProbe::SootMassMeasured, target);
-        assert_eq!(request.kind(), OperationKind::Ea189DpfProbe);
-        let operation = SafetyPolicy::default()
-            .authorize_activity(Activity::Diagnose, request)
-            .unwrap();
-        assert!(matches!(
-            operation,
-            Operation::Ea189DpfProbe(ref request)
-                if request.probe() == Ea189DpfProbe::SootMassMeasured
-                    && matches!(
-                        request.scope(),
-                        DiagnosticScope::KnownEcu {
-                            role: crate::diagnostic_job::EcuRole::Engine,
-                            ..
-                        }
-                    )
-        ));
-    }
-
-    #[test]
     fn bounded_ecu_identification_is_diagnose_only_and_read_only() {
         let catalog =
             crate::knowledge_db::KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -503,38 +439,6 @@ mod tests {
                 Activity::Read,
                 OperationRequest::EcuIdentification(plan.candidates()[0].clone())
             )
-            .is_err());
-    }
-
-    #[test]
-    fn vw_cluster_odometer_is_allowed_only_as_a_diagnose_activity() {
-        let policy = SafetyPolicy::default();
-        assert_eq!(
-            policy
-                .authorize_activity(Activity::Diagnose, OperationRequest::VwClusterOdometer)
-                .unwrap(),
-            Operation::VwClusterOdometer
-        );
-        for activity in [
-            Activity::Read,
-            Activity::Observe,
-            Activity::Idle,
-            Activity::Write,
-        ] {
-            assert!(policy
-                .authorize_activity(activity, OperationRequest::VwClusterOdometer)
-                .is_err());
-        }
-    }
-
-    #[test]
-    fn generic_signal_path_cannot_construct_an_ea189_dpf_did() {
-        assert!(OperationRequest::read_signal("dpf.soot_mass_measured").is_err());
-        let target = crate::diagnostic_job::KnownTarget::new("validated-engine").unwrap();
-        let request =
-            OperationRequest::ea189_dpf_probe(Ea189DpfProbe::DifferentialPressure, target);
-        assert!(SafetyPolicy::default()
-            .authorize_activity(Activity::Read, request)
             .is_err());
     }
 

@@ -84,17 +84,6 @@ final class ReconnectAcceptance {
             String second = service.snapshot().getString("recording");
             require(!second.equals(first) && headerProfile(new File(recordings, second)).equals("engine-drive"), "REQ-020.8 the new recording uses the same profile in a new file");
 
-            // REQ-020.8: a test sequence is never restarted
-            service.stopRecording(); waitFor(() -> service.snapshot().optString("recording").isEmpty(), "stop before the test sequence");
-            service.startRecording("ea189-ash-test", "engine_off"); waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "test sequence start");
-            String test = service.snapshot().getString("recording"); int testOpens = fake.opens.size();
-            fake.last.up = false;
-            waitFor(() -> fake.opens.size() > testOpens, "retry after the interrupted test sequence");
-            ready(service); SystemClock.sleep(1500);
-            String testEnd = lastEvent(new File(recordings, test));
-            require(testEnd.contains("\"reason\":\"error\"") && read(new File(recordings, test)).contains("\"status\":\"aborted\""), "REQ-020.8 the interrupted test sequence is aborted and stays partial");
-            require(service.snapshot().optString("recording").isEmpty(), "REQ-020.8 a test sequence is never restarted automatically");
-
             // REQ-020.4: every manual stop ends the attempts, and none start again
             String stored = first;
             stopCases(service, fake, "REQ-020.4 manual disconnect", service::disconnect);
@@ -181,8 +170,8 @@ final class ReconnectAcceptance {
         p.setEnabled(false);
         require(!p.enabled() && !p.pending() && p.lost() == -1 && !p.startup(), "REQ-020.6 switched off: no attempts");
         require(new ReconnectPolicy(true).failed() == -1, "REQ-020.4 a failure outside an automatic attempt (manual connect) schedules nothing");
-        require(ReconnectPolicy.resumeProfile("engine-drive", false).equals("engine-drive") && ReconnectPolicy.resumeProfile("ea189-dpf", false).equals("ea189-dpf"), "REQ-020.8 a normal profile continues with the same profile");
-        require(ReconnectPolicy.resumeProfile("ea189-ash-test", false).isEmpty() && ReconnectPolicy.resumeProfile("engine-drive", true).isEmpty() && ReconnectPolicy.resumeProfile("", false).isEmpty(), "REQ-020.8 a test sequence or no recording never continues");
+        require(ReconnectPolicy.resumeProfile("engine-drive").equals("engine-drive"), "REQ-020.8 a profile continues with the same profile");
+        require(ReconnectPolicy.resumeProfile("").isEmpty() && ReconnectPolicy.resumeProfile(null).isEmpty(), "REQ-020.8 no recording never continues");
     }
 
     private static Set<String> names(File dir) { String[] list = dir.list(); return list == null ? new HashSet<>() : new HashSet<>(Arrays.asList(list)); }

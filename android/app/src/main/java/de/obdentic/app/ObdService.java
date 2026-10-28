@@ -49,7 +49,6 @@ public final class ObdService extends Service {
     private int scanGeneration;
     private android.os.PowerManager.WakeLock wakeLock;
     private volatile String recordingProfile = "";
-    private volatile int sequenceIndex = -1;
     private final Map<String, Long> due = new HashMap<>(), intervals = new HashMap<>();
     private final Map<String, JSONObject> values = new LinkedHashMap<>();
     public volatile VehicleStore vehicles;
@@ -87,7 +86,7 @@ public final class ObdService extends Service {
     /** REQ-021: pending buttons live here, not in the Activity, so they survive its recreation. */
     public final PendingActions pending = new PendingActions();
     public JSONObject snapshot() {
-        synchronized(stateLock) { put(state,"busy",busy || sequenceIndex>=0); put(state,"records",listRecords()); put(state,"vehicles",vehicles.snapshot());
+        synchronized(stateLock) { put(state,"busy",busy); put(state,"records",listRecords()); put(state,"vehicles",vehicles.snapshot());
             put(state,"autoExport",RecordingExporter.auto(this)); put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
             try { return new JSONObject(state.toString()); } catch(JSONException e) { return new JSONObject(); } }
     }
@@ -242,7 +241,6 @@ public final class ObdService extends Service {
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
             put(state,"replayFile","");
             put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"replayPartial",false);
-            put(state,"testSequence",new JSONObject()); put(state,"ashEvidence",new JSONObject());
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
         synchronized(due) { due.clear(); }
@@ -351,7 +349,7 @@ public final class ObdService extends Service {
         if(token!=generation) return;
         String text=error.getMessage()==null ? error.toString():error.getMessage();
         boolean live=mode.equals("live"), established=!sessionAddress.isEmpty(); sessionAddress="";
-        String resume=established ? ReconnectPolicy.resumeProfile(recordingProfile,sequenceIndex>=0) : ""; // REQ-020.8: before the recording closes
+        String resume=established ? ReconnectPolicy.resumeProfile(recordingProfile) : ""; // REQ-020.8: before the recording closes
         Link active=transport; transport=null; if(active!=null) active.close(); destroyCore();
         set("phase","error"); message(text); closeRecording("error",text);
         long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
@@ -388,73 +386,21 @@ public final class ObdService extends Service {
         } set("selected",checked);
     }
     public void runJob(String action) {
-        if(busy || sequenceIndex>=0 || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
-        if(!action.equals("inventory") && !action.equals("dtc.scan") && !isEa189Job(action) && !action.equals(CLUSTER_ODOMETER) && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
+        if(busy || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
+        if(!action.equals("inventory") && !action.equals("dtc.scan") && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
         busy=true; changed(); int token=generation;
         worker.execute(() -> { try {
             if(token!=generation) return;
-            if(sequenceIndex>=0) { message("Während des Testlaufs sind andere Aufträge gesperrt"); return; }
             String argument=action.startsWith("read:") ? action.substring(5) : "";
-            if(action.equals(CLUSTER_ODOMETER)) { String blocked=clusterOdometerBlocker(snapshot()); if(blocked!=null) { message(blocked); return; } } // REQ-016.2: nothing is sent
-            if(isEa189Job(action)) { JSONObject inventory=execute("inventory",""); if(token!=generation) return; set("vehicle",inventory.opt("data")); }
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
             if(token!=generation) return;
             set("jobResult",result);
             if(action.equals("inventory")) { set("vehicle",result.opt("data")); if(result.optJSONObject("data") != null) applySupport(result.optJSONObject("data")); }
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
             if(!argument.isEmpty()) updateValue(argument,result);
-            if(isEa189Job(action)) applyDpf(result);
-            if(action.equals(CLUSTER_ODOMETER)) { message(storeClusterOdometer(result)); return; }
             String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
         } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } } });
-    }
-    public static final String CLUSTER_ODOMETER = "vw.cluster.odometer";
-    /** REQ-016.2: null when the experimental cluster read may start, otherwise the German reason shown next to the disabled button. Busy state is not part of it. */
-    public static String clusterOdometerBlocker(JSONObject snapshot) {
-        String mode=snapshot.optString("mode","live");
-        if(mode.equals("replay")) return "Im Replay nicht verfügbar";
-        if(mode.equals("demo")) return "Kein gespeichertes Fahrzeug (Demo)";
-        if(!snapshot.optString("phase").equals("ready")) return "Keine aktive Sitzung";
-        JSONObject store=snapshot.optJSONObject("vehicles"), session=snapshot.optJSONObject("vehicle"), record=null;
-        JSONArray rows=store==null ? null : store.optJSONArray("vehicles");
-        for(int i=0;rows!=null && i<rows.length();i++) if(rows.optJSONObject(i).optString("vin").equals(store.optString("selected"))) record=rows.optJSONObject(i);
-        if(record==null) return "Kein gespeichertes Fahrzeug gewählt";
-        String vin=session==null ? "" : session.optString("vin");
-        if(vin.isEmpty() || !vin.equals(record.optString("vin"))) return "Das gewählte Fahrzeug ist nicht das verbundene";
-        if(!VehicleStore.isVwGroup(record.optString("manufacturer_hint"))) return "Kein Herstellerhinweis der VW-Gruppe";
-        return null;
-    }
-    /** REQ-016.1/.4/.5/.8: live mode only; the result goes to the record of the current session VIN, never into the PID A6 fields. Returns the status message. */
-    private String storeClusterOdometer(JSONObject result) {
-        JSONObject data=result.optJSONObject("data");
-        if(!result.optBoolean("ok") || data==null) return result.optString("error","Kombiinstrument-Auftrag nicht ausgeführt"); // refused: nothing was sent
-        String outcome=data.optString("outcome"), error, text;
-        long now=System.currentTimeMillis();
-        JSONObject session; synchronized(stateLock) { session=state.optJSONObject("vehicle"); }
-        String vin=session==null ? "" : session.optString("vin");
-        if(outcome.equals("value")) { long km=data.optLong("value_km");
-            text="Kombiinstrument: "+java.text.NumberFormat.getIntegerInstance(Locale.GERMANY).format(km)+" km (experimentell, ungeprüft)";
-            error=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin()) ? vehicles.clusterOdometer(vin,km,now,data.optString("source"),data.optString("classification"),data.optString("hardware_validation")) : null;
-        } else { JSONArray bytes=data.optJSONArray("response_data"); StringBuilder raw=new StringBuilder();
-            for(int i=0;bytes!=null && i<bytes.length();i++) raw.append(i>0?" ":"").append(String.format(Locale.ROOT,"%02X",bytes.optInt(i)));
-            boolean unreadable=outcome.equals("unparseable_length");
-            String reason=unreadable ? "nicht auswertbar" : data.optString("error","Keine Antwort");
-            text="Kombiinstrument-km-Stand nicht gelesen: "+reason;
-            error=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin()) ? vehicles.clusterOdometerFailure(vin,reason,unreadable ? raw.toString() : null,now) : null;
-        }
-        return error==null ? text : error;
-    }
-    private static boolean isEa189Job(String action) {
-        return action.equals("ea189.dpf.probe") || action.equals("ea189.extended.probe");
-    }
-    private void applyDpf(JSONObject result) {
-        JSONObject data=result.optJSONObject("data"); if(data==null) return;
-        JSONArray readings=data.optJSONArray("readings"); if(readings==null) return;
-        for(int i=0;i<readings.length();i++) { JSONObject reading=readings.optJSONObject(i); if(reading==null) continue;
-            JSONObject envelope=new JSONObject(); put(envelope,"ok",!reading.has("error")); put(envelope,"data",reading); put(envelope,"error",reading.opt("error"));
-            updateValue(reading.optString("semantic"),envelope);
-        }
     }
     private void poll() {
         if(wakeLock!=null && SystemClock.elapsedRealtime()-lastWakeRefresh>5*60*1000L && (phase().equals("ready") || phase().equals("connecting") || policy.state()==ReconnectPolicy.State.WAITING)) {
@@ -462,29 +408,20 @@ public final class ObdService extends Service {
         }
         if(busy || !phase().equals("ready") || core==0) return;
         Link active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
-        if(sequenceIndex>=0) { pollSequence(); return; }
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
-        String probeAction=recordingProfile.equals("ea189-dpf")?"ea189.dpf.probe":recordingProfile.equals("ea189-extended")?"ea189.extended.probe":"";
-        boolean dpf=!probeAction.isEmpty();
-        if((selected.length()==0 && !dpf) || SystemClock.elapsedRealtime()-lastPoll<(dpf?10000:500)) return;
+        if(selected.length()==0 || SystemClock.elapsedRealtime()-lastPoll<500) return;
         int token=generation;
         try {
-            if(dpf) {
-                boolean validated; synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); validated=vehicle!=null && vehicle.optBoolean("engine_target_validated"); }
-                if(!validated) { JSONObject inventory=execute("inventory",""); if(token!=generation) return; set("vehicle",inventory.opt("data")); }
-                JSONObject result=execute(probeAction,""); if(token!=generation) return; applyDpf(result); set("jobResult",result);
-            } else {
-                long now=SystemClock.elapsedRealtime(), earliest=Long.MAX_VALUE; String semantic=null;
-                synchronized(due) { for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i); long next=due.getOrDefault(candidate,0L);
-                    boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
-                        for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j); if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true; }
-                    }
-                    if(!unsupported && next<=now && next<earliest) { semantic=candidate; earliest=next; }
-                } }
-                if(semantic!=null) {
-                    JSONObject result=execute("read",semantic); if(token==generation) updateValue(semantic,result);
-                    synchronized(due) { due.put(semantic,SystemClock.elapsedRealtime()+Math.max(1000,intervals.getOrDefault(semantic,2000L))); }
+            long now=SystemClock.elapsedRealtime(), earliest=Long.MAX_VALUE; String semantic=null;
+            synchronized(due) { for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i); long next=due.getOrDefault(candidate,0L);
+                boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
+                    for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j); if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true; }
                 }
+                if(!unsupported && next<=now && next<earliest) { semantic=candidate; earliest=next; }
+            } }
+            if(semantic!=null) {
+                JSONObject result=execute("read",semantic); if(token==generation) updateValue(semantic,result);
+                synchronized(due) { due.put(semantic,SystemClock.elapsedRealtime()+Math.max(1000,intervals.getOrDefault(semantic,2000L))); }
             }
         } catch(Throwable e) { fail(token,e); }
         finally { lastPoll=SystemClock.elapsedRealtime(); if(token==generation) changed(); }
@@ -508,13 +445,10 @@ public final class ObdService extends Service {
             values.put(semantic,row); put(state,"values",new JSONArray(values.values()));
         } changed();
     }
-    public void startRecording(String profileId) { startRecording(profileId,""); }
-    public void startRecording(String profileId,String context) { worker.execute(() -> startRecordingNow(profileId,context)); }
-    private void startRecordingNow(String profileId,String context) {
+    public void startRecording(String profileId) { worker.execute(() -> startRecordingNow(profileId)); }
+    private void startRecordingNow(String profileId) {
         if(!phase().equals("ready")) { message("Zum Aufzeichnen zuerst verbinden"); return; }
-        if(busy || sequenceIndex>=0) { message("Zuerst laufenden Auftrag oder Testlauf beenden"); return; }
-        boolean test=profileId.equals(TestSequence.PROFILE);
-        if(test && !TestSequence.validContext(context)) { message("Für den Testlauf zuerst den Betriebszustand auswählen"); return; }
+        if(busy) { message("Zuerst laufenden Auftrag beenden"); return; }
         JSONArray signals=null, periods=null; synchronized(stateLock) { JSONArray profiles=state.optJSONArray("profiles");
             for(int i=0;i<profiles.length();i++) if(profileId.equals(profiles.optJSONObject(i).optString("id"))) { signals=profiles.optJSONObject(i).optJSONArray("signals"); periods=profiles.optJSONObject(i).optJSONArray("intervals_ms"); } }
         if(signals==null) { message("Unbekanntes Aufnahmeprofil"); return; }
@@ -526,29 +460,20 @@ public final class ObdService extends Service {
                 recordingOriginNanos=SystemClock.elapsedRealtimeNanos();
                 writer=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory,name)),StandardCharsets.UTF_8));
                 set("recording",name);
-                JSONObject header=new JSONObject(); put(header,"type","session"); put(header,"schema","OBDENTIC-MOBILE"); put(header,"version",1); put(header,"mode",mode); put(header,"profile",profileId); put(header,"selected",profileId.equals("ea189-dpf")||profileId.equals("ea189-extended")?new JSONArray():signals);
-                if(test) {
-                    set("ashEvidence",new JSONObject());
-                    JSONObject sequence=new JSONObject(); put(sequence,"profile",profileId); put(sequence,"operator_context",context); put(sequence,"context_label",TestSequence.contextLabel(context));
-                    put(sequence,"context_source","operator_report"); put(sequence,"status","running"); put(sequence,"step",0); put(sequence,"total",TestSequence.Step.values().length); put(sequence,"file",name);
-                    put(header,"test_sequence",sequence); set("testSequence",sequence);
-                } else set("testSequence",new JSONObject());
+                JSONObject header=new JSONObject(); put(header,"type","session"); put(header,"schema","OBDENTIC-MOBILE"); put(header,"version",1); put(header,"mode",mode); put(header,"profile",profileId); put(header,"selected",signals);
                 synchronized(stateLock) { put(header,"vehicle",state.opt("vehicle")); put(header,"diagnostics",state.opt("diagnostics")); put(header,"catalog",state.opt("signals")); put(header,"profiles",state.opt("profiles")); }
                 // Notifications must not precede the header in the new evidence stream.
                 record(header);
-                if(writer==null) { if(test)sequenceProgress("aborted","Aufnahme konnte nicht geschrieben werden"); return; }
+                if(writer==null) return;
             }
             recordingProfile=profileId;
-            sequenceIndex=test?0:-1;
             synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?1200L:periods.optLong(i,1200L)); }
-            if(test||profileId.equals("ea189-dpf")||profileId.equals("ea189-extended"))set("selected",new JSONArray());else selectSignals(signals); message("Aufnahme läuft: " + profileId);
+            selectSignals(signals); message("Aufnahme läuft: " + profileId);
         } catch(IOException e) { message(e.getMessage()); }
     }
     public void stopRecording() { if(!worker.isShutdown()) worker.execute(this::stopRecordingNow); }
     private void stopRecordingNow() { closeRecording("stopped",""); }
     private void closeRecording(String reason,String detail) {
-        if(sequenceIndex>=0) sequenceProgress(reason.equals("completed")?"completed":"aborted",detail);
-        sequenceIndex=-1;
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
         boolean completed=false; String closed; synchronized(stateLock) { closed=state.optString("recording"); }
         synchronized(recordLock) {
@@ -556,7 +481,7 @@ public final class ObdService extends Service {
             if(writer!=null) { try { writer.close(); completed=true; } catch(IOException e) { message("Aufnahme konnte nicht abgeschlossen werden: "+e.getMessage()); } writer=null; }
         }
         set("recording","");
-        if(completed) message(reason.equals("completed")?"Testlauf aufgezeichnet · Antworten auswerten":reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
+        if(completed) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
         if(completed && !closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty())) exportNow(closed); // REQ-018.4: any ending reason
     }
     /** Test seam (REQ-018): when set, replaces the stored folder as export destination. */
@@ -576,42 +501,10 @@ public final class ObdService extends Service {
         if(result.unavailable) exportUnavailable(); else message(result.message());
     }
     private void exportUnavailable() { if(exportTarget==null) RecordingExporter.setFolder(this,""); message(RecordingExporter.UNAVAILABLE); }
-    private void sequenceProgress(String status,String label) {
-        JSONObject progress;
-        synchronized(stateLock) {
-            try { progress=new JSONObject(state.getJSONObject("testSequence").toString()); }
-            catch(JSONException e) { throw new IllegalStateException(e); }
-        }
-        put(progress,"status",status); put(progress,"step",Math.min(sequenceIndex+1,TestSequence.Step.values().length)); put(progress,"label",label);
-        set("testSequence",progress);
-        JSONObject event=new JSONObject(); put(event,"type","test_sequence"); put(event,"progress",progress); record(event);
-    }
-    private void pollSequence() {
-        int token=generation;
-        TestSequence.Step step=TestSequence.Step.values()[sequenceIndex];
-        sequenceProgress("running",step.label);
-        try {
-            synchronized(recordLock) { if(writer==null || sequenceIndex<0)return; }
-            JSONObject result=execute(step.action,step.argument);
-            if(token!=generation) return;
-            synchronized(recordLock) { if(writer==null) { sequenceIndex=-1; return; } }
-            set("jobResult",result);
-            if(!result.optBoolean("ok")) { closeRecording("error",result.optString("error","Testschritt fehlgeschlagen")); return; }
-            JSONObject data=result.optJSONObject("data");
-            if(step==TestSequence.Step.INVENTORY) {
-                set("vehicle",data); if(data!=null)applySupport(data);
-                if(data==null || !data.optBoolean("engine_target_validated")) { closeRecording("error","Motorsteuergerät nicht gezielt bestätigt"); return; }
-            } else if(step==TestSequence.Step.ASH) set("ashEvidence",data);
-            else if(step==TestSequence.Step.DPF) applyDpf(result);
-            else updateValue(step.argument,result);
-            if(sequenceIndex+1==TestSequence.Step.values().length)closeRecording("completed","");
-            else sequenceIndex++;
-        } catch(Throwable e) { fail(token,e); }
-    }
     private void record(JSONObject event) {
         put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
             try { writer.write(event.toString()); writer.newLine(); writer.flush(); }
-            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; if(sequenceIndex>=0){sequenceIndex=-1;synchronized(stateLock){put(state.optJSONObject("testSequence"),"status","aborted");}} synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=state.optString("recording"); } set("recording",""); message("Aufnahmefehler: "+e.getMessage());
+            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=state.optString("recording"); } set("recording",""); message("Aufnahmefehler: "+e.getMessage());
                 // REQ-018.4: a recording ended by a write error is auto-exported too (after the lock is released).
                 if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(failed)); }
         }
@@ -678,35 +571,25 @@ public final class ObdService extends Service {
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
                         else if(action.equals("inventory")) restoreVehicle(result.optJSONObject("data"));
-                        else if(action.equals("dtc.scan") || action.equals("ea189.ash.probe") || action.equals(CLUSTER_ODOMETER) || isEa189Job(action)) {
+                        else if(action.equals("dtc.scan")) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));
-                            if(action.equals("dtc.scan")) set("diagnostics",decoded.opt("data")); else if(action.equals("ea189.ash.probe"))set("ashEvidence",decoded.opt("data")); else if(!action.equals(CLUSTER_ODOMETER)) applyDpf(decoded); // REQ-016.7: re-decoded, never stored
+                            set("diagnostics",decoded.opt("data"));
                             result=decoded;
                         }
                         set("jobResult",result);
                     } else if(event.optString("type").equals("session")) {
-                        String savedProfile=event.optString("profile");if(savedProfile.equals("ea189-dpf")||savedProfile.equals("ea189-extended"))set("selected",new JSONArray());else selectSignals(event.optJSONArray("selected")==null?new JSONArray():event.optJSONArray("selected"));
+                        selectSignals(event.optJSONArray("selected")==null?new JSONArray():event.optJSONArray("selected"));
                         if(event.optJSONObject("vehicle")!=null) restoreVehicle(event.optJSONObject("vehicle"));
-                        if(event.optJSONObject("test_sequence")!=null)set("testSequence",event.optJSONObject("test_sequence"));
                         if(event.optJSONObject("diagnostics")!=null && event.optJSONObject("diagnostics").has("raw_response")) { JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay.dtc.scan",event.optJSONObject("diagnostics").toString())); set("diagnostics",decoded.opt("data")); }
                         set("replaySourceMode",event.optString("mode","unknown"));
-                    } else if(event.optString("type").equals("test_sequence")) { if(event.optJSONObject("progress")!=null)set("testSequence",event.optJSONObject("progress"));
                     } else if(event.optString("type").equals("wire")) { synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } }
                 }
                 if(!headerFound) throw new IOException("Leere Aufnahme");
-                if(token==generation) { restoreSequenceOutcome(endFound,outcome); set("replayPartial",!endFound); set("replayOutcome",outcome); message(!endFound?"Teilaufnahme ohne Abschlussmarker: "+filename:outcome.equals("error")?"Aufnahme mit Fehler beendet: "+outcomeDetail:"Offline geöffnet ("+outcome+"): "+filename); }
+                if(token==generation) { set("replayPartial",!endFound); set("replayOutcome",outcome); message(!endFound?"Teilaufnahme ohne Abschlussmarker: "+filename:outcome.equals("error")?"Aufnahme mit Fehler beendet: "+outcomeDetail:"Offline geöffnet ("+outcome+"): "+filename); }
             }
-        } catch(Exception e) { if(token==generation) { if(!headerAccepted){replayFilename="";set("replayFile","");} restoreSequenceOutcome(false,""); set("replayPartial",true); message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
+        } catch(Exception e) { if(token==generation) { if(!headerAccepted){replayFilename="";set("replayFile","");} set("replayPartial",true); message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
         finally { if(token==generation) { busy=false; changed(); } } });
-    }
-    private void restoreSequenceOutcome(boolean complete,String outcome) {
-        synchronized(stateLock) {
-            JSONObject sequence=state.optJSONObject("testSequence");
-            if(sequence==null || sequence.length()==0)return;
-            if(!complete)put(sequence,"status","incomplete");
-            else if(sequence.optString("status").equals("running"))put(sequence,"status",outcome.equals("completed")?"completed":"aborted");
-        }
     }
     private void restoreVehicle(JSONObject vehicle) throws Exception {
         if(vehicle==null)return;
@@ -750,15 +633,6 @@ public final class ObdService extends Service {
             else if(c.equals("0146")) response="7E8 03 41 46 3C\r>";
             else if(c.equals("014A")) response="7E8 03 41 4A 20\r>";
             else if(c.equals("014C")) response="7E8 03 41 4C 20\r>";
-            else if(c.equals("22114E")) response="7E8 05 62 11 4E 03 E8\r>";
-            else if(c.equals("22114F")) response="7E8 05 62 11 4F 04 F8\r>";
-            else if(c.equals("221156")) response="7E8 07 62 11 56 00 00 8C A0\r>";
-            else if(c.equals("22115E")) response="7E8 07 62 11 5E 00 00 0D 2F\r>";
-            else if(c.equals("2211B2")) response="7E8 05 62 11 B2 16 A8\r>";
-            else if(c.equals("2210F9")) response="7E8 05 62 10 F9 14 B4\r>";
-            else if(c.equals("2214F5")) response="7E8 05 62 14 F5 00 0A\r>";
-            else if(c.equals("22178C")) response="7E8 03 7F 22 31\r>";
-            else if(c.equals("222203")) response="77E 05 62 22 03 30 39\r>";
             else if(c.equals("010C")) response="7E8 04 41 0C 0C 80\r>";
             else if(c.equals("010D")) response="7E8 03 41 0D 00\r>";
             else if(c.equals("0105")) response="7E8 03 41 05 7B\r>";
@@ -792,21 +666,9 @@ public final class ObdService extends Service {
                 case "015E":data="00 64";break;
                 case "0161":case "0162":data="96";break;
                 case "0163":data="01 90";break;
-                case "221153":data="00 0C";break;
-                case "22115A":data="01 F4";break;
-                case "22115B":case "22115C":case "2211C1":data="00";break;
-                case "221057":case "221149":data="03 E8";break;
-                case "2211BE":data="0E 2F";break;
-                case "22162D":data="0C 3B";break;
-                case "2210FF":case "221100":data="00 0A";break;
-                case "221104":case "221105":data="FF F6";break;
-                case "221169":case "22116A":data="0B B8";break;
                 default:return null;
             }
-            boolean uds=command.startsWith("22");
-            int length=(uds?3:2)+data.split(" ").length;
-            return String.format(Locale.ROOT,"7E8 %02X %s %s %s\r>",length,uds?"62":"41",
-                uds?command.substring(2,4)+" "+command.substring(4):command.substring(2),data);
+            return String.format(Locale.ROOT,"7E8 %02X 41 %s %s\r>",2+data.split(" ").length,command.substring(2),data);
         }
     }
 }

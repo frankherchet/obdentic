@@ -694,14 +694,14 @@ mod tests {
         let rendered = render_inspection(
             "job.jsonl",
             &capture(vec![
-                CaptureEvent::capture_started(Some(1), Some("ea189.dpf.probe".into())),
+                CaptureEvent::capture_started(Some(1), Some("dtc.scan".into())),
                 CaptureEvent::DiagnosticJobStarted {
-                    job_id: "ea189.dpf.probe".into(),
+                    job_id: "dtc.scan".into(),
                     model_version: 1,
                     step_count: 1,
                 },
                 CaptureEvent::DiagnosticJobCompleted {
-                    job_id: "ea189.dpf.probe".into(),
+                    job_id: "dtc.scan".into(),
                     status: JobStatus::Completed,
                 },
                 CaptureEvent::SessionStopped {

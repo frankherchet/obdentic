@@ -14,9 +14,9 @@ public final class ReconnectPolicy {
     /** REQ-020.3: pause before the attempt with this zero-based number: 2, 5, 10 s, then every 30 s. */
     public static long delayMs(int attempt) { return attempt < PAUSES_MS.length ? PAUSES_MS[attempt] : REPEAT_MS; }
 
-    /** REQ-020.8: the profile to start again after reconnection; "" for no profile, no recording or a test sequence (never restarted). */
-    public static String resumeProfile(String profile, boolean testSequence) {
-        return testSequence || profile == null || profile.equals(TestSequence.PROFILE) ? "" : profile;
+    /** REQ-020.8: the profile to start again after reconnection; "" for no profile or no recording. */
+    public static String resumeProfile(String profile) {
+        return profile == null ? "" : profile;
     }
 
     public synchronized boolean enabled() { return enabled; }

@@ -32,20 +32,12 @@ pub struct SignalDefinition {
     decode: fn(&[u8]) -> f64,
 }
 
-const PROFILES: [ProfileMetadata; 2] = [
-    ProfileMetadata {
-        id: "obd2-v1",
-        description: "Generic SAE J1979 Mode 01 signals.",
-        confidence: "standards-derived/offline-tested",
-        hardware_validation: "rust-hardware-pending",
-    },
-    ProfileMetadata {
-        id: "vw-ea189-v1",
-        description: "EA189 profile skeleton; no manufacturer-specific signals yet.",
-        confidence: "experimental",
-        hardware_validation: "hardware-evidence-required",
-    },
-];
+const PROFILES: [ProfileMetadata; 1] = [ProfileMetadata {
+    id: "obd2-v1",
+    description: "Generic SAE J1979 Mode 01 signals.",
+    confidence: "standards-derived/offline-tested",
+    hardware_validation: "rust-hardware-pending",
+}];
 
 const SIGNALS: [SignalDefinition; 50] = [
     SignalDefinition::new(
