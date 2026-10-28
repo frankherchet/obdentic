@@ -107,6 +107,19 @@ and the button is usable again; a late result still updates the display. The pen
 text is the button's content description and is announced, as is the final state. The mapping from action to
 target state is the comment above the specs in `MainActivity`.
 
+## Pending feedback
+
+Buttons whose action finishes asynchronously (recording start/stop, test run, search, connect,
+disconnect, Diagnose jobs, export all, automatic export and connection, vehicle select/rename/delete)
+react at once (REQ-021): the button is disabled, shows a pending text ("Aufzeichnung wird gestartet …")
+with a progress indicator, and repeated taps start nothing. The state ends when the service snapshot
+shows the target state or a message for the action arrives; without either after the limit (connect 30 s,
+search 15 s, Diagnose jobs and export 60 s, everything else 10 s) the status line says "Keine Rückmeldung · <Aktion>"
+and the button is usable again; a late result still updates the display. The pending entries
+(`PendingActions`) live in `ObdService`, so they survive tab switches and Activity recreation; the pending
+text is the button's content description and is announced, as is the final state. The mapping from action to
+target state is the comment above the specs in `MainActivity`.
+
 ## Build and install
 
 Prerequisites: JDK 17+, Rust 1.98.0, `rtk`, Android SDK platform 36, build tools
