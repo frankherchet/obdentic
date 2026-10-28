@@ -1,6 +1,6 @@
 # 0002. ECU request targets in the Knowledge DB (VAG first)
 Date: 2026-10-28
-Status: proposed
+Status: accepted
 
 ## Context
 Spike #238 asks how to model manufacturer ECU request targets (request and
