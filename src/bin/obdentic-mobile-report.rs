@@ -88,6 +88,7 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                 let offline_action = match action {
                     "read" => "replay.read",
                     "dtc.scan" => "replay.dtc.scan",
+                    "adapter.throughput" => "replay.adapter.throughput",
                     _ => continue,
                 };
                 let decoded: Value = serde_json::from_str(
@@ -102,6 +103,11 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                         .ok_or("read without semantic")?
                         .to_string();
                     values.insert(semantic, decoded["data"].clone());
+                } else if action == "adapter.throughput" {
+                    jobs.push(
+                        json!({"action":action,"at":event["at"],"data":decoded["data"],
+                        "summary":obdentic::throughput::summary_lines(&decoded["data"])}),
+                    );
                 } else {
                     jobs.push(json!({"action":action,"at":event["at"],"data":decoded["data"]}));
                 }
@@ -149,6 +155,26 @@ mod tests {
         assert_eq!(value["mode"], "demo");
         assert_eq!(value["complete"], false);
         assert_eq!(value["issues"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn req_022_6_throughput_summary_is_rederived_offline_from_recorded_evidence() {
+        let recording = concat!(
+            "{\"type\":\"session\",\"schema\":\"OBDENTIC-MOBILE\",\"version\":1,\"mode\":\"live\"}\n",
+            "{\"type\":\"action\",\"action\":\"adapter.throughput\",\"result\":{\"ok\":true,\"data\":{",
+            "\"phase1_reads\":[",
+            "{\"semantic\":\"engine.rpm\",\"elapsed_ms\":100.0,\"response\":[65,12,31,64]},",
+            "{\"semantic\":\"engine.rpm\",\"elapsed_ms\":200.0,\"response\":[65,12,31,64]}],",
+            "\"phase2_requests\":[{\"semantic\":[\"engine.rpm\",\"vehicle.speed\"],\"elapsed_ms\":150.0,",
+            "\"payload\":[65,12,31,64,13,50]}],\"phase1\":{\"overall\":{\"reads_per_s\":999}}}}}\n",
+            "{\"type\":\"session_end\",\"reason\":\"completed\"}\n"
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        let job = &report["diagnostic_jobs"][0];
+        assert_eq!(job["data"]["phase1"]["overall"]["median_ms"], 150.0);
+        assert_eq!(job["data"]["phase1"]["overall"]["reads_per_s"], 6.7);
+        assert_eq!(job["data"]["phase2"][0]["outcome"], "full");
+        assert!(job["summary"][0].as_str().unwrap().contains("6.7 reads/s"));
     }
 
     #[test]

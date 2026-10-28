@@ -120,6 +120,20 @@ and the button is usable again; a late result still updates the display. The pen
 text is the button's content description and is announced, as is the final state. The mapping from action to
 target state is the comment above the specs in `MainActivity`.
 
+## Adapter throughput (Diagnose)
+
+"Adapter-Leistung messen" in the Diagnose tab runs a closed, read-only job (`adapter.throughput`, REQ-022). It
+needs a live, ready session with the validated engine target and no running recording; in demo, replay or
+without a connection the button is disabled and the reason is shown. Phase 1 reads up to 6 advertised catalog
+PIDs 10 times each as single requests (median, 90th percentile, reads per second); phase 2 sends one Mode 01
+request with 2, 3 and 6 of those PIDs (`01 0C 05 ...`, built only from advertised catalog PIDs) and reports each as
+vollständig, teilweise or abgelehnt with its time. The reply is decoded per PID with the catalog decoders; a
+missing or malformed PID is reported and never filled in. The job writes its own recording (profile
+`adapter-throughput`, all TX/RX plus the result), ends after at most 60 s on its own (`truncated`), and the Rust core
+has no cancellation: stop or disconnect closes the link, the pending read fails and the recording stays partial.
+Opening the recording shows the same card, re-derived with `replay.adapter.throughput`; `obdentic-mobile-report`
+prints the same summary. The demo answers 2 and 3 PIDs and rejects 6; real vehicle answers are covered in #178.
+
 ## Build and install
 
 Prerequisites: JDK 17+, Rust 1.98.0, `rtk`, Android SDK platform 36, build tools

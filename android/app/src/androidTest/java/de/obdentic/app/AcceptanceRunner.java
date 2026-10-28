@@ -187,6 +187,14 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Known vehicles: VIN-keyed records, stored odometer, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
             ReconnectAcceptance.run(service,getTargetContext());
             passed("Automatic connection (REQ-020): policy schedule 2/5/10/30 s and reset, known adapter stored/replaced app-private, retries only to the known address, manual disconnect/stop/demo/replay end attempts, switch default on and persisted, partial recording kept and same-profile continuation, Bluetooth/permission off shows the reason and resumes, no job repeated; fake adapter link, no real BLE (direct GATT connect, engine start/stop and app restart remain for #178)");
+            ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
+                public String text(String tab) throws Exception { return tabText(activity,tab); }
+                public Boolean enabled(String label,boolean expected) throws Exception { 
+                    Boolean now=null; for(int i=0;i<50;i++) { now=onMain(() -> { findButton(activity.getWindow().getDecorView(),"Diagnose").performClick(); /* re-renders from the current state: the paused Activity does not poll */ Button b=findButton(activity.getWindow().getDecorView(),label); return b==null?null:b.isEnabled(); }); if(now!=null&&now==expected) break; SystemClock.sleep(100); }
+                    return now; }
+            });
+            passed("Adapter throughput job (REQ-022): unavailable with a reason in demo, not connected and replay without any traffic; live and ready runs the closed job against the simulated adapter (6 PIDs x 10 reads with median/p90/reads per second, multi-PID with 2, 3 and 6 PIDs decoded per PID: full, full, rejected), own complete recording with every TX/RX and the result, summary card in Diagnose, replay re-derives the same summary (real multi-PID answers of a vehicle remain for #178)");
+            capture(activity,"Diagnose","acceptance-diagnose.png");
             runOnMainSync(activity::recreate);
             SystemClock.sleep(1500);
             require("ready".equals(service.snapshot().optString("phase")),"Activity recreation preserves session");
@@ -283,8 +291,8 @@ public final class AcceptanceRunner extends Instrumentation {
         shoot(activity,"acceptance-vehicles.png");
         runOnMainSync(() -> findButton(activity.getWindow().getDecorView(),"Live").performClick());
     }
-    private boolean onMain(java.util.concurrent.Callable<Boolean> check) throws Exception {
-        java.util.concurrent.FutureTask<Boolean> task=new java.util.concurrent.FutureTask<>(check);
+    private <T> T onMain(java.util.concurrent.Callable<T> check) throws Exception {
+        java.util.concurrent.FutureTask<T> task=new java.util.concurrent.FutureTask<>(check);
         runOnMainSync(task); return task.get();
     }
     /** Own visibility up to the content root: isShown() is false for a stopped (backgrounded) Activity's window. */
@@ -301,6 +309,16 @@ public final class AcceptanceRunner extends Instrumentation {
         if(view.getContentDescription()!=null && description.contentEquals(view.getContentDescription())) return view;
         if(view instanceof ViewGroup) { ViewGroup group=(ViewGroup)view; for(int i=0;i<group.getChildCount();i++) { View found=findDescribed(group.getChildAt(i),description); if(found!=null) return found; } }
         return null;
+    }
+    /** REQ-022: opens {@code tab}, waits for the 500 ms refresh and returns all visible texts. */
+    private String tabText(Activity activity,String tab) throws Exception {
+        runOnMainSync(() -> { Button button=findButton(activity.getWindow().getDecorView(),tab); require(button!=null,"Navigation tab "+tab); button.performClick(); });
+        SystemClock.sleep(1500);
+        return onMain(() -> { StringBuilder all=new StringBuilder(); collectText(activity.getWindow().getDecorView(),all); return all.toString(); });
+    }
+    private void collectText(View view,StringBuilder out) {
+        if(view instanceof android.widget.TextView && visible(view)) out.append(((android.widget.TextView)view).getText()).append('\n');
+        if(view instanceof ViewGroup) { ViewGroup group=(ViewGroup)view; for(int i=0;i<group.getChildCount();i++) collectText(group.getChildAt(i),out); }
     }
     private void capture(Activity activity,String tab,String name) {
         runOnMainSync(() -> {
