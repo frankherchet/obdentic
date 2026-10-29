@@ -68,6 +68,14 @@ final class AutoRecordingAcceptance {
             require(!resumed.equals(beforeNamed), "REQ-028.4 the automatic recording continues in a new file");
             require(new JSONObject(lastLine(new File(dir, named))).optString("type").equals("session_end") && new JSONObject(lines(new File(dir, named)).get(0)).optString("profile").equals("engine-drive"), "REQ-028.4 the named recording is complete and unchanged in kind");
 
+            // REQ-028.4: a job with its own recording closes the automatic one with a marker and the automatic one resumes afterwards
+            String beforeJob = service.snapshot().optString("autoRecording"); Set<String> beforeJobFiles = names(dir);
+            service.runJob(ObdService.THROUGHPUT); waitFor(() -> service.snapshot().optString("message").contains("Auftrag abgeschlossen") && !service.snapshot().optBoolean("busy"), "throughput job");
+            require(new JSONObject(lastLine(new File(dir, beforeJob))).optString("type").equals("session_end"), "REQ-028.4 the automatic recording is closed with a marker before a job's own recording starts: " + lastLine(new File(dir, beforeJob)));
+            waitFor(() -> !service.snapshot().optString("autoRecording").isEmpty() && !service.snapshot().optString("autoRecording").equals(beforeJob), "automatic recording resumes after the job");
+            Set<String> jobFiles = names(dir); jobFiles.removeAll(beforeJobFiles); jobFiles.removeIf(n -> n.endsWith("-auto.jsonl"));
+            require(jobFiles.size() == 1, "REQ-028.4 the job wrote its own recording: " + jobFiles);
+
             // REQ-028.3: rotation by size and by age, without a gap
             service.rotateBytes = 6000; Set<String> beforeRotate = names(dir);
             waitFor(() -> { Set<String> now = names(dir); now.removeAll(beforeRotate); return now.size() >= 3; }, "rotation by size");

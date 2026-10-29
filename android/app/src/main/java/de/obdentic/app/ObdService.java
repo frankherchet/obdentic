@@ -44,6 +44,9 @@ public final class ObdService extends Service {
     };
     private volatile boolean busy;
     private volatile boolean knowledgeJob;
+    /** REQ-030.4: jobs queued behind the running one (ECU identification, then the availability check). Test seam: runners switch the automatic survey off. */
+    public static volatile boolean autoSurvey = true;
+    private final java.util.Deque<String> chain = new java.util.concurrent.ConcurrentLinkedDeque<>();
     private volatile boolean udsJob;
     private long core;
     private BluetoothLeScanner scanner;
@@ -259,7 +262,7 @@ public final class ObdService extends Service {
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
             put(state,"uds",new JSONObject()); put(state,"udsCandidates",0);
             put(state,"replayFile","");
-            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"replayPartial",false);
+            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"availability",new JSONObject()); put(state,"replayPartial",false);
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
         synchronized(due) { due.clear(); }
@@ -274,6 +277,7 @@ public final class ObdService extends Service {
         JSONObject inventory=execute("inventory","");
         if(token!=generation) return;
         String outcome=observeVehicle(inventory.optJSONObject("data")), notice=vehicleNotice(outcome,inventory.optJSONObject("data"));
+        if(outcome.equals("created") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add(AVAILABILITY); worker.execute(() -> runJob("ecu.discover")); } // REQ-030.4: a new vehicle is surveyed once it is ready
         readOdometer(inventory.optJSONObject("data"),outcome);
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
@@ -489,7 +493,7 @@ public final class ObdService extends Service {
     }
     public void runJob(String action) {
         if(busy || !phase().equals("ready")) { message("Keine freie Verbindung für diesen Auftrag"); return; }
-        boolean knowledge=action.equals("ecu.discover") || action.equals("knowledge.learn");
+        boolean knowledge=action.equals("ecu.discover") || action.equals("knowledge.learn") || action.equals(AVAILABILITY);
         boolean uds=action.equals("uds.enable") || action.equals("uds.disable");
         if(!action.equals("inventory") && !action.equals("dtc.scan") && !action.equals(THROUGHPUT) && !knowledge && !uds && !action.startsWith("read:")) { message("Unbekannter Diagnoseauftrag"); return; }
         if(action.equals(THROUGHPUT) || knowledge) { String blocked=throughputBlocker(); if(blocked!=null) { message(blocked); return; } }
@@ -497,16 +501,18 @@ public final class ObdService extends Service {
         final String diagnosticVin;
         synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); diagnosticVin=vehicle==null?"":vehicle.optString("vin"); }
         busy=true; udsJob=uds; changed(); int token=generation;
+        final boolean[] succeeded={false};
         worker.execute(() -> { try {
             if(token!=generation) return;
             String argument=action.startsWith("read:") ? action.substring(5) : "";
             if(knowledge) execute("uds.disable","");
             boolean own=action.equals(THROUGHPUT) || knowledge;
+            if(own) closeRecording("stopped","",false); // REQ-028.4: the automatic recording pauses, with a marker, while the job writes its own
             if(own && !beginRecording(action.equals(THROUGHPUT)?THROUGHPUT_PROFILE:action.replace('.','-'),new JSONArray())) return;
             knowledgeJob=knowledge;
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
             if(knowledge && result.optBoolean("ok") && result.optJSONObject("data")!=null && !diagnosticVin.isEmpty()) {
-                String error=vehicles.setDiagnostic(diagnosticVin,action.equals("ecu.discover")?"ecu_discovery":"knowledge_learning",result.optJSONObject("data"));
+                String error=vehicles.setDiagnostic(diagnosticVin,action.equals("ecu.discover")?"ecu_discovery":action.equals(AVAILABILITY)?"availability":"knowledge_learning",result.optJSONObject("data"));
                 if(error!=null && token==generation) message(error);
             }
             if(token!=generation) return;
@@ -515,7 +521,7 @@ public final class ObdService extends Service {
                 if(result.optBoolean("ok")) {
                     if(action.equals(THROUGHPUT)) set("throughput",result.opt("data"));
                     if(knowledge) {
-                        String key=action.equals("ecu.discover")?"ecuDiscovery":"knowledgeLearning";
+                        String key=action.equals("ecu.discover")?"ecuDiscovery":action.equals(AVAILABILITY)?"availability":"knowledgeLearning";
                         set(key,result.opt("data"));
                         applyCatalog(execute("catalog",""));
                     }
@@ -531,10 +537,13 @@ public final class ObdService extends Service {
             if(!argument.isEmpty()) updateValue(argument,result);
             String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
-        } catch(Throwable e) { fail(token,e); } finally { knowledgeJob=false; udsJob=false; if(token==generation) { busy=false; changed(); } } });
+            succeeded[0]=result.optBoolean("ok");
+            if(succeeded[0] && action.equals("inventory") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add("ecu.discover"); chain.add(AVAILABILITY); } // REQ-030.4
+        } catch(Throwable e) { fail(token,e); } finally { knowledgeJob=false; udsJob=false; if(token==generation) { busy=false; changed(); }
+            String next=succeeded[0] && token==generation ? chain.poll() : null; if(next==null) chain.clear(); else if(!worker.isShutdown()) worker.execute(() -> runJob(next)); } });
     }
     /** REQ-022: action name and recording profile of the adapter throughput job (not a polling profile). */
-    public static final String THROUGHPUT="adapter.throughput", THROUGHPUT_PROFILE="adapter-throughput";
+    public static final String THROUGHPUT="adapter.throughput", THROUGHPUT_PROFILE="adapter-throughput", AVAILABILITY="knowledge.availability";
     /** REQ-022.1: the German reason why the throughput job cannot start now, or null. Live and ready only. */
     public static String throughputBlocker(JSONObject state) {
         String mode=state.optString("mode","live"), phase=state.optString("phase","idle");
@@ -785,6 +794,7 @@ public final class ObdService extends Service {
                         else if(action.equals("catalog")) { applyCatalog(result); continue; } // REQ-028.10: automatic files start before the handshake
                         else if(action.equals("initialize")) { JSONObject support=result.optJSONObject("data"); if(support!=null) { restoreVehicle(support); applySupport(support); } continue; }
                         else if(action.equals("inventory")) { restoreVehicle(result.optJSONObject("data")); if(result.optJSONObject("data")!=null) applySupport(result.optJSONObject("data")); }
+                        else if(action.equals(AVAILABILITY)) { set("availability",result.opt("data")); } // REQ-030.5: statuses are the job's own summary; raw TX/RX stay in the file
                         else if(action.equals(THROUGHPUT) || action.equals("ecu.discover") || action.equals("knowledge.learn")) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));

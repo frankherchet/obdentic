@@ -221,7 +221,7 @@ public class MainActivity extends Activity {
         LinearLayout c=card();note(c,"FAHRZEUG & FEHLERSPEICHER",ACCENT);
         job(c,"Fahrzeug und Steuergeräte erfassen","inventory");job(c,"Fehlercodes lesen","dtc.scan");
         throughputCard();
-        ecuDiscoveryCard();
+        ecuDiscoveryCard();availabilityCard();
         knowledgeLearningCard();
         udsSessionCard();
 
@@ -293,6 +293,15 @@ public class MainActivity extends Activity {
         if(vehicle.optBoolean("engine_target_validated"))note(c,"Motorsteuergerät gezielt geprüft",MUTED);
     }
     /** REQ-023.5: shows persisted present ECUs and not-observed targets separately. */
+    /** REQ-030: measured availability of the Knowledge signals; the selector shows it per signal (#261). */
+    private void availabilityCard(){
+        LinearLayout c=card();note(c,"VERFÜGBARKEIT DER MESSWERTE",ACCENT);job(c,"Verfügbarkeit prüfen","knowledge.availability");
+        JSONObject result=state.optJSONObject("availability"),record=selectedVehicle();if((result==null||result.length()==0)&&record!=null)result=record.optJSONObject("availability");
+        JSONArray entries=result==null?null:result.optJSONArray("entries");
+        if(entries==null||entries.length()==0){smallNote(c,"Fragt jeden Wert der erkannten Steuergeräte einmal lesend ab (ca. 25 s) · läuft automatisch bei neuen Fahrzeugen und beim Erfassen.",MUTED);return;}
+        int answered=0,rejected=0,silent=0;for(int i=0;i<entries.length();i++){String status=entries.optJSONObject(i).optString("status");if(status.equals("answered"))answered++;else if(status.equals("rejected"))rejected++;else silent++;}
+        note(c,answered+" antworten · "+rejected+" lehnen ab · "+silent+" ohne Antwort"+(result.optBoolean("truncated")||result.optBoolean("stopped")?" · unvollständig":""),TEXT);
+    }
     private void ecuDiscoveryCard(){
         LinearLayout c=card();note(c,"STEUERGERÄTE ERKENNEN",ACCENT);job(c,"Steuergeräte aus Knowledge-Zielen erkennen","ecu.discover");
         JSONObject result=state.optJSONObject("ecuDiscovery"),record=selectedVehicle();if((result==null||result.length()==0)&&record!=null)result=record.optJSONObject("ecu_discovery");

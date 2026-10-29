@@ -470,6 +470,90 @@ fn issue_256_every_catalog_signal_key_is_unique_across_all_present_ecus() {
 }
 
 #[test]
+// REQ-030.1, REQ-030.2, REQ-030.3
+fn req_030_1_2_3_availability_reads_each_default_did_once_and_classifies_the_answers() {
+    let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    let before_discovery = run(&mut core, "knowledge.availability", "");
+    assert_eq!(before_discovery["ok"], false, "{before_discovery}");
+    assert!(before_discovery["error"]
+        .as_str()
+        .unwrap()
+        .contains("discover"));
+
+    let discovery = discover(&mut core);
+    let default_keys = discovery["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|signal| signal["extended_session_required"] == false)
+        .map(|signal| signal["key"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(default_keys.len() > 5);
+    {
+        let mut link = state.lock().unwrap();
+        link.did_replies.insert(
+            0x11BE,
+            VecDeque::from([Reply::Payload(vec![0x62, 0x11, 0xBE, 0x04, 0x00])]),
+        );
+        link.did_replies.insert(
+            0x1153,
+            VecDeque::from([Reply::Payload(vec![0x7F, 0x22, 0x31])]),
+        );
+        link.commands.clear();
+    }
+    let result = run(&mut core, "knowledge.availability", "");
+    assert_eq!(result["ok"], true, "{result}");
+    let data = &result["data"];
+    assert_eq!(data["truncated"], false);
+    assert!(data["knowledge_revision"].as_str().unwrap().len() >= 7);
+    let entries = data["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), default_keys.len());
+    let entry = |key: &str| entries.iter().find(|entry| entry["key"] == key).unwrap();
+    assert_eq!(
+        entry("engine.oil_temperature@vag.ecu_target.7e0")["status"],
+        "answered"
+    );
+    assert!(entry("engine.oil_temperature@vag.ecu_target.7e0")
+        .get("value")
+        .is_none());
+    let rejected = entries
+        .iter()
+        .find(|entry| entry["status"] == "rejected")
+        .unwrap();
+    assert_eq!(rejected["nrc"], 0x31);
+    assert!(entries
+        .iter()
+        .filter(|entry| entry["status"] == "not_answered")
+        .all(|entry| entry["reason"].is_string()));
+
+    let dids = diagnostic_dids(&state);
+    assert_eq!(dids.len(), default_keys.len(), "one 0x22 read per signal");
+    let services = commands(&state)
+        .into_iter()
+        .filter(|command| !command.wire.starts_with("AT"))
+        .map(|command| command.wire)
+        .collect::<Vec<_>>();
+    assert!(
+        services.iter().all(|wire| wire.starts_with("22")),
+        "{services:?}"
+    );
+}
+
+#[test]
+// REQ-030.6
+fn req_030_6_a_run_that_hits_the_limit_is_marked_truncated() {
+    let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    discover(&mut core);
+    state.lock().unwrap().commands.clear();
+    let data = core
+        .knowledge_availability(Duration::from_secs(11))
+        .unwrap();
+    assert_eq!(data["truncated"], true);
+    assert!(data["entries"].as_array().unwrap().is_empty());
+    assert!(diagnostic_dids(&state).is_empty());
+}
+
+#[test]
 // REQ-026.1, REQ-026.2
 fn req_026_1_2_learning_probes_each_candidate_once_without_session_change() {
     let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);

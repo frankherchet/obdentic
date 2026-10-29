@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 pub(super) const LEARNING_LIMIT: Duration = Duration::from_secs(120);
+/// REQ-030.1
+pub(super) const AVAILABILITY_LIMIT: Duration = Duration::from_secs(90);
 pub(super) const PRESENCE_DID: u16 = 0xF187;
 
 #[derive(Clone)]

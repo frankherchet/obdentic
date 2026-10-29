@@ -184,6 +184,7 @@ impl<E: Exchange> MobileCore<E> {
                 | "adapter.throughput"
                 | "ecu.discover"
                 | "knowledge.learn"
+                | "knowledge.availability"
                 | "uds.enable"
                 | "uds.disable"
                 | "uds.tick"
@@ -217,6 +218,7 @@ impl<E: Exchange> MobileCore<E> {
             "adapter.throughput" => self.adapter_throughput(THROUGHPUT_LIMIT),
             "ecu.discover" => self.discover_ecus(),
             "knowledge.learn" => self.learn_knowledge(knowledge::LEARNING_LIMIT),
+            "knowledge.availability" => self.knowledge_availability(knowledge::AVAILABILITY_LIMIT),
             "uds.enable" => self.enable_uds(),
             "uds.disable" => Ok(self.disable_uds_outcome()),
             "uds.tick" => Ok(self.tick_uds()),
@@ -581,6 +583,72 @@ impl<E: Exchange> MobileCore<E> {
             "truncated":truncated,
             "functional_restore_error":restore_error,
             "results":results
+        }))
+    }
+
+    /// REQ-030: one targeted 0x22 read per default-session Knowledge signal of the identified ECUs, classified
+    /// without keeping any value. Each read goes through the same authorised path as a live read.
+    fn knowledge_availability(&mut self, limit: Duration) -> Result<Value, String> {
+        let started = Instant::now();
+        self.disable_uds()?;
+        let knowledge = self
+            .knowledge
+            .as_ref()
+            .ok_or("discover ECU targets before checking Knowledge availability")?;
+        let keys = knowledge
+            .signal_catalog(|_, _| false)?
+            .into_iter()
+            .filter(|signal| signal["extended_session_required"] == false)
+            .filter_map(|signal| signal["key"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Err(
+                "no applicable default-session Knowledge definitions for identified ECUs".into(),
+            );
+        }
+        let repository = knowledge.catalog.pin().repository().to_owned();
+        let revision = knowledge.catalog.pin().revision().to_owned();
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis();
+        let (mut entries, mut stopped, mut truncated) = (Vec::new(), false, false);
+        for key in keys {
+            // Same worst case as the learning job: two cold AT header changes plus one ECU read.
+            if started.elapsed().saturating_add(Duration::from_secs(11)) > limit {
+                truncated = true;
+                break;
+            }
+            match self.read_signal(&key) {
+                Ok(read) if read["status"] == "available" => {
+                    entries.push(json!({"key":key,"status":"answered"}));
+                }
+                Ok(read) if read["nrc"].is_number() => {
+                    entries.push(json!({"key":key,"status":"rejected","nrc":read["nrc"]}));
+                }
+                Ok(read) => entries.push(json!({"key":key,"status":"not_answered",
+                    "reason":read["error"].as_str().unwrap_or("no usable answer")})),
+                Err(error) => {
+                    let fatal = crate::scheduler::is_fatal_runtime_error(&error);
+                    entries.push(json!({"key":key,"status":"not_answered","reason":error}));
+                    if fatal {
+                        stopped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let restore_error = self.restore_functional_addressing().err();
+        Ok(json!({
+            "knowledge_repository":repository,
+            "knowledge_revision":revision,
+            "started_at_ms":started_at,
+            "elapsed_ms":started.elapsed().as_millis(),
+            "limit_s":limit.as_secs(),
+            "stopped":stopped,
+            "truncated":truncated,
+            "functional_restore_error":restore_error,
+            "entries":entries
         }))
     }
 

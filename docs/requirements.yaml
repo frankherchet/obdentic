@@ -647,3 +647,28 @@ requirements:
         text: A failure to write the log never raises an exception into the caller and never stops a session.
       - id: REQ-029.6
         text: Each export run (REQ-018.2, REQ-018.4) also copies the sealed log files unchanged under the same skip rules, `tools/pull-recordings.sh` pulls `*.log` files, and the log adds no permission and no dependency.
+
+  - id: REQ-030
+    title: Measure which default-session Knowledge signals answer in the vehicle
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-29: epic #253, decisions by @frankherchet"
+    description: >
+      Availability of UDS DIDs is not advertised, so the app measures it: a bounded,
+      read-only job asks each identified ECU once for every default-session Knowledge
+      DID, runs automatically for a new vehicle and on every vehicle and ECU survey,
+      and stores the result with the vehicle record.
+    acceptance:
+      - id: REQ-030.1
+        text: The job "knowledge.availability" sends exactly one targeted 0x22 read per default-session Knowledge definition of each identified ECU, no session change and no other service, and stops within 90 seconds; a requires-session definition is never read.
+      - id: REQ-030.2
+        text: Its result lists per signal key the status answered, rejected (with the negative response code) or not_answered (with the reason), plus the Knowledge revision, elapsed time and a truncated flag; a negative response or malformed payload never yields a value.
+      - id: REQ-030.3
+        text: Without ECU identification the job fails with a message that names the missing step and sends nothing.
+      - id: REQ-030.4
+        text: In a live session the job starts automatically after ECU identification when the connection created a new vehicle record, and after every "Fahrzeug und Steuergeräte erfassen" job; it does not start in demo or replay, while another job runs, or after a failed inventory.
+      - id: REQ-030.5
+        text: The job writes its own recording with all TX/RX; the result is stored in the vehicle record with date and Knowledge revision, is not exported or shared, and replay of the recording restores the per-signal statuses without adapter traffic.
+      - id: REQ-030.6
+        text: A truncated or interrupted run keeps the statuses it measured and marks the result as incomplete; losing the link ends the job with an error and stores nothing from it.
