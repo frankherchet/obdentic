@@ -180,6 +180,15 @@ The default OBDentic capability is read-only.
 
 Ordinary CLI use, capture, TUI, MCP and AI-assisted diagnosis must remain unable to mutate the vehicle unless the process was explicitly started in a separately reviewed service capability mode.
 
+The explicitly user-started, read-only UDS extended-session job is a separate,
+closed exception for session management (ADR 0003). It can send only `10 03`,
+`10 01`, `3E 80`, and Knowledge-listed `22` reads to one identified ECU. It
+does not grant a mutating service capability. Profiles, layouts, MCP calls,
+AI prompts and Knowledge cannot activate it. The core enforces its timeout,
+target and service restrictions, and attempts to return to the default session
+before functional operations or shutdown. If that return cannot be confirmed,
+further vehicle operations stop until reconnection; a lost link stops keepalive.
+
 ### Initial allowed mutation goal
 
 The first and currently only intended mutating service capability is DTC clearing.

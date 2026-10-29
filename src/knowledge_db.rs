@@ -16,6 +16,8 @@ pub const SUPPORTED_KNOWLEDGE_SCHEMA_VERSION: u32 = 2;
 pub const CANONICAL_KNOWLEDGE_REPOSITORY: &str = "frankherchet/obdentic-knowledge";
 pub const STANDARD_UDS_ECU_IDENTIFICATION_SET: &str = "uds.standard.ecu_identification";
 const VIN_DID: u16 = 0xF190;
+const ECU_TARGET_SCHEMA_VERSION: u32 = 3;
+const EXTENDED_SESSION_DEFINITION_PREFIX: &str = "vag.ea189_session.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnowledgePin {
@@ -131,6 +133,7 @@ pub struct KnowledgeCatalog {
     definitions: BTreeMap<String, KnowledgeDefinition>,
     semantic_definitions: BTreeMap<String, Vec<String>>,
     sets: BTreeMap<String, KnowledgeSet>,
+    ecu_targets: Vec<KnowledgeEcuTarget>,
 }
 
 impl KnowledgeCatalog {
@@ -163,17 +166,68 @@ impl KnowledgeCatalog {
             ));
         }
 
-        let mut definitions = BTreeMap::new();
-        let mut semantic_definitions = BTreeMap::<String, Vec<String>>::new();
-        let mut sets = BTreeMap::new();
-
+        let mut documents = Vec::with_capacity(files.len());
         for relative_path in files {
             let path = knowledge_root.join(&relative_path);
             let text = fs::read_to_string(&path).map_err(|error| KnowledgeLoadError::Io {
                 path: path.clone(),
                 error: error.to_string(),
             })?;
-            let document = parse_document(&relative_path, &text, pin.schema_version())?;
+            documents.push((relative_path, text));
+        }
+        Self::from_documents(
+            pin,
+            documents
+                .iter()
+                .map(|(path, text)| (path.clone(), text.as_str())),
+        )
+    }
+
+    /// Load the pinned catalog from compile-time Knowledge files. This path
+    /// performs no filesystem or Git access and is suitable for Android.
+    pub fn embedded_pinned() -> Result<Self, KnowledgeLoadError> {
+        // shortcut: embeds the four current YAML files, update this list when the Knowledge pin changes.
+        const DOCUMENTS: &[(&str, &str)] = &[
+            (
+                "standards/uds/ecu-identification.yaml",
+                include_str!("../knowledge/standards/uds/ecu-identification.yaml"),
+            ),
+            (
+                "manufacturers/vag/ecu-targets.yaml",
+                include_str!("../knowledge/manufacturers/vag/ecu-targets.yaml"),
+            ),
+            (
+                "manufacturers/vag/ea189-engine.yaml",
+                include_str!("../knowledge/manufacturers/vag/ea189-engine.yaml"),
+            ),
+            (
+                "manufacturers/vag/ea189-engine-session-candidates.yaml",
+                include_str!("../knowledge/manufacturers/vag/ea189-engine-session-candidates.yaml"),
+            ),
+        ];
+        let pin = KnowledgePin::parse(
+            Path::new("knowledge.lock"),
+            include_str!("../knowledge.lock"),
+        )?;
+        Self::from_documents(
+            pin,
+            DOCUMENTS
+                .iter()
+                .map(|(path, text)| (PathBuf::from(path), *text)),
+        )
+    }
+
+    fn from_documents<'a>(
+        pin: KnowledgePin,
+        documents: impl IntoIterator<Item = (PathBuf, &'a str)>,
+    ) -> Result<Self, KnowledgeLoadError> {
+        let mut definitions = BTreeMap::new();
+        let mut semantic_definitions = BTreeMap::<String, Vec<String>>::new();
+        let mut sets = BTreeMap::new();
+        let mut ecu_targets = Vec::new();
+
+        for (relative_path, text) in documents {
+            let document = parse_document(&relative_path, text, pin.schema_version())?;
 
             for raw_definition in document.definitions {
                 let definition = KnowledgeDefinition::from_raw(&relative_path, raw_definition)?;
@@ -199,6 +253,23 @@ impl KnowledgeCatalog {
                         path: relative_path.clone(),
                     });
                 }
+            }
+
+            for raw_target in document.ecu_targets {
+                let target = KnowledgeEcuTarget::from_raw(&relative_path, raw_target)?;
+                if ecu_targets.iter().any(|known: &KnowledgeEcuTarget| {
+                    known.id() == target.id()
+                        || known.request_id() == target.request_id()
+                        || known.response_id() == target.response_id()
+                        || known.request_id() == target.response_id()
+                        || known.response_id() == target.request_id()
+                }) {
+                    return Err(KnowledgeLoadError::InvalidDefinition {
+                        path: relative_path.clone(),
+                        reason: format!("duplicate ECU target id/address in {:?}", target.id()),
+                    });
+                }
+                ecu_targets.push(target);
             }
         }
 
@@ -248,6 +319,7 @@ impl KnowledgeCatalog {
             definitions,
             semantic_definitions,
             sets,
+            ecu_targets,
         })
     }
 
@@ -293,6 +365,10 @@ impl KnowledgeCatalog {
 
     pub fn sets(&self) -> impl ExactSizeIterator<Item = &KnowledgeSet> {
         self.sets.values()
+    }
+
+    pub fn ecu_targets(&self) -> &[KnowledgeEcuTarget] {
+        &self.ecu_targets
     }
 }
 
@@ -344,6 +420,138 @@ impl KnowledgeSet {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KnowledgeEcuTarget {
+    id: String,
+    request_id: u16,
+    response_id: u16,
+    role: String,
+    manufacturer: String,
+}
+
+impl KnowledgeEcuTarget {
+    fn from_raw(path: &Path, raw: RawEcuTarget) -> Result<Self, KnowledgeLoadError> {
+        if !is_stable_id(&raw.id) {
+            return Err(invalid_target(
+                path,
+                &raw.id,
+                "id must be a stable identifier",
+            ));
+        }
+        if raw.addressing.family != "can_11bit" {
+            return Err(invalid_target(
+                path,
+                &raw.id,
+                "unsupported addressing family",
+            ));
+        }
+        let request_id =
+            parse_can_address(path, &raw.id, "request_id", &raw.addressing.request_id)?;
+        let response_id =
+            parse_can_address(path, &raw.id, "response_id", &raw.addressing.response_id)?;
+        let expected_response_id = match raw.addressing.response_id_rule.as_str() {
+            "iso15765_plus_8" => request_id.checked_add(8),
+            "vag_plus_0x6a" => request_id.checked_add(0x6A),
+            _ => return Err(invalid_target(path, &raw.id, "unknown response id rule")),
+        };
+        if raw.addressing.response_id_rule == "vag_plus_0x6a"
+            && !raw.addressing.response_id_stated_in_source
+        {
+            return Err(invalid_target(
+                path,
+                &raw.id,
+                "vag_plus_0x6a requires a response id stated in the source",
+            ));
+        }
+        if expected_response_id != Some(response_id) {
+            return Err(invalid_target(
+                path,
+                &raw.id,
+                "response_id does not match response_id_rule",
+            ));
+        }
+        if raw.transport != "iso_tp_can" {
+            return Err(invalid_target(path, &raw.id, "unsupported transport"));
+        }
+        if !is_ecu_role(&raw.logical_role.value) {
+            return Err(invalid_target(path, &raw.id, "unknown logical role"));
+        }
+        parse_confidence(&raw.logical_role.confidence)?;
+        if !is_stable_id(&raw.applicability.vehicle_manufacturer) {
+            return Err(invalid_target(
+                path,
+                &raw.id,
+                "vehicle_manufacturer must be a stable identifier",
+            ));
+        }
+        let platforms = raw.applicability.platforms.unwrap_or_default();
+        let unique_platforms: BTreeSet<&str> = platforms.iter().map(String::as_str).collect();
+        if unique_platforms.len() != platforms.len() || platforms.iter().any(|v| !is_stable_id(v)) {
+            return Err(invalid_target(
+                path,
+                &raw.id,
+                "platforms must be unique stable identifiers",
+            ));
+        }
+        if raw.provenance.sources.iter().any(|source| {
+            source
+                .archive_version
+                .as_ref()
+                .is_some_and(|version| version.trim().is_empty())
+                || source.profile_count == Some(0)
+                || source.profile_total == Some(0)
+                || source
+                    .profile_count
+                    .zip(source.profile_total)
+                    .is_some_and(|(count, total)| count > total)
+                || source.plain_read_profile_count.is_some_and(|count| {
+                    source
+                        .profile_count
+                        .is_some_and(|profile_count| count > profile_count)
+                        || source
+                            .profile_total
+                            .is_some_and(|profile_total| count > profile_total)
+                })
+        }) {
+            return Err(invalid_target(
+                path,
+                &raw.id,
+                "invalid target source archive counts",
+            ));
+        }
+        let _provenance =
+            KnowledgeProvenance::from_raw(path, raw.provenance.into_knowledge_provenance())?;
+        let _hardware_validation = HardwareValidation::from_raw(path, raw.hardware_validation)?;
+        Ok(Self {
+            id: raw.id,
+            request_id,
+            response_id,
+            role: raw.logical_role.value,
+            manufacturer: raw.applicability.vehicle_manufacturer,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub const fn request_id(&self) -> u16 {
+        self.request_id
+    }
+
+    pub const fn response_id(&self) -> u16 {
+        self.response_id
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    pub fn manufacturer(&self) -> &str {
+        &self.manufacturer
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct KnowledgeDefinition {
     id: String,
@@ -359,6 +567,7 @@ pub struct KnowledgeDefinition {
     provenance: KnowledgeProvenance,
     hardware_validation: HardwareValidation,
     notes: Option<String>,
+    requires_extended_session: bool,
 }
 
 impl KnowledgeDefinition {
@@ -380,6 +589,11 @@ impl KnowledgeDefinition {
             .transpose()?;
         let provenance = KnowledgeProvenance::from_raw(path, raw.provenance)?;
         let hardware_validation = HardwareValidation::from_raw(path, raw.hardware_validation)?;
+        let requires_extended_session = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "ea189-engine-session-candidates.yaml")
+            || raw.id.starts_with(EXTENDED_SESSION_DEFINITION_PREFIX);
         Ok(Self {
             id: raw.id,
             semantic: raw.semantic,
@@ -394,6 +608,7 @@ impl KnowledgeDefinition {
             provenance,
             hardware_validation,
             notes: raw.notes,
+            requires_extended_session,
         })
     }
 
@@ -447,6 +662,10 @@ impl KnowledgeDefinition {
 
     pub fn notes(&self) -> Option<&str> {
         self.notes.as_deref()
+    }
+
+    pub const fn requires_extended_session(&self) -> bool {
+        self.requires_extended_session
     }
 
     /// Validate normalized UDS response evidence using the same closed core
@@ -1225,14 +1444,104 @@ impl std::error::Error for KnowledgeLoadError {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawDocument {
+struct RawDocumentInput {
     schema_version: u32,
     namespace: String,
     #[allow(dead_code)]
     description: Option<String>,
-    #[serde(default)]
+    sets: Option<Vec<RawSet>>,
+    definitions: Option<Vec<RawDefinition>>,
+    ecu_targets: Option<Vec<RawEcuTarget>>,
+}
+
+#[derive(Debug)]
+struct RawDocument {
+    #[allow(dead_code)]
+    namespace: String,
+    #[allow(dead_code)]
+    description: Option<String>,
     sets: Vec<RawSet>,
     definitions: Vec<RawDefinition>,
+    ecu_targets: Vec<RawEcuTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEcuTarget {
+    id: String,
+    addressing: RawEcuTargetAddressing,
+    transport: String,
+    logical_role: RawEcuTargetRole,
+    applicability: RawEcuTargetApplicability,
+    provenance: RawEcuTargetProvenance,
+    hardware_validation: RawHardwareValidation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEcuTargetAddressing {
+    family: String,
+    request_id: String,
+    response_id: String,
+    response_id_rule: String,
+    response_id_stated_in_source: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEcuTargetRole {
+    value: String,
+    confidence: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEcuTargetApplicability {
+    vehicle_manufacturer: String,
+    platforms: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEcuTargetProvenance {
+    classification: String,
+    confidence: String,
+    sources: Vec<RawEcuTargetSource>,
+}
+
+impl RawEcuTargetProvenance {
+    fn into_knowledge_provenance(self) -> RawProvenance {
+        RawProvenance {
+            classification: self.classification,
+            confidence: self.confidence,
+            sources: self
+                .sources
+                .into_iter()
+                .map(|source| RawSource {
+                    kind: if source.kind == "community_archive" {
+                        "community".into()
+                    } else {
+                        source.kind
+                    },
+                    citation: source.citation,
+                    url: None,
+                    note: source.note,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEcuTargetSource {
+    kind: String,
+    citation: String,
+    archive_version: Option<String>,
+    profile_count: Option<u32>,
+    profile_total: Option<u32>,
+    plain_read_profile_count: Option<u32>,
+    note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1347,26 +1656,76 @@ fn parse_document(
     text: &str,
     pinned_schema_version: u32,
 ) -> Result<RawDocument, KnowledgeLoadError> {
-    let document: RawDocument =
+    let input: RawDocumentInput =
         serde_yaml_ng::from_str(text).map_err(|error| KnowledgeLoadError::Yaml {
             path: path.to_path_buf(),
             error: error.to_string(),
         })?;
-    if document.schema_version != SUPPORTED_KNOWLEDGE_SCHEMA_VERSION
-        || document.schema_version != pinned_schema_version
-    {
-        return Err(KnowledgeLoadError::UnsupportedSchemaVersion {
-            path: path.to_path_buf(),
-            found: document.schema_version,
-        });
-    }
-    if document.namespace.trim().is_empty() || document.definitions.is_empty() {
+    if input.namespace.trim().is_empty() {
         return Err(KnowledgeLoadError::InvalidDefinition {
             path: path.to_path_buf(),
-            reason: "namespace must be non-empty and definitions must not be empty".into(),
+            reason: "namespace must be non-empty".into(),
         });
     }
-    Ok(document)
+    if input.schema_version == ECU_TARGET_SCHEMA_VERSION && !is_stable_id(&input.namespace) {
+        return Err(KnowledgeLoadError::InvalidDefinition {
+            path: path.to_path_buf(),
+            reason: "schema v3 namespace must be a stable identifier".into(),
+        });
+    }
+
+    let (sets, definitions, ecu_targets) = match input.schema_version {
+        SUPPORTED_KNOWLEDGE_SCHEMA_VERSION
+            if pinned_schema_version == SUPPORTED_KNOWLEDGE_SCHEMA_VERSION =>
+        {
+            if input.ecu_targets.is_some() {
+                return Err(KnowledgeLoadError::InvalidDefinition {
+                    path: path.to_path_buf(),
+                    reason: "schema v2 documents cannot contain ecu_targets".into(),
+                });
+            }
+            let definitions = input.definitions.unwrap_or_default();
+            if definitions.is_empty() {
+                return Err(KnowledgeLoadError::InvalidDefinition {
+                    path: path.to_path_buf(),
+                    reason: "schema v2 definitions must not be empty".into(),
+                });
+            }
+            (input.sets.unwrap_or_default(), definitions, Vec::new())
+        }
+        ECU_TARGET_SCHEMA_VERSION
+            if pinned_schema_version == SUPPORTED_KNOWLEDGE_SCHEMA_VERSION =>
+        {
+            if input.definitions.is_some() || input.sets.is_some() {
+                return Err(KnowledgeLoadError::InvalidDefinition {
+                    path: path.to_path_buf(),
+                    reason: "schema v3 target documents cannot contain definitions or sets".into(),
+                });
+            }
+            let ecu_targets = input.ecu_targets.unwrap_or_default();
+            if ecu_targets.is_empty() {
+                return Err(KnowledgeLoadError::InvalidDefinition {
+                    path: path.to_path_buf(),
+                    reason: "schema v3 ecu_targets must not be empty".into(),
+                });
+            }
+            (Vec::new(), Vec::new(), ecu_targets)
+        }
+        found => {
+            return Err(KnowledgeLoadError::UnsupportedSchemaVersion {
+                path: path.to_path_buf(),
+                found,
+            })
+        }
+    };
+
+    Ok(RawDocument {
+        namespace: input.namespace,
+        description: input.description,
+        sets,
+        definitions,
+        ecu_targets,
+    })
 }
 
 fn canonical_yaml_files(root: &Path) -> Result<Vec<PathBuf>, KnowledgeLoadError> {
@@ -1441,6 +1800,79 @@ fn parse_hex_u16(path: &Path, field: &str, value: &str) -> Result<u16, Knowledge
         path: path.to_path_buf(),
         reason: format!("invalid hexadecimal {field} {value:?}"),
     })
+}
+
+fn parse_can_address(
+    path: &Path,
+    target_id: &str,
+    field: &str,
+    value: &str,
+) -> Result<u16, KnowledgeLoadError> {
+    if value.len() != 3
+        || !value.starts_with('7')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+    {
+        return Err(invalid_target(
+            path,
+            target_id,
+            &format!("{field} must be a 7xx 11-bit CAN id"),
+        ));
+    }
+    u16::from_str_radix(value, 16)
+        .map_err(|_| invalid_target(path, target_id, &format!("invalid {field}")))
+}
+
+fn is_stable_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.split(['.', '_', '-']).all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+fn is_ecu_role(value: &str) -> bool {
+    matches!(
+        value,
+        "engine"
+            | "transmission"
+            | "gateway"
+            | "abs_esp"
+            | "instrument_cluster"
+            | "airbag"
+            | "climate"
+            | "tpms"
+            | "body_control"
+            | "all_wheel_drive"
+            | "steering"
+            | "driver_assistance"
+            | "emergency_call"
+            | "infotainment"
+            | "battery_management"
+            | "electric_drive"
+            | "hv_charger"
+            | "differential_lock"
+            | "ptc_heater"
+    )
+}
+
+fn parse_confidence(value: &str) -> Result<KnowledgeConfidence, KnowledgeLoadError> {
+    match value {
+        "high" => Ok(KnowledgeConfidence::High),
+        "medium" => Ok(KnowledgeConfidence::Medium),
+        "low" => Ok(KnowledgeConfidence::Low),
+        other => Err(KnowledgeLoadError::UnknownConfidence(other.into())),
+    }
+}
+
+fn invalid_target(path: &Path, id: &str, reason: &str) -> KnowledgeLoadError {
+    KnowledgeLoadError::InvalidDefinition {
+        path: path.to_path_buf(),
+        reason: format!("invalid ECU target {id:?}: {reason}"),
+    }
 }
 
 fn parse_hex_u8(path: &Path, field: &str, value: &str) -> Result<u8, KnowledgeLoadError> {
@@ -1531,6 +1963,31 @@ definitions:
         )
     }
 
+    fn valid_target_document(extra: &str) -> String {
+        r#"schema_version: 3
+namespace: test.ecu_targets
+ecu_targets:
+  - id: test.engine
+    addressing: { family: can_11bit, request_id: "7E0", response_id: "7E8", response_id_rule: iso15765_plus_8, response_id_stated_in_source: false }
+    transport: iso_tp_can
+    logical_role: { value: engine, confidence: medium }
+    applicability: { vehicle_manufacturer: vag }
+    provenance:
+      classification: COMMUNITY
+      confidence: medium
+      sources:
+        - kind: community_archive
+          citation: test archive
+          archive_version: "1"
+          profile_count: 2
+          profile_total: 2
+          plain_read_profile_count: 2
+    hardware_validation: { status: not_validated }
+__EXTRA__
+"#
+            .replace("__EXTRA__", extra)
+    }
+
     #[test]
     fn pin_parser_is_strict_and_preserves_revision() {
         let parsed = KnowledgePin::parse(
@@ -1597,10 +2054,10 @@ definitions:
 
     #[test]
     fn unsupported_schema_version_is_rejected_before_definition_conversion() {
-        let text = valid_document("").replace("schema_version: 2", "schema_version: 3");
+        let text = valid_document("").replace("schema_version: 2", "schema_version: 4");
         assert!(matches!(
             parse_document(Path::new("future.yaml"), &text, 2),
-            Err(KnowledgeLoadError::UnsupportedSchemaVersion { found: 3, .. })
+            Err(KnowledgeLoadError::UnsupportedSchemaVersion { found: 4, .. })
         ));
     }
 
@@ -1618,5 +2075,69 @@ definitions:
         )
         .unwrap();
         assert_eq!(definition.operation().did(), VIN_DID);
+    }
+
+    #[test]
+    fn schema_v3_target_documents_are_closed_to_raw_operations() {
+        let error = parse_document(
+            Path::new("unsafe-target.yaml"),
+            &valid_target_document(
+                "    operation: {type: uds.read_data_by_identifier, identifier: \"0xF187\"}",
+            ),
+            2,
+        )
+        .unwrap_err();
+        assert!(matches!(error, KnowledgeLoadError::Yaml { .. }));
+    }
+
+    #[test]
+    fn schema_v3_target_ids_are_validated_as_can_addresses() {
+        let text = valid_target_document("").replace("request_id: \"7E0\"", "request_id: \"800\"");
+        let document = parse_document(Path::new("invalid-target.yaml"), &text, 2).unwrap();
+        assert!(KnowledgeEcuTarget::from_raw(
+            Path::new("invalid-target.yaml"),
+            document.ecu_targets.into_iter().next().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pinned_catalog_loads_v3_targets_and_marks_session_candidates() {
+        let catalog = KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert_eq!(catalog.ecu_targets().len(), 18);
+
+        let engine = catalog
+            .ecu_targets()
+            .iter()
+            .find(|target| target.id() == "vag.ecu_target.7e0")
+            .unwrap();
+        assert_eq!(engine.request_id(), 0x7E0);
+        assert_eq!(engine.response_id(), 0x7E8);
+        assert_eq!(engine.role(), "engine");
+        assert_eq!(engine.manufacturer(), "vag");
+
+        let regular = catalog
+            .definition("vag.ea189.dpf.differential_pressure")
+            .unwrap();
+        assert!(!regular.requires_extended_session());
+        let candidate = catalog
+            .definitions()
+            .find(|definition| definition.id().starts_with("vag.ea189_session."))
+            .unwrap();
+        assert!(candidate.requires_extended_session());
+    }
+
+    #[test]
+    fn embedded_pinned_catalog_uses_the_same_validated_knowledge() {
+        let catalog = KnowledgeCatalog::embedded_pinned().unwrap();
+        let filesystem = KnowledgeCatalog::load_pinned(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert_eq!(catalog, filesystem);
+        assert_eq!(catalog.ecu_targets().len(), 18);
+        assert!(catalog
+            .definition("uds.f189.manufacturer_software_version")
+            .is_some());
+        assert!(catalog
+            .definitions()
+            .any(KnowledgeDefinition::requires_extended_session));
     }
 }

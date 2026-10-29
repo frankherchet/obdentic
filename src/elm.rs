@@ -813,6 +813,14 @@ pub(crate) struct ElmSession<E> {
 /// Header and response filter of a configured target.
 pub(crate) type TargetKey = (String, String);
 
+/// The complete session-control vocabulary: no caller-provided service bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UdsSessionCommand {
+    Enter,
+    Leave,
+    TesterPresent,
+}
+
 impl<E> ElmSession<E>
 where
     E: ElmExchange,
@@ -862,6 +870,13 @@ where
             self.reinitialize().await?;
         }
         Ok(())
+    }
+
+    /// Close a targeted job while retaining the Carly reinitialization requirement.
+    pub(crate) async fn restore_functional_addressing(&mut self) -> Result<(), String> {
+        self.configured_target = None;
+        self.functional_dirty = true;
+        restore_functional(&mut self.exchange).await
     }
 
     pub(crate) async fn establish_protocol(&mut self) -> Result<ProtocolNegotiation, String> {
@@ -1014,6 +1029,153 @@ where
     pub(crate) async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
         self.ensure_functional().await?;
         read_elm_mode03_responses(&mut self.exchange).await
+    }
+
+    pub(crate) async fn uds_session_command(
+        &mut self,
+        command: UdsSessionCommand,
+        target: &RequestTarget,
+        expected: &ResponderIdentity,
+    ) -> Result<ReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
+        let key = target_key(target, expected);
+        if self.configured_target.as_ref() != Some(&key) {
+            self.configured_target = None;
+            configure_target(&mut self.exchange, target, expected)
+                .await
+                .map_err(|error| ReadEvidenceError {
+                    error,
+                    observations: Vec::new(),
+                })?;
+            self.configured_target = Some(key);
+        }
+        let (wire, positive) = match command {
+            UdsSessionCommand::Enter => ("1003\r", [0x50, 0x03]),
+            UdsSessionCommand::Leave => ("1001\r", [0x50, 0x01]),
+            UdsSessionCommand::TesterPresent => ("3E80\r", [0x7E, 0x00]),
+        };
+        let response = self
+            .exchange
+            .exchange(wire, COMMAND_TIMEOUT)
+            .await
+            .map_err(|error| {
+                self.configured_target = None;
+                ReadEvidenceError {
+                    error: error.to_string(),
+                    observations: Vec::new(),
+                }
+            })?;
+        let responses = normalize_isotp_responses(&response, wire.trim(), "UDS session", false)
+            .map_err(|error| ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })?;
+        // 3E 80 suppresses a positive reply; only an explicit adapter NO DATA is accepted.
+        if command == UdsSessionCommand::TesterPresent
+            && responses.is_empty()
+            && response
+                .split(['\r', '\n', '>'])
+                .map(str::trim)
+                .any(|line| line == "NO DATA")
+        {
+            return Ok(ReadEvidence {
+                payload: Vec::new(),
+                observations: vec![responses.observation(None)],
+            });
+        }
+        match targeted_payload(&responses, expected) {
+            Ok(payload) if payload.starts_with(&positive) => Ok(ReadEvidence {
+                payload,
+                observations: vec![responses.observation_for_target(expected, None)],
+            }),
+            result => {
+                let error = match result {
+                    Ok(payload) => format!("UDS session rejected: {}", crate::hex(&payload)),
+                    Err(error) => error,
+                };
+                Err(ReadEvidenceError {
+                    error: error.clone(),
+                    observations: vec![responses.observation_for_target(expected, Some(error))],
+                })
+            }
+        }
+    }
+
+    /// One Knowledge-listed DID read, without retries or session escalation.
+    pub(crate) async fn read_knowledge_with_evidence(
+        &mut self,
+        definition: &crate::knowledge_db::KnowledgeDefinition,
+        target: &RequestTarget,
+        expected: &ResponderIdentity,
+    ) -> Result<ReadEvidence, ReadEvidenceError> {
+        self.read_did_once(definition.operation().did(), target, expected)
+            .await
+    }
+
+    pub(crate) async fn read_identification_once_with_evidence(
+        &mut self,
+        request: &TargetedEcuIdentificationRequest,
+    ) -> Result<ReadEvidence, ReadEvidenceError> {
+        self.read_did_once(
+            request.did(),
+            request.target(),
+            request.expected_responder(),
+        )
+        .await
+    }
+
+    async fn read_did_once(
+        &mut self,
+        did: u16,
+        target: &RequestTarget,
+        expected: &ResponderIdentity,
+    ) -> Result<ReadEvidence, ReadEvidenceError> {
+        self.functional_dirty = true;
+        let key = target_key(target, expected);
+        if self.configured_target.as_ref() != Some(&key) {
+            self.configured_target = None;
+            configure_target(&mut self.exchange, target, expected)
+                .await
+                .map_err(|error| ReadEvidenceError {
+                    error,
+                    observations: Vec::new(),
+                })?;
+            self.configured_target = Some(key);
+        }
+        let command = format!("22{did:04X}\r");
+        let response = self
+            .exchange
+            .exchange(&command, COMMAND_TIMEOUT)
+            .await
+            .map_err(|error| {
+                self.configured_target = None;
+                ReadEvidenceError {
+                    error: error.to_string(),
+                    observations: Vec::new(),
+                }
+            })?;
+        let responses =
+            normalize_uds_responses(&response, did).map_err(|error| ReadEvidenceError {
+                error,
+                observations: Vec::new(),
+            })?;
+        match targeted_payload(&responses, expected) {
+            Ok(payload) => Ok(ReadEvidence {
+                payload,
+                observations: vec![responses.observation_for_target(expected, None)],
+            }),
+            Err(error) => {
+                let error = responses
+                    .errors()
+                    .first()
+                    .filter(|_| responses.is_empty())
+                    .map_or(error, |issue| issue.error.clone());
+                Err(ReadEvidenceError {
+                    error: error.clone(),
+                    observations: vec![responses.observation_for_target(expected, Some(error))],
+                })
+            }
+        }
     }
 
     pub(crate) async fn read_ecu_identification_with_evidence(
@@ -2806,6 +2968,67 @@ fn normalize_isotp_responses(
 mod tests {
     use super::*;
     use crate::test_support::ScriptedExchange;
+
+    #[tokio::test]
+    async fn req_027_4_session_transport_has_only_closed_commands_and_reuses_target() {
+        let exchange = ScriptedExchange::new([
+            "OK\r>",
+            "OK\r>",
+            "7E8 06 50 03 00 32 01 F4\r>",
+            "NO DATA\r>",
+            "7E8 02 50 01\r>",
+        ]);
+        let spy = exchange.spy();
+        let mut session = ElmSession::new(exchange);
+        let target = RequestTarget::concrete(
+            crate::topology::ProtocolContext::new(
+                crate::topology::Protocol::Obd2,
+                crate::topology::AddressingContext::Physical,
+            ),
+            crate::topology::RequestAddress::new("elm-header", "7E0"),
+        );
+        let expected = ResponderIdentity::ElmHeader("7E8".into());
+        for command in [
+            UdsSessionCommand::Enter,
+            UdsSessionCommand::TesterPresent,
+            UdsSessionCommand::Leave,
+        ] {
+            session
+                .uds_session_command(command, &target, &expected)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            spy.commands(),
+            ["ATSH 7E0\r", "ATCRA 7E8\r", "1003\r", "3E80\r", "1001\r"]
+        );
+        assert!(session.functional_dirty);
+    }
+
+    #[tokio::test]
+    async fn req_027_5_session_negative_and_wrong_responder_remain_errors() {
+        for response in ["7E8 03 7F 10 22\r>", "7E9 02 50 03\r>"] {
+            let exchange = ScriptedExchange::new(["OK\r>", "OK\r>", response]);
+            let mut session = ElmSession::new(exchange);
+            let target = RequestTarget::concrete(
+                crate::topology::ProtocolContext::new(
+                    crate::topology::Protocol::Obd2,
+                    crate::topology::AddressingContext::Physical,
+                ),
+                crate::topology::RequestAddress::new("elm-header", "7E0"),
+            );
+            let error = session
+                .uds_session_command(
+                    UdsSessionCommand::Enter,
+                    &target,
+                    &ResponderIdentity::ElmHeader("7E8".into()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.observations.len(), 1);
+            assert!(!error.error.is_empty());
+        }
+    }
 
     fn canonical_ecu_identification_request() -> TargetedEcuIdentificationRequest {
         let catalog =

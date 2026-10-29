@@ -89,6 +89,8 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                     "read" => "replay.read",
                     "dtc.scan" => "replay.dtc.scan",
                     "adapter.throughput" => "replay.adapter.throughput",
+                    "ecu.discover" => "replay.ecu.discover",
+                    "knowledge.learn" => "replay.knowledge.learn",
                     _ => continue,
                 };
                 let decoded: Value = serde_json::from_str(

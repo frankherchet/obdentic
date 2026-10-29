@@ -3,6 +3,7 @@ package de.obdentic.app;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -18,16 +19,22 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.View;
+import android.view.Window;
 import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.text.Editable;
+import android.text.TextWatcher;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -50,6 +57,7 @@ public class MainActivity extends Activity {
      */
     private static boolean msg(JSONObject now,JSONObject base){return now.optLong("messageSeq")!=base.optLong("messageSeq");}
     private static boolean recording(JSONObject s){return !s.optString("recording").isEmpty();}
+    private static boolean udsActive(JSONObject s){JSONObject uds=s.optJSONObject("uds");return uds!=null&&uds.optBoolean("active");}
     private static final PendingActions.Spec
         REC_START=new PendingActions.Spec("rec.start","Aufzeichnung starten","Aufzeichnung wird gestartet …",10000,(n,b)->recording(n)||msg(n,b)),
         REC_STOP=new PendingActions.Spec("rec.stop","Aufzeichnung stoppen","Aufzeichnung wird gestoppt …",10000,(n,b)->!recording(n)||msg(n,b)),
@@ -60,6 +68,8 @@ public class MainActivity extends Activity {
         AUTO_STOP=new PendingActions.Spec("auto.stop","Automatische Verbindung stoppen","Stoppe automatische Verbindung …",10000,(n,b)->!n.optBoolean("autoPending")||msg(n,b)),
         AUTO_EXPORT=new PendingActions.Spec("auto.export","Automatischer Export","Ändere automatischen Export …",10000,(n,b)->n.optBoolean("autoExport")!=b.optBoolean("autoExport")),
         EXPORT_ALL=new PendingActions.Spec("export.all","Alle exportieren","Exportiere …",60000,MainActivity::msg),
+        UDS_ENABLE=new PendingActions.Spec("uds.enable","UDS-Sitzung aktivieren","UDS-Sitzung wird aktiviert …",10000,(n,b)->udsActive(n)!=udsActive(b)||msg(n,b)),
+        UDS_DISABLE=new PendingActions.Spec("uds.disable","UDS-Sitzung beenden","Standard-Sitzung wird wiederhergestellt …",10000,(n,b)->udsActive(n)!=udsActive(b)||msg(n,b)),
         VEHICLE_SELECT=new PendingActions.Spec("vehicle.select","Fahrzeug auswählen","Wähle Fahrzeug …",10000,MainActivity::msg),
         VEHICLE_RENAME=new PendingActions.Spec("vehicle.rename","Fahrzeug umbenennen","Benenne um …",10000,MainActivity::msg),
         VEHICLE_DELETE=new PendingActions.Spec("vehicle.delete","Fahrzeug löschen","Lösche Fahrzeug …",10000,MainActivity::msg);
@@ -74,7 +84,8 @@ public class MainActivity extends Activity {
     private JSONObject state=new JSONObject();
     private LinearLayout body, nav;
     private ScrollView scroll;
-    private TextView badge, status;
+    private TextView badge, status, udsIndicator, udsRemaining;
+    public volatile Dialog activeSignalSelector;
     private Button chip;
     private TextView debugLog;
     private int tab=0;
@@ -95,6 +106,7 @@ public class MainActivity extends Activity {
         setContentView(root);
         LinearLayout heading=row();heading.setPadding(dp(20),dp(12),dp(20),dp(6));
         TextView name=text("OBDentic",27,TEXT);name.setTypeface(null,Typeface.BOLD);heading.addView(name,new LinearLayout.LayoutParams(0,-2,1));
+        udsIndicator=text("UDS erweiterte Sitzung aktiv",11,ACCENT);udsIndicator.setGravity(Gravity.CENTER);udsIndicator.setMaxWidth(dp(128));udsIndicator.setMaxLines(3);udsIndicator.setPadding(dp(7),dp(6),dp(7),dp(6));udsIndicator.setBackground(surface(0xff203f3a,10));udsIndicator.setVisibility(View.GONE);heading.addView(udsIndicator);
         badge=text("STARTET",12,ACCENT);badge.setTypeface(null,Typeface.BOLD);badge.setGravity(Gravity.CENTER);badge.setMaxLines(2);badge.setMaxWidth(dp(220));badge.setPadding(dp(12),dp(8),dp(12),dp(8));badge.setBackground(surface(0xff203f3a,10));heading.addView(badge);root.addView(heading);
         chip=button("Kein Fahrzeug gewählt",()->{tab=5;structure="";scroll.scrollTo(0,0);buildNav();refresh();});chip.setSingleLine(true);chip.setEllipsize(android.text.TextUtils.TruncateAt.END);
         LinearLayout.LayoutParams chipParams=new LinearLayout.LayoutParams(-1,-2);chipParams.setMargins(dp(20),0,dp(20),dp(2));root.addView(chip,chipParams);
@@ -145,12 +157,13 @@ public class MainActivity extends Activity {
         if(mode.equals("replay")&&state.optBoolean("replayPartial"))replayBadge+="\nTEILAUFNAHME";
         badge.setText(mode.equals("demo")?"DEMO · SIMULIERT":mode.equals("replay")?replayBadge:phase.equals("ready")?"LIVE · ADAPTER":"LIVE · GETRENNT");
         int tint=mode.equals("live")?ACCENT:0xffffca75;badge.setTextColor(tint);
+        boolean extended=udsActive(state);udsIndicator.setText(extended?"UDS erweiterte Sitzung aktiv\n(OBD2 pausiert)":"UDS erweiterte Sitzung aktiv");udsIndicator.setVisibility(extended?View.VISIBLE:View.GONE);udsIndicator.setContentDescription(extended?"UDS erweiterte Sitzung aktiv, OBD2 pausiert":"UDS Standardsitzung");
         String message=pending.notice(seq);if(message.isEmpty())message=state.optString("message","");
         status.setText(phaseName(phase)+(state.optBoolean("busy")?" · Auftrag läuft":"")+(message.isEmpty()?"":"\n"+message));
         status.setTextColor(phase.equals("error")?0xffffa79c:MUTED);
         if(!historyMode.equals(mode)){historyMode=mode;histories.clear();lastSamples.clear();}
         collectHistory();
-        String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles");
+        String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
         if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile");
@@ -158,16 +171,27 @@ public class MainActivity extends Activity {
         if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
         if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->scroll.scrollTo(0,y));}
         updateValues();
+        updateUdsStatus();
         if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText()))debugLog.setText(content);}
     }
     private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
+    private String udsStructureKey(){JSONObject uds=state.optJSONObject("uds");return uds==null?"":uds.optString("state")+"|"+uds.optBoolean("active")+"|"+uds.optString("error")+"|"+uds.optString("target",uds.optString("target_id"));}
+    private void updateUdsStatus(){if(udsIndicator==null)return;boolean active=udsActive(state);udsIndicator.setText(active?"UDS erweiterte Sitzung aktiv\n(OBD2 pausiert)":"UDS erweiterte Sitzung aktiv");udsIndicator.setVisibility(active?View.VISIBLE:View.GONE);udsIndicator.setContentDescription(active?"UDS erweiterte Sitzung aktiv, OBD2 pausiert":"UDS Standardsitzung");if(udsRemaining!=null)udsRemaining.setText(udsStatusText());}
+    private String udsStatusText(){JSONObject uds=state.optJSONObject("uds");if(udsActive(state)){long seconds=uds==null?0:uds.optLong("remaining_s",uds.optLong("remaining_ms")/1000);String target=uds==null?"":uds.optString("target",uds.optString("target_id"));return "UDS erweiterte Sitzung aktiv · OBD2 pausiert"+(target.isEmpty()?"":" · "+target)+(seconds>0?" · noch etwa "+seconds+" s":"");}String error=uds==null?"":uds.optString("error");if(error.isEmpty()&&uds!=null&&"indeterminate".equals(uds.optString("state")))error="Sitzungsstatus unklar";return error.isEmpty()?udsEnableBlocker():"Erweiterte Sitzung nicht aktiv · "+error;}
+    private String udsEnableBlocker(){if(!state.optString("mode","live").equals("live"))return "Nur im Livebetrieb verfügbar";if(!state.optString("phase").equals("ready"))return "Erst eine bereite Live-Verbindung herstellen";if(!state.optString("recording").isEmpty())return "Während einer Aufzeichnung nicht aktivierbar";JSONObject uds=state.optJSONObject("uds");if(uds!=null&&"indeterminate".equals(uds.optString("state")))return "UDS-Sitzungsstatus unklar · Adapter neu verbinden";if(state.optBoolean("busy"))return "Ein Diagnoseauftrag läuft";if(!identifiedEngineResponded())return "Erst ein identifiziertes Motorsteuergerät erkennen";if(!udsCandidatesExpected())return "Keine passenden session-markierten Knowledge-Messwerte verfügbar";return "";}
+    private boolean identifiedEngineResponded(){JSONObject result=state.optJSONObject("ecuDiscovery"),record=selectedVehicle();if((result==null||result.length()==0)&&record!=null)result=record.optJSONObject("ecu_discovery");JSONArray targets=result==null?null:result.optJSONArray("targets");for(int i=0;targets!=null&&i<targets.length();i++){JSONObject target=targets.optJSONObject(i);if(target==null||!"present".equals(target.optString("status")))continue;String role=target.optString("role",target.optString("logical_role"));boolean engine=role.toLowerCase(java.util.Locale.ROOT).contains("engine")||role.toLowerCase(java.util.Locale.ROOT).contains("motor"),identified=false;JSONArray identity=target.optJSONArray("identity");if(identity==null)identity=target.optJSONArray("identification");for(int j=0;identity!=null&&j<identity.length();j++){JSONObject item=identity.optJSONObject(j);if(item==null)continue;String semantic=item.optString("semantic"),value=item.optString("value");if(semantic.contains("logical_role")&&(value.toLowerCase(java.util.Locale.ROOT).contains("engine")||value.toLowerCase(java.util.Locale.ROOT).contains("motor")))engine=true;if(!value.isEmpty()||positiveUdsResponse(item.opt("response")))identified=true;}if(engine&&identified)return true;}return false;}
+    private static boolean positiveUdsResponse(Object response){if(response instanceof JSONArray){JSONArray bytes=(JSONArray)response;return bytes.length()>0&&bytes.optInt(0,-1)==0x62;}if(response instanceof String)return ((String)response).trim().toLowerCase(java.util.Locale.ROOT).startsWith("62");return false;}
+    private boolean udsCandidatesExpected(){if(state.optInt("udsCandidates",0)>0)return true;JSONArray candidates=state.optJSONArray("udsCandidates");if(candidates!=null&&candidates.length()>0)return true;for(int i=0;i<array("signals").length();i++){JSONObject signal=array("signals").optJSONObject(i);if(signal==null)continue;String protocol=signalField(signal,"protocol").toLowerCase(java.util.Locale.ROOT),session=signalField(signal,"session_requirement").toLowerCase(java.util.Locale.ROOT);if(protocol.equals("uds")||signal.optBoolean("session_required")||session.contains("extended")||session.contains("required"))return true;}return false;}
     private void buildNav(){nav.removeAllViews();nav.setWeightSum(5);String[] titles={"Live","Diagnose","Aufnahmen","Debug","Adapter"};for(int i=0;i<titles.length;i++){final int next=i;Button b=button(titles[i],()->{tab=next;structure="";scroll.scrollTo(0,0);buildNav();refresh();});b.setTextSize(12);b.setMinWidth(0);b.setMinimumWidth(0);b.setPadding(dp(2),dp(4),dp(2),dp(4));b.setTextColor(tab==i?BG:MUTED);b.setBackground(surface(tab==i?ACCENT:CARD,12));b.setBackgroundTintList(null);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(48),1);p.setMargins(dp(2),0,dp(2),0);nav.addView(b,p);}}
-    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;default:connection();}}
+    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;udsRemaining=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;default:connection();}}
     private void live(){
         title("Live-Messwerte","Werte und Verlauf auf einen Blick");
         addButton(body,"Messwerte auswählen",this::chooseSignals).setEnabled(state.optString("recording").isEmpty());
+        JSONArray selected=array("selected");
+        boolean canRecordSelection=!state.optString("mode","live").equals("replay")&&state.optString("phase").equals("ready")&&!state.optBoolean("busy")&&state.optString("recording").isEmpty()&&selected.length()>0;
+        actionButton(body,REC_START,":selection","Gewählte Messwerte aufzeichnen",canRecordSelection,()->perform(REC_START,":selection",()->service().startRecording("live-selection")));
         if(!state.optString("recording").isEmpty())note(body,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);
-        JSONArray selected=array("selected");JSONArray values=array("values");
+        JSONArray values=array("values");
         LinkedHashMap<String,JSONObject> shown=new LinkedHashMap<>();
         for(int i=0;i<selected.length();i++){String s=selected.optString(i);shown.put(s,signal(s));}
         for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v!=null&&selected.length()==0)shown.put(v.optString("semantic"),v);}
@@ -183,6 +207,8 @@ public class MainActivity extends Activity {
             SparklineView graph=new SparklineView(this,ACCENT);tile.addView(graph,new LinearLayout.LayoutParams(-1,dp(28)));graphViews.put(id,graph);
             TextView range=text("",11,MUTED);range.setSingleLine(true);range.setEllipsize(android.text.TextUtils.TruncateAt.END);range.setTag("live-range");tile.addView(range);rangeViews.put(id,range);
             TextView freshness=text("",11,0xffffca75);freshness.setVisibility(View.GONE);tile.addView(freshness);freshnessViews.put(id,freshness);
+            String protocol=signalProtocolLabel(s,udsActive(state));if(!protocol.isEmpty()){TextView meta=text(protocol,10,ACCENT);meta.setTag("live-protocol");tile.addView(meta);}
+            String validation=knowledgeValidationBadge(s);if(!validation.isEmpty()){TextView meta=text(validation,10,MUTED);meta.setTag("live-validation");tile.addView(meta);}
             col=(col+1)%columns;
         }
         while(col!=0&&col<columns){row.addView(new View(this),new LinearLayout.LayoutParams(0,1,1));col++;}
@@ -193,6 +219,9 @@ public class MainActivity extends Activity {
         LinearLayout c=card();note(c,"FAHRZEUG & FEHLERSPEICHER",ACCENT);
         job(c,"Fahrzeug und Steuergeräte erfassen","inventory");job(c,"Fehlercodes lesen","dtc.scan");
         throughputCard();
+        ecuDiscoveryCard();
+        knowledgeLearningCard();
+        udsSessionCard();
 
         JSONObject vehicle=state.optJSONObject("vehicle");
         if(vehicle!=null&&vehicle.length()>0)showInventory(vehicle);
@@ -233,6 +262,14 @@ public class MainActivity extends Activity {
         if(t.optBoolean("replay"))smallNote(c,"Aus gespeicherter Aufnahme neu berechnet",MUTED);
     }
     private static String ms(JSONObject o,String key){return o.isNull(key)||!o.has(key)?"—":MeasurementFormat.formatMeasurement(o.optDouble(key),"ms");}
+    /** Canonical identification is opaque: show bytes and label printable text as a preview. */
+    public static String identityValue(JSONObject item){
+        if(item.isNull("value"))return "";
+        JSONArray bytes=item.optJSONArray("value");if(bytes==null)return item.optString("value","");
+        StringBuilder hex=new StringBuilder(),ascii=new StringBuilder();boolean printable=bytes.length()>0;
+        for(int i=0;i<bytes.length();i++){int value=bytes.optInt(i,-1);if(value<0||value>255)return "Ungültige Identifikationsbytes";if(i>0)hex.append(' ');hex.append(String.format(java.util.Locale.ROOT,"%02X",value));if(value<32||value>126)printable=false;ascii.append((char)value);}
+        return printable?"ASCII: "+ascii+" · Bytes: "+hex:"Bytes: "+hex;
+    }
     private void showInventory(JSONObject vehicle){
         LinearLayout c=card();note(c,"FAHRZEUG · TEILABDECKUNG",ACCENT);note(c,"Funktionale OBD-Erkennung · kein vollständiges Herstellerverzeichnis",MUTED);
         String vin=vehicle.optString("vin","");String identityError=vehicle.optString("identity_error","");
@@ -252,6 +289,42 @@ public class MainActivity extends Activity {
         else{StringBuilder ids=new StringBuilder();for(int i=0;i<responders.length();i++){if(i>0)ids.append(", ");ids.append(responders.optString(i));}note(c,"Responder (Steuergeräte): "+ids,TEXT);}
         JSONArray signals=vehicle.optJSONArray("signals");if(signals!=null){int supported=0;for(int i=0;i<signals.length();i++)if("supported".equals(signals.optJSONObject(i).optString("status")))supported++;note(c,"Messwerte unterstützt: "+supported+" von "+signals.length(),MUTED);}
         if(vehicle.optBoolean("engine_target_validated"))note(c,"Motorsteuergerät gezielt geprüft",MUTED);
+    }
+    /** REQ-023.5: shows persisted present ECUs and not-observed targets separately. */
+    private void ecuDiscoveryCard(){
+        LinearLayout c=card();note(c,"STEUERGERÄTE ERKENNEN",ACCENT);job(c,"Steuergeräte aus Knowledge-Zielen erkennen","ecu.discover");
+        JSONObject result=state.optJSONObject("ecuDiscovery"),record=selectedVehicle();if((result==null||result.length()==0)&&record!=null)result=record.optJSONObject("ecu_discovery");
+        JSONArray targets=result==null?null:result.optJSONArray("targets");if(targets==null||targets.length()==0){smallNote(c,"Erkennt nur die für den Hersteller hinterlegten Ziele · nicht beobachtet bedeutet nicht abwesend.",MUTED);return;}
+        boolean hasPresent=false,hasUnobserved=false,hasOther=false;for(int i=0;i<targets.length();i++){JSONObject target=targets.optJSONObject(i);if(target==null)continue;String status=target.optString("status");if("present".equals(status))hasPresent=true;else if("not_observed".equals(status))hasUnobserved=true;else hasOther=true;}
+        if(hasPresent){note(c,"VORHANDEN",TEXT);for(int i=0;i<targets.length();i++){JSONObject target=targets.optJSONObject(i);if(target==null||!"present".equals(target.optString("status")))continue;
+            String role=target.optString("role","Steuergerät"),request=signalField(target,"request_id"),response=signalField(target,"response_id"),route=!request.isEmpty()?" · Anfrage "+request+(response.isEmpty()?"":" · erwartete Antwort "+response):signalField(target,"address");if(route.isEmpty())route=signalField(target,"target");note(c,role+(route.isEmpty()?"":" · "+route),TEXT);
+            JSONArray identity=target.optJSONArray("identity");if(identity==null)identity=target.optJSONArray("identification");
+            if(identity!=null){for(int j=0;j<identity.length();j++){JSONObject item=identity.optJSONObject(j);if(item==null)continue;String semantic=signalField(item,"semantic");if(semantic.isEmpty())semantic=signalField(item,"name");if(semantic.isEmpty())semantic="Identifikation";String value=identityValue(item);String label=SignalNames.shortName(semantic,semantic);if(label.equals(semantic)&&semantic.contains("."))label=semantic.substring(semantic.lastIndexOf('.')+1).replace('_',' ');if(!value.isEmpty())smallNote(c,label+": "+value,MUTED);else if(!item.isNull("nrc"))smallNote(c,label+" · NRC "+item.optString("nrc"),MUTED);}}
+            else{JSONObject fields=target.optJSONObject("identity");if(fields==null)fields=target.optJSONObject("identification");if(fields!=null){java.util.Iterator<String> keys=fields.keys();while(keys.hasNext()){String key=keys.next(),value=fields.optString(key);if(!value.isEmpty())smallNote(c,key.replace('_',' ')+": "+value,MUTED);}}}
+        }}
+        if(hasUnobserved){note(c,"NICHT BEOBACHTET",TEXT);for(int i=0;i<targets.length();i++){JSONObject target=targets.optJSONObject(i);if(target==null||!"not_observed".equals(target.optString("status")))continue;String role=target.optString("role","Steuergerät"),address=target.optString("address",target.optString("target"));smallNote(c,role+(address.isEmpty()?"":" · "+address)+" · nicht beobachtet",MUTED);}}
+        if(hasOther){note(c,"WEITERE ERGEBNISSE",TEXT);for(int i=0;i<targets.length();i++){JSONObject target=targets.optJSONObject(i);if(target==null)continue;String status=target.optString("status");if(!status.isEmpty()&&!status.equals("present")&&!status.equals("not_observed"))smallNote(c,target.optString("role","Steuergerät")+" · "+status,MUTED);}}
+    }
+    /** REQ-026.2: keeps default-session learning outcomes and unconfirmed values visible. */
+    private void knowledgeLearningCard(){
+        LinearLayout c=card();note(c,"STANDARD-SITZUNG LERNEN",ACCENT);job(c,"Knowledge-Messwerte prüfen","knowledge.learn");
+        JSONObject result=state.optJSONObject("knowledgeLearning"),record=selectedVehicle();if((result==null||result.length()==0)&&record!=null)result=record.optJSONObject("knowledge_learning");
+        JSONArray rows=result==null?null:result.optJSONArray("results");if(rows==null||rows.length()==0){smallNote(c,"Prüft markierte Knowledge-Messwerte in der Standard-Sitzung · Werte bleiben unbestätigt.",MUTED);return;}
+        for(int i=0;i<rows.length();i++){JSONObject item=rows.optJSONObject(i);if(item==null)continue;String semantic=item.optString("semantic",item.optString("name",item.optString("did","Messwert"))),status=item.optString("status");
+            String label=SignalNames.shortName(semantic,semantic);String outcome=status.equals("answered")?"beantwortet · Wert unbestätigt":status.equals("rejected")?"abgelehnt":status.equals("not_answered")?"nicht beantwortet":status;
+            String nrc=item.optString("nrc","");if(!nrc.isEmpty()&&status.equals("rejected"))outcome+=" · NRC "+nrc;
+            String value=item.optString("value",item.optString("text",""));note(c,label+" · "+outcome,TEXT);if(!value.isEmpty())smallNote(c,"Wert: "+value,MUTED);
+        }
+    }
+    /** REQ-027.1/.3: explicit, gated extended-session controls; disabling remains available during recording. */
+    private void udsSessionCard(){
+        LinearLayout c=card();note(c,"UDS · ERWEITERTE SITZUNG",ACCENT);boolean active=udsActive(state);
+        udsRemaining=text("",14,active?ACCENT:MUTED);c.addView(udsRemaining);
+        PendingActions.Spec spec=active?UDS_DISABLE:UDS_ENABLE;String action=active?"uds.disable":"uds.enable";
+        boolean enabled=active?!state.optBoolean("busy"):udsEnableBlocker().isEmpty();
+        actionButton(c,spec,"",active?"Standard-Sitzung wiederherstellen":"Erweiterte Sitzung aktivieren",enabled,()->perform(spec,"",()->service().runJob(action)));
+        if(!active){String reason=udsEnableBlocker();if(!reason.isEmpty())smallNote(c,reason,MUTED);}
+        smallNote(c,"Nur Knowledge-Messwerte des identifizierten Steuergeräts · Rückkehr zur Standard-Sitzung nach dem Ausschalten und vor funktionalen OBD-Anfragen.",MUTED);
     }
     private void showDtcs(JSONObject dtcs){
         LinearLayout c=card();note(c,"GESPEICHERTE FEHLERCODES",ACCENT);JSONArray observations=dtcs.optJSONArray("observations");
@@ -384,8 +457,83 @@ public class MainActivity extends Activity {
         if(stored.equals("supported")||stored.equals("unsupported"))return (stored.equals("supported")?" · unterstützt":" · nicht unterstützt")+" (zuletzt gesehen "+formatDate(seenAt)+")";
         return " · ungeprüft";
     }
-    private void chooseSignals(){JSONArray signals=array("signals");JSONObject vehicle=selectedVehicle();JSONObject stored=new JSONObject();long seenAt=0;String name="";boolean session=!state.optString("mode","live").equals("live")||state.optString("phase").equals("ready");
-        if(vehicle!=null){seenAt=vehicle.optLong("last_connected");name=vehicle.optString("name");JSONArray rows=vehicle.optJSONArray("signals");for(int i=0;rows!=null&&i<rows.length();i++)try{stored.put(rows.optJSONObject(i).optString("semantic"),rows.optJSONObject(i).optString("status"));}catch(org.json.JSONException ignored){}}String[] labels=new String[signals.length()];boolean[] checked=new boolean[signals.length()];for(int i=0;i<signals.length();i++){JSONObject s=signals.optJSONObject(i);String semantic=s.optString("semantic");labels[i]=signalLabel(semantic,s)+"  ·  "+MeasurementFormat.displayUnit(s.optString("unit"))+supportLabel(session?s.optString("status"):"",stored.optString(semantic,""),seenAt);checked[i]=contains(array("selected"),semantic);}new AlertDialog.Builder(this).setTitle("Live-Messwerte · maximal 32"+(name.isEmpty()?"":" · "+name)).setMultiChoiceItems(labels,checked,(d,which,on)->checked[which]=on).setPositiveButton("Übernehmen",(d,w)->{JSONArray selected=new JSONArray();for(int i=0;i<checked.length;i++)if(checked[i])selected.put(signals.optJSONObject(i).optString("semantic"));act(()->service().setSignals(selected));}).setNegativeButton("Abbrechen",null).show();}
+    private void chooseSignals(){
+        if(!state.optString("recording").isEmpty()){toast("Messwertauswahl während Aufnahme gesperrt");return;}
+        JSONArray signals=array("signals");JSONObject vehicle=selectedVehicle();JSONObject stored=new JSONObject();long seenAt=0;String name="";
+        boolean session=!state.optString("mode","live").equals("live")||state.optString("phase").equals("ready");
+        if(vehicle!=null){seenAt=vehicle.optLong("last_connected");name=vehicle.optString("name");JSONArray rows=vehicle.optJSONArray("signals");for(int i=0;rows!=null&&i<rows.length();i++){JSONObject row=rows.optJSONObject(i);if(row!=null)try{stored.put(row.optString("semantic"),row.optString("status"));}catch(org.json.JSONException ignored){}}}
+        final long supportSeenAt=seenAt;
+        LinkedHashMap<String,LinkedHashMap<String,ArrayList<Integer>>> groups=new LinkedHashMap<>();
+        for(int i=0;i<signals.length();i++){
+            JSONObject signal=signals.optJSONObject(i);if(signal==null)continue;
+            String ecu=signalField(signal,"ecu");if(ecu.isEmpty())ecu="OBD-Standard";
+            String group=signalField(signal,"group");if(group.isEmpty())group=signalField(signal,"subsystem");if(group.isEmpty())group="Allgemein";
+            groups.computeIfAbsent(ecu,k->new LinkedHashMap<>()).computeIfAbsent(group,k->new ArrayList<>()).add(i);
+        }
+        LinkedHashSet<String> chosen=new LinkedHashSet<>();JSONArray current=array("selected");for(int i=0;i<current.length()&&chosen.size()<32;i++)chosen.add(current.optString(i));
+        Dialog dialog=new Dialog(this,android.R.style.Theme_Material_NoActionBar);dialog.setCanceledOnTouchOutside(true);
+        LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(BG);root.setPadding(dp(18),dp(12),dp(18),dp(12));
+        LinearLayout heading=row();TextView title=text("Live-Messwerte",22,TEXT);title.setTypeface(null,Typeface.BOLD);heading.addView(title,new LinearLayout.LayoutParams(0,-2,1));Button close=button("Schließen",dialog::dismiss);heading.addView(close);root.addView(heading);
+        if(!name.isEmpty())smallNote(root,name,MUTED);
+        EditText search=new EditText(this);search.setSingleLine(true);search.setTextColor(TEXT);search.setHintTextColor(MUTED);search.setHint("Messwert, Gruppe oder Einheit suchen");search.setPadding(dp(12),0,dp(12),0);search.setBackground(surface(CARD,12));LinearLayout.LayoutParams searchParams=new LinearLayout.LayoutParams(-1,dp(50));searchParams.setMargins(0,dp(8),0,dp(6));root.addView(search,searchParams);
+        TextView count=text("",15,ACCENT);count.setTypeface(null,Typeface.BOLD);root.addView(count);
+        TextView feedback=text("",13,0xffffca75);root.addView(feedback);
+        ScrollView listScroll=new ScrollView(this);listScroll.setFillViewport(false);LinearLayout list=new LinearLayout(this);list.setOrientation(LinearLayout.VERTICAL);listScroll.addView(list);root.addView(listScroll,new LinearLayout.LayoutParams(-1,0,1));
+        boolean locked=!state.optString("recording").isEmpty();
+        LinearLayout presetRow=row();Button save=button("Preset speichern",()->saveSignalPreset(chosen));save.setEnabled(!locked&&vehicle!=null&&state.optString("mode","live").equals("live"));presetRow.addView(save,new LinearLayout.LayoutParams(0,-2,1));Button apply=button("Preset anwenden",()->chooseSignalPreset(dialog));apply.setEnabled(!locked&&vehicle!=null&&state.optString("mode","live").equals("live"));presetRow.addView(apply,new LinearLayout.LayoutParams(0,-2,1));root.addView(presetRow);
+        LinearLayout actions=row();Button cancel=button("Abbrechen",dialog::dismiss);actions.addView(cancel,new LinearLayout.LayoutParams(0,-2,1));Button accept=button("Übernehmen",()->{
+            if(service()==null)return;
+            if(!service().snapshot().optString("recording").isEmpty()){toast("Messwertauswahl während Aufnahme gesperrt");return;}
+            JSONArray selection=new JSONArray();for(String semantic:chosen)selection.put(semantic);
+            dialog.dismiss();act(()->service().setSignals(selection));
+        });actions.addView(accept,new LinearLayout.LayoutParams(0,-2,1));root.addView(actions);
+        Runnable[] rebuild=new Runnable[1];
+        Runnable updateCount=()->count.setText(chosen.size()+" / 32 gewählt");
+        rebuild[0]=()->{
+            String query=search.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);list.removeAllViews();
+            for(Map.Entry<String,LinkedHashMap<String,ArrayList<Integer>>> section:groups.entrySet()){
+                boolean sectionShown=false;LinearLayout sectionView=new LinearLayout(this);sectionView.setOrientation(LinearLayout.VERTICAL);
+                for(Map.Entry<String,ArrayList<Integer>> group:section.getValue().entrySet()){
+                    ArrayList<Integer> matches=new ArrayList<>();
+                    for(int index:group.getValue())if(matchesSignal(signals.optJSONObject(index),group.getKey(),query))matches.add(index);
+                    if(matches.isEmpty())continue;
+                    sectionShown=true;
+                    LinearLayout groupHeader=row();TextView groupTitle=text(group.getKey(),16,ACCENT);groupTitle.setTypeface(null,Typeface.BOLD);groupHeader.addView(groupTitle,new LinearLayout.LayoutParams(0,-2,1));
+                    Button none=button("Keine",()->{if(recordingNow()){toast("Messwertauswahl während Aufnahme gesperrt");return;}for(int index:group.getValue())chosen.remove(signals.optJSONObject(index).optString("semantic"));feedback.setText("");rebuild[0].run();});none.setTextSize(12);none.setEnabled(!locked);groupHeader.addView(none);
+                    Button all=button("Alle",()->{if(recordingNow()){toast("Messwertauswahl während Aufnahme gesperrt");return;}int room=32-chosen.size(),skipped=0;for(int index:group.getValue()){String semantic=signals.optJSONObject(index).optString("semantic");if(chosen.contains(semantic))continue;if(room>0){chosen.add(semantic);room--;}else skipped++;}feedback.setText(skipped>0?"Gruppe gekürzt · maximal 32 Messwerte":"");rebuild[0].run();});all.setTextSize(12);all.setEnabled(!locked);groupHeader.addView(all);sectionView.addView(groupHeader);
+                    for(int index:matches){JSONObject signal=signals.optJSONObject(index);String semantic=signal.optString("semantic");String unit=MeasurementFormat.displayUnit(signal.optString("unit"));String protocol=signalProtocolLabel(signal,udsActive(state));CheckBox check=new CheckBox(this);check.setText(signalLabel(semantic,signal)+(unit.isEmpty()?"":" · "+unit));check.setTextColor(TEXT);check.setMinHeight(dp(44));check.setChecked(chosen.contains(semantic));check.setEnabled(!locked);check.setContentDescription(check.getText()+", "+signalSupport(signal,stored.optString(semantic,""),session,supportSeenAt)+", "+validationState(signal)+(protocol.isEmpty()?"":", "+protocol));
+                        android.widget.CompoundButton.OnCheckedChangeListener[] listener=new android.widget.CompoundButton.OnCheckedChangeListener[1];listener[0]=(button,on)->{if(recordingNow()){button.setOnCheckedChangeListener(null);button.setChecked(chosen.contains(semantic));button.setOnCheckedChangeListener(listener[0]);feedback.setText("Messwertauswahl während Aufnahme gesperrt");return;}if(on&&chosen.size()>=32){button.setChecked(false);feedback.setText("Maximal 32 Messwerte · Auswahl nicht erweitert");return;}if(on)chosen.add(semantic);else chosen.remove(semantic);feedback.setText("");updateCount.run();};check.setOnCheckedChangeListener(listener[0]);
+                        sectionView.addView(check);
+                        TextView details=text(signalSupport(signal,stored.optString(semantic,""),session,supportSeenAt)+" · "+validationState(signal)+(protocol.isEmpty()?"":" · "+protocol),12,MUTED);details.setPadding(dp(36),0,0,dp(5));sectionView.addView(details);
+                    }
+                }
+                if(sectionShown){TextView sectionTitle=text(section.getKey().equals("OBD-Standard")?"OBD-Standard":"Steuergerät · "+section.getKey(),18,TEXT);sectionTitle.setTypeface(null,Typeface.BOLD);sectionTitle.setPadding(0,dp(12),0,dp(4));list.addView(sectionTitle);list.addView(sectionView);}
+            }
+            if(list.getChildCount()==0)note(list,"Keine passenden Messwerte",MUTED);
+            updateCount.run();
+        };
+        search.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int start,int count,int after){}public void onTextChanged(CharSequence s,int start,int before,int count){rebuild[0].run();}public void afterTextChanged(Editable e){}});
+        rebuild[0].run();dialog.setContentView(root);dialog.setOnDismissListener(ignored->{if(activeSignalSelector==dialog)activeSignalSelector=null;});dialog.show();activeSignalSelector=dialog;Window window=dialog.getWindow();if(window!=null){window.setLayout(-1,-1);window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(BG));window.setStatusBarColor(BG);window.setNavigationBarColor(BG);}
+    }
+    private static String signalField(JSONObject signal,String key){Object value=signal.opt(key);if(value instanceof JSONObject){JSONObject object=(JSONObject)value;return object.optString("status",object.optString("state",object.optString("name","")));}return value==null||JSONObject.NULL.equals(value)?"":String.valueOf(value);}
+    public static String signalProtocolLabel(JSONObject signal,boolean udsActive){String protocol=signalField(signal,"protocol"),lower=protocol.toLowerCase(java.util.Locale.ROOT);boolean extended=signal.optBoolean("extended_session_required")||signal.optBoolean("session_required");if(udsActive&&extended)return "UDS · erweiterte Sitzung";if(udsActive&&isObd2Signal(signal))return "OBD2 · pausiert";if(protocol.isEmpty())return "";return lower.equals("uds")&&udsActive?"UDS · erweiterte Sitzung":protocol.toUpperCase(java.util.Locale.ROOT);}
+    private static boolean isObd2Signal(JSONObject signal){String protocol=signalField(signal,"protocol").toLowerCase(java.util.Locale.ROOT);if(!protocol.isEmpty())return protocol.contains("obd");String ecu=signalField(signal,"ecu");return ecu.isEmpty()||ecu.equalsIgnoreCase("OBD-Standard");}
+    private boolean recordingNow(){return service()!=null&&!service().snapshot().optString("recording").isEmpty();}
+    private static boolean matchesSignal(JSONObject signal,String group,String query){if(query.isEmpty())return true;String semantic=signal.optString("semantic"),name=SignalNames.shortName(semantic,signal.optString("title","")),unit=MeasurementFormat.displayUnit(signal.optString("unit"));return (name+" "+group+" "+unit).toLowerCase(java.util.Locale.ROOT).contains(query);}
+    private static String validationState(JSONObject signal){String value=signalField(signal,"validation");if(value.isEmpty())return "Validierung: nicht angegeben";if(value.equals("not_validated"))value="nicht validiert";else if(value.equals("validated"))value="validiert";else if(value.equals("unconfirmed"))value="unbestätigt";return "Validierung: "+value;}
+    private static String validationLabel(JSONObject signal){String value=signalField(signal,"validation_label");if(!value.isEmpty())return value;value=signalField(signal,"validation");if(value.equals("not_validated"))return "nicht abgeglichen";if(value.equals("validated"))return "validiert";if(value.equals("not_applicable"))return "nicht anwendbar";if(value.equals("unconfirmed"))return "unbestätigt";return value.isEmpty()?"Validierung nicht angegeben":value;}
+    public static String knowledgeValidationBadge(JSONObject signal){return signal.has("definition_id")&&!signal.isNull("definition_id")?validationLabel(signal):"";}
+    private static String signalSupport(JSONObject signal,String stored,boolean session,long seenAt){String status=session?signal.optString("status",""):"";if(status.isEmpty()&&session&&signal.has("supported")&&!signal.isNull("supported"))status=signal.optBoolean("supported")?"supported":"unsupported";boolean lastSeen=false;if(status.isEmpty()){status=stored;lastSeen=!status.isEmpty();}String label=status.equals("supported")?"unterstützt":status.equals("unsupported")?"nicht unterstützt":"ungeprüft";if(lastSeen)label+=" (zuletzt gesehen "+formatDate(seenAt)+")";return "Unterstützung: "+label;}
+    private void saveSignalPreset(LinkedHashSet<String> selection){
+        if(service()==null)return;EditText input=new EditText(this);input.setSingleLine(true);input.setHint("Name · 1 bis 40 Zeichen");
+        new AlertDialog.Builder(this).setTitle("Auswahl als Preset speichern").setView(input).setPositiveButton("Speichern",(d,w)->{String name=input.getText().toString().trim();if(name.isEmpty()||name.length()>40){toast("Der Presetname muss 1 bis 40 Zeichen lang sein");return;}JSONArray semantics=new JSONArray();for(String semantic:selection)semantics.put(semantic);act(()->service().saveSignalPreset(name,semantics));}).setNegativeButton("Abbrechen",null).show();
+    }
+    private void chooseSignalPreset(Dialog selector){
+        JSONObject vehicle=selectedVehicle();if(vehicle==null){toast("Kein Fahrzeug für Presets gewählt");return;}
+        JSONArray presets=vehicle.optJSONArray("presets");if(presets==null||presets.length()==0){toast("Für dieses Fahrzeug sind keine Presets gespeichert");return;}
+        ArrayList<String> names=new ArrayList<>();for(int i=0;i<presets.length();i++){JSONObject preset=presets.optJSONObject(i);if(preset!=null)names.add(preset.optString("name"));}
+        new AlertDialog.Builder(this).setTitle("Preset anwenden").setItems(names.toArray(new String[0]),(d,which)->{String name=names.get(which);selector.dismiss();act(()->service().applySignalPreset(name));}).setNegativeButton("Abbrechen",null).show();
+    }
     private void chooseProfile(){JSONArray p=array("profiles");String[] names=new String[p.length()];int chosen=0;for(int i=0;i<p.length();i++){JSONObject item=p.optJSONObject(i);names[i]=item.optString("title",item.optString("id"));if(item.optString("id").equals(profile))chosen=i;}new AlertDialog.Builder(this).setTitle("Aufnahmeprofil / Testsequenz").setSingleChoiceItems(names,chosen,(dialog,which)->{profile=p.optJSONObject(which).optString("id");structure="";dialog.dismiss();refresh();}).setNegativeButton("Schließen",null).show();}
     private void export(String name) {
         if(name.equals(state.optString("recording"))) {toast("Aufzeichnung vor dem Export stoppen");return;}

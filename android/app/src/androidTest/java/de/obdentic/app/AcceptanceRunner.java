@@ -52,6 +52,11 @@ public final class AcceptanceRunner extends Instrumentation {
             require(state.getJSONArray("signals").length() == 50, "Expanded semantic catalog");
             require(state.getJSONArray("profiles").length() == 4, "Standard capture profiles only");
             passed("Rust JNI library, real initialization/parser, signal and profile catalogs");
+            SignalSelectorAcceptance.run(getTargetContext());
+            SignalSelectorAcceptance.verifyUi(this::onMain, activity, service);
+            UdsAcceptance.verifyDemoGate(this::onMain, activity, service);
+            UdsAcceptance.verifyLive(this::onMain, activity, service, getTargetContext());
+            passed("Private signal presets, persisted ECU/learning results, UDS demo gate and simulated UDS activation, recording, default-session return before disconnect and offline replay");
 
             service.setSignals(new JSONArray());waitIdle();
             JSONArray catalog=state.getJSONArray("signals");
