@@ -65,7 +65,7 @@ final class BleTransport implements ObdService.Link {
             } catch (SecurityException e) {
                 failure = "Bluetooth permission missing"; close(); throw new IOException(failure,e);
             } catch (Exception e) {
-                failure = e.getMessage();
+                failure = e.getMessage(); AppLog.e("ble", "exchange failed", e); // the native layer only reports "Java exception was thrown"
                 // A late prompt cannot safely be associated with the next command.
                 close();
                 throw e;
@@ -78,7 +78,7 @@ final class BleTransport implements ObdService.Link {
             try { synchronized (lock) {
                 if (closed) return;
                 if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) {
-                    failure = "BLE disconnected (" + status + ")"; ready = false; lock.notifyAll();
+                    failure = "BLE disconnected (" + status + ")"; ready = false; lock.notifyAll(); AppLog.w("ble", "connection state " + state + " status " + status);
                 } else if (state == BluetoothProfile.STATE_CONNECTED && !g.discoverServices()) {
                     failure = "BLE service discovery rejected"; lock.notifyAll();
                 }
@@ -92,7 +92,7 @@ final class BleTransport implements ObdService.Link {
                 if (status != BluetoothGatt.GATT_SUCCESS || channel == null ||
                     (channel.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0 ||
                     (channel.getProperties() & (BluetoothGattCharacteristic.PROPERTY_WRITE | BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) == 0) {
-                    failure = "Carly FFE0/FFE1 notify/write service missing"; lock.notifyAll(); return;
+                    failure = "Carly FFE0/FFE1 notify/write service missing"; lock.notifyAll(); AppLog.w("ble", "service discovery status " + status + " channel " + (channel != null)); return;
                 }
                 BluetoothGattDescriptor descriptor = channel.getDescriptor(CCC);
                 if (descriptor == null || !g.setCharacteristicNotification(channel, true)) {
@@ -104,11 +104,11 @@ final class BleTransport implements ObdService.Link {
         }
         public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor descriptor, int status) {
             synchronized (lock) { if (closed) return; ready = status == BluetoothGatt.GATT_SUCCESS;
-                if (!ready) failure = "Notification setup failed (" + status + ")"; lock.notifyAll(); }
+                if (!ready) { failure = "Notification setup failed (" + status + ")"; AppLog.w("ble", failure); } lock.notifyAll(); }
         }
         public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic c, int status) {
             synchronized (lock) { if (closed) return; writeDone = status == BluetoothGatt.GATT_SUCCESS;
-                if (!writeDone) failure = "BLE write failed (" + status + ")"; lock.notifyAll(); }
+                if (!writeDone) { failure = "BLE write failed (" + status + ")"; AppLog.w("ble", failure); } lock.notifyAll(); }
         }
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c) { accept(c.getValue()); }
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c, byte[] value) { accept(value); }

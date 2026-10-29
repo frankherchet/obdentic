@@ -622,3 +622,28 @@ requirements:
         text: Automatic recordings stay in the app-private directory; they are exported, pulled and handled under the same rules as other recordings (REQ-018, REQ-019), and the app adds no permission.
       - id: REQ-028.10
         text: Replay and the desktop mobile report of an automatic recording re-derive the vehicle and signal support from the recorded handshake and inventory events, as they do for named recordings.
+
+  - id: REQ-029
+    title: Keep a rolling app debug log separate from vehicle evidence
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-29: epic #253, decisions by @frankherchet"
+    description: >
+      The app writes an operational debug log with stack traces, so failures such as an
+      unexplained BLE "Java exception was thrown" abort can be diagnosed afterwards.
+      It is separate from the replayable vehicle evidence and contains no vehicle
+      identifiers or raw adapter traffic.
+    acceptance:
+      - id: REQ-029.1
+        text: The app writes text lines "<ISO-8601 time> <LEVEL> <tag> <message>" to the app-private file logs/app.log and to Logcat; the file is sealed under a unique name logs/app-<yyyyMMdd-HHmmss-SSS>.log when it reaches 1 MB or a connection ends (disconnect or error), and only the newest 50 sealed files are kept.
+      - id: REQ-029.2
+        text: The log records service start and stop, every connection attempt with its outcome and reason, reconnect delays, BLE connection, service-discovery and write status codes, diagnostic job start and end with duration and ok flag, and recording start, rotation, end and write failure.
+      - id: REQ-029.3
+        text: Every logged exception includes its full stack trace with causes; the real cause of a BLE exchange failure is logged where it is thrown, and an uncaught exception on any thread is logged before the process ends.
+      - id: REQ-029.4
+        text: A log line never contains a 17-character VIN, a raw adapter command or response (six or more hex bytes in a row) or an unmasked Bluetooth address; such content in a message is replaced by a placeholder.
+      - id: REQ-029.5
+        text: A failure to write the log never raises an exception into the caller and never stops a session.
+      - id: REQ-029.6
+        text: Each export run (REQ-018.2, REQ-018.4) also copies the sealed log files unchanged under the same skip rules, `tools/pull-recordings.sh` pulls `*.log` files, and the log adds no permission and no dependency.

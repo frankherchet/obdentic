@@ -59,7 +59,7 @@ final class RecordingExportAcceptance {
             // REQ-018.2/.3/.7: first export copies all completed files, never the active one
             File dir = tempDir(context, dirs); service.exportTarget = new DirTarget(dir);
             exportAndWait(service, "Export: " + n + " kopiert, 0 übersprungen, 0 fehlgeschlagen");
-            require(new HashSet<>(Arrays.asList(dir.list())).equals(new HashSet<>(names)), "REQ-018.3 only completed recordings were copied, not " + active);
+            require(new HashSet<>(Arrays.asList(recordingNames(dir))).equals(new HashSet<>(names)), "REQ-018.3 only completed recordings were copied, not " + active);
             for (String name : names) require(Arrays.equals(originals.get(name), Files.readAllBytes(new File(dir, name).toPath())), "REQ-018.7 byte-identical copy of " + name);
             verifyUnchanged(recordings, originals, times);
             // REQ-018.2: second run skips what is present with the same name and size
@@ -77,7 +77,7 @@ final class RecordingExportAcceptance {
             File faulty = tempDir(context, dirs); service.exportTarget = new FaultTarget(faulty, 100);
             for (String name : names) require(originals.get(name).length > 100, "fixture is longer than the failure point: " + name);
             exportAndWait(service, "Export: 0 kopiert, 0 übersprungen, " + n + " fehlgeschlagen");
-            require(faulty.list().length == 0, "REQ-018.6 no partial target left: " + Arrays.toString(faulty.list()));
+            require(recordingNames(faulty).length == 0, "REQ-018.6 no partial target left: " + Arrays.toString(recordingNames(faulty)));
             verifyUnchanged(recordings, originals, times);
 
             // REQ-018.6: missing folder -> message, internals untouched
@@ -117,7 +117,7 @@ final class RecordingExportAcceptance {
             waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "auto-export recording starts");
             String stopped = service.snapshot().getString("recording"); created.add(stopped);
             SystemClock.sleep(1200);
-            require(auto.list().length == 0, "REQ-018.3/.4 nothing is exported while the recording runs");
+            require(recordingNames(auto).length == 0, "REQ-018.3/.4 nothing is exported while the recording runs");
             service.stopRecording();
             waitFor(() -> new File(auto, stopped).isFile() && service.snapshot().optString("message").startsWith("Export: 1 kopiert"), "REQ-018.4 automatic export after stop");
             require(Arrays.equals(Files.readAllBytes(new File(recordings, stopped).toPath()), Files.readAllBytes(new File(auto, stopped).toPath())), "REQ-018.7 automatic copy is byte-identical");
@@ -128,7 +128,7 @@ final class RecordingExportAcceptance {
             service.stopRecording();
             waitFor(() -> service.snapshot().optString("recording").isEmpty(), "recording without auto-export stops");
             SystemClock.sleep(800);
-            require(!new File(auto, quiet).exists() && auto.list().length == 1, "REQ-018.4 nothing is exported while the flag is off");
+            require(!new File(auto, quiet).exists() && recordingNames(auto).length == 1, "REQ-018.4 nothing is exported while the flag is off");
             RecordingExporter.setAuto(context, true);
             service.startRecording("engine-drive");
             waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "disconnect-export recording starts");
@@ -184,6 +184,9 @@ final class RecordingExportAcceptance {
         File[] children = file.listFiles(); if (children != null) for (File child : children) deleteTree(child);
         file.delete();
     }
+
+    /** REQ-029.6: sealed app logs ride along with every export run; the REQ-018 checks look at recordings only. */
+    private static String[] recordingNames(File dir) { List<String> out = new ArrayList<>(); for (String n : dir.list()) if (!n.endsWith(".log")) out.add(n); return out.toArray(new String[0]); }
 
     private static class DirTarget implements RecordingExporter.Target {
         final File dir; DirTarget(File dir) { this.dir = dir; }

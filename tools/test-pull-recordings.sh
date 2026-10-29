@@ -183,6 +183,15 @@ check REQ-019.6 "failing report does not fail the pull" [ "$RC" -eq 0 ]
 check REQ-019.6 "failing report prints a warning" has "warning: report failed for a.jsonl; file kept"
 check REQ-019.6 "failing report keeps the file" cmp -s "$phone/a.jsonl" "$evidence_root/report-fail/a.jsonl"
 
+# REQ-029.6: sealed app logs are pulled byte-for-byte, are not classified as partial recordings, and unsafe log names are skipped.
+printf 'line\n' >"$phone/app-20261029-120000-000.log"
+printf 'x\n' >"$phone/evil name.log"
+log_dest="$evidence_root/logs"
+run "$script" --dest "$log_dest"
+check REQ-029.6 "sealed log copied byte-for-byte" cmp -s "$phone/app-20261029-120000-000.log" "$log_dest/app-20261029-120000-000.log"
+check REQ-029.6 "log reported as log, not partial" has "copied app-20261029-120000-000.log (log)"
+check REQ-029.6 "unsafe log name skipped" has "skipping unexpected name: evil name.log"
+
 # Usage text.
 run "$script" --help
 check usage "--help prints usage and exits 0" [ "$RC" -eq 0 ]

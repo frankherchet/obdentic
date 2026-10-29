@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pull OBDentic recordings (*.jsonl) from the phone over adb into a git-ignored
+# Pull OBDentic recordings (*.jsonl) and sealed app logs (*.log) from the phone over adb into a git-ignored
 # local folder. Read-only on the phone: only adb devices, shell ls/stat/test, pull.
 set -euo pipefail
 
@@ -7,7 +7,7 @@ usage() {
   cat <<'EOF'
 Usage: tools/pull-recordings.sh [--report] [--source <phone dir>] [--dest <dir>]
 
-Copies every *.jsonl file from the phone folder into the local destination.
+Copies every *.jsonl and *.log file from the phone folder into the local destination.
 Files already present with the same name and size are skipped.
 
 Options:
@@ -94,7 +94,7 @@ copied=0
 partial=0
 skipped=0
 failed=0
-name_re='^[A-Za-z0-9_.-]+\.jsonl$'
+name_re='^[A-Za-z0-9_.-]+\.(jsonl|log)$'
 
 while IFS= read -r line; do
   name="${line//$'\r'/}"
@@ -131,6 +131,9 @@ while IFS= read -r line; do
   fi
   mv -f "$tmp_file" "$local_file"
 
+  case "$name" in
+    *.log) echo "copied $name (log)"; copied=$((copied + 1)); continue ;;
+  esac
   last_line="$(awk '{ sub(/\r$/, "") } NF { last = $0 } END { print last }' "$local_file")"
   case "$last_line" in
     *'"type":"session_end"'*) state=complete ;;
