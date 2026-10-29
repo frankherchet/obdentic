@@ -412,6 +412,64 @@ fn req_024_1_2_3_5_catalog_and_reads_are_applicable_default_only_and_fail_closed
 }
 
 #[test]
+// #256: a Knowledge signal whose semantic is also a standard PID is addressed by its own key
+fn issue_256_knowledge_signal_sharing_a_pid_semantic_is_read_by_its_key_not_as_the_pid() {
+    let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    let discovery = discover(&mut core);
+    let signal = discovery["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|signal| signal["definition_id"] == "vag.ea189.oil.oil_temperature")
+        .unwrap();
+    assert_eq!(signal["semantic"], "engine.oil_temperature");
+    assert_eq!(signal["key"], "engine.oil_temperature@vag.ecu_target.7e0");
+
+    state.lock().unwrap().did_replies.insert(
+        0x11BE,
+        VecDeque::from([Reply::Payload(vec![0x62, 0x11, 0xBE, 0x04, 0x00])]),
+    );
+    let read = run(
+        &mut core,
+        "read",
+        "engine.oil_temperature@vag.ecu_target.7e0",
+    );
+    assert_eq!(read["ok"], true, "{read}");
+    assert_eq!(read["data"]["semantic"], "engine.oil_temperature");
+    assert!(read["data"]["value"].is_number(), "{read}");
+    assert_eq!(
+        diagnostic_dids(&state)
+            .iter()
+            .filter(|(_, did)| *did == 0x11BE)
+            .count(),
+        1
+    );
+
+    let unknown = run(
+        &mut core,
+        "read",
+        "engine.oil_temperature@vag.ecu_target.7e1",
+    );
+    assert_eq!(unknown["ok"], false, "{unknown}");
+}
+
+#[test]
+// #256: with several ECUs present, signals that repeat a semantic per ECU still have unique keys
+fn issue_256_every_catalog_signal_key_is_unique_across_all_present_ecus() {
+    let (mut core, _state, _) = setup(true, &[]);
+    let discovery = discover(&mut core);
+    let keys = discovery["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|signal| signal["key"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let unique = keys.iter().collect::<std::collections::HashSet<_>>();
+    assert!(keys.len() > 1);
+    assert_eq!(unique.len(), keys.len(), "duplicate signal keys: {keys:?}");
+}
+
+#[test]
 // REQ-026.1, REQ-026.2
 fn req_026_1_2_learning_probes_each_candidate_once_without_session_change() {
     let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);

@@ -59,8 +59,9 @@ final class AppLogAcceptance {
             service.disconnect(); blocked.delete(); AppLog.setDirectory(work);
 
             // REQ-029.2: attempt, ready, job, recording and the sealed log per connection
+            int sealedBefore = AppLog.sealed().size();
             service.connect(ADAPTER); ready(service); service.runJob("inventory"); waitFor(() -> !service.snapshot().optBoolean("busy"), "inventory job");
-            service.disconnect(); waitFor(() -> !AppLog.sealed().isEmpty(), "log sealed when the connection ends");
+            service.disconnect(); waitFor(() -> AppLog.sealed().size() > sealedBefore, "log sealed when the connection ends");
             String session = read(AppLog.sealed().get(0));
             for (String needle : new String[]{"service create", "conn attempt simulated …00:07", "conn ready …00:07", "job initialize start", "job inventory end ok=true", "rec start", "profile session-auto", "conn disconnect requested", "rec end"})
                 if (!session.contains(needle) && !needle.equals("service create")) throw new AssertionError("REQ-029.2 session log lacks '" + needle + "': " + session);

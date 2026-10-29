@@ -411,9 +411,15 @@ public final class ObdService extends Service {
         Link active = transport; if(mode.equals("live") && active != null && !active.isOpen()) throw new IOException("BLE-Verbindung beendet; bitte neu verbinden");
         return result;
     }
+    /** #256: a Knowledge signal can share its semantic with a standard PID (or with another ECU's signal), so its id here is the core's key; the semantic stays as "meaning" for labels. */
+    private static JSONObject identify(JSONObject signal) {
+        if(signal!=null && signal.has("key") && !signal.has("meaning")) { put(signal,"meaning",signal.optString("semantic")); put(signal,"semantic",signal.optString("key")); }
+        return signal;
+    }
     private void applyCatalog(JSONObject result) {
         JSONObject data=result.optJSONObject("data"); if(data==null) return;
         JSONArray next=data.optJSONArray("signals") == null ? new JSONArray() : data.optJSONArray("signals");
+        for(int i=0;i<next.length();i++) identify(next.optJSONObject(i));
         synchronized(stateLock) {
             JSONArray previous=state.optJSONArray("signals");
             for(int i=0;i<next.length();i++) {
@@ -586,7 +592,8 @@ public final class ObdService extends Service {
         if(!result.optBoolean("ok")) put(row,"error",result.optString("error"));
         synchronized(stateLock) {
             JSONArray catalog=state.optJSONArray("signals"); for(int i=0;i<catalog.length();i++) { JSONObject s=catalog.optJSONObject(i);
-                if(semantic.equals(s.optString("semantic"))) { put(row,"title",s.optString("title",semantic)); if(!row.has("unit")) put(row,"unit",s.optString("unit")); } }
+                if(semantic.equals(s.optString("semantic"))) { put(row,"title",s.optString("title",semantic)); if(!row.has("unit")) put(row,"unit",s.optString("unit")); if(s.has("meaning")) put(row,"meaning",s.optString("meaning")); } }
+            put(row,"semantic",semantic); // the result carries the plain semantic; the row is keyed by the signal id
             JSONArray history = values.containsKey(semantic) ? values.get(semantic).optJSONArray("history") : null;
             if (history == null) history = new JSONArray();
             if (row.has("value") && !row.has("error") && Double.isFinite(row.optDouble("value",Double.NaN))) {
@@ -786,7 +793,7 @@ public final class ObdService extends Service {
                                 JSONArray extra=decoded.optJSONObject("data").optJSONArray("signals");
                                 if(extra!=null) synchronized(stateLock) {
                                     JSONArray catalog=state.optJSONArray("signals");
-                                    for(int i=0;i<extra.length();i++) { JSONObject signal=extra.optJSONObject(i); boolean found=false;
+                                    for(int i=0;i<extra.length();i++) { JSONObject signal=identify(extra.optJSONObject(i)); boolean found=false;
                                         for(int j=0;j<catalog.length();j++) if(signal.optString("semantic").equals(catalog.optJSONObject(j).optString("semantic"))) found=true;
                                         if(!found) catalog.put(signal);
                                     }

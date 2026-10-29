@@ -197,6 +197,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Continuous recording (REQ-028): starts before the first adapter byte with the handshake, ends with a marker, failed attempts leave an error file, named recordings replace and resume it, rotation by size and age without a gap, persistent switch, unwritable folder keeps the session alive, explicit delete only, replay re-derives the vehicle");
             AppLogAcceptance.run(service,getTargetContext());
             passed("App debug log (REQ-029): line format, size/connection seal with unique names and newest-50 retention, stack traces with causes and uncaught exceptions, VIN/address/raw-traffic scrubbing, unwritable log never disturbs a session, job/connection/recording/reconnect events, sealed logs exported byte-identical and skipped on rerun");
+            SignalKeyAcceptance.run(service,getTargetContext());
+            passed("#256 a Knowledge signal sharing its semantic with a standard PID has its own id, status and value; the unsupported PID is not polled");
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
                 public String text(String tab) throws Exception { return tabText(activity,tab); }
                 public Boolean enabled(String label,boolean expected) throws Exception { 

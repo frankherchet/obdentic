@@ -218,15 +218,24 @@ impl MobileKnowledge {
 
     pub(super) fn select_signal(
         &self,
-        semantic: &str,
+        key: &str,
         can_read: impl Fn(&CandidateTarget, &KnowledgeDefinition) -> bool,
     ) -> Result<ResolvedDid, String> {
+        let (semantic, only_target) = match key.rsplit_once('@') {
+            Some((semantic, target)) => (semantic, Some(target)),
+            None => (key, None),
+        };
         let effective = self.effective()?;
         let mut found = Vec::new();
         for ecu in effective.ecus() {
             let Some(resolution) = ecu.semantic(semantic) else {
                 continue;
             };
+            if only_target
+                .is_some_and(|only| self.candidate(ecu.ecu_id()).is_none_or(|t| t.id != only))
+            {
+                continue;
+            }
             let Some(definition) = resolution.selected_definition(&self.catalog) else {
                 continue;
             };
@@ -239,11 +248,11 @@ impl MobileKnowledge {
         }
         match found.len() {
             0 => Err(format!(
-                "Knowledge signal is not applicable to an identified ECU: {semantic}"
+                "Knowledge signal is not applicable to an identified ECU: {key}"
             )),
             1 => Ok(found.remove(0)),
             _ => Err(format!(
-                "Knowledge signal matches more than one identified ECU: {semantic}"
+                "Knowledge signal matches more than one identified ECU: {key}"
             )),
         }
     }
@@ -331,11 +340,18 @@ fn target_facts(target: &EcuState) -> ObservedEcuFacts {
         .expect("pinned target ids and normalized fields are validated")
 }
 
+/// #256: the identity of a live signal. A Knowledge semantic can coincide with a standard PID or with
+/// the same semantic of another ECU, so a Knowledge signal is addressed as `<semantic>@<target id>`.
+pub(super) fn signal_key(semantic: &str, target_id: &str) -> String {
+    format!("{semantic}@{target_id}")
+}
+
 fn signal_json(target: &CandidateTarget, definition: &KnowledgeDefinition) -> Value {
     let id_parts = definition.id().split('.').collect::<Vec<_>>();
     let validation = hardware_validation(definition);
     json!({
         "semantic":definition.semantic(),
+        "key":signal_key(definition.semantic(), &target.id),
         "definition_id":definition.id(),
         "target_id":target.id,
         "title":definition.description().unwrap_or(definition.semantic()),
