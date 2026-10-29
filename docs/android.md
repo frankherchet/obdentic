@@ -243,7 +243,9 @@ never contains VINs, raw adapter traffic or unmasked Bluetooth addresses. The ac
 file is sealed as `app-<timestamp>.log` when a connection ends or at 1 MB; the newest 50
 sealed files are kept. Every export run copies the sealed logs next to the recordings,
 and `tools/pull-recordings.sh` pulls `*.log` too. The log is operational data, not
-vehicle evidence: it cannot be replayed.
+vehicle evidence: it cannot be replayed. Every user-visible message (including the reason
+an action was refused, tag `msg`) is logged; the ~2 s tester-present cycles of an extended
+session are not, only a failing one (REQ-029.7/.8).
 
 Each saved recording has **Aufnahme löschen …**. Confirmation permanently deletes
 only the phone's internal file; exported copies remain. Stop an active recording

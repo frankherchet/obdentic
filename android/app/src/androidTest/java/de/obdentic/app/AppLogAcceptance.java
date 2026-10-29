@@ -76,6 +76,24 @@ final class AppLogAcceptance {
             require(failed.contains("INFO reconnect") && failed.contains("next attempt in 2 s"), "REQ-029.2 reconnect delay logged: " + failed);
             service.disconnect(); service.setAutoConnect(false);
 
+            // REQ-029.7 / .8: a refusal is explained in the log; tester-present cycles are not logged as jobs, a failing one is a warning
+            AvailabilityAcceptance.Link[] link = new AvailabilityAcceptance.Link[1];
+            service.connector = address -> { link[0] = new AvailabilityAcceptance.Link(service.simulatedLink()); return link[0]; };
+            service.connect(ADAPTER); ready(service); service.runJob("inventory"); waitFor(() -> !service.snapshot().optBoolean("busy") && service.snapshot().optJSONObject("vehicle").optBoolean("engine_target_validated"), "engine validated");
+            service.runJob("ecu.discover"); waitFor(() -> !service.snapshot().optBoolean("busy") && service.snapshot().optInt("udsCandidates") > 0, "engine identified");
+            service.startRecording("engine-drive"); waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "named recording");
+            service.runJob("uds.enable"); waitFor(() -> service.snapshot().optString("message").contains("Aufnahme"), "refusal message");
+            service.stopRecording(); waitFor(() -> service.snapshot().optString("recording").isEmpty(), "named recording stopped");
+            service.runJob("uds.enable"); waitFor(() -> service.snapshot().optJSONObject("uds").optBoolean("active"), "extended session active");
+            waitFor(() -> link[0].commands.contains("7E0:3E80"), "tester present sent"); SystemClock.sleep(2500);
+            link[0].tickFails = true; waitFor(() -> link[0].commands.stream().filter(c -> c.equals("7E0:3E80")).count() >= 3, "failing tester present"); SystemClock.sleep(500);
+            service.runJob("uds.disable"); waitFor(() -> !service.snapshot().optJSONObject("uds").optBoolean("active") && !service.snapshot().optBoolean("busy"), "extended session left");
+            String all = ""; for (File f : AppLog.sealed()) all += read(f); if (new File(work, "app.log").exists()) all += read(new File(work, "app.log"));
+            require(all.contains("INFO msg UDS nur mit echtem Adapter; vor dem Einschalten Aufnahme stoppen"), "REQ-029.7 the refusal is in the log: " + all);
+            require(all.contains("job uds.enable end ok=true") && !all.contains("job uds.tick"), "REQ-029.8 tester present is not logged as a job");
+            require(all.contains("WARN job uds.tick"), "REQ-029.8 a failing tester present is logged as a warning: " + all);
+            service.disconnect();
+
             // REQ-029.6: each export run also copies the sealed logs unchanged, with the usual skip rule and without changing the recording report
             List<File> logs = AppLog.sealed(); require(!logs.isEmpty(), "test setup: sealed logs");
             File target = new File(context.getCacheDir(), "applog-export-" + System.nanoTime()); require(target.mkdirs(), "test setup");
