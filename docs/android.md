@@ -30,6 +30,14 @@ jobs were removed (#230). Manufacturer DID signals now come from pinned Knowledg
 and require an identified, applicable ECU. Old recordings containing removed
 actions still open in replay; those actions are skipped and never sent.
 
+**Verfügbarkeit (REQ-030):** UDS DIDs are not advertised by the ECU, so the app measures them. The
+job `knowledge.availability` (Diagnose tab, "Verfügbarkeit prüfen") sends one targeted `22` read
+per default-session Knowledge signal of the identified ECUs (about 25 s, hard limit 90 s, no
+session change) and classifies each as answered, rejected (with the NRC) or not answered,
+keeping no value. It runs automatically after ECU identification for a newly created vehicle record
+and after every "Fahrzeug und Steuergeräte erfassen" job, writes its own recording and is stored
+with the vehicle record (never exported or shared). Replay restores the statuses from the recording.
+
 A Knowledge signal is identified by `key` (`<semantic>@<target id>`), not by its semantic:
 the same semantic can also be a standard PID (for example the engine oil temperature) or
 exist on several ECUs. The Android app uses the key as the signal id for selection, polling,

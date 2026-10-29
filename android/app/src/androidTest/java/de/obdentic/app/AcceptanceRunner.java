@@ -29,6 +29,7 @@ public final class AcceptanceRunner extends Instrumentation {
     /** Default runs never lock the phone; pass `-e screenOff true` to also exercise a real screen-off period. */
     @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); screenOff = arguments != null && "true".equals(arguments.getString("screenOff")); start(); }
     @Override public void onStart() {
+        ObdService.autoSurvey=false; // REQ-030.4: only AvailabilityAcceptance switches the automatic survey on
         Bundle result = new Bundle();
         // Demo recordings made by this run must not be auto-exported into the user's real export folder.
         boolean userAutoExport = RecordingExporter.auto(getTargetContext());
@@ -199,6 +200,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("App debug log (REQ-029): line format, size/connection seal with unique names and newest-50 retention, stack traces with causes and uncaught exceptions, VIN/address/raw-traffic scrubbing, unwritable log never disturbs a session, job/connection/recording/reconnect events, sealed logs exported byte-identical and skipped on rerun");
             SignalKeyAcceptance.run(service,getTargetContext());
             passed("#256 a Knowledge signal sharing its semantic with a standard PID has its own id, status and value; the unsupported PID is not polled");
+            AvailabilityAcceptance.run(service,getTargetContext());
+            passed("Availability check (REQ-030): starts automatically for a new vehicle and after every inventory job, one closed 0x22 read per default-session signal, answered/rejected(NRC) classification without values, stored with the vehicle, own recording, replay restores the statuses without traffic, never in demo");
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
                 public String text(String tab) throws Exception { return tabText(activity,tab); }
                 public Boolean enabled(String label,boolean expected) throws Exception { 

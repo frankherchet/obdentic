@@ -205,9 +205,9 @@ public final class VehicleStore {
         }
         return null;
     }
-    /** REQ-023.5/REQ-026.2: persists only the two closed diagnostic result types on their vehicle. */
+    /** REQ-023.5/REQ-026.2: persists only the closed diagnostic result types (ECU discovery, learning, availability) on their vehicle. */
     public synchronized String setDiagnostic(String vin, String key, JSONObject result) {
-        if (!"ecu_discovery".equals(key) && !"knowledge_learning".equals(key)) return "Unbekanntes Diagnoseergebnis";
+        if (!"ecu_discovery".equals(key) && !"knowledge_learning".equals(key) && !"availability".equals(key)) return "Unbekanntes Diagnoseergebnis";
         if (result == null) return "Diagnoseergebnis fehlt";
         JSONObject saved = copy(result);
         return mutate(vin, next -> put(find(next, vin), key, saved));
