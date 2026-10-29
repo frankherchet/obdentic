@@ -90,7 +90,7 @@ final class AppLogAcceptance {
             service.runJob("uds.disable"); waitFor(() -> !service.snapshot().optJSONObject("uds").optBoolean("active") && !service.snapshot().optBoolean("busy"), "extended session left");
             String all = ""; for (File f : AppLog.sealed()) all += read(f); if (new File(work, "app.log").exists()) all += read(new File(work, "app.log"));
             require(all.contains("INFO msg UDS nur mit echtem Adapter; vor dem Einschalten Aufnahme stoppen"), "REQ-029.7 the refusal is in the log: " + all);
-            require(all.contains("job uds.enable end ok=true") && !all.contains("job uds.tick"), "REQ-029.8 tester present is not logged as a job");
+            require(all.contains("job uds.enable end ok=true") && !all.contains("job uds.tick start") && !all.contains("job uds.tick end"), "REQ-029.8 tester present is not logged as a job: " + all);
             require(all.contains("WARN job uds.tick"), "REQ-029.8 a failing tester present is logged as a warning: " + all);
             service.disconnect();
 
