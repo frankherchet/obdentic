@@ -502,6 +502,7 @@ public final class ObdService extends Service {
             String argument=action.startsWith("read:") ? action.substring(5) : "";
             if(knowledge) execute("uds.disable","");
             boolean own=action.equals(THROUGHPUT) || knowledge;
+            if(own) closeRecording("stopped","",false); // REQ-028.4: the automatic recording pauses, with a marker, while the job writes its own
             if(own && !beginRecording(action.equals(THROUGHPUT)?THROUGHPUT_PROFILE:action.replace('.','-'),new JSONArray())) return;
             knowledgeJob=knowledge;
             JSONObject result=execute(argument.isEmpty()?action:"read",argument);
