@@ -30,6 +30,12 @@ jobs were removed (#230). Manufacturer DID signals now come from pinned Knowledg
 and require an identified, applicable ECU. Old recordings containing removed
 actions still open in replay; those actions are skipped and never sent.
 
+A Knowledge signal is identified by `key` (`<semantic>@<target id>`), not by its semantic:
+the same semantic can also be a standard PID (for example the engine oil temperature) or
+exist on several ECUs. The Android app uses the key as the signal id for selection, polling,
+values and recordings and keeps the semantic as `meaning` for display names; standard PIDs
+keep their plain semantic.
+
 For a targeted read, selection uses the explicitly expected responder, never
 the decoded value. Additional responders remain in the evidence. A missing
 expected response or conflicting payloads from that same responder still fail;
