@@ -672,3 +672,22 @@ requirements:
         text: The job writes its own recording with all TX/RX; the result is stored in the vehicle record with date and Knowledge revision, is not exported or shared, and replay of the recording restores the per-signal statuses without adapter traffic.
       - id: REQ-030.6
         text: A truncated or interrupted run keeps the statuses it measured and marks the result as incomplete; losing the link ends the job with an error and stores nothing from it.
+
+  - id: REQ-031
+    title: Show measured availability in the selector and explain missing values
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-29: epic #253, decisions by @frankherchet"
+    description: >
+      The user can select every signal but sees at a glance which ones the vehicle
+      delivers, can hide those it does not, and is told why a selected signal has no value.
+    acceptance:
+      - id: REQ-031.1
+        text: The selector shows for every Knowledge signal its measured availability - "antwortet", "lehnt ab (NRC 0x..)", "ohne Antwort" or "ungeprüft" - from the current session's check, else from the vehicle record's stored result labelled with its date; standard PIDs keep their support label.
+      - id: REQ-031.2
+        text: A checkbox "Nur verfügbare" is on by default and hides standard PIDs the ECU does not report and Knowledge signals measured as rejected or not answered, except signals that are already selected; with it off every signal is listed; unchecked ("ungeprüft") signals are always listed; the selector states how many are hidden.
+      - id: REQ-031.3
+        text: Every listed signal can be selected regardless of its availability, and the filter never changes the selection or what is polled.
+      - id: REQ-031.4
+        text: A selected signal that has no value shows "Nicht verfügbar" with its reason on the tile - "nicht unterstützt (Fahrzeug meldet PID nicht)", "lehnt ab · NRC 0x31" or the error/"keine Antwort" - and never a bare dash; the reason is also in the tile's content description.

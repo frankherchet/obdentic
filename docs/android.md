@@ -38,6 +38,12 @@ keeping no value. It runs automatically after ECU identification for a newly cre
 and after every "Fahrzeug und Steuergeräte erfassen" job, writes its own recording and is stored
 with the vehicle record (never exported or shared). Replay restores the statuses from the recording.
 
+The signal selector shows each Knowledge signal's measured availability ("antwortet", "lehnt ab
+(NRC 0x31)", "ohne Antwort", "ungeprüft"; the stored result of the vehicle record is dated) and a
+button "Nur verfügbare: an" (default) that hides PIDs the ECU does not report and signals measured as
+rejected or silent, except already selected ones; every listed signal is selectable. A selected
+signal without a value shows "Nicht verfügbar" with its reason on the tile (REQ-031).
+
 A Knowledge signal is identified by `key` (`<semantic>@<target id>`), not by its semantic:
 the same semantic can also be a standard PID (for example the engine oil temperature) or
 exist on several ECUs. The Android app uses the key as the signal id for selection, polling,

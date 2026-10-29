@@ -12,7 +12,7 @@ import java.util.*;
 final class AvailabilityAcceptance {
     private static final String ADAPTER = "AA:BB:CC:00:00:30", OIL = "engine.oil_temperature@vag.ecu_target.7e0";
 
-    private static final class Link implements ObdService.Link {
+    static final class Link implements ObdService.Link {
         final ObdService.Link delegate; final List<String> commands = Collections.synchronizedList(new ArrayList<>()); volatile String target = "";
         Link(ObdService.Link delegate) { this.delegate = delegate; }
         public boolean isOpen() { return delegate.isOpen(); }
@@ -21,6 +21,7 @@ final class AvailabilityAcceptance {
             String compact = command.trim().replace(" ", "").toUpperCase(Locale.ROOT);
             if (compact.startsWith("ATSH")) target = compact.substring(4);
             commands.add(target + ":" + compact);
+            if (compact.equals("0140")) return "7E8 06 41 40 FF FF FF EF\r>"; // without PID 5C (engine oil temperature), like a real EA189
             if (compact.startsWith("22") && compact.length() == 6) {
                 if (!target.equals("7E0")) return "NO DATA\r>";
                 int did = Integer.parseInt(compact.substring(2), 16);
