@@ -58,6 +58,8 @@ public final class AcceptanceRunner extends Instrumentation {
             UdsAcceptance.verifyDemoGate(this::onMain, activity, service);
             UdsAcceptance.verifyLive(this::onMain, activity, service, getTargetContext());
             passed("Private signal presets, persisted ECU/learning results, UDS demo gate and simulated UDS activation, recording, default-session return before disconnect and offline replay");
+            AvailabilityUiAcceptance.run(this::onMain, activity, service, getTargetContext());
+            passed("Availability in the selector and on tiles (REQ-031): measured states, hidden-count and 'Nur verfügbare' filter, every signal selectable, tiles state their reason instead of a dash");
 
             service.setSignals(new JSONArray());waitIdle();
             JSONArray catalog=state.getJSONArray("signals");

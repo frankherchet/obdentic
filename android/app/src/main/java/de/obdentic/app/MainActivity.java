@@ -209,6 +209,7 @@ public class MainActivity extends Activity {
             SparklineView graph=new SparklineView(this,ACCENT);tile.addView(graph,new LinearLayout.LayoutParams(-1,dp(28)));graphViews.put(id,graph);
             TextView range=text("",11,MUTED);range.setSingleLine(true);range.setEllipsize(android.text.TextUtils.TruncateAt.END);range.setTag("live-range");tile.addView(range);rangeViews.put(id,range);
             TextView freshness=text("",11,0xffffca75);freshness.setVisibility(View.GONE);tile.addView(freshness);freshnessViews.put(id,freshness);
+            String reason=missingReason(id,null);if(!reason.isEmpty()){number.setText("Nicht verfügbar");number.setTextSize(15);number.setTextColor(0xffffca75);freshness.setText(reason);freshness.setVisibility(View.VISIBLE);number.setContentDescription(signalLabel(id,s)+": Nicht verfügbar. "+reason);}
             String protocol=signalProtocolLabel(s,udsActive(state));if(!protocol.isEmpty()){TextView meta=text(protocol,10,ACCENT);meta.setTag("live-protocol");tile.addView(meta);}
             String validation=knowledgeValidationBadge(s);if(!validation.isEmpty()){TextView meta=text(validation,10,MUTED);meta.setTag("live-validation");tile.addView(meta);}
             col=(col+1)%columns;
@@ -508,29 +509,36 @@ public class MainActivity extends Activity {
             JSONArray selection=new JSONArray();for(String semantic:chosen)selection.put(semantic);
             dialog.dismiss();act(()->service().setSignals(selection));
         });actions.addView(accept,new LinearLayout.LayoutParams(0,-2,1));root.addView(actions);
+        boolean[] onlyAvailable={true};int[] hidden={0};
+        Button filter=button("Nur verfügbare: an",()->{});root.addView(filter,root.indexOfChild(listScroll));
+        TextView hiddenNote=text("",12,MUTED);root.addView(hiddenNote,root.indexOfChild(listScroll));
         Runnable[] rebuild=new Runnable[1];
+        filter.setOnClickListener(v->{onlyAvailable[0]=!onlyAvailable[0];filter.setText(onlyAvailable[0]?"Nur verfügbare: an":"Nur verfügbare: aus");rebuild[0].run();}); // a Button: the list's checkboxes stay the signals
         Runnable updateCount=()->count.setText(chosen.size()+" / 32 gewählt");
         rebuild[0]=()->{
-            String query=search.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);list.removeAllViews();
+            String query=search.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);list.removeAllViews();hidden[0]=0;
             for(Map.Entry<String,LinkedHashMap<String,ArrayList<Integer>>> section:groups.entrySet()){
                 boolean sectionShown=false;LinearLayout sectionView=new LinearLayout(this);sectionView.setOrientation(LinearLayout.VERTICAL);
                 for(Map.Entry<String,ArrayList<Integer>> group:section.getValue().entrySet()){
                     ArrayList<Integer> matches=new ArrayList<>();
-                    for(int index:group.getValue())if(matchesSignal(signals.optJSONObject(index),group.getKey(),query))matches.add(index);
+                    for(int index:group.getValue()){JSONObject candidate=signals.optJSONObject(index);if(!matchesSignal(candidate,group.getKey(),query))continue;
+                        if(onlyAvailable[0]&&knownUnavailable(candidate,session)&&!chosen.contains(candidate.optString("semantic"))){hidden[0]++;continue;} // REQ-031.2
+                        matches.add(index);}
                     if(matches.isEmpty())continue;
                     sectionShown=true;
                     LinearLayout groupHeader=row();TextView groupTitle=text(group.getKey(),16,ACCENT);groupTitle.setTypeface(null,Typeface.BOLD);groupHeader.addView(groupTitle,new LinearLayout.LayoutParams(0,-2,1));
                     Button none=button("Keine",()->{if(recordingNow()){toast("Messwertauswahl während Aufnahme gesperrt");return;}for(int index:group.getValue())chosen.remove(signals.optJSONObject(index).optString("semantic"));feedback.setText("");rebuild[0].run();});none.setTextSize(12);none.setEnabled(!locked);groupHeader.addView(none);
                     Button all=button("Alle",()->{if(recordingNow()){toast("Messwertauswahl während Aufnahme gesperrt");return;}int room=32-chosen.size(),skipped=0;for(int index:group.getValue()){String semantic=signals.optJSONObject(index).optString("semantic");if(chosen.contains(semantic))continue;if(room>0){chosen.add(semantic);room--;}else skipped++;}feedback.setText(skipped>0?"Gruppe gekürzt · maximal 32 Messwerte":"");rebuild[0].run();});all.setTextSize(12);all.setEnabled(!locked);groupHeader.addView(all);sectionView.addView(groupHeader);
-                    for(int index:matches){JSONObject signal=signals.optJSONObject(index);String semantic=signal.optString("semantic");String unit=MeasurementFormat.displayUnit(signal.optString("unit"));String protocol=signalProtocolLabel(signal,udsActive(state));CheckBox check=new CheckBox(this);check.setText(signalLabel(semantic,signal)+(unit.isEmpty()?"":" · "+unit));check.setTextColor(TEXT);check.setMinHeight(dp(44));check.setChecked(chosen.contains(semantic));check.setEnabled(!locked);check.setContentDescription(check.getText()+", "+signalSupport(signal,stored.optString(semantic,""),session,supportSeenAt)+", "+validationState(signal)+(protocol.isEmpty()?"":", "+protocol));
+                    for(int index:matches){JSONObject signal=signals.optJSONObject(index);String semantic=signal.optString("semantic");String unit=MeasurementFormat.displayUnit(signal.optString("unit"));String protocol=signalProtocolLabel(signal,udsActive(state));CheckBox check=new CheckBox(this);check.setText(signalLabel(semantic,signal)+(unit.isEmpty()?"":" · "+unit));check.setTextColor(TEXT);check.setMinHeight(dp(44));check.setChecked(chosen.contains(semantic));check.setEnabled(!locked);check.setContentDescription(check.getText()+", "+supportOrAvailability(signal,stored.optString(semantic,""),session,supportSeenAt)+", "+validationState(signal)+(protocol.isEmpty()?"":", "+protocol));
                         android.widget.CompoundButton.OnCheckedChangeListener[] listener=new android.widget.CompoundButton.OnCheckedChangeListener[1];listener[0]=(button,on)->{if(recordingNow()){button.setOnCheckedChangeListener(null);button.setChecked(chosen.contains(semantic));button.setOnCheckedChangeListener(listener[0]);feedback.setText("Messwertauswahl während Aufnahme gesperrt");return;}if(on&&chosen.size()>=32){button.setChecked(false);feedback.setText("Maximal 32 Messwerte · Auswahl nicht erweitert");return;}if(on)chosen.add(semantic);else chosen.remove(semantic);feedback.setText("");updateCount.run();};check.setOnCheckedChangeListener(listener[0]);
                         sectionView.addView(check);
-                        TextView details=text(signalSupport(signal,stored.optString(semantic,""),session,supportSeenAt)+" · "+validationState(signal)+(protocol.isEmpty()?"":" · "+protocol),12,MUTED);details.setPadding(dp(36),0,0,dp(5));sectionView.addView(details);
+                        TextView details=text(supportOrAvailability(signal,stored.optString(semantic,""),session,supportSeenAt)+" · "+validationState(signal)+(protocol.isEmpty()?"":" · "+protocol),12,MUTED);details.setPadding(dp(36),0,0,dp(5));sectionView.addView(details);
                     }
                 }
                 if(sectionShown){TextView sectionTitle=text(section.getKey().equals("OBD-Standard")?"OBD-Standard":"Steuergerät · "+section.getKey(),18,TEXT);sectionTitle.setTypeface(null,Typeface.BOLD);sectionTitle.setPadding(0,dp(12),0,dp(4));list.addView(sectionTitle);list.addView(sectionView);}
             }
             if(list.getChildCount()==0)note(list,"Keine passenden Messwerte",MUTED);
+            hiddenNote.setText(hidden[0]>0?hidden[0]+" nicht verfügbare Messwerte ausgeblendet":"");
             updateCount.run();
         };
         search.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int start,int count,int after){}public void onTextChanged(CharSequence s,int start,int before,int count){rebuild[0].run();}public void afterTextChanged(Editable e){}});
@@ -545,6 +553,7 @@ public class MainActivity extends Activity {
     private static String validationState(JSONObject signal){String value=signalField(signal,"validation");if(value.isEmpty())return "Validierung: nicht angegeben";if(value.equals("not_validated"))value="nicht validiert";else if(value.equals("validated"))value="validiert";else if(value.equals("unconfirmed"))value="unbestätigt";return "Validierung: "+value;}
     private static String validationLabel(JSONObject signal){String value=signalField(signal,"validation_label");if(!value.isEmpty())return value;value=signalField(signal,"validation");if(value.equals("not_validated"))return "nicht abgeglichen";if(value.equals("validated"))return "validiert";if(value.equals("not_applicable"))return "nicht anwendbar";if(value.equals("unconfirmed"))return "unbestätigt";return value.isEmpty()?"Validierung nicht angegeben":value;}
     public static String knowledgeValidationBadge(JSONObject signal){return signal.has("definition_id")&&!signal.isNull("definition_id")?validationLabel(signal):"";}
+    private String supportOrAvailability(JSONObject signal,String stored,boolean session,long seenAt){return signal.has("definition_id")?"Verfügbarkeit: "+availabilityLabel(signal.optString("semantic")):signalSupport(signal,stored,session,seenAt);}
     private static String signalSupport(JSONObject signal,String stored,boolean session,long seenAt){String status=session?signal.optString("status",""):"";if(status.isEmpty()&&session&&signal.has("supported")&&!signal.isNull("supported"))status=signal.optBoolean("supported")?"supported":"unsupported";boolean lastSeen=false;if(status.isEmpty()){status=stored;lastSeen=!status.isEmpty();}String label=status.equals("supported")?"unterstützt":status.equals("unsupported")?"nicht unterstützt":"ungeprüft";if(lastSeen)label+=" (zuletzt gesehen "+formatDate(seenAt)+")";return "Unterstützung: "+label;}
     private void saveSignalPreset(LinkedHashSet<String> selection){
         if(service()==null)return;EditText input=new EditText(this);input.setSingleLine(true);input.setHint("Name · 1 bis 40 Zeichen");
@@ -597,7 +606,37 @@ public class MainActivity extends Activity {
     public static String staleText(long ageSeconds,boolean replay){return ageSeconds>10&&!replay?"vor "+ageSeconds+" s":"";}
     /** #239: "min … · max …" over a signal's session history. */
     public static String rangeText(ArrayList<Float> h,String unit){if(h==null||h.isEmpty())return "";float lo=h.get(0),hi=lo;for(float f:h){lo=Math.min(lo,f);hi=Math.max(hi,f);}return "min "+MeasurementFormat.formatMeasurement(lo,unit)+" · max "+MeasurementFormat.formatMeasurement(hi,unit);}
-    private void updateValues(){JSONArray values=array("values");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic");TextView target=valueViews.get(id);if(target==null)continue;String error=v.optString("error","");String value=v.has("value")?MeasurementFormat.formatReading(v):MeasurementFormat.formatMeasurement(v.optString("text","—"),v.optString("unit"));long age=Math.max(0,(System.currentTimeMillis()-v.optLong("updatedAt",System.currentTimeMillis()))/1000);boolean replay=state.optString("mode").equals("replay"),stale=age>10&&!replay;String stateText=staleText(age,replay);target.setText(error.isEmpty()?value:"Nicht verfügbar");target.setTextColor(error.isEmpty()&&!stale?TEXT:0xffffca75);target.setContentDescription(signalLabel(id,signal(id))+": "+target.getText()+(error.isEmpty()?(stale?". Veraltet, "+stateText:""):". Nicht verfügbar. "+error));TextView freshness=freshnessViews.get(id);if(freshness!=null){freshness.setText(stateText);freshness.setVisibility(error.isEmpty()&&stale?View.VISIBLE:View.GONE);}TextView range=rangeViews.get(id);if(range!=null)range.setText(rangeText(histories.get(id),v.optString("unit")));SparklineView graph=graphViews.get(id);if(graph!=null)graph.setValues(histories.get(id));}}
+    private void updateValues(){JSONArray values=array("values");for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v==null)continue;String id=v.optString("semantic");TextView target=valueViews.get(id);if(target==null)continue;String error=missingReason(id,v);String value=v.has("value")?MeasurementFormat.formatReading(v):MeasurementFormat.formatMeasurement(v.optString("text","—"),v.optString("unit"));long age=Math.max(0,(System.currentTimeMillis()-v.optLong("updatedAt",System.currentTimeMillis()))/1000);boolean replay=state.optString("mode").equals("replay"),stale=age>10&&!replay;String stateText=staleText(age,replay);target.setText(error.isEmpty()?value:"Nicht verfügbar");target.setTextSize(error.isEmpty()?24:15);target.setTextColor(error.isEmpty()&&!stale?TEXT:0xffffca75);target.setContentDescription(signalLabel(id,signal(id))+": "+target.getText()+(error.isEmpty()?(stale?". Veraltet, "+stateText:""):". Nicht verfügbar. "+error));TextView freshness=freshnessViews.get(id);if(freshness!=null){freshness.setText(error.isEmpty()?stateText:error);freshness.setVisibility(!error.isEmpty()||stale?View.VISIBLE:View.GONE);}TextView range=rangeViews.get(id);if(range!=null)range.setText(rangeText(histories.get(id),v.optString("unit")));SparklineView graph=graphViews.get(id);if(graph!=null)graph.setValues(histories.get(id));}}
+    /** REQ-031.1: the measured availability entry of a Knowledge signal (current session first, else the vehicle record), or null. */
+    private JSONObject availabilityEntry(String key,boolean[] stored){
+        JSONObject result=state.optJSONObject("availability");if(result==null||result.optJSONArray("entries")==null){JSONObject record=selectedVehicle();result=record==null?null:record.optJSONObject("availability");if(stored!=null)stored[0]=true;}
+        JSONArray entries=result==null?null:result.optJSONArray("entries");
+        for(int i=0;entries!=null&&i<entries.length();i++){JSONObject entry=entries.optJSONObject(i);if(entry!=null&&key.equals(entry.optString("key")))return entry;}
+        return null;
+    }
+    private static String nrcText(JSONObject source){return "NRC 0x"+String.format(java.util.Locale.ROOT,"%02X",source.optInt("nrc"));}
+    private String availabilityLabel(String key){
+        boolean[] stored={false};JSONObject entry=availabilityEntry(key,stored);if(entry==null)return "ungeprüft";
+        String status=entry.optString("status"),label=status.equals("answered")?"antwortet":status.equals("rejected")?"lehnt ab ("+nrcText(entry)+")":"ohne Antwort";
+        if(stored[0]){JSONObject record=selectedVehicle(),result=record==null?null:record.optJSONObject("availability");label+=" (zuletzt gemessen "+formatDate(result==null?0:result.optLong("started_at_ms"))+")";}
+        return label;
+    }
+    /** REQ-031.2: the signal is known not to deliver in this vehicle. */
+    private boolean knownUnavailable(JSONObject signal,boolean session){
+        if(signal.has("definition_id")){JSONObject entry=availabilityEntry(signal.optString("semantic"),null);return entry!=null&&!entry.optString("status").equals("answered");}
+        return session&&"unsupported".equals(signal.optString("status"));
+    }
+    /** REQ-031.4: why a signal has no value, or "". */
+    private String missingReason(String id,JSONObject row){
+        if(row!=null&&(row.optString("status").equals("unavailable")||!row.optString("error","").isEmpty())){
+            if(row.has("nrc")&&!row.isNull("nrc"))return "lehnt ab · "+nrcText(row);
+            return row.optString("error","").isEmpty()?"keine Antwort":row.optString("error");
+        }
+        if(row!=null&&row.has("value"))return "";
+        JSONObject signal=signal(id);
+        if(signal.has("definition_id")){JSONObject entry=availabilityEntry(id,null);if(entry!=null&&entry.optString("status").equals("rejected"))return "lehnt ab · "+nrcText(entry);if(entry!=null&&entry.optString("status").equals("not_answered"))return "keine Antwort";return "";}
+        return "unsupported".equals(signal.optString("status"))?"nicht unterstützt (Fahrzeug meldet PID nicht)":"";
+    }
     private JSONObject signal(String id){JSONArray signals=array("signals");for(int i=0;i<signals.length();i++){JSONObject s=signals.optJSONObject(i);if(s!=null&&s.optString("semantic").equals(id))return s;}JSONObject fallback=new JSONObject();try{fallback.put("semantic",id);fallback.put("title",id);}catch(Exception ignored){}return fallback;}
     private String signalLabel(String id,JSONObject signal){return SignalNames.shortName(signal.optString("meaning",id),signal.optString("title",""));}
     private JSONArray array(String key){JSONArray a=state.optJSONArray(key);return a==null?new JSONArray():a;}
