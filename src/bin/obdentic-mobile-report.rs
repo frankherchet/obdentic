@@ -220,4 +220,22 @@ mod tests {
         assert!(report["issues"].as_array().unwrap().is_empty());
         assert!(report["diagnostic_jobs"].as_array().unwrap().is_empty());
     }
+
+    #[test]
+    fn req_028_3_and_10_rotated_automatic_file_with_early_header_is_complete_and_rederived() {
+        let recording = concat!(
+            "{\"type\":\"session\",\"schema\":\"OBDENTIC-MOBILE\",\"version\":1,\"mode\":\"live\",\"profile\":\"session-auto\",\"selected\":[],\"vehicle\":{}}\n",
+            "{\"type\":\"wire\",\"direction\":\"TX\",\"text\":\"ATZ\"}\n",
+            "{\"type\":\"action\",\"action\":\"initialize\",\"result\":{\"ok\":true,\"data\":{\"signals\":[]}}}\n",
+            "{\"type\":\"action\",\"action\":\"catalog\",\"result\":{\"ok\":true,\"data\":{\"signals\":[]}}}\n",
+            "{\"type\":\"action\",\"action\":\"inventory\",\"result\":{\"ok\":true,\"data\":{\"responders\":[]}}}\n",
+            "{\"type\":\"action\",\"action\":\"read\",\"argument\":\"engine.rpm\",\"result\":{\"ok\":true,\"data\":{\"semantic\":\"engine.rpm\",\"response\":[65,12,31,64]}}}\n",
+            "{\"type\":\"session_end\",\"reason\":\"rotated\"}\n"
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["outcome"]["reason"], "rotated");
+        assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["last_values"]["engine.rpm"]["value"], 2000.0);
+    }
 }

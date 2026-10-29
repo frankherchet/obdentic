@@ -202,6 +202,19 @@ requires a new connection; existing files remain available as partial recordings
 
 ## Recording, privacy and desktop inspection
 
+**Dauer-Aufzeichnung (REQ-028):** every live connection attempt is recorded
+automatically, from before the first adapter byte, so initialisation, support
+discovery and inventory TX/RX are in the file. The file `…-live-auto.jsonl` has the
+normal `OBDENTIC-MOBILE` v1 format with profile `session-auto`; it ends on
+disconnect, error or when the switch is turned off, and a failed attempt still leaves
+a file with its error marker. A new file starts every 30 minutes or 10 MB
+(`session_end` reason `rotated`). A named recording or test sequence closes the
+automatic file and the automatic recording continues after it ends. The switch and
+**Automatische Aufnahmen löschen …** are on the recordings tab. The app never deletes
+a recording on its own; demo and replay are never recorded automatically. Replay
+and `obdentic-mobile-report` re-derive the vehicle and signal support from the
+recorded handshake.
+
 Each saved recording has **Aufnahme löschen …**. Confirmation permanently deletes
 only the phone's internal file; exported copies remain. Stop an active recording
 first, or leave a loaded replay before deleting its file.

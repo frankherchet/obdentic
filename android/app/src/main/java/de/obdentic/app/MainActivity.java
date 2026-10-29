@@ -66,6 +66,8 @@ public class MainActivity extends Activity {
         DISCONNECT=new PendingActions.Spec("disconnect","Verbindung trennen","Trenne …",10000,MainActivity::msg),
         AUTO_CONNECT=new PendingActions.Spec("auto.connect","Automatisch verbinden","Ändere automatische Verbindung …",10000,(n,b)->n.optBoolean("autoConnect")!=b.optBoolean("autoConnect")||msg(n,b)),
         AUTO_STOP=new PendingActions.Spec("auto.stop","Automatische Verbindung stoppen","Stoppe automatische Verbindung …",10000,(n,b)->!n.optBoolean("autoPending")||msg(n,b)),
+        AUTO_RECORD=new PendingActions.Spec("auto.record","Dauer-Aufzeichnung","Ändere Dauer-Aufzeichnung …",10000,(n,b)->n.optBoolean("autoRecord")!=b.optBoolean("autoRecord")),
+        AUTO_RECORD_DELETE=new PendingActions.Spec("auto.record.delete","Automatische Aufnahmen löschen","Lösche automatische Aufnahmen …",60000,MainActivity::msg),
         AUTO_EXPORT=new PendingActions.Spec("auto.export","Automatischer Export","Ändere automatischen Export …",10000,(n,b)->n.optBoolean("autoExport")!=b.optBoolean("autoExport")),
         EXPORT_ALL=new PendingActions.Spec("export.all","Alle exportieren","Exportiere …",60000,MainActivity::msg),
         UDS_ENABLE=new PendingActions.Spec("uds.enable","UDS-Sitzung aktivieren","UDS-Sitzung wird aktiviert …",10000,(n,b)->udsActive(n)!=udsActive(b)||msg(n,b)),
@@ -163,7 +165,7 @@ public class MainActivity extends Activity {
         status.setTextColor(phase.equals("error")?0xffffa79c:MUTED);
         if(!historyMode.equals(mode)){historyMode=mode;histories.clear();lastSamples.clear();}
         collectHistory();
-        String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
+        String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+state.optString("autoRecording")+state.optBoolean("autoRecord")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
         if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile");
@@ -349,9 +351,19 @@ public class MainActivity extends Activity {
         String selectedProfile=profile;
         actionButton(c,running?REC_STOP:REC_START,"",running?"Aufzeichnung stoppen":"Aufzeichnung starten",running||canRun(),()->{if(running)perform(REC_STOP,"",()->service().stopRecording());else perform(REC_START,"",()->service().startRecording(selectedProfile));});
         note(c,running?"● "+state.optString("recording"):"Aufzeichnungen enthalten möglicherweise Fahrzeugkennungen. Export erfolgt nur auf deine ausdrückliche Auswahl.",running?ACCENT:MUTED);
+        autoRecordCard();
         exportCard();
         JSONArray records=array("records");if(records.length()==0)empty("Noch keine Aufnahmen","Starte eine Aufzeichnung im Live- oder Demomodus. Die Dateien bleiben auf diesem Handy.");
         for(int i=0;i<records.length();i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");LinearLayout item=card();note(item,name,TEXT);note(item,record.optLong("bytes")+" Bytes",MUTED);addButton(item,"Als Replay öffnen",()->act(()->{service().openRecording(name);tab=0;buildNav();structure="";}));addButton(item,"Datei exportieren …",()->export(name));Button delete=addButton(item,"Aufnahme löschen …",()->confirmDeleteRecording(name));delete.setEnabled(!name.equals(state.optString("recording"))&&!name.equals(state.optString("replayFile")));}
+    }
+    /** REQ-028: always-on session recording switch and delete-all. */
+    private void autoRecordCard(){
+        boolean on=state.optBoolean("autoRecord",true);
+        LinearLayout c=card();note(c,"DAUER-AUFZEICHNUNG",ACCENT);
+        note(c,"Jede Live-Verbindung wird ab dem ersten Verbindungsversuch automatisch aufgezeichnet (…-auto.jsonl, alle 30 min oder 10 MB neue Datei). Die App löscht nichts selbst.",MUTED);
+        if(!state.optString("autoRecording").isEmpty())note(c,"● "+state.optString("autoRecording"),ACCENT);
+        actionButton(c,AUTO_RECORD,"","Dauer-Aufzeichnung: "+(on?"an":"aus"),true,()->perform(AUTO_RECORD,"",()->service().setAutoRecord(!on)));
+        actionButton(c,AUTO_RECORD_DELETE,"","Automatische Aufnahmen löschen …",true,()->new AlertDialog.Builder(this).setTitle("Automatische Aufnahmen löschen?").setMessage("Alle abgeschlossenen automatischen Aufnahmen werden dauerhaft gelöscht. Benannte Aufnahmen und exportierte Kopien bleiben.").setPositiveButton("Löschen",(d,w)->perform(AUTO_RECORD_DELETE,"",()->service().deleteAutoRecordings())).setNegativeButton("Abbrechen",null).show());
     }
     /** REQ-018: export folder, one-tap and automatic export, share sheet. */
     private void exportCard(){
@@ -376,7 +388,7 @@ public class MainActivity extends Activity {
             .setPositiveButton("Ordner wählen",(d,w)->pick.run()).setNegativeButton("Abbrechen",null).show();
     }
     private void shareAll(){
-        java.util.List<String> names=RecordingExporter.completed(array("records"),state.optString("recording"));
+        java.util.List<String> names=RecordingExporter.completed(array("records"),activeRecordingName());
         if(names.isEmpty()){toast("Keine abgeschlossenen Aufnahmen");return;}
         try{startActivity(Intent.createChooser(RecordingExporter.share(this,names),"Aufnahmen teilen"));}catch(Exception e){toast("Teilen nicht möglich: "+e.getMessage());}
     }
@@ -518,6 +530,7 @@ public class MainActivity extends Activity {
     private static String signalField(JSONObject signal,String key){Object value=signal.opt(key);if(value instanceof JSONObject){JSONObject object=(JSONObject)value;return object.optString("status",object.optString("state",object.optString("name","")));}return value==null||JSONObject.NULL.equals(value)?"":String.valueOf(value);}
     public static String signalProtocolLabel(JSONObject signal,boolean udsActive){String protocol=signalField(signal,"protocol"),lower=protocol.toLowerCase(java.util.Locale.ROOT);boolean extended=signal.optBoolean("extended_session_required")||signal.optBoolean("session_required");if(udsActive&&extended)return "UDS · erweiterte Sitzung";if(udsActive&&isObd2Signal(signal))return "OBD2 · pausiert";if(protocol.isEmpty())return "";return lower.equals("uds")&&udsActive?"UDS · erweiterte Sitzung":protocol.toUpperCase(java.util.Locale.ROOT);}
     private static boolean isObd2Signal(JSONObject signal){String protocol=signalField(signal,"protocol").toLowerCase(java.util.Locale.ROOT);if(!protocol.isEmpty())return protocol.contains("obd");String ecu=signalField(signal,"ecu");return ecu.isEmpty()||ecu.equalsIgnoreCase("OBD-Standard");}
+    private String activeRecordingName(){String named=state.optString("recording");return named.isEmpty()?state.optString("autoRecording"):named;}
     private boolean recordingNow(){return service()!=null&&!service().snapshot().optString("recording").isEmpty();}
     private static boolean matchesSignal(JSONObject signal,String group,String query){if(query.isEmpty())return true;String semantic=signal.optString("semantic"),name=SignalNames.shortName(semantic,signal.optString("title","")),unit=MeasurementFormat.displayUnit(signal.optString("unit"));return (name+" "+group+" "+unit).toLowerCase(java.util.Locale.ROOT).contains(query);}
     private static String validationState(JSONObject signal){String value=signalField(signal,"validation");if(value.isEmpty())return "Validierung: nicht angegeben";if(value.equals("not_validated"))value="nicht validiert";else if(value.equals("validated"))value="validiert";else if(value.equals("unconfirmed"))value="unbestätigt";return "Validierung: "+value;}
@@ -536,7 +549,7 @@ public class MainActivity extends Activity {
     }
     private void chooseProfile(){JSONArray p=array("profiles");String[] names=new String[p.length()];int chosen=0;for(int i=0;i<p.length();i++){JSONObject item=p.optJSONObject(i);names[i]=item.optString("title",item.optString("id"));if(item.optString("id").equals(profile))chosen=i;}new AlertDialog.Builder(this).setTitle("Aufnahmeprofil / Testsequenz").setSingleChoiceItems(names,chosen,(dialog,which)->{profile=p.optJSONObject(which).optString("id");structure="";dialog.dismiss();refresh();}).setNegativeButton("Schließen",null).show();}
     private void export(String name) {
-        if(name.equals(state.optString("recording"))) {toast("Aufzeichnung vor dem Export stoppen");return;}
+        if(name.equals(activeRecordingName())) {toast("Aufzeichnung vor dem Export stoppen");return;}
         pendingExport=name;
         Intent save=new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
             .setType("application/x-ndjson").putExtra(Intent.EXTRA_TITLE,name);
