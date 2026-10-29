@@ -63,7 +63,7 @@ final class ThroughputAcceptance {
             require("engine.rpm".equals(first.getString("semantic")) && first.getDouble("value") == 800.0, "REQ-022.7 the multi-PID reply is decoded per PID with the catalog decoder: " + first);
             require(multi.getJSONObject(2).getJSONArray("values").getJSONObject(0).optString("status").equals("missing") && !multi.getJSONObject(2).getJSONArray("values").getJSONObject(0).has("value"), "REQ-022.7 a rejected request invents no value");
             // REQ-022.5: own recording, complete
-            Set<String> added = names(recordings); added.removeAll(before);
+            Set<String> added = names(recordings); added.removeAll(before); added.removeIf(n -> n.endsWith("-auto.jsonl")); // REQ-028: the continuous recording is separate from the job's own
             require(added.size() == 1, "REQ-022.5 exactly one new recording: " + added);
             String name = added.iterator().next(); File file = new File(recordings, name);
             String[] lines = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8).trim().split("\n");

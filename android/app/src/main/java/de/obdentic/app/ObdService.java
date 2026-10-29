@@ -30,7 +30,11 @@ public final class ObdService extends Service {
     /** Test seams (REQ-020): replace BLE as the live link and the Bluetooth/permission state. All null in the app. */
     public volatile Connector connector;
     public volatile Boolean permissionOverride, bluetoothOverride;
-    private static final String PREFS = "adapter", KNOWN = "known_address", AUTO = "auto";
+    private static final String PREFS = "adapter", KNOWN = "known_address", AUTO = "auto", AUTO_REC = "auto_recording";
+    /** REQ-028: header profile of the automatic session recording, and the point where its file rotates. Fields are test seams. */
+    static final String AUTO_PROFILE = "session-auto";
+    public volatile long rotateBytes = 10L * 1024 * 1024, rotateMs = 30L * 60 * 1000;
+    private long recordingBytes, recordingStartedAt;
     private ReconnectPolicy policy = new ReconnectPolicy(true);
     private volatile String sessionAddress = "", pendingProfile = "", retryNote = "";
     private volatile long nextAttemptAt;
@@ -65,7 +69,7 @@ public final class ObdService extends Service {
             put(state,"phase","idle"); put(state,"mode","live"); put(state,"busy",false);
             put(state,"message","Carly verbinden oder Demo starten");
             for (String key : new String[]{"devices","signals","profiles","values","debug","selected","records"}) put(state,key,new JSONArray());
-            put(state,"recording",""); put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject());
+            put(state,"recording",""); put(state,"autoRecording",""); put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject());
         }
         NotificationManager manager = getSystemService(NotificationManager.class);
         manager.createNotificationChannel(new NotificationChannel("connection", "OBD-Verbindung", NotificationManager.IMPORTANCE_LOW));
@@ -90,7 +94,7 @@ public final class ObdService extends Service {
     public final PendingActions pending = new PendingActions();
     public JSONObject snapshot() {
         synchronized(stateLock) { put(state,"busy",busy); put(state,"records",listRecords()); put(state,"vehicles",vehicles.snapshot());
-            put(state,"autoExport",RecordingExporter.auto(this)); put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
+            put(state,"autoExport",RecordingExporter.auto(this)); put(state,"autoRecord",autoRecordEnabled(this)); put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
             try { return new JSONObject(state.toString()); } catch(JSONException e) { return new JSONObject(); } }
     }
     private boolean permitted() {
@@ -165,6 +169,7 @@ public final class ObdService extends Service {
         if(!foreground()) { busy=false; set("phase","error"); return false; }
         worker.execute(() -> {
             try {
+                startAutoRecording(); // REQ-028.1: before the first adapter byte, so the handshake is in the file
                 destroyCore(); Link next;
                 if(connector != null) { next=connector.open(address); if(token != generation) { next.close(); return; } transport=next; }
                 else {
@@ -186,6 +191,13 @@ public final class ObdService extends Service {
         policy.success(); String resume=pendingProfile; pendingProfile="";
         foreground();
         if(!resume.isEmpty()) startRecording(resume); // queued behind this task, so busy is clear by then
+    }
+    /** REQ-028.5: "Dauer-Aufzeichnung", on by default. */
+    public static boolean autoRecordEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO_REC,true); }
+    public void setAutoRecord(boolean on) {
+        getSharedPreferences(PREFS,MODE_PRIVATE).edit().putBoolean(AUTO_REC,on).commit();
+        message(on ? "Dauer-Aufzeichnung an" : "Dauer-Aufzeichnung aus");
+        if(!on && !worker.isShutdown()) worker.execute(() -> { if(recordingProfile.equals(AUTO_PROFILE)) closeRecording("stopped","",false); });
     }
     public static boolean autoConnectEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO,true); }
     /** The last successfully connected adapter's address, or "". App-private; never exported or shown in full. */
@@ -360,7 +372,7 @@ public final class ObdService extends Service {
         if(token!=generation) return;
         String text=error.getMessage()==null ? error.toString():error.getMessage();
         boolean live=mode.equals("live"), established=!sessionAddress.isEmpty(); sessionAddress="";
-        String resume=established ? ReconnectPolicy.resumeProfile(recordingProfile) : ""; // REQ-020.8: before the recording closes
+        String resume=established && !recordingProfile.equals(AUTO_PROFILE) ? ReconnectPolicy.resumeProfile(recordingProfile) : ""; // REQ-020.8: before the recording closes
         Link active=transport; transport=null; if(active!=null) active.close(); destroyCore();
         set("phase","error"); message(text); closeRecording("error",text);
         long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
@@ -585,7 +597,7 @@ public final class ObdService extends Service {
             if(signals.length()==0) { message("Zuerst Messwerte wählen"); return; }
         }
         if(signals==null) { message("Unbekanntes Aufnahmeprofil"); return; }
-        stopRecordingNow();
+        closeRecording("stopped","",false); // REQ-028.4: the automatic recording resumes only after the named one ends
         if(!beginRecording(profileId,signals)) return;
         synchronized(due) { due.clear(); intervals.clear(); for(int i=0;i<signals.length();i++) intervals.put(signals.optString(i),periods==null?PollSchedule.DEFAULT_PERIOD_MS:periods.optLong(i,PollSchedule.DEFAULT_PERIOD_MS)); }
         selectSignals(signals); message("Aufnahme läuft: " + profileId);
@@ -594,11 +606,13 @@ public final class ObdService extends Service {
     private boolean beginRecording(String profileId,JSONArray signals) {
         try {
             File directory=new File(getFilesDir(),"recordings"); if(!directory.exists() && !directory.mkdirs()) throw new IOException("Aufnahmeordner nicht verfügbar");
-            String name=new SimpleDateFormat("yyyyMMdd-HHmmss-SSS",Locale.ROOT).format(new Date())+"-"+mode+".jsonl";
+            boolean auto=profileId.equals(AUTO_PROFILE);
+            String name=new SimpleDateFormat("yyyyMMdd-HHmmss-SSS",Locale.ROOT).format(new Date())+"-"+mode+(auto?"-auto":"")+".jsonl";
             synchronized(recordLock) {
                 recordingOriginNanos=SystemClock.elapsedRealtimeNanos();
                 writer=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory,name)),StandardCharsets.UTF_8));
-                set("recording",name);
+                recordingBytes=0; recordingStartedAt=SystemClock.elapsedRealtime();
+                set(auto?"autoRecording":"recording",name);
                 JSONObject header=new JSONObject(); put(header,"type","session"); put(header,"schema","OBDENTIC-MOBILE"); put(header,"version",1); put(header,"mode",mode); put(header,"profile",profileId); put(header,"selected",signals);
                 synchronized(stateLock) { put(header,"vehicle",state.opt("vehicle")); put(header,"diagnostics",state.opt("diagnostics")); put(header,"catalog",state.opt("signals")); put(header,"profiles",state.opt("profiles")); }
                 // Notifications must not precede the header in the new evidence stream.
@@ -615,16 +629,28 @@ public final class ObdService extends Service {
         if(!worker.isShutdown()) worker.execute(this::stopRecordingNow);
     }
     private void stopRecordingNow() { closeRecording("stopped",""); }
-    private void closeRecording(String reason,String detail) {
+    private void closeRecording(String reason,String detail) { closeRecording(reason,detail,true); }
+    private void closeRecording(String reason,String detail,boolean resumeAuto) {
+        boolean wasAuto=recordingProfile.equals(AUTO_PROFILE);
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
-        boolean completed=false; String closed; synchronized(stateLock) { closed=state.optString("recording"); }
+        boolean completed=false; String closed; synchronized(stateLock) { closed=activeRecording(); }
         synchronized(recordLock) {
             JSONObject end=new JSONObject(); put(end,"type","session_end"); put(end,"reason",reason); if(!detail.isEmpty()) put(end,"detail",detail); record(end);
             if(writer!=null) { try { writer.close(); completed=true; } catch(IOException e) { message("Aufnahme konnte nicht abgeschlossen werden: "+e.getMessage()); } writer=null; }
         }
-        set("recording","");
-        if(completed) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("completed")?"Messung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
+        set("recording",""); set("autoRecording","");
+        if(completed && !wasAuto) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("completed")?"Messung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
         if(completed && !closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty())) exportNow(closed); // REQ-018.4: any ending reason
+        if(resumeAuto && completed && !wasAuto && (reason.equals("stopped") || reason.equals("completed")) && mode.equals("live") && phase().equals("ready")) startAutoRecording(); // REQ-028.4
+    }
+    /** The file being written, named or automatic, or "". Caller holds stateLock or does not need atomicity. */
+    private String activeRecording() { String named=state.optString("recording"); return named.isEmpty() ? state.optString("autoRecording") : named; }
+    /** REQ-028.1: worker thread. Live mode only; a failed start is reported and never stops the session. */
+    private void startAutoRecording() {
+        if(!autoRecordEnabled(this) || !mode.equals("live")) return;
+        synchronized(recordLock) { if(writer!=null) return; }
+        JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
+        beginRecording(AUTO_PROFILE,selected==null?new JSONArray():selected);
     }
     /** Test seam (REQ-018): when set, replaces the stored folder as export destination. */
     public volatile RecordingExporter.Target exportTarget;
@@ -637,7 +663,7 @@ public final class ObdService extends Service {
             try { target=RecordingExporter.tree(this,stored); } catch(RecordingExporter.Unavailable e) { exportUnavailable(); return; }
         }
         List<File> files=new ArrayList<>();
-        synchronized(recordLock) { String active; synchronized(stateLock) { active=state.optString("recording"); }
+        synchronized(recordLock) { String active; synchronized(stateLock) { active=activeRecording(); }
             for(String name:RecordingExporter.completed(listRecords(),active)) if(only==null || name.equals(only)) try { files.add(recordingFile(name)); } catch(IOException ignored) { /* not an app-written name */ } }
         RecordingExporter.Result result=RecordingExporter.export(files,target);
         if(result.unavailable) exportUnavailable(); else message(result.message());
@@ -645,12 +671,33 @@ public final class ObdService extends Service {
     private void exportUnavailable() { if(exportTarget==null) RecordingExporter.setFolder(this,""); message(RecordingExporter.UNAVAILABLE); }
     private void record(JSONObject event) {
         put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
-            try { writer.write(event.toString()); writer.newLine(); writer.flush(); }
-            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=state.optString("recording"); } set("recording",""); message("Aufnahmefehler: "+e.getMessage());
+            try { String line=event.toString(); writer.write(line); writer.newLine(); writer.flush(); recordingBytes+=line.length()+1; rotateIfDue(); }
+            catch(IOException e) { try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=activeRecording(); } set("recording",""); set("autoRecording",""); message("Aufnahmefehler: "+e.getMessage());
                 // REQ-018.4: a recording ended by a write error is auto-exported too (after the lock is released).
                 if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(failed)); }
         }
     }
+    /** REQ-028.3: caller holds recordLock. Closes the automatic file as "rotated" and continues in a new one that starts with a fresh header. */
+    private void rotateIfDue() throws IOException {
+        if(!recordingProfile.equals(AUTO_PROFILE) || (recordingBytes<rotateBytes && SystemClock.elapsedRealtime()-recordingStartedAt<rotateMs)) return;
+        String closed; synchronized(stateLock) { closed=state.optString("autoRecording"); }
+        JSONObject end=new JSONObject(); put(end,"type","session_end"); put(end,"reason","rotated"); put(end,"at",System.currentTimeMillis());
+        put(end,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
+        writer.write(end.toString()); writer.newLine(); writer.flush(); writer.close(); writer=null;
+        JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
+        if(!beginRecording(AUTO_PROFILE,selected==null?new JSONArray():selected)) { recordingProfile=""; set("autoRecording",""); }
+        if(!closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(closed)); // REQ-018.4: any ending reason
+    }
+    /** REQ-028.7: removes completed automatic recordings; the running file, named recordings and a loaded replay stay. */
+    public void deleteAutoRecordings() { if(!worker.isShutdown()) worker.execute(() -> {
+        int removed=0; long freed=0;
+        synchronized(recordLock) { String active; synchronized(stateLock) { active=activeRecording(); }
+            File[] files=new File(getFilesDir(),"recordings").listFiles();
+            if(files!=null) for(File file:files) { String name=file.getName();
+                if(!file.isFile() || !name.endsWith("-auto.jsonl") || name.equals(active) || name.equals(replayFilename)) continue;
+                long size=file.length(); if(file.delete()) { removed++; freed+=size; } } }
+        message(removed+" automatische Aufnahmen gelöscht · "+freed/1024+" KB frei");
+    }); }
     private void debug(String direction,String text) {
         JSONObject event=new JSONObject(); put(event,"type","wire"); put(event,"direction",direction); put(event,"text",text); put(event,"at",System.currentTimeMillis()); record(event);
         synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } changed();
@@ -679,7 +726,7 @@ public final class ObdService extends Service {
         catch(IOException e) { message(e.getMessage()); return; }
         synchronized(recordLock) {
             String active;
-            synchronized(stateLock) { active=state.optString("recording"); }
+            synchronized(stateLock) { active=activeRecording(); }
             if(filename.equals(active) && writer!=null) { message("Aufzeichnung vor dem Löschen stoppen"); return; }
             if(filename.equals(replayFilename)) { message("Im Replay geöffnete Aufzeichnung kann nicht gelöscht werden"); return; }
             if(!file.isFile()) { message("Aufnahme nicht gefunden"); return; }
@@ -712,7 +759,9 @@ public final class ObdService extends Service {
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay.read",recorded.toString()));
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
-                        else if(action.equals("inventory")) restoreVehicle(result.optJSONObject("data"));
+                        else if(action.equals("catalog")) { applyCatalog(result); continue; } // REQ-028.10: automatic files start before the handshake
+                        else if(action.equals("initialize")) { JSONObject support=result.optJSONObject("data"); if(support!=null) { restoreVehicle(support); applySupport(support); } continue; }
+                        else if(action.equals("inventory")) { restoreVehicle(result.optJSONObject("data")); if(result.optJSONObject("data")!=null) applySupport(result.optJSONObject("data")); }
                         else if(action.equals(THROUGHPUT) || action.equals("ecu.discover") || action.equals("knowledge.learn")) {
                             JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay."+action,recorded.toString()));

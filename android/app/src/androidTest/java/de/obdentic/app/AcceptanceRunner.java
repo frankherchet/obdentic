@@ -193,6 +193,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Known vehicles: VIN-keyed records, stored odometer, demo/replay isolation, selection, rename, delete, corrupt-store and write-failure safety, header chip on every tab");
             ReconnectAcceptance.run(service,getTargetContext());
             passed("Automatic connection (REQ-020): policy schedule 2/5/10/30 s and reset, known adapter stored/replaced app-private, retries only to the known address, manual disconnect/stop/demo/replay end attempts, switch default on and persisted, partial recording kept and same-profile continuation, Bluetooth/permission off shows the reason and resumes, no job repeated; fake adapter link, no real BLE (direct GATT connect, engine start/stop and app restart remain for #178)");
+            AutoRecordingAcceptance.run(service,getTargetContext());
+            passed("Continuous recording (REQ-028): starts before the first adapter byte with the handshake, ends with a marker, failed attempts leave an error file, named recordings replace and resume it, rotation by size and age without a gap, persistent switch, unwritable folder keeps the session alive, explicit delete only, replay re-derives the vehicle");
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
                 public String text(String tab) throws Exception { return tabText(activity,tab); }
                 public Boolean enabled(String label,boolean expected) throws Exception { 

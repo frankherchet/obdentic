@@ -589,3 +589,36 @@ requirements:
         text: In extended session the app sends to the vehicle only 10 03, 10 01, 3E 80 and 0x22 reads of Knowledge-listed DIDs; SecurityAccess, RoutineControl, InputOutputControl, WriteDataByIdentifier, ECUReset, communication or DTC control and caller-provided services, addresses or DIDs are impossible.
       - id: REQ-027.5
         text: A negative response to 10 03 leaves the ECU in the default session, shows the response code and offers no UDS signals; recordings mark the session state of every read and replay re-decodes them offline.
+
+  - id: REQ-028
+    title: Record every live session automatically with bounded storage
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-29: epic #253, decisions by @frankherchet"
+    description: >
+      Every live session is recorded from its first connection attempt without a button
+      press, including the adapter handshake, so evidence exists for every drive. Files
+      stay local and rotate to bound crash loss; the app never deletes them on its own;
+      named recordings and test sequences keep working as before.
+    acceptance:
+      - id: REQ-028.1
+        text: When the app starts a live connection attempt (manual or automatic) and the setting "Dauer-Aufzeichnung" is on, a recording starts before the first adapter byte is sent, so initialisation, support discovery and inventory TX/RX are in the file, with the vehicle in the header unknown until the recorded inventory result; an attempt that fails still leaves a file with its error marker; demo and replay never start one.
+      - id: REQ-028.2
+        text: The recording ends with a session_end marker on disconnect, error or user stop, and a reconnect starts a new file; after process death the file stays readable up to at most 5 seconds before the last write.
+      - id: REQ-028.3
+        text: At 30 minutes of age or 10 MB of size the file is closed with session_end reason "rotated" and a new file with a fresh header continues without a gap in TX/RX; the mobile report treats a rotated file as complete.
+      - id: REQ-028.4
+        text: Starting a named recording or a test sequence closes the automatic recording and, after that one ends, a new automatic recording continues; named recordings and test sequences behave exactly as before.
+      - id: REQ-028.5
+        text: The setting is on by default, is shown in the app settings, persists across restarts, and switching it off closes the running automatic recording.
+      - id: REQ-028.6
+        text: The app never deletes a recording on its own; only an explicit user action (REQ-028.7 or the existing per-recording delete) removes one.
+      - id: REQ-028.7
+        text: "\"Automatische Aufnahmen löschen\" removes every completed automatic recording after a confirmation and shows the freed size; named recordings, the running recording and exported copies stay untouched."
+      - id: REQ-028.8
+        text: When the recording cannot be written (storage full or I/O error), the live session continues, the user sees a message, and the recording ends with an error marker where possible; the app does not crash.
+      - id: REQ-028.9
+        text: Automatic recordings stay in the app-private directory; they are exported, pulled and handled under the same rules as other recordings (REQ-018, REQ-019), and the app adds no permission.
+      - id: REQ-028.10
+        text: Replay and the desktop mobile report of an automatic recording re-derive the vehicle and signal support from the recorded handshake and inventory events, as they do for named recordings.
