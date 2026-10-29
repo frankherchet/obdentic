@@ -97,7 +97,7 @@ public class MainActivity extends Activity {
     private String pendingExport="";
     private final Runnable poll=new Runnable(){public void run(){refresh();handler.postDelayed(this,500);}};
 
-    @Override public void onCreate(Bundle saved){
+    @Override public void onCreate(Bundle saved){AppLog.init(this);
         setTheme(android.R.style.Theme_Material_NoActionBar);
         super.onCreate(saved);
         if(saved!=null){tab=saved.getInt("tab",0);profile=saved.getString("profile","");pendingExport=saved.getString("pendingExport","");}

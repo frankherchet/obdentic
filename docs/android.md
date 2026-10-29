@@ -215,6 +215,16 @@ a recording on its own; demo and replay are never recorded automatically. Replay
 and `obdentic-mobile-report` re-derive the vehicle and signal support from the
 recorded handshake.
 
+**App debug log (REQ-029):** a separate operational log (`logs/app.log`, text lines
+with time, level, tag and message, also in Logcat) records service lifecycle, every
+connection attempt and its outcome, reconnect delays, BLE status codes, diagnostic jobs,
+recording events and exceptions with full stack traces (including uncaught ones). It
+never contains VINs, raw adapter traffic or unmasked Bluetooth addresses. The active
+file is sealed as `app-<timestamp>.log` when a connection ends or at 1 MB; the newest 50
+sealed files are kept. Every export run copies the sealed logs next to the recordings,
+and `tools/pull-recordings.sh` pulls `*.log` too. The log is operational data, not
+vehicle evidence: it cannot be replayed.
+
 Each saved recording has **Aufnahme löschen …**. Confirmation permanently deletes
 only the phone's internal file; exported copies remain. Stop an active recording
 first, or leave a loaded replay before deleting its file.
