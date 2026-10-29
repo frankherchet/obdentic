@@ -647,6 +647,10 @@ requirements:
         text: A failure to write the log never raises an exception into the caller and never stops a session.
       - id: REQ-029.6
         text: Each export run (REQ-018.2, REQ-018.4) also copies the sealed log files unchanged under the same skip rules, `tools/pull-recordings.sh` pulls `*.log` files, and the log adds no permission and no dependency.
+      - id: REQ-029.7
+        text: Every user-visible message of the app, including the reason an action was refused, is also written to the log with the tag "msg".
+      - id: REQ-029.8
+        text: Tester-present cycles (uds.tick) are not logged as jobs; a tick that fails or reports a session error is logged as a warning with the error.
 
   - id: REQ-030
     title: Measure which default-session Knowledge signals answer in the vehicle

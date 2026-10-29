@@ -92,7 +92,7 @@ public final class ObdService extends Service {
     private void set(String key,Object value) { synchronized(stateLock) { put(state,key,value); } changed(); }
     private String phase() { synchronized(stateLock) { return state.optString("phase"); } }
     /** REQ-021: counts messages, so a button can tell that a (possibly identical) message for its action arrived. */
-    private void message(String value) { synchronized(stateLock) { put(state,"messageSeq",state.optLong("messageSeq")+1); put(state,"message",value); } changed(); }
+    private void message(String value) { AppLog.i("msg",value); synchronized(stateLock) { put(state,"messageSeq",state.optLong("messageSeq")+1); put(state,"message",value); } changed(); }
     /** REQ-021: pending buttons live here, not in the Activity, so they survive its recreation. */
     public final PendingActions pending = new PendingActions();
     public JSONObject snapshot() {
@@ -395,6 +395,12 @@ public final class ObdService extends Service {
     /** REQ-029.2: every job (not the per-second reads) is logged with its duration. */
     private JSONObject execute(String action,String argument) throws Exception {
         if(action.equals("read")) return executeNow(action,argument);
+        if(action.equals("uds.tick")) { // REQ-029.8: every ~2 s in an extended session; only a problem is worth a line
+            JSONObject result=executeNow(action,argument); JSONObject uds=result.optJSONObject("uds"); String problem=result.optString("error","");
+            if(problem.isEmpty() && uds!=null && !uds.isNull("error")) problem=uds.optString("error");
+            if(!result.optBoolean("ok",true) || !problem.isEmpty()) AppLog.w("job","uds.tick problem: "+problem);
+            return result;
+        }
         long start=SystemClock.elapsedRealtime(); AppLog.i("job",action+" start");
         try { JSONObject result=executeNow(action,argument); AppLog.i("job",action+" end ok="+result.optBoolean("ok")+" "+(SystemClock.elapsedRealtime()-start)+" ms"); return result; }
         catch(Exception e) { AppLog.e("job",action+" failed after "+(SystemClock.elapsedRealtime()-start)+" ms",e); throw e; }

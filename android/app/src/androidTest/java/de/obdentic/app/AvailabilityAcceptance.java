@@ -13,7 +13,7 @@ final class AvailabilityAcceptance {
     private static final String ADAPTER = "AA:BB:CC:00:00:30", OIL = "engine.oil_temperature@vag.ecu_target.7e0";
 
     static final class Link implements ObdService.Link {
-        final ObdService.Link delegate; final List<String> commands = Collections.synchronizedList(new ArrayList<>()); volatile String target = "";
+        final ObdService.Link delegate; final List<String> commands = Collections.synchronizedList(new ArrayList<>()); volatile String target = ""; volatile boolean tickFails;
         Link(ObdService.Link delegate) { this.delegate = delegate; }
         public boolean isOpen() { return delegate.isOpen(); }
         public void close() { delegate.close(); }
@@ -21,6 +21,9 @@ final class AvailabilityAcceptance {
             String compact = command.trim().replace(" ", "").toUpperCase(Locale.ROOT);
             if (compact.startsWith("ATSH")) target = compact.substring(4);
             commands.add(target + ":" + compact);
+            if (compact.equals("1003")) return target.equals("7E0") ? "7E8 06 50 03 00 32 01 F4\r>" : "NO DATA\r>"; // like UdsAcceptance's fake adapter
+            if (compact.equals("1001")) return target.equals("7E0") ? "7E8 02 50 01\r>" : "NO DATA\r>";
+            if (compact.equals("3E80")) return tickFails ? "7E8 03 7F 3E 12\r>" : "NO DATA\r>";
             if (compact.equals("0140")) return "7E8 06 41 40 FF FF FF EF\r>"; // without PID 5C (engine oil temperature), like a real EA189
             if (compact.startsWith("22") && compact.length() == 6) {
                 if (!target.equals("7E0")) return "NO DATA\r>";
