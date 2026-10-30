@@ -420,7 +420,7 @@ requirements:
       - id: REQ-020.2
         text: When the app starts with a known adapter, automatic connection enabled, Bluetooth on and the required permissions granted, it connects to the known adapter without user action and shows the attempt in the status line.
       - id: REQ-020.3
-        text: After an unexpected connection loss, the app retries connecting to the known adapter after pauses of 2, 5 and 10 seconds and then every 30 seconds until it succeeds or the user stops it, and shows when the next attempt follows.
+        text: After an unexpected connection loss, the app retries connecting to the known adapter after pauses of 2, 5, 10, 30, 60 and 120 seconds and then every 5 minutes until it succeeds or the user stops it, and shows when the next attempt follows.
       - id: REQ-020.4
         text: "A manual \"Verbindung trennen\", starting the demo or opening a replay stops automatic connection attempts, and none start again until the user connects or the app is started again."
       - id: REQ-020.5
@@ -428,11 +428,13 @@ requirements:
       - id: REQ-020.6
         text: The user can switch automatic connection off and on; it is on by default, and the setting stays across app restarts.
       - id: REQ-020.7
-        text: After an automatic connection, only the existing read-only initialization and inventory run automatically, with the normal vehicle-record handling; no other job is repeated.
+        text: After an automatic connection, only the existing read-only initialization, inventory and ECU identification (REQ-030.7) run automatically, with the normal vehicle-record handling; no other job is repeated.
       - id: REQ-020.8
         text: A recording interrupted by connection loss stays saved as a partial recording; after the automatic reconnection a new recording with the same profile starts automatically, while a test sequence is never restarted automatically.
       - id: REQ-020.9
         text: With Bluetooth off or a required permission missing, no attempt is made, the app shows why, and attempts resume once Bluetooth is on again while the app runs.
+      - id: REQ-020.10
+        text: When the app comes to the foreground while it waits for the next automatic attempt, that attempt starts immediately and the following pauses start again at 2 seconds.
 
   - id: REQ-021
     title: Show immediate pending feedback on state-changing buttons
@@ -622,6 +624,10 @@ requirements:
         text: Automatic recordings stay in the app-private directory; they are exported, pulled and handled under the same rules as other recordings (REQ-018, REQ-019), and the app adds no permission.
       - id: REQ-028.10
         text: Replay and the desktop mobile report of an automatic recording re-derive the vehicle and signal support from the recorded handshake and inventory events, as they do for named recordings.
+      - id: REQ-028.11
+        text: A button "Jetzt exportieren" next to the continuous-recording switch ends the running automatic file with session_end reason "rotated", continues recording in a new file at once, seals the app log and exports all completed recordings and sealed logs to the export folder; without an export folder it says so and nothing is closed.
+      - id: REQ-028.12
+        text: An automatic connection attempt that never reaches the adapter (Bluetooth link not established) writes no recording file and seals no app log; the attempt and its error are written to the running app log only.
 
   - id: REQ-029
     title: Keep a rolling app debug log separate from vehicle evidence
@@ -676,6 +682,8 @@ requirements:
         text: The job writes its own recording with all TX/RX; the result is stored in the vehicle record with date and Knowledge revision, is not exported or shared, and replay of the recording restores the per-signal statuses without adapter traffic.
       - id: REQ-030.6
         text: A truncated or interrupted run keeps the statuses it measured and marks the result as incomplete; losing the link ends the job with an error and stores nothing from it.
+      - id: REQ-030.7
+        text: In a live session the ECU identification ("ecu.discover") starts automatically after every connection whose inventory identified the vehicle manufacturer, also for a known vehicle, so its Knowledge signals are selectable in that session; for a known vehicle no availability check follows automatically.
 
   - id: REQ-031
     title: Show measured availability in the selector and explain missing values
@@ -695,3 +703,18 @@ requirements:
         text: Every listed signal can be selected regardless of its availability, and the filter never changes the selection or what is polled.
       - id: REQ-031.4
         text: A selected signal that has no value shows "Nicht verfügbar" with its reason on the tile - "nicht unterstützt (Fahrzeug meldet PID nicht)", "lehnt ab · NRC 0x31" or the error/"keine Antwort" - and never a bare dash; the reason is also in the tile's content description.
+
+  - id: REQ-032
+    title: Keep the vehicle identification when one VIN read loses a frame
+    type: functional
+    priority: must
+    status: accepted
+    source: "Conversation 2026-10-30: vehicle evidence, decisions by @frankherchet"
+    description: >
+      The adapter can drop one CAN frame of the multi-frame VIN answer. One lost frame
+      must not make the app forget which manufacturer it is talking to.
+    acceptance:
+      - id: REQ-032.1
+        text: When the Mode 09 VIN answer of an inventory is a truncated or malformed multi-frame answer, the inventory repeats the read exactly once (a NO DATA or rejected answer is not repeated); a successful repeat yields the same result as a first-time success.
+      - id: REQ-032.2
+        text: When both reads fail, the inventory reports identity_error and keeps the manufacturer identified earlier in the same connection, so ECU identification still runs; without an earlier identification it fails as before.
