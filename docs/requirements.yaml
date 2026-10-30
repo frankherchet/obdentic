@@ -553,6 +553,10 @@ requirements:
         text: The user can save the current selection as a named preset in the vehicle record and apply it later; applying ignores signals that are not selectable for the current vehicle and reports how many were skipped.
       - id: REQ-025.5
         text: The selection cannot be changed while a recording runs, as before.
+      - id: REQ-025.6
+        text: "\"Preset anwenden\" offers built-in presets - the former recording profiles of the catalog, with German names - in every mode except replay and without a vehicle record, followed by the vehicle's own presets in a live session; a built-in preset selects its signals like a stored preset, skipping unsupported ones."
+      - id: REQ-025.7
+        text: The recordings tab has no recording-profile chooser and no start/stop button; a recording of the Live selection is started with "Gewählte Messwerte aufzeichnen" and stopped with "Aufzeichnung stoppen" on the same button in the Live tab.
 
   - id: REQ-026
     title: Learn which session-flagged DIDs answer in the default session

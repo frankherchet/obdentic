@@ -13,9 +13,11 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 - VIN where readable and a **partial** functional responder inventory; this is not
   a full manufacturer installation list.
 - Stored Mode 03 DTCs, scoped by responder.
-- The engine baseline, drive and OBD expansion capture profiles.
-- The `obd2-extended-validation` profile records additional standard scalars
-  conservatively; unavailable optional values are not assumed supported.
+- The engine baseline, drive and OBD expansion profiles of the catalog, offered as built-in
+  presets ("Vorlage · Motor-Grundwerte", "Fahrt", "OBD-Zusatzwerte", "Weitere OBD-Werte") under
+  Live → Messwerte auswählen → Preset anwenden (REQ-025.6); unsupported signals are skipped.
+  There is no recording-profile chooser: "Gewählte Messwerte aufzeichnen" in Live starts a
+  recording of the selection and the same button stops it (REQ-025.7).
 - Private recording, foreground connected-device service, screen-off operation,
   explicit export, offline replay and timestamped raw TX/RX.
 - Confirmed deletion of completed internal recordings; active recordings and loaded
@@ -454,7 +456,7 @@ outputs private and publish only sanitized acceptance summaries.
 1. Search for Carly, connect, inspect initialization TX/RX and supported signals.
 2. Read real measurements, inventory and stored DTCs; verify responder attribution.
 3. Retain unsupported/negative answers explicitly rather than treating them as zero values.
-4. Record the drive profile while locked for at least five minutes. Stop it,
+4. Apply the built-in preset "Fahrt" and record the selection while locked for at least five minutes. Stop it,
    export locally, replay on the phone and inspect the same file on the Mac.
 5. Disconnect, reconnect and test adapter power loss. The UI must not retain old
    live values under a new connection or silently continue a failed recording.

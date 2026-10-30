@@ -94,7 +94,7 @@ public class MainActivity extends Activity {
     private int tab=0;
     private static final int SHOWN_RECORDS=30;
     private String shownRecords(){JSONArray r=array("records"),shown=new JSONArray();for(int i=0;i<Math.min(r.length(),SHOWN_RECORDS);i++)shown.put(r.opt(i));return shown.toString();}
-    private String structure="", profile="";
+    private String structure="";
     private String historyMode="";
     private boolean launchDemo=false, scanAfterPermission=false;
     private String pendingExport="";
@@ -103,7 +103,7 @@ public class MainActivity extends Activity {
     @Override public void onCreate(Bundle saved){AppLog.init(this);
         setTheme(android.R.style.Theme_Material_NoActionBar);
         super.onCreate(saved);
-        if(saved!=null){tab=saved.getInt("tab",0);profile=saved.getString("profile","");pendingExport=saved.getString("pendingExport","");}
+        if(saved!=null){tab=saved.getInt("tab",0);pendingExport=saved.getString("pendingExport","");}
         launchDemo="demo".equals(getIntent().getStringExtra("mode"));
         getWindow().setStatusBarColor(BG);getWindow().setNavigationBarColor(BG);
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(BG);
@@ -126,7 +126,7 @@ public class MainActivity extends Activity {
     @Override protected void onStop(){getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);super.onStop();}
     @Override protected void onResume(){super.onResume();resumed=this;handler.post(poll);if(service()!=null)service().resumeIfBlocked();}
     @Override protected void onPause(){handler.removeCallbacks(poll);if(resumed==this)resumed=null;super.onPause();}
-    @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("profile",profile);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
+    @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
     private ObdService service(){return ObdService.current;}
     private void act(Runnable action){try{if(service()!=null)action.run();else toast("Dienst startet. Bitte kurz warten.");}catch(Exception e){toast(e.getMessage()==null?"Aktion fehlgeschlagen":e.getMessage());}refresh();}
     /** REQ-021.1/.4: starts the pending state, then the service call; a second tap while pending starts nothing. */
@@ -171,7 +171,7 @@ public class MainActivity extends Activity {
         String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+state.optString("autoRecording")+state.optBoolean("autoRecord")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
-        if(tab==2)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile");
+        if(tab==2)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+state.optString("recording")+"|"+state.optString("replayFile");
         if(tab==3)key+="|"+(array("debug").length()==0);
         if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
         if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->{if(debugLog!=null)scroll.fullScroll(View.FOCUS_DOWN);else scroll.scrollTo(0,y);});}
@@ -193,8 +193,10 @@ public class MainActivity extends Activity {
         title("Live-Messwerte","Werte und Verlauf auf einen Blick");
         addButton(body,"Messwerte auswählen",this::chooseSignals).setEnabled(state.optString("recording").isEmpty());
         JSONArray selected=array("selected");
-        boolean canRecordSelection=!state.optString("mode","live").equals("replay")&&state.optString("phase").equals("ready")&&!state.optBoolean("busy")&&state.optString("recording").isEmpty()&&selected.length()>0;
-        actionButton(body,REC_START,":selection","Gewählte Messwerte aufzeichnen",canRecordSelection,()->perform(REC_START,":selection",()->service().startRecording("live-selection")));
+        boolean recordingNow=!state.optString("recording").isEmpty();
+        boolean canRecordSelection=!state.optString("mode","live").equals("replay")&&state.optString("phase").equals("ready")&&!state.optBoolean("busy")&&!recordingNow&&selected.length()>0;
+        // REQ-025.7: the one place to start and stop a recording of the selection
+        actionButton(body,recordingNow?REC_STOP:REC_START,"",recordingNow?"Aufzeichnung stoppen":"Gewählte Messwerte aufzeichnen",recordingNow||canRecordSelection,()->{if(recordingNow)perform(REC_STOP,"",()->service().stopRecording());else perform(REC_START,"",()->service().startRecording("live-selection"));});
         if(!state.optString("recording").isEmpty())note(body,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);
         JSONArray values=array("values");
         LinkedHashMap<String,JSONObject> shown=new LinkedHashMap<>();
@@ -357,13 +359,8 @@ public class MainActivity extends Activity {
     private boolean canRun(){String mode=state.optString("mode");return !state.optBoolean("busy")&&!mode.equals("replay")&&(mode.equals("demo")||state.optString("phase").equals("ready"));}
     private void recordings(){
         title("Aufnahmen","Lokal sichern · später ohne Auto untersuchen");
-        JSONArray profiles=array("profiles");if(profile.isEmpty()&&profiles.length()>0)profile=profiles.optJSONObject(0).optString("id");
-        JSONObject chosen=new JSONObject();for(int i=0;i<profiles.length();i++)if(profile.equals(profiles.optJSONObject(i).optString("id")))chosen=profiles.optJSONObject(i);
-        LinearLayout c=card();note(c,"AUFNAHMEPROFIL",ACCENT);addButton(c,profile.isEmpty()?"Profil auswählen":chosen.optString("title",profile),this::chooseProfile);
-        boolean running=!state.optString("recording").isEmpty();
-        String selectedProfile=profile;
-        actionButton(c,running?REC_STOP:REC_START,"",running?"Aufzeichnung stoppen":"Aufzeichnung starten",running||canRun(),()->{if(running)perform(REC_STOP,"",()->service().stopRecording());else perform(REC_START,"",()->service().startRecording(selectedProfile));});
-        note(c,running?"● "+state.optString("recording"):"Aufzeichnungen enthalten möglicherweise Fahrzeugkennungen. Export erfolgt nur auf deine ausdrückliche Auswahl.",running?ACCENT:MUTED);
+        if(!state.optString("recording").isEmpty())note(body,"● "+state.optString("recording"),ACCENT);
+        note(body,"Aufzeichnungen enthalten möglicherweise Fahrzeugkennungen. Export erfolgt nur auf deine ausdrückliche Auswahl.",MUTED); // REQ-025.7: no recording profiles; Live records the selection
         autoRecordCard();
         exportCard();
         JSONArray records=array("records");if(records.length()==0)empty("Noch keine Aufnahmen","Starte eine Aufzeichnung im Live- oder Demomodus. Die Dateien bleiben auf diesem Handy.");
@@ -508,7 +505,7 @@ public class MainActivity extends Activity {
         TextView feedback=text("",13,0xffffca75);root.addView(feedback);
         ScrollView listScroll=new ScrollView(this);listScroll.setFillViewport(false);LinearLayout list=new LinearLayout(this);list.setOrientation(LinearLayout.VERTICAL);listScroll.addView(list);root.addView(listScroll,new LinearLayout.LayoutParams(-1,0,1));
         boolean locked=!state.optString("recording").isEmpty();
-        LinearLayout presetRow=row();Button save=button("Preset speichern",()->saveSignalPreset(chosen));save.setEnabled(!locked&&vehicle!=null&&state.optString("mode","live").equals("live"));presetRow.addView(save,new LinearLayout.LayoutParams(0,-2,1));Button apply=button("Preset anwenden",()->chooseSignalPreset(dialog));apply.setEnabled(!locked&&vehicle!=null&&state.optString("mode","live").equals("live"));presetRow.addView(apply,new LinearLayout.LayoutParams(0,-2,1));root.addView(presetRow);
+        LinearLayout presetRow=row();Button save=button("Preset speichern",()->saveSignalPreset(chosen));save.setEnabled(!locked&&vehicle!=null&&state.optString("mode","live").equals("live"));presetRow.addView(save,new LinearLayout.LayoutParams(0,-2,1));Button apply=button("Preset anwenden",()->chooseSignalPreset(dialog));apply.setEnabled(!locked&&!state.optString("mode","live").equals("replay"));presetRow.addView(apply,new LinearLayout.LayoutParams(0,-2,1));root.addView(presetRow);
         LinearLayout actions=row();Button cancel=button("Abbrechen",dialog::dismiss);actions.addView(cancel,new LinearLayout.LayoutParams(0,-2,1));Button accept=button("Übernehmen",()->{
             if(service()==null)return;
             if(!service().snapshot().optString("recording").isEmpty()){toast("Messwertauswahl während Aufnahme gesperrt");return;}
@@ -565,13 +562,16 @@ public class MainActivity extends Activity {
         if(service()==null)return;EditText input=new EditText(this);input.setSingleLine(true);input.setHint("Name · 1 bis 40 Zeichen");
         new AlertDialog.Builder(this).setTitle("Auswahl als Preset speichern").setView(input).setPositiveButton("Speichern",(d,w)->{String name=input.getText().toString().trim();if(name.isEmpty()||name.length()>40){toast("Der Presetname muss 1 bis 40 Zeichen lang sein");return;}JSONArray semantics=new JSONArray();for(String semantic:selection)semantics.put(semantic);act(()->service().saveSignalPreset(name,semantics));}).setNegativeButton("Abbrechen",null).show();
     }
+    /** REQ-025.6: built-in presets (the former recording profiles) first, then the vehicle's own presets. */
     private void chooseSignalPreset(Dialog selector){
-        JSONObject vehicle=selectedVehicle();if(vehicle==null){toast("Kein Fahrzeug für Presets gewählt");return;}
-        JSONArray presets=vehicle.optJSONArray("presets");if(presets==null||presets.length()==0){toast("Für dieses Fahrzeug sind keine Presets gespeichert");return;}
-        ArrayList<String> names=new ArrayList<>();for(int i=0;i<presets.length();i++){JSONObject preset=presets.optJSONObject(i);if(preset!=null)names.add(preset.optString("name"));}
-        new AlertDialog.Builder(this).setTitle("Preset anwenden").setItems(names.toArray(new String[0]),(d,which)->{String name=names.get(which);selector.dismiss();act(()->service().applySignalPreset(name));}).setNegativeButton("Abbrechen",null).show();
+        ArrayList<String> names=new ArrayList<>(),keys=new ArrayList<>();
+        JSONArray profiles=array("profiles");for(int i=0;i<profiles.length();i++){String id=profiles.optJSONObject(i).optString("id");names.add("Vorlage · "+builtinName(id));keys.add(ObdService.BUILTIN+id);}
+        JSONObject vehicle=selectedVehicle();JSONArray presets=vehicle==null||!state.optString("mode","live").equals("live")?null:vehicle.optJSONArray("presets");
+        if(presets!=null)for(int i=0;i<presets.length();i++){JSONObject preset=presets.optJSONObject(i);if(preset!=null){names.add(preset.optString("name"));keys.add(preset.optString("name"));}}
+        if(names.isEmpty()){toast("Keine Presets verfügbar");return;}
+        new AlertDialog.Builder(this).setTitle("Preset anwenden").setItems(names.toArray(new String[0]),(d,which)->{String key=keys.get(which);selector.dismiss();act(()->service().applySignalPreset(key));}).setNegativeButton("Abbrechen",null).show();
     }
-    private void chooseProfile(){JSONArray p=array("profiles");String[] names=new String[p.length()];int chosen=0;for(int i=0;i<p.length();i++){JSONObject item=p.optJSONObject(i);names[i]=item.optString("title",item.optString("id"));if(item.optString("id").equals(profile))chosen=i;}new AlertDialog.Builder(this).setTitle("Aufnahmeprofil / Testsequenz").setSingleChoiceItems(names,chosen,(dialog,which)->{profile=p.optJSONObject(which).optString("id");structure="";dialog.dismiss();refresh();}).setNegativeButton("Schließen",null).show();}
+    private static String builtinName(String id){switch(id){case "engine-baseline":return "Motor-Grundwerte";case "engine-drive":return "Fahrt";case "obd2-expansion-validation":return "OBD-Zusatzwerte";case "obd2-extended-validation":return "Weitere OBD-Werte";default:return id;}}
     private void export(String name) {
         if(name.equals(activeRecordingName())) {toast("Aufzeichnung vor dem Export stoppen");return;}
         pendingExport=name;

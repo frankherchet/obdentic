@@ -474,11 +474,14 @@ public final class ObdService extends Service {
             return error==null ? "Vorlage gespeichert: "+name : error;
         });
     }
+    /** Key prefix of a built-in preset: one of the catalog's former recording profiles (REQ-025.6). */
+    public static final String BUILTIN="builtin:";
     public void applySignalPreset(String name) {
         vehicleAction(() -> {
-            if(!mode.equals("live") || selectedVin().isEmpty()) return "Zuerst ein Fahrzeug wählen";
+            boolean builtin=name.startsWith(BUILTIN);
+            if(builtin ? mode.equals("replay") : !mode.equals("live") || selectedVin().isEmpty()) return builtin ? "Im Replay nicht verfügbar" : "Zuerst ein Fahrzeug wählen";
             synchronized(stateLock) { if(!state.optString("recording").isEmpty()) return "Messwertauswahl während Aufnahme gesperrt"; }
-            JSONArray preset=vehicles.preset(selectedVin(),name);
+            JSONArray preset=builtin ? builtinPreset(name.substring(BUILTIN.length())) : vehicles.preset(selectedVin(),name);
             if(preset==null) return "Vorlage nicht gefunden";
             JSONArray available=new JSONArray();
             synchronized(stateLock) {
@@ -494,6 +497,11 @@ public final class ObdService extends Service {
             selectSignals(available); storeSelection();
             return "Vorlage angewendet · "+(preset.length()-available.length())+" nicht verfügbare Messwerte übersprungen";
         });
+    }
+    private JSONArray builtinPreset(String id) {
+        synchronized(stateLock) { JSONArray profiles=state.optJSONArray("profiles");
+            for(int i=0;profiles!=null && i<profiles.length();i++) if(id.equals(profiles.optJSONObject(i).optString("id"))) return profiles.optJSONObject(i).optJSONArray("signals"); }
+        return null;
     }
     private void selectSignals(JSONArray semantics) {
         JSONArray checked=new JSONArray(); synchronized(stateLock) {
