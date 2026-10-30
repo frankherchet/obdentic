@@ -984,11 +984,17 @@ impl<E: Exchange> MobileCore<E> {
         // Do not retain target evidence from an earlier inventory if this
         // discovery no longer observes the expected engine responder.
         self.engine = None;
-        self.vehicle_manufacturer = None;
+        let earlier = self.vehicle_manufacturer.take();
         self.knowledge = None;
-        let identity = self
+        let mut identity = self
             .runtime
             .block_on(self.session.as_mut().unwrap().identify());
+        // REQ-032.1: the adapter can drop one frame of the multi-frame VIN answer; NO DATA is final.
+        if matches!(&identity, Err(e) if e.contains("ISO-TP") || e.contains("consecutive frame")) {
+            identity = self
+                .runtime
+                .block_on(self.session.as_mut().unwrap().identify());
+        }
         let mut data = self.support();
         match identity {
             Ok(identity) => {
@@ -997,7 +1003,10 @@ impl<E: Exchange> MobileCore<E> {
                 self.vehicle_manufacturer =
                     knowledge::manufacturer_from_vin(identity.vin().as_str());
             }
-            Err(error) => data["identity_error"] = json!(error),
+            Err(error) => {
+                data["identity_error"] = json!(error);
+                self.vehicle_manufacturer = earlier; // REQ-032.2: same connection, same vehicle
+            }
         }
         if self
             .session
@@ -1283,6 +1292,65 @@ mod tests {
                 .unwrap()
                 .len(),
             crate::supported_signals().len()
+        );
+    }
+
+    const VIN_FULL: &str =
+        "7E9 10 14 49 02 01 57 56 57\r7E9 21 5A 5A 5A 31 4A 5A 58\r7E9 22 57 30 30 30 30 30 31\r>";
+    const VIN_TRUNCATED: &str = "7E9 10 14 49 02 01 57 56 57\r7E9 21 5A 5A 5A 31 4A 5A 58\r>";
+    const PAGE: (&str, &str) = ("0100\r", "7E9 06 41 00 00 10 00 00\r>");
+    fn transmission_only(extra: &[(&'static str, &'static str)]) -> MobileCore<Script> {
+        core_with_pages(&[PAGE], extra)
+    }
+
+    #[test]
+    fn req_032_1_inventory_repeats_a_failed_vin_read_once() {
+        let mut core =
+            transmission_only(&[PAGE, ("0902\r", VIN_TRUNCATED), PAGE, ("0902\r", VIN_FULL)]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let inventory = run(&mut core, "inventory", "");
+        assert!(inventory["data"]["identity_error"].is_null(), "{inventory}");
+        assert_eq!(inventory["data"]["vin"], "WVWZZZ1JZXW000001");
+        assert_eq!(core.vehicle_manufacturer.as_deref(), Some("vag"));
+    }
+
+    #[test]
+    fn req_032_2_failed_vin_reads_keep_the_manufacturer_of_the_connection() {
+        let mut core = transmission_only(&[
+            PAGE,
+            ("0902\r", VIN_FULL),
+            PAGE,
+            ("0902\r", VIN_TRUNCATED),
+            PAGE,
+            ("0902\r", VIN_TRUNCATED),
+        ]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        assert!(run(&mut core, "inventory", "")["data"]["identity_error"].is_null());
+        let again = run(&mut core, "inventory", "");
+        assert_eq!(
+            again["data"]["identity_error"],
+            "truncated ISO-TP Mode 09 response"
+        );
+        assert_eq!(core.vehicle_manufacturer.as_deref(), Some("vag"));
+    }
+
+    #[test]
+    fn req_032_2_without_earlier_identification_ecu_discovery_still_refuses() {
+        let mut core = transmission_only(&[
+            PAGE,
+            ("0902\r", VIN_TRUNCATED),
+            PAGE,
+            ("0902\r", VIN_TRUNCATED),
+        ]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        assert!(!run(&mut core, "inventory", "")["data"]["identity_error"].is_null());
+        let discover = run(&mut core, "ecu.discover", "");
+        assert!(
+            discover["error"]
+                .as_str()
+                .unwrap()
+                .contains("manufacturer is not identified"),
+            "{discover}"
         );
     }
 
