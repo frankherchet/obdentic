@@ -378,6 +378,8 @@ requirements:
         text: Every exported file is byte-identical to its internal recording, and export never deletes, moves or modifies an internal recording.
       - id: REQ-018.8
         text: The app declares exactly the same permissions as before; neither internet access nor a storage permission is added.
+      - id: REQ-018.9
+        text: Exporting never runs on the thread that talks to the adapter; while an export copies files, live polling, connection handling and jobs continue without waiting for it.
 
   - id: REQ-019
     title: Pull exported recordings to the computer over adb
@@ -611,7 +613,7 @@ requirements:
       - id: REQ-028.3
         text: At 30 minutes of age or 10 MB of size the file is closed with session_end reason "rotated" and a new file with a fresh header continues without a gap in TX/RX; the mobile report treats a rotated file as complete.
       - id: REQ-028.4
-        text: Starting a named recording or a test sequence closes the automatic recording and, after that one ends, a new automatic recording continues; named recordings and test sequences behave exactly as before.
+        text: Starting a named recording or a test sequence closes the automatic recording and, after that one ends, a new automatic recording continues; named recordings and test sequences behave exactly as before. Knowledge jobs (ECU identification, availability check, learning) do not close it; their TX/RX and result are written into the running automatic recording.
       - id: REQ-028.5
         text: The setting is on by default, is shown in the app settings, persists across restarts, and switching it off closes the running automatic recording.
       - id: REQ-028.6
@@ -654,7 +656,7 @@ requirements:
       - id: REQ-029.6
         text: Each export run (REQ-018.2, REQ-018.4) also copies the sealed log files unchanged under the same skip rules, `tools/pull-recordings.sh` pulls `*.log` files, and the log adds no permission and no dependency.
       - id: REQ-029.7
-        text: Every user-visible message of the app, including the reason an action was refused, is also written to the log with the tag "msg".
+        text: Every user-visible message of the app, including the reason an action was refused, is also written to the log with the tag "msg"; only the once-per-second countdown to the next automatic attempt is not.
       - id: REQ-029.8
         text: Tester-present cycles (uds.tick) are not logged as jobs; a tick that fails or reports a session error is logged as a warning with the error.
 
@@ -679,7 +681,7 @@ requirements:
       - id: REQ-030.4
         text: In a live session the job starts automatically after ECU identification when the connection created a new vehicle record, and after every "Fahrzeug und Steuergeräte erfassen" job; it does not start in demo or replay, while another job runs, or after a failed inventory.
       - id: REQ-030.5
-        text: The job writes its own recording with all TX/RX; the result is stored in the vehicle record with date and Knowledge revision, is not exported or shared, and replay of the recording restores the per-signal statuses without adapter traffic.
+        text: The job writes all TX/RX into the running automatic recording, or into its own recording when none runs; the result is stored in the vehicle record with date and Knowledge revision, is not exported or shared, and replay of the recording restores the per-signal statuses without adapter traffic.
       - id: REQ-030.6
         text: A truncated or interrupted run keeps the statuses it measured and marks the result as incomplete; losing the link ends the job with an error and stores nothing from it.
       - id: REQ-030.7

@@ -74,6 +74,9 @@ final class AppLogAcceptance {
             String failed = read(AppLog.sealed().get(0)) + read(new File(work, "app.log")); // the failure ends a connection, so it sits in the sealed file
             require(failed.contains("ERROR conn attempt failed: Adapter nicht erreichbar") && failed.contains("java.io.IOException: Adapter nicht erreichbar") && failed.contains("at de.obdentic.app"), "REQ-029.3 failed attempt logged with stack trace: " + failed);
             require(failed.contains("INFO reconnect") && failed.contains("next attempt in 2 s"), "REQ-029.2 reconnect delay logged: " + failed);
+            SystemClock.sleep(1500);
+            String countdown = read(new File(work, "app.log"));
+            require(!countdown.contains("neuer Versuch in 1 s"), "REQ-029.7 the once-per-second countdown is not logged: " + countdown);
             service.disconnect(); service.setAutoConnect(false);
 
             // REQ-029.7 / .8: a refusal is explained in the log; tester-present cycles are not logged as jobs, a failing one is a warning
