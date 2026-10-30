@@ -61,15 +61,14 @@ final class AvailabilityAcceptance {
             List<String> services = new ArrayList<>(); for (String c : link[0].commands) { String wire = c.substring(c.indexOf(':') + 1); if (!wire.startsWith("AT") && !wire.startsWith("01") && !wire.startsWith("09") && !wire.startsWith("03")) services.add(wire); }
             require(!link[0].commands.toString().contains(":1003") && services.stream().allMatch(w -> w.startsWith("22")), "REQ-030.1 only 0x22 reads and no session change: " + services);
 
-            // REQ-030.5: stored with the vehicle, own recording, automatic recording resumed
+            // REQ-030.5 / REQ-028.4: stored with the vehicle; the jobs write into the one running automatic recording
             JSONObject record = firstVehicle(service);
             require(record != null && record.optJSONObject("availability") != null && record.getJSONObject("availability").optString("knowledge_revision").length() >= 7, "REQ-030.5 result is stored in the vehicle record: " + record);
             Set<String> created = names(recordings); created.removeAll(before);
-            String own = null; for (String n : created) if (!n.endsWith("-auto.jsonl") && new String(Files.readAllBytes(new File(recordings, n).toPath()), StandardCharsets.UTF_8).contains("\"profile\":\"knowledge-availability\"")) own = n;
-            require(own != null, "REQ-030.5 the job wrote its own recording: " + created);
-            List<String> lines = Files.readAllLines(new File(recordings, own).toPath());
-            require(new JSONObject(lines.get(lines.size() - 1)).optString("type").equals("session_end"), "REQ-030.5 the recording is complete");
-            waitFor(() -> !service.snapshot().optString("autoRecording").isEmpty(), "automatic recording resumed");
+            String own = service.snapshot().optString("autoRecording");
+            require(created.size() == 1 && created.contains(own), "REQ-028.4 ECU identification and availability check did not cut the automatic recording: " + created);
+            String content = new String(Files.readAllBytes(new File(recordings, own).toPath()), StandardCharsets.UTF_8);
+            require(content.contains("\"action\":\"ecu.discover\"") && content.contains("\"action\":\"knowledge.availability\"") && !content.contains("\"type\":\"session_end\""), "REQ-030.5 the job TX/RX and results are in the running automatic recording");
 
             // REQ-030.4: every inventory job surveys again
             long firstRun = data.optLong("started_at_ms"); String ownName = own;
@@ -78,16 +77,18 @@ final class AvailabilityAcceptance {
 
             // REQ-030.7: a known vehicle gets its ECU identification on every connection, but no automatic availability check
             service.disconnect(); waitFor(() -> service.snapshot().optString("phase").equals("disconnected"), "disconnected");
+            List<String> lines = Files.readAllLines(new File(recordings, ownName).toPath());
+            require(new JSONObject(lines.get(lines.size() - 1)).optString("type").equals("session_end"), "REQ-030.5 the recording is complete");
             Set<String> beforeKnown = names(recordings);
             service.connect(ADAPTER);
             waitFor(() -> service.snapshot().optString("phase").equals("ready") && service.snapshot().optJSONArray("signals").toString().contains("@vag.") && !service.snapshot().optBoolean("busy"), "REQ-030.7 Knowledge signals after reconnecting a known vehicle");
             SystemClock.sleep(1500);
-            Set<String> known = names(recordings); known.removeAll(beforeKnown); String profiles = "";
-            for (String n : known) profiles += new JSONObject(Files.readAllLines(new File(recordings, n).toPath()).get(0)).optString("profile") + " ";
-            require(profiles.contains("ecu-discover") && !profiles.contains("knowledge-availability"), "REQ-030.7 ECU identification ran, the availability check did not: " + profiles);
+            Set<String> known = names(recordings); known.removeAll(beforeKnown); String actions = "";
+            for (String n : known) actions += new String(Files.readAllBytes(new File(recordings, n).toPath()), StandardCharsets.UTF_8);
+            require(known.size() == 1 && actions.contains("\"action\":\"ecu.discover\"") && !actions.contains("\"action\":\"knowledge.availability\""), "REQ-030.7 ECU identification ran, the availability check did not: " + known);
 
             // REQ-030.5: replay restores the statuses without adapter traffic
-            service.disconnect(); waitFor(() -> service.snapshot().optString("phase").equals("disconnected"), "disconnected");
+            service.disconnect(); waitFor(() -> service.snapshot().optString("phase").equals("disconnected") && service.snapshot().optString("autoRecording").isEmpty(), "disconnected");
             int sent = link[0].commands.size();
             service.openRecording(ownName);
             waitFor(() -> service.snapshot().optString("mode").equals("replay") && service.snapshot().optJSONObject("availability") != null && service.snapshot().optJSONObject("availability").optJSONArray("entries") != null && !service.snapshot().optBoolean("busy"), "replay restores the availability");

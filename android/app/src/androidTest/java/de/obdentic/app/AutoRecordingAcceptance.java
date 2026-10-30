@@ -118,6 +118,17 @@ final class AutoRecordingAcceptance {
             require(new JSONObject(lastLine(new File(exportDir, exported))).optString("reason").equals("rotated"), "REQ-028.11 the exported copy is complete");
             String[] logs = exportDir.list((d, n) -> n.matches("app-.*\\.log"));
             require(logs != null && logs.length > 0, "REQ-028.11 the sealed app log is exported");
+            // REQ-018.9: a slow export never holds up the adapter thread
+            AppLogAcceptance.DirTarget slowDir = new AppLogAcceptance.DirTarget(exportDir);
+            service.exportTarget = new RecordingExporter.Target() {
+                public Map<String, Long> list() throws IOException { SystemClock.sleep(5000); return slowDir.list(); }
+                public OutputStream create(String name) throws IOException { return slowDir.create(name); }
+                public void delete(String name) { slowDir.delete(name); } };
+            service.exportAll(); SystemClock.sleep(200);
+            long jobStart = SystemClock.elapsedRealtime(); service.runJob("dtc.scan");
+            waitFor(() -> service.snapshot().optString("message").contains("Auftrag abgeschlossen: dtc.scan") && !service.snapshot().optBoolean("busy"), "job during a slow export");
+            require(SystemClock.elapsedRealtime() - jobStart < 3000, "REQ-018.9 the job did not wait for the export: " + (SystemClock.elapsedRealtime() - jobStart) + " ms");
+            waitFor(() -> service.snapshot().optString("message").startsWith("Export"), "slow export finished");
             service.exportTarget = savedTarget;
 
             // REQ-028.5: the switch persists and closes the running recording; off means no recording

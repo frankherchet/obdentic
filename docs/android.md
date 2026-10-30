@@ -35,7 +35,8 @@ job `knowledge.availability` (Diagnose tab, "Verfügbarkeit prüfen") sends one 
 per default-session Knowledge signal of the identified ECUs (about 25 s, hard limit 90 s, no
 session change) and classifies each as answered, rejected (with the NRC) or not answered,
 keeping no value. It runs automatically after ECU identification for a newly created vehicle record
-and after every "Fahrzeug und Steuergeräte erfassen" job, writes its own recording and is stored
+and after every "Fahrzeug und Steuergeräte erfassen" job, writes into the running automatic recording
+(its own recording only when none runs) and is stored
 with the vehicle record (never exported or shared). Replay restores the statuses from the recording.
 The ECU identification itself (`ecu.discover`, about 18 s) runs after every live connection whose
 inventory identified the manufacturer, also for a known vehicle, because the Knowledge signals only
@@ -238,7 +239,9 @@ log, only lines in the running app log (REQ-028.12). **Jetzt exportieren** ends 
 `rotated`, continues at once in a new one, seals the app log and exports everything completed
 (REQ-028.11). A new file starts every 30 minutes or 10 MB
 (`session_end` reason `rotated`). A named recording or test sequence closes the
-automatic file and the automatic recording continues after it ends. The switch and
+automatic file and the automatic recording continues after it ends; Knowledge jobs (ECU
+identification, availability check, learning) write into the running automatic file instead
+(REQ-028.4). The switch and
 **Automatische Aufnahmen löschen …** are on the recordings tab. The app never deletes
 a recording on its own; demo and replay are never recorded automatically. Replay
 and `obdentic-mobile-report` re-derive the vehicle and signal support from the
@@ -277,6 +280,8 @@ The **EXPORT** card on the recordings tab offers:
   never overwritten. The recording being written is never exported.
 - **Automatischer Export: aus/an**: off by default. When on, each recording is
   copied right after it ends (stop, completion, disconnect or error).
+  Every export runs on its own thread, so copying into a large folder never holds up
+  polling, jobs or the connection (REQ-018.9).
 - **Aufnahmen teilen …**: hands all completed recordings to the Android share sheet
   as read-only content URIs.
 

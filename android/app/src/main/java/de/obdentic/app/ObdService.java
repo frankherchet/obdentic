@@ -22,6 +22,7 @@ public final class ObdService extends Service {
     private final JSONObject state = new JSONObject();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
+    private final ExecutorService exporter = Executors.newSingleThreadExecutor(); // REQ-018.9: copying files never holds up the adapter thread
     private volatile int generation;
     private volatile Link transport;
     /** The live adapter link: BLE in the app, a fake in acceptance tests (REQ-020). */
@@ -92,7 +93,8 @@ public final class ObdService extends Service {
     private void set(String key,Object value) { synchronized(stateLock) { put(state,key,value); } changed(); }
     private String phase() { synchronized(stateLock) { return state.optString("phase"); } }
     /** REQ-021: counts messages, so a button can tell that a (possibly identical) message for its action arrived. */
-    private void message(String value) { AppLog.i("msg",value); synchronized(stateLock) { put(state,"messageSeq",state.optLong("messageSeq")+1); put(state,"message",value); } changed(); }
+    private void message(String value) { message(value,true); }
+    private void message(String value,boolean log) { if(log) AppLog.i("msg",value); synchronized(stateLock) { put(state,"messageSeq",state.optLong("messageSeq")+1); put(state,"message",value); } changed(); }
     /** REQ-021: pending buttons live here, not in the Activity, so they survive its recreation. */
     public final PendingActions pending = new PendingActions();
     public JSONObject snapshot() {
@@ -248,7 +250,7 @@ public final class ObdService extends Service {
     private void retryTick() {
         long left=nextAttemptAt-SystemClock.elapsedRealtime();
         if(left > 0) {
-            if(phase().equals("error")) message(retryNote+" · neuer Versuch in "+(left+999)/1000+" s"+(pendingProfile.isEmpty() ? "" : " · Aufnahme wird fortgesetzt"));
+            if(phase().equals("error")) message(retryNote+" · neuer Versuch in "+(left+999)/1000+" s"+(pendingProfile.isEmpty() ? "" : " · Aufnahme wird fortgesetzt"),false); // REQ-029.7: the countdown is not logged
             main.postDelayed(retryTick,Math.min(1000,left));
         } else if(policy.attemptDue()) attempt();
     }
@@ -517,7 +519,8 @@ public final class ObdService extends Service {
             if(token!=generation) return;
             String argument=action.startsWith("read:") ? action.substring(5) : "";
             if(knowledge) execute("uds.disable","");
-            boolean own=action.equals(THROUGHPUT) || knowledge;
+            // REQ-028.4/REQ-030.5: Knowledge jobs write into the running automatic recording; the throughput test sequence keeps its own file
+            boolean own=action.equals(THROUGHPUT) || (knowledge && !recordingProfile.equals(AUTO_PROFILE));
             if(own) closeRecording("stopped","",false); // REQ-028.4: the automatic recording pauses, with a marker, while the job writes its own
             if(own && !beginRecording(action.equals(THROUGHPUT)?THROUGHPUT_PROFILE:action.replace('.','-'),new JSONArray())) return;
             knowledgeJob=knowledge;
@@ -528,7 +531,7 @@ public final class ObdService extends Service {
             }
             if(token!=generation) return;
             set("jobResult",result);
-            if(own) {
+            if(own || knowledge) {
                 if(result.optBoolean("ok")) {
                     if(action.equals(THROUGHPUT)) set("throughput",result.opt("data"));
                     if(knowledge) {
@@ -541,7 +544,7 @@ public final class ObdService extends Service {
                 JSONObject data=result.optJSONObject("data");
                 String reason=!result.optBoolean("ok") || (data!=null && data.optBoolean("stopped")) ? "error"
                     : data!=null && data.optBoolean("truncated") ? "truncated" : "completed";
-                closeRecording(reason,result.optString("error"));
+                if(own) closeRecording(reason,result.optString("error"));
             }
             if(action.equals("inventory")) { set("vehicle",result.opt("data")); if(result.optJSONObject("data") != null) applySupport(result.optJSONObject("data")); }
             if(action.equals("dtc.scan")) set("diagnostics",result.opt("data"));
@@ -683,7 +686,7 @@ public final class ObdService extends Service {
         AppLog.i("rec","end "+closed+" reason "+reason+(detail.isEmpty()?"":" ("+detail+")"));
         if(reason.equals("disconnected") || (reason.equals("error") && linked)) AppLog.seal(); // REQ-029.1: one sealed log per connection; REQ-028.12: none per unreachable attempt
         if(completed && !wasAuto) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("completed")?"Messung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
-        if(completed && !closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty())) exportNow(closed); // REQ-018.4: any ending reason
+        if(completed && !closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty())) exportLater(closed); // REQ-018.4: any ending reason
         if(resumeAuto && completed && !wasAuto && (reason.equals("stopped") || reason.equals("completed")) && mode.equals("live") && phase().equals("ready")) startAutoRecording(); // REQ-028.4
     }
     /** The file being written, named or automatic, or "". Caller holds stateLock or does not need atomicity. */
@@ -698,7 +701,8 @@ public final class ObdService extends Service {
     /** Test seam (REQ-018): when set, replaces the stored folder as export destination. */
     public volatile RecordingExporter.Target exportTarget;
     private volatile boolean linked; // REQ-028.12: the current attempt reached the adapter link
-    public void exportAll() { if(!worker.isShutdown()) worker.execute(() -> exportNow(null)); }
+    public void exportAll() { exportLater(null); }
+    private void exportLater(String only) { if(!exporter.isShutdown()) exporter.execute(() -> exportNow(only)); }
     /** REQ-018.2/.3/.6: worker thread only. Copies completed recordings (all, or just {@code only}); the recording being written is never a candidate. */
     private void exportNow(String only) {
         RecordingExporter.Target target=exportTarget; String stored=RecordingExporter.folder(this);
@@ -719,14 +723,14 @@ public final class ObdService extends Service {
             try { String line=event.toString(); writer.write(line); writer.newLine(); writer.flush(); recordingBytes+=line.length()+1; rotateIfDue(); }
             catch(IOException e) { AppLog.e("rec","write failed",e); try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=activeRecording(); } set("recording",""); set("autoRecording",""); message("Aufnahmefehler: "+e.getMessage());
                 // REQ-018.4: a recording ended by a write error is auto-exported too (after the lock is released).
-                if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(failed)); }
+                if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) ) exportLater(failed); }
         }
     }
     /** REQ-028.3: caller holds recordLock. Closes the automatic file as "rotated" and continues in a new one that starts with a fresh header. */
     private void rotateIfDue() throws IOException {
         if(!recordingProfile.equals(AUTO_PROFILE) || (recordingBytes<rotateBytes && SystemClock.elapsedRealtime()-recordingStartedAt<rotateMs)) return;
         String closed=rotate();
-        if(!closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(closed)); // REQ-018.4: any ending reason
+        if(!closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) ) exportLater(closed); // REQ-018.4: any ending reason
     }
     /** Caller holds recordLock and an automatic file is open. Ends it as "rotated" and continues in a new one; returns the closed name. */
     private String rotate() throws IOException {
@@ -742,7 +746,7 @@ public final class ObdService extends Service {
     public void exportCurrent() { if(!worker.isShutdown()) worker.execute(() -> {
         if(exportTarget==null && RecordingExporter.folder(this).isEmpty()) { message("Kein Export-Ordner gewählt"); return; }
         synchronized(recordLock) { if(writer!=null && recordingProfile.equals(AUTO_PROFILE)) try { rotate(); } catch(IOException e) { AppLog.e("rec","rotate failed",e); } }
-        AppLog.seal(); exportNow(null);
+        AppLog.seal(); exportLater(null);
     }); }
     /** REQ-028.7: removes completed automatic recordings; the running file, named recordings and a loaded replay stay. */
     public void deleteAutoRecordings() { if(!worker.isShutdown()) worker.execute(() -> {
@@ -866,7 +870,7 @@ public final class ObdService extends Service {
         }
         set("vehicle",vehicle);
     }
-    public void onDestroy() { AppLog.i("service","destroy"); disconnect(); try { unregisterReceiver(bluetoothReceiver); } catch(IllegalArgumentException ignored) {} worker.execute(this::destroyCore); worker.shutdown(); listener=null; current=null; super.onDestroy(); }
+    public void onDestroy() { AppLog.i("service","destroy"); disconnect(); try { unregisterReceiver(bluetoothReceiver); } catch(IllegalArgumentException ignored) {} worker.execute(this::destroyCore); worker.shutdown(); exporter.shutdown(); listener=null; current=null; super.onDestroy(); }
     private final class Demo implements Link {
         private final String only; private volatile boolean open=true;
         Demo(String only) { this.only=only; }
