@@ -13,7 +13,7 @@ final class AppLogAcceptance {
     private static final String ADAPTER = "AA:BB:CC:00:00:07";
     private static final Pattern LINE = Pattern.compile("\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}[+-]\\d{4} INFO unit hello world");
 
-    private static final class DirTarget implements RecordingExporter.Target {
+    static final class DirTarget implements RecordingExporter.Target {
         final File dir; DirTarget(File dir) { this.dir = dir; }
         public Map<String, Long> list() { Map<String, Long> names = new HashMap<>(); File[] files = dir.listFiles(); if (files != null) for (File f : files) names.put(f.getName(), f.length()); return names; }
         public OutputStream create(String name) throws IOException { return new FileOutputStream(new File(dir, name)); }

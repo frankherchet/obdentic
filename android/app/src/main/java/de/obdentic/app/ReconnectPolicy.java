@@ -3,15 +3,15 @@ package de.obdentic.app;
 /** REQ-020: when automatic connection to the known adapter may run and how long it waits. No Android dependencies, no timers: the service drives it. */
 public final class ReconnectPolicy {
     public enum State { IDLE, WAITING, CONNECTING, BLOCKED, STOPPED }
-    private static final long[] PAUSES_MS = {2000, 5000, 10000};
-    private static final long REPEAT_MS = 30000;
+    private static final long[] PAUSES_MS = {2000, 5000, 10000, 30000, 60000, 120000};
+    private static final long REPEAT_MS = 300000;
     private boolean enabled;
     private State state = State.IDLE;
     private int attempts;
 
     public ReconnectPolicy(boolean enabled) { this.enabled = enabled; }
 
-    /** REQ-020.3: pause before the attempt with this zero-based number: 2, 5, 10 s, then every 30 s. */
+    /** REQ-020.3: pause before the attempt with this zero-based number: 2, 5, 10, 30, 60, 120 s, then every 5 min. */
     public static long delayMs(int attempt) { return attempt < PAUSES_MS.length ? PAUSES_MS[attempt] : REPEAT_MS; }
 
     /** REQ-020.8: the profile to start again after reconnection; "" for no profile or no recording. */
@@ -34,6 +34,8 @@ public final class ReconnectPolicy {
     public synchronized long failed() { if (!enabled || state != State.CONNECTING) return -1; state = State.WAITING; return delayMs(attempts++); }
     /** The pause is over; true when the attempt may start now. */
     public synchronized boolean attemptDue() { if (!enabled || state != State.WAITING) return false; state = State.CONNECTING; return true; }
+    /** REQ-020.10: the app came to the foreground while waiting; true when the attempt may start now, the pauses start again at 2 s. */
+    public synchronized boolean wake() { if (!enabled || state != State.WAITING) return false; state = State.CONNECTING; attempts = 0; return true; }
     /** REQ-020.9: Bluetooth off or permission missing; no attempt until {@link #unblock}. */
     public synchronized void block() { if (enabled && (state == State.WAITING || state == State.CONNECTING)) state = State.BLOCKED; }
     public synchronized boolean unblock() { if (!enabled || state != State.BLOCKED) return false; state = State.CONNECTING; attempts = 0; return true; }

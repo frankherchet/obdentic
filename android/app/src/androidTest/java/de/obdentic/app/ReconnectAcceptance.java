@@ -101,6 +101,18 @@ final class ReconnectAcceptance {
             ready(service);
             require(fake.opens.size() == startOpens + 1 && fake.opens.get(startOpens).equals(B), "REQ-020.2 app start connects the known adapter without user action");
 
+            // REQ-020.10: coming to the foreground while waiting starts the attempt at once
+            service.disconnect(); fake.reachable = false; int wakeOpens = fake.opens.size(); service.autoStart();
+            waitFor(() -> fake.opens.size() >= wakeOpens + 3 && !service.snapshot().optBoolean("busy") && service.snapshot().optBoolean("autoPending") && service.snapshot().optString("message").contains("neuer Versuch in"), "REQ-020.10 third failed attempt waits 10 s");
+            SystemClock.sleep(300);
+            int waiting = fake.opens.size(); long woke = SystemClock.elapsedRealtime(); service.resumeIfBlocked();
+            waitFor(() -> fake.opens.size() > waiting, "REQ-020.10 attempt after waking");
+            require(fake.times.get(waiting) - woke < 1500, "REQ-020.10 the attempt follows at once: " + (fake.times.get(waiting) - woke) + " ms");
+            waitFor(() -> fake.opens.size() > waiting + 1, "REQ-020.10 next attempt");
+            long gap = fake.times.get(waiting + 1) - fake.times.get(waiting);
+            require(gap < 3500, "REQ-020.10 the pauses start again at 2 s: " + gap + " ms");
+            fake.reachable = true; service.disconnect(); service.connect(B); ready(service);
+
             // REQ-020.6: switched off, a loss starts no attempt; switching on connects again; persisted
             service.setAutoConnect(false);
             xml = new String(Files.readAllBytes(new File(context.getFilesDir().getParentFile(), "shared_prefs/adapter.xml").toPath()), "UTF-8");
@@ -154,7 +166,7 @@ final class ReconnectAcceptance {
 
     private static void policy() {
         ReconnectPolicy p = new ReconnectPolicy(true);
-        long[] expected = {2000, 5000, 10000, 30000, 30000, 30000};
+        long[] expected = {2000, 5000, 10000, 30000, 60000, 120000, 300000, 300000};
         for (int i = 0; i < expected.length; i++) require(ReconnectPolicy.delayMs(i) == expected[i], "REQ-020.3 pause " + i);
         require(p.lost() == 2000, "REQ-020.3 loss: first pause 2 s");
         for (int i = 1; i < expected.length; i++) { require(p.attemptDue(), "REQ-020.3 pause over"); require(p.failed() == expected[i], "REQ-020.3 pause after failure " + i + " is " + expected[i]); }
@@ -164,6 +176,8 @@ final class ReconnectAcceptance {
         require(p.lost() == -1 && p.failed() == -1 && !p.attemptDue() && !p.pending(), "REQ-020.4 after a manual stop nothing is scheduled");
         p.userConnect();
         require(p.lost() == 2000, "REQ-020.4 a user connection allows attempts after a later loss again");
+        require(p.attemptDue() && p.failed() == 5000 && p.wake() && p.state() == ReconnectPolicy.State.CONNECTING && !p.wake(), "REQ-020.10 the foreground starts a waiting attempt at once");
+        require(p.failed() == 2000, "REQ-020.10 after waking, the pauses start again at 2 s");
         p.stop(); require(p.startup() && p.state() == ReconnectPolicy.State.CONNECTING, "REQ-020.2 an app start begins with an immediate attempt");
         p.block(); require(p.pending() && !p.attemptDue() && p.state() == ReconnectPolicy.State.BLOCKED, "REQ-020.9 blocked: no attempt");
         require(p.unblock() && p.state() == ReconnectPolicy.State.CONNECTING && !p.unblock(), "REQ-020.9 unblock resumes once");

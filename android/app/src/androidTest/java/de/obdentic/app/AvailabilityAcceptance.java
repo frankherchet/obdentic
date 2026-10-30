@@ -76,6 +76,16 @@ final class AvailabilityAcceptance {
             service.runJob("inventory");
             waitFor(() -> service.snapshot().optJSONObject("availability").optLong("started_at_ms") > firstRun && !service.snapshot().optBoolean("busy"), "inventory triggers a new survey");
 
+            // REQ-030.7: a known vehicle gets its ECU identification on every connection, but no automatic availability check
+            service.disconnect(); waitFor(() -> service.snapshot().optString("phase").equals("disconnected"), "disconnected");
+            Set<String> beforeKnown = names(recordings);
+            service.connect(ADAPTER);
+            waitFor(() -> service.snapshot().optString("phase").equals("ready") && service.snapshot().optJSONArray("signals").toString().contains("@vag.") && !service.snapshot().optBoolean("busy"), "REQ-030.7 Knowledge signals after reconnecting a known vehicle");
+            SystemClock.sleep(1500);
+            Set<String> known = names(recordings); known.removeAll(beforeKnown); String profiles = "";
+            for (String n : known) profiles += new JSONObject(Files.readAllLines(new File(recordings, n).toPath()).get(0)).optString("profile") + " ";
+            require(profiles.contains("ecu-discover") && !profiles.contains("knowledge-availability"), "REQ-030.7 ECU identification ran, the availability check did not: " + profiles);
+
             // REQ-030.5: replay restores the statuses without adapter traffic
             service.disconnect(); waitFor(() -> service.snapshot().optString("phase").equals("disconnected"), "disconnected");
             int sent = link[0].commands.size();
