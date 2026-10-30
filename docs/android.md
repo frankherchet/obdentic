@@ -37,6 +37,11 @@ session change) and classifies each as answered, rejected (with the NRC) or not 
 keeping no value. It runs automatically after ECU identification for a newly created vehicle record
 and after every "Fahrzeug und Steuergeräte erfassen" job, writes its own recording and is stored
 with the vehicle record (never exported or shared). Replay restores the statuses from the recording.
+The ECU identification itself (`ecu.discover`, about 18 s) runs after every live connection whose
+inventory identified the manufacturer, also for a known vehicle, because the Knowledge signals only
+exist in the session that identified the ECUs; a stored selection of Knowledge signals is applied
+again afterwards (REQ-030.7). If the multi-frame VIN answer arrives truncated, the inventory reads it
+once more and keeps the manufacturer identified earlier in the connection (REQ-032).
 
 The signal selector shows each Knowledge signal's measured availability ("antwortet", "lehnt ab
 (NRC 0x31)", "ohne Antwort", "ungeprüft"; the stored result of the vehicle record is dated) and a
@@ -101,8 +106,9 @@ live connection still discovers support and the current observation replaces the
 The app remembers the last successfully connected adapter (its address, in the app-private
 `adapter` preferences; backup is disabled and the address is never exported or recorded) and
 connects to exactly that address, directly through GATT and without a scan, when the app starts
-and after an unexpected connection loss (REQ-020). A failed attempt is retried after 2, 5 and
-10 seconds and then every 30 seconds; the status line shows when the next attempt follows. The
+and after an unexpected connection loss (REQ-020). A failed attempt is retried after 2, 5, 10,
+30, 60 and 120 seconds and then every 5 minutes; bringing the app to the foreground starts a waiting
+attempt at once and the pauses start again at 2 seconds (REQ-020.10); the status line shows when the next attempt follows. The
 foreground service stays up while waiting, so retries also run with the screen off. A manual
 "Verbindung trennen", the "Automatische Verbindung stoppen" button, starting the demo or opening
 a replay ends the attempts; none follow until the user connects or the app is started again.
@@ -222,12 +228,15 @@ requires a new connection; existing files remain available as partial recordings
 
 ## Recording, privacy and desktop inspection
 
-**Dauer-Aufzeichnung (REQ-028):** every live connection attempt is recorded
-automatically, from before the first adapter byte, so initialisation, support
+**Dauer-Aufzeichnung (REQ-028):** every live connection is recorded
+automatically once the Bluetooth link is up, before the first adapter byte, so initialisation, support
 discovery and inventory TX/RX are in the file. The file `…-live-auto.jsonl` has the
 normal `OBDENTIC-MOBILE` v1 format with profile `session-auto`; it ends on
-disconnect, error or when the switch is turned off, and a failed attempt still leaves
-a file with its error marker. A new file starts every 30 minutes or 10 MB
+disconnect, error or when the switch is turned off, and an attempt that fails after the link is up still leaves
+a file with its error marker; an attempt that never reaches the adapter writes no file and seals no
+log, only lines in the running app log (REQ-028.12). **Jetzt exportieren** ends the running file as
+`rotated`, continues at once in a new one, seals the app log and exports everything completed
+(REQ-028.11). A new file starts every 30 minutes or 10 MB
 (`session_end` reason `rotated`). A named recording or test sequence closes the
 automatic file and the automatic recording continues after it ends. The switch and
 **Automatische Aufnahmen löschen …** are on the recordings tab. The app never deletes
@@ -240,7 +249,7 @@ with time, level, tag and message, also in Logcat) records service lifecycle, ev
 connection attempt and its outcome, reconnect delays, BLE status codes, diagnostic jobs,
 recording events and exceptions with full stack traces (including uncaught ones). It
 never contains VINs, raw adapter traffic or unmasked Bluetooth addresses. The active
-file is sealed as `app-<timestamp>.log` when a connection ends or at 1 MB; the newest 50
+file is sealed as `app-<timestamp>.log` when a connection ends (disconnect, or an error once the link was up) or at 1 MB; the newest 50
 sealed files are kept. Every export run copies the sealed logs next to the recordings,
 and `tools/pull-recordings.sh` pulls `*.log` too. The log is operational data, not
 vehicle evidence: it cannot be replayed. Every user-visible message (including the reason

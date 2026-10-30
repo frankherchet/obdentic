@@ -605,7 +605,7 @@ requirements:
       named recordings and test sequences keep working as before.
     acceptance:
       - id: REQ-028.1
-        text: When the app starts a live connection attempt (manual or automatic) and the setting "Dauer-Aufzeichnung" is on, a recording starts before the first adapter byte is sent, so initialisation, support discovery and inventory TX/RX are in the file, with the vehicle in the header unknown until the recorded inventory result; an attempt that fails still leaves a file with its error marker; demo and replay never start one.
+        text: When the app starts a live connection attempt (manual or automatic) and the setting "Dauer-Aufzeichnung" is on, a recording starts before the first adapter byte is sent, so initialisation, support discovery and inventory TX/RX are in the file, with the vehicle in the header unknown until the recorded inventory result; an attempt that fails after the adapter link is up still leaves a file with its error marker (see REQ-028.12); demo and replay never start one.
       - id: REQ-028.2
         text: The recording ends with a session_end marker on disconnect, error or user stop, and a reconnect starts a new file; after process death the file stays readable up to at most 5 seconds before the last write.
       - id: REQ-028.3
@@ -642,7 +642,7 @@ requirements:
       identifiers or raw adapter traffic.
     acceptance:
       - id: REQ-029.1
-        text: The app writes text lines "<ISO-8601 time> <LEVEL> <tag> <message>" to the app-private file logs/app.log and to Logcat; the file is sealed under a unique name logs/app-<yyyyMMdd-HHmmss-SSS>.log when it reaches 1 MB or a connection ends (disconnect or error), and only the newest 50 sealed files are kept.
+        text: The app writes text lines "<ISO-8601 time> <LEVEL> <tag> <message>" to the app-private file logs/app.log and to Logcat; the file is sealed under a unique name logs/app-<yyyyMMdd-HHmmss-SSS>.log when it reaches 1 MB or a connection ends (disconnect, or an error once the adapter link was up), and only the newest 50 sealed files are kept.
       - id: REQ-029.2
         text: The log records service start and stop, every connection attempt with its outcome and reason, reconnect delays, BLE connection, service-discovery and write status codes, diagnostic job start and end with duration and ok flag, and recording start, rotation, end and write failure.
       - id: REQ-029.3

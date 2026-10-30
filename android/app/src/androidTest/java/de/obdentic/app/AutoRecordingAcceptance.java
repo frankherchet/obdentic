@@ -18,12 +18,16 @@ final class AutoRecordingAcceptance {
         File dir = new File(context.getFilesDir(), "recordings");
         Set<String> before = names(dir);
         VehicleStore savedStore = service.vehicles; ObdService.Connector savedConnector = service.connector;
-        boolean[] reachable = {true};
+        boolean[] reachable = {true}, linkDead = {false};
+        RecordingExporter.Target savedTarget = service.exportTarget; String savedFolder = RecordingExporter.folder(context);
+        File exportDir = new File(context.getCacheDir(), "export-now-" + System.nanoTime());
         try {
             prefs.edit().clear().commit();
             require(ObdService.autoRecordEnabled(context), "REQ-028.5 the continuous recording is on by default");
             service.vehicles = new VehicleStore(new File(context.getCacheDir(), "autorec-vehicles-" + System.nanoTime() + ".json"));
-            service.connector = address -> { if (!reachable[0]) throw new IOException("Adapter nicht erreichbar"); return service.simulatedLink(); };
+            service.connector = address -> { if (!reachable[0]) throw new IOException("Adapter nicht erreichbar");
+                if (linkDead[0]) return new ObdService.Link() { public boolean isOpen() { return true; } public void close() {} public String exchange(String c, long t) throws Exception { throw new IOException("keine Antwort"); } };
+                return service.simulatedLink(); };
             service.setAutoConnect(false); service.disconnect();
 
             // REQ-028.1 / .2: the file starts before the first adapter byte and ends with the disconnect
@@ -44,15 +48,22 @@ final class AutoRecordingAcceptance {
             JSONObject end = new JSONObject(lastLine(firstFile));
             require(end.optString("type").equals("session_end") && end.optString("reason").equals("disconnected"), "REQ-028.2 session_end on disconnect: " + end);
 
-            // REQ-028.1: an attempt that fails still leaves a file with its error marker
-            reachable[0] = false; Set<String> beforeFail = names(dir);
+            // REQ-028.12: an attempt that never reaches the adapter writes no file and seals no log
+            reachable[0] = false; Set<String> beforeFail = names(dir); List<File> sealedBefore = AppLog.sealed();
             service.connect(ADAPTER); waitFor(() -> service.snapshot().optString("phase").equals("error"), "failed attempt");
-            waitFor(() -> service.snapshot().optString("autoRecording").isEmpty(), "failed attempt closes its recording");
+            SystemClock.sleep(300);
             Set<String> failedFiles = names(dir); failedFiles.removeAll(beforeFail);
-            require(failedFiles.size() == 1, "REQ-028.1 a failed attempt leaves one file: " + failedFiles);
+            require(failedFiles.isEmpty() && service.snapshot().optString("autoRecording").isEmpty(), "REQ-028.12 an unreachable adapter leaves no recording: " + failedFiles);
+            require(AppLog.sealed().equals(sealedBefore), "REQ-028.12 an unreachable adapter seals no app log");
+            // REQ-028.1: an attempt that fails once the link is up still leaves a file with its error marker
+            linkDead[0] = true; reachable[0] = true;
+            service.connect(ADAPTER); waitFor(() -> service.snapshot().optString("phase").equals("error"), "failed attempt with link");
+            waitFor(() -> service.snapshot().optString("autoRecording").isEmpty(), "failed attempt closes its recording");
+            failedFiles = names(dir); failedFiles.removeAll(beforeFail);
+            require(failedFiles.size() == 1, "REQ-028.1 a failed attempt with the link up leaves one file: " + failedFiles);
             String failedName = failedFiles.iterator().next();
             require(failedName.endsWith("-auto.jsonl") && new JSONObject(lastLine(new File(dir, failedName))).optString("reason").equals("error"), "REQ-028.1 the failed attempt ends with an error marker");
-            reachable[0] = true; service.disconnect();
+            linkDead[0] = false; service.disconnect();
 
             // REQ-028.4: a named recording replaces the automatic one, which resumes afterwards
             service.connect(ADAPTER); ready(service);
@@ -94,6 +105,21 @@ final class AutoRecordingAcceptance {
             waitFor(() -> !service.snapshot().optString("autoRecording").equals(timed), "rotation by age"); service.rotateMs = 30L * 60 * 1000;
             require(new JSONObject(lastLine(new File(dir, timed))).optString("reason").equals("rotated"), "REQ-028.3 rotation by age");
 
+            // REQ-028.11: "Jetzt exportieren" - without a folder nothing is closed; with one the running file ends as rotated, recording goes on, log and files are exported
+            service.exportTarget = null; RecordingExporter.setFolder(context, "");
+            String current = service.snapshot().optString("autoRecording"); long seq = service.snapshot().optLong("messageSeq");
+            service.exportCurrent(); waitFor(() -> service.snapshot().optLong("messageSeq") > seq, "export without folder answers");
+            require(service.snapshot().optString("message").contains("Kein Export-Ordner") && service.snapshot().optString("autoRecording").equals(current), "REQ-028.11 without a folder it says so and nothing is closed: " + service.snapshot().optString("message"));
+            require(exportDir.mkdirs(), "test setup: export folder"); service.exportTarget = new AppLogAcceptance.DirTarget(exportDir);
+            String exported = service.snapshot().optString("autoRecording");
+            service.exportCurrent();
+            waitFor(() -> new File(exportDir, exported).isFile() && !service.snapshot().optString("autoRecording").equals(exported) && !service.snapshot().optString("autoRecording").isEmpty(), "export now");
+            require(new JSONObject(lastLine(new File(dir, exported))).optString("reason").equals("rotated"), "REQ-028.11 the running file ends as rotated");
+            require(new JSONObject(lastLine(new File(exportDir, exported))).optString("reason").equals("rotated"), "REQ-028.11 the exported copy is complete");
+            String[] logs = exportDir.list((d, n) -> n.matches("app-.*\\.log"));
+            require(logs != null && logs.length > 0, "REQ-028.11 the sealed app log is exported");
+            service.exportTarget = savedTarget;
+
             // REQ-028.5: the switch persists and closes the running recording; off means no recording
             String running = service.snapshot().optString("autoRecording");
             service.setAutoRecord(false); waitFor(() -> service.snapshot().optString("autoRecording").isEmpty(), "switch off closes the recording");
@@ -129,6 +155,8 @@ final class AutoRecordingAcceptance {
             for (int i = 0; i < signals.length(); i++) if ("supported".equals(signals.getJSONObject(i).optString("status"))) supported++;
             require(supported > 0, "REQ-028.10 signal support is re-derived from the recorded handshake");
         } finally {
+            service.exportTarget = savedTarget; RecordingExporter.setFolder(context, savedFolder);
+            File[] copies = exportDir.listFiles(); if (copies != null) for (File f : copies) f.delete(); exportDir.delete();
             dir.setWritable(true); service.disconnect(); service.connector = savedConnector; service.vehicles = savedStore; service.rotateBytes = 10L * 1024 * 1024; service.rotateMs = 30L * 60 * 1000;
             prefs.edit().clear().commit();
             service.setDemo(); // the runner continues in demo mode

@@ -1008,6 +1008,7 @@ impl<E: Exchange> MobileCore<E> {
                 self.vehicle_manufacturer = earlier; // REQ-032.2: same connection, same vehicle
             }
         }
+        data["knowledge_manufacturer"] = json!(self.vehicle_manufacturer); // REQ-030.7
         if self
             .session
             .as_ref()
@@ -1312,6 +1313,7 @@ mod tests {
         assert!(inventory["data"]["identity_error"].is_null(), "{inventory}");
         assert_eq!(inventory["data"]["vin"], "WVWZZZ1JZXW000001");
         assert_eq!(core.vehicle_manufacturer.as_deref(), Some("vag"));
+        assert_eq!(inventory["data"]["knowledge_manufacturer"], "vag"); // REQ-030.7
     }
 
     #[test]

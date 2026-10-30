@@ -173,8 +173,7 @@ public final class ObdService extends Service {
         if(!foreground()) { busy=false; set("phase","error"); return false; }
         worker.execute(() -> {
             try {
-                startAutoRecording(); // REQ-028.1: before the first adapter byte, so the handshake is in the file
-                destroyCore(); Link next;
+                linked=false; destroyCore(); Link next;
                 if(connector != null) { next=connector.open(address); if(token != generation) { next.close(); return; } transport=next; }
                 else {
                     BleTransport ble=new BleTransport(this::debug); transport=ble;
@@ -183,6 +182,7 @@ public final class ObdService extends Service {
                     ble.connect(this,adapter.getRemoteDevice(address)); next=ble; // direct GATT connect to the exact address, no scan needed
                 }
                 if(token != generation) return;
+                linked=true; startAutoRecording(); // REQ-028.1: before the first adapter byte; REQ-028.12: only once the link is up
                 core=NativeCore.create(next); initialize(token);
                 if(token == generation && phase().equals("ready")) connected(address);
             } catch(Throwable e) { fail(token,e); } finally { if(token==generation) { busy=false; changed(); } }
@@ -225,7 +225,10 @@ public final class ObdService extends Service {
     }
     /** REQ-020.9: Bluetooth turned on, or the app came back to the foreground (permission may have been granted). */
     public void resumeIfBlocked() {
-        main.post(() -> { if(policy.state() == ReconnectPolicy.State.BLOCKED && environmentBlocker() == null && policy.unblock()) attempt(); });
+        main.post(() -> {
+            if(policy.state() == ReconnectPolicy.State.BLOCKED && environmentBlocker() == null && policy.unblock()) attempt();
+            else if(policy.wake()) { main.removeCallbacks(retryTick); attempt(); } // REQ-020.10
+        });
     }
     /** Main thread; the policy is CONNECTING. Only ever connects the exact known address (REQ-020.5). */
     private void attempt() {
@@ -277,7 +280,9 @@ public final class ObdService extends Service {
         JSONObject inventory=execute("inventory","");
         if(token!=generation) return;
         String outcome=observeVehicle(inventory.optJSONObject("data")), notice=vehicleNotice(outcome,inventory.optJSONObject("data"));
-        if(outcome.equals("created") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add(AVAILABILITY); worker.execute(() -> runJob("ecu.discover")); } // REQ-030.4: a new vehicle is surveyed once it is ready
+        boolean knowledge=inventory.optJSONObject("data")!=null && !inventory.optJSONObject("data").isNull("knowledge_manufacturer");
+        // REQ-030.7: ECU identification on every connection (Knowledge signals live in the session); REQ-030.4: availability for a new vehicle only
+        if(knowledge && autoSurvey && mode.equals("live")) { chain.clear(); if(outcome.equals("created")) chain.add(AVAILABILITY); worker.execute(() -> runJob("ecu.discover")); }
         readOdometer(inventory.optJSONObject("data"),outcome);
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
@@ -530,6 +535,7 @@ public final class ObdService extends Service {
                         String key=action.equals("ecu.discover")?"ecuDiscovery":action.equals(AVAILABILITY)?"availability":"knowledgeLearning";
                         set(key,result.opt("data"));
                         applyCatalog(execute("catalog",""));
+                        if(action.equals("ecu.discover")) restoreSelection(diagnosticVin); // REQ-030.7: a stored Knowledge selection applies once its signals exist
                     }
                 }
                 JSONObject data=result.optJSONObject("data");
@@ -675,7 +681,7 @@ public final class ObdService extends Service {
         }
         set("recording",""); set("autoRecording","");
         AppLog.i("rec","end "+closed+" reason "+reason+(detail.isEmpty()?"":" ("+detail+")"));
-        if(reason.equals("disconnected") || reason.equals("error")) AppLog.seal(); // REQ-029.1: one sealed log per connection
+        if(reason.equals("disconnected") || (reason.equals("error") && linked)) AppLog.seal(); // REQ-029.1: one sealed log per connection; REQ-028.12: none per unreachable attempt
         if(completed && !wasAuto) message(reason.equals("stopped")?"Aufzeichnung gespeichert":reason.equals("completed")?"Messung gespeichert":reason.equals("error")?"Aufzeichnung mit Fehler beendet: "+detail:"Aufzeichnung nach Trennen gespeichert");
         if(completed && !closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty())) exportNow(closed); // REQ-018.4: any ending reason
         if(resumeAuto && completed && !wasAuto && (reason.equals("stopped") || reason.equals("completed")) && mode.equals("live") && phase().equals("ready")) startAutoRecording(); // REQ-028.4
@@ -691,6 +697,7 @@ public final class ObdService extends Service {
     }
     /** Test seam (REQ-018): when set, replaces the stored folder as export destination. */
     public volatile RecordingExporter.Target exportTarget;
+    private volatile boolean linked; // REQ-028.12: the current attempt reached the adapter link
     public void exportAll() { if(!worker.isShutdown()) worker.execute(() -> exportNow(null)); }
     /** REQ-018.2/.3/.6: worker thread only. Copies completed recordings (all, or just {@code only}); the recording being written is never a candidate. */
     private void exportNow(String only) {
@@ -718,14 +725,25 @@ public final class ObdService extends Service {
     /** REQ-028.3: caller holds recordLock. Closes the automatic file as "rotated" and continues in a new one that starts with a fresh header. */
     private void rotateIfDue() throws IOException {
         if(!recordingProfile.equals(AUTO_PROFILE) || (recordingBytes<rotateBytes && SystemClock.elapsedRealtime()-recordingStartedAt<rotateMs)) return;
+        String closed=rotate();
+        if(!closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(closed)); // REQ-018.4: any ending reason
+    }
+    /** Caller holds recordLock and an automatic file is open. Ends it as "rotated" and continues in a new one; returns the closed name. */
+    private String rotate() throws IOException {
         String closed; synchronized(stateLock) { closed=state.optString("autoRecording"); }
         JSONObject end=new JSONObject(); put(end,"type","session_end"); put(end,"reason","rotated"); put(end,"at",System.currentTimeMillis());
         put(end,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
         writer.write(end.toString()); writer.newLine(); writer.flush(); writer.close(); writer=null; AppLog.i("rec","rotated "+closed);
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
         if(!beginRecording(AUTO_PROFILE,selected==null?new JSONArray():selected)) { recordingProfile=""; set("autoRecording",""); }
-        if(!closed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) && !worker.isShutdown()) worker.execute(() -> exportNow(closed)); // REQ-018.4: any ending reason
+        return closed;
     }
+    /** REQ-028.11: "Jetzt exportieren" - ends the running automatic file, seals the app log and exports everything completed; recording goes on. */
+    public void exportCurrent() { if(!worker.isShutdown()) worker.execute(() -> {
+        if(exportTarget==null && RecordingExporter.folder(this).isEmpty()) { message("Kein Export-Ordner gewählt"); return; }
+        synchronized(recordLock) { if(writer!=null && recordingProfile.equals(AUTO_PROFILE)) try { rotate(); } catch(IOException e) { AppLog.e("rec","rotate failed",e); } }
+        AppLog.seal(); exportNow(null);
+    }); }
     /** REQ-028.7: removes completed automatic recordings; the running file, named recordings and a loaded replay stay. */
     public void deleteAutoRecordings() { if(!worker.isShutdown()) worker.execute(() -> {
         int removed=0; long freed=0;

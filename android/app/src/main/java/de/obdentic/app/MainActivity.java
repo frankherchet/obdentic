@@ -69,6 +69,7 @@ public class MainActivity extends Activity {
         AUTO_RECORD=new PendingActions.Spec("auto.record","Dauer-Aufzeichnung","Ändere Dauer-Aufzeichnung …",10000,(n,b)->n.optBoolean("autoRecord")!=b.optBoolean("autoRecord")),
         AUTO_RECORD_DELETE=new PendingActions.Spec("auto.record.delete","Automatische Aufnahmen löschen","Lösche automatische Aufnahmen …",60000,MainActivity::msg),
         AUTO_EXPORT=new PendingActions.Spec("auto.export","Automatischer Export","Ändere automatischen Export …",10000,(n,b)->n.optBoolean("autoExport")!=b.optBoolean("autoExport")),
+        EXPORT_NOW=new PendingActions.Spec("export.now","Jetzt exportieren","Exportiere …",60000,MainActivity::msg),
         EXPORT_ALL=new PendingActions.Spec("export.all","Alle exportieren","Exportiere …",60000,MainActivity::msg),
         UDS_ENABLE=new PendingActions.Spec("uds.enable","UDS-Sitzung aktivieren","UDS-Sitzung wird aktiviert …",10000,(n,b)->udsActive(n)!=udsActive(b)||msg(n,b)),
         UDS_DISABLE=new PendingActions.Spec("uds.disable","UDS-Sitzung beenden","Standard-Sitzung wird wiederhergestellt …",10000,(n,b)->udsActive(n)!=udsActive(b)||msg(n,b)),
@@ -370,9 +371,10 @@ public class MainActivity extends Activity {
     private void autoRecordCard(){
         boolean on=state.optBoolean("autoRecord",true);
         LinearLayout c=card();note(c,"DAUER-AUFZEICHNUNG",ACCENT);
-        note(c,"Jede Live-Verbindung wird ab dem ersten Verbindungsversuch automatisch aufgezeichnet (…-auto.jsonl, alle 30 min oder 10 MB neue Datei). Die App löscht nichts selbst.",MUTED);
+        note(c,"Jede Live-Verbindung wird ab dem Verbindungsaufbau zum Adapter automatisch aufgezeichnet (…-auto.jsonl, alle 30 min oder 10 MB neue Datei). Die App löscht nichts selbst.",MUTED);
         if(!state.optString("autoRecording").isEmpty())note(c,"● "+state.optString("autoRecording"),ACCENT);
         actionButton(c,AUTO_RECORD,"","Dauer-Aufzeichnung: "+(on?"an":"aus"),true,()->perform(AUTO_RECORD,"",()->service().setAutoRecord(!on)));
+        actionButton(c,EXPORT_NOW,"","Jetzt exportieren",true,()->perform(EXPORT_NOW,"",()->service().exportCurrent())); // REQ-028.11
         actionButton(c,AUTO_RECORD_DELETE,"","Automatische Aufnahmen löschen …",true,()->new AlertDialog.Builder(this).setTitle("Automatische Aufnahmen löschen?").setMessage("Alle abgeschlossenen automatischen Aufnahmen werden dauerhaft gelöscht. Benannte Aufnahmen und exportierte Kopien bleiben.").setPositiveButton("Löschen",(d,w)->perform(AUTO_RECORD_DELETE,"",()->service().deleteAutoRecordings())).setNegativeButton("Abbrechen",null).show());
     }
     /** REQ-018: export folder, one-tap and automatic export, share sheet. */
