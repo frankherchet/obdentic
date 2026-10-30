@@ -88,6 +88,8 @@ public final class AcceptanceRunner extends Instrumentation {
             waitIdle();
             passed("Live RPM/coolant readings and changing observation selection");
             activity = PendingFeedbackAcceptance.run(this, activity, service); // recreates the Activity (REQ-021.6)
+            RecordingListAcceptance.run(this, service);
+            passed("Recordings tab with 3000 extra recordings (REQ-028.13): opens fast, lists the newest 30, states how many older ones are not shown, snapshots stay fast; debug tab is one full-height window that follows the newest line (REQ-033.1)");
             passed("Pending feedback (REQ-021): disabled pending button with text, indicator and content description, tap while pending ignored, state survives tab switch and Activity recreation, ends on the observed target state, time-limit message and usable button, announcements, real recording start and stop");
 
             job("inventory");

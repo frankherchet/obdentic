@@ -282,6 +282,8 @@ The **EXPORT** card on the recordings tab offers:
   copied right after it ends (stop, completion, disconnect or error).
   Every export runs on its own thread, so copying into a large folder never holds up
   polling, jobs or the connection (REQ-018.9).
+- The list shows the newest 30 recordings and how many older ones are hidden; export and
+  sharing still cover all of them (REQ-028.13).
 - **Aufnahmen teilen …**: hands all completed recordings to the Android share sheet
   as read-only content URIs.
 
@@ -409,6 +411,8 @@ version again. Missing secrets are listed by name in the failing step.
 ## Acceptance
 
 Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals); ids stay in the Debug tab.
+
+The Debug tab is one full-height TX/RX window that scrolls to the newest line after every update (REQ-033.1).
 
 Build and install the instrumentation APK, then run it with the phone unlocked:
 

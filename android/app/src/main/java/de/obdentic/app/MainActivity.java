@@ -92,6 +92,8 @@ public class MainActivity extends Activity {
     private Button chip;
     private TextView debugLog;
     private int tab=0;
+    private static final int SHOWN_RECORDS=30;
+    private String shownRecords(){JSONArray r=array("records"),shown=new JSONArray();for(int i=0;i<Math.min(r.length(),SHOWN_RECORDS);i++)shown.put(r.opt(i));return shown.toString();}
     private String structure="", profile="";
     private String historyMode="";
     private boolean launchDemo=false, scanAfterPermission=false;
@@ -169,13 +171,13 @@ public class MainActivity extends Activity {
         String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+state.optString("autoRecording")+state.optBoolean("autoRecord")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
-        if(tab==2)key+="|"+array("records")+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile");
+        if(tab==2)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+array("profiles")+"|"+profile+"|"+state.optString("replayFile");
         if(tab==3)key+="|"+(array("debug").length()==0);
         if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
-        if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->scroll.scrollTo(0,y));}
+        if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->{if(debugLog!=null)scroll.fullScroll(View.FOCUS_DOWN);else scroll.scrollTo(0,y);});}
         updateValues();
         updateUdsStatus();
-        if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText()))debugLog.setText(content);}
+        if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText())){debugLog.setText(content);scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));}}
     }
     private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
     private String udsStructureKey(){JSONObject uds=state.optJSONObject("uds");return uds==null?"":uds.optString("state")+"|"+uds.optBoolean("active")+"|"+uds.optString("error")+"|"+uds.optString("target",uds.optString("target_id"));}
@@ -365,7 +367,9 @@ public class MainActivity extends Activity {
         autoRecordCard();
         exportCard();
         JSONArray records=array("records");if(records.length()==0)empty("Noch keine Aufnahmen","Starte eine Aufzeichnung im Live- oder Demomodus. Die Dateien bleiben auf diesem Handy.");
-        for(int i=0;i<records.length();i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");LinearLayout item=card();note(item,name,TEXT);note(item,record.optLong("bytes")+" Bytes",MUTED);addButton(item,"Als Replay öffnen",()->act(()->{service().openRecording(name);tab=0;buildNav();structure="";}));addButton(item,"Datei exportieren …",()->export(name));Button delete=addButton(item,"Aufnahme löschen …",()->confirmDeleteRecording(name));delete.setEnabled(!name.equals(state.optString("recording"))&&!name.equals(state.optString("replayFile")));}
+        // REQ-028.13: only the newest ones; thousands of cards froze the main thread
+        if(records.length()>SHOWN_RECORDS)note(card(),(records.length()-SHOWN_RECORDS)+" ältere Aufnahmen nicht angezeigt – Export und Teilen erfassen alle.",MUTED);
+        for(int i=0;i<Math.min(records.length(),SHOWN_RECORDS);i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");LinearLayout item=card();note(item,name,TEXT);note(item,record.optLong("bytes")+" Bytes",MUTED);addButton(item,"Als Replay öffnen",()->act(()->{service().openRecording(name);tab=0;buildNav();structure="";}));addButton(item,"Datei exportieren …",()->export(name));Button delete=addButton(item,"Aufnahme löschen …",()->confirmDeleteRecording(name));delete.setEnabled(!name.equals(state.optString("recording"))&&!name.equals(state.optString("replayFile")));}
     }
     /** REQ-028: always-on session recording switch and delete-all. */
     private void autoRecordCard(){
@@ -453,12 +457,12 @@ public class MainActivity extends Activity {
     private void confirmDeleteVehicle(String vin,String name){new AlertDialog.Builder(this).setTitle("Fahrzeug endgültig löschen?").setMessage(name+"\n\nDer Eintrag wird dauerhaft aus dem internen Speicher gelöscht. Aufnahmen bleiben erhalten.").setPositiveButton("Endgültig löschen",(d,w)->perform(VEHICLE_DELETE,":"+vin,()->service().deleteVehicle(vin))).setNegativeButton("Abbrechen",null).show();}
     private void confirmResetVehicles(){new AlertDialog.Builder(this).setTitle("Fahrzeugspeicher zurücksetzen?").setMessage("Alle gespeicherten Fahrzeuge werden dauerhaft gelöscht und der Speicher wird neu angelegt. Aufnahmen bleiben erhalten.").setPositiveButton("Zurücksetzen",(d,w)->act(()->service().resetVehicleStore())).setNegativeButton("Abbrechen",null).show();}
     private void confirmDeleteRecording(String name){new AlertDialog.Builder(this).setTitle("Aufnahme endgültig löschen?").setMessage("Diese Datei wird dauerhaft aus dem internen Speicher gelöscht. Exportierte Kopien bleiben bestehen.\n\n"+name).setPositiveButton("Endgültig löschen",(dialog,which)->act(()->service().deleteRecording(name))).setNegativeButton("Abbrechen",null).show();}
+    /** One full-height window; the page itself scrolls and always follows the newest line (bottom). */
     private void debug(){
-        title("Debug-Daten","Zeitgestempelte TX/RX-Daten dieser Sitzung");
         addButton(body,"Debug-Daten lokal kopieren",()->{ClipboardManager cm=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);cm.setPrimaryClip(ClipData.newPlainText("OBDentic Debug",debugText()));toast("In die lokale Zwischenablage kopiert");});
         note(body,"Kann VIN, Steuergerätekennungen und weitere Fahrzeugdaten enthalten. Nur gezielt teilen.",MUTED);
         if(array("debug").length()==0)empty("Noch kein Datenverkehr","Verbinden oder einen Diagnoseauftrag starten. Hier erscheinen gesendete Befehle, Antworten und Dienstmeldungen.");
-        else{LinearLayout c=card();debugLog=text(debugText(),12,TEXT);debugLog.setTypeface(Typeface.MONOSPACE);debugLog.setTextIsSelectable(true);c.addView(debugLog);}
+        else{debugLog=text(debugText(),12,TEXT);debugLog.setTypeface(Typeface.MONOSPACE);debugLog.setTextIsSelectable(true);debugLog.setMinHeight(scroll.getHeight());body.addView(debugLog);}
     }
     private String debugText(){StringBuilder s=new StringBuilder();JSONArray logs=array("debug");for(int i=0;i<logs.length();i++){JSONObject j=logs.optJSONObject(i);if(j==null){s.append(logs.optString(i)).append('\n');continue;}s.append(j.optString("at")).append("  ").append(j.optString("direction")).append("  ").append(j.optString("text")).append('\n');}return s.toString();}
     private void connection(){
