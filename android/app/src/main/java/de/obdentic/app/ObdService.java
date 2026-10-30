@@ -762,11 +762,15 @@ public final class ObdService extends Service {
         JSONObject event=new JSONObject(); put(event,"type","wire"); put(event,"direction",direction); put(event,"text",text); put(event,"at",System.currentTimeMillis()); record(event);
         synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } changed();
     }
-    public JSONArray listRecords() {
-        JSONArray records=new JSONArray(); File[] files=new File(getFilesDir(),"recordings").listFiles(); if(files==null) return records;
-        Arrays.sort(files,(a,b) -> Long.compare(b.lastModified(),a.lastModified()));
-        for(File file:files) if(file.isFile() && file.getName().endsWith(".jsonl")) { JSONObject row=new JSONObject(); put(row,"name",file.getName()); put(row,"bytes",file.length()); put(row,"modified",file.lastModified()); records.put(row); }
-        return records;
+    private JSONArray recordsCache=new JSONArray(); private long recordsStamp=-1; private int recordsCount=-1;
+    /** REQ-028.13: rebuilt only when the folder changes; snapshot() runs every 500 ms on the main thread. ponytail: the size of the file being written refreshes with the next folder change. */
+    public synchronized JSONArray listRecords() {
+        File directory=new File(getFilesDir(),"recordings"); String[] names=directory.list(); if(names==null) return new JSONArray();
+        long stamp=directory.lastModified(); if(stamp==recordsStamp && names.length==recordsCount) return recordsCache;
+        Arrays.sort(names,Collections.reverseOrder()); // names start with the timestamp: newest first
+        JSONArray records=new JSONArray();
+        for(String name:names) { File file=new File(directory,name); if(name.endsWith(".jsonl") && file.isFile()) { JSONObject row=new JSONObject(); put(row,"name",name); put(row,"bytes",file.length()); put(row,"modified",file.lastModified()); records.put(row); } }
+        recordsCache=records; recordsStamp=stamp; recordsCount=names.length; return records;
     }
     public void deleteRecording(String filename) {
         if(!worker.isShutdown()) worker.execute(() -> deleteRecordingNow(filename));

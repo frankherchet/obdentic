@@ -630,6 +630,8 @@ requirements:
         text: A button "Jetzt exportieren" next to the continuous-recording switch ends the running automatic file with session_end reason "rotated", continues recording in a new file at once, seals the app log and exports all completed recordings and sealed logs to the export folder; without an export folder it says so and nothing is closed.
       - id: REQ-028.12
         text: An automatic connection attempt that never reaches the adapter (Bluetooth link not established) writes no recording file and seals no app log; the attempt and its error are written to the running app log only.
+      - id: REQ-028.13
+        text: With thousands of recordings on the phone the recordings tab lists only the newest 30 and states how many older ones are not shown (export and sharing still cover all); opening the tab with 3000 extra recordings takes under 1.5 seconds and the app never stops responding.
 
   - id: REQ-029
     title: Keep a rolling app debug log separate from vehicle evidence
@@ -720,3 +722,15 @@ requirements:
         text: When the Mode 09 VIN answer of an inventory is a truncated or malformed multi-frame answer, the inventory repeats the read exactly once (a NO DATA or rejected answer is not repeated); a successful repeat yields the same result as a first-time success.
       - id: REQ-032.2
         text: When both reads fail, the inventory reports identity_error and keeps the manufacturer identified earlier in the same connection, so ECU identification still runs; without an earlier identification it fails as before.
+
+  - id: REQ-033
+    title: Read the live debug log without scrolling by hand
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-10-30, request by @frankherchet"
+    description: >
+      While testing in the vehicle the user watches the TX/RX log and wants the newest lines in view.
+    acceptance:
+      - id: REQ-033.1
+        text: The debug tab shows the session's TX/RX log as one window at least as tall as the visible screen, without a card or title around it, and after every new line it scrolls so the newest line (bottom) is visible.
