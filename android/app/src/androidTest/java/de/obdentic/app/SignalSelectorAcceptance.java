@@ -141,6 +141,25 @@ public final class SignalSelectorAcceptance {
             require(screen.activeSignalSelector == null, "REQ-025.5 selector does not open during recording");
             require(before.equals(service.snapshot().optJSONArray("selected").toString()),
                 "REQ-025.5 recording keeps its signal selection unchanged");
+
+            // REQ-025.7: the Live button stops the recording; the recordings tab has no profile chooser any more
+            String recorded = service.snapshot().optString("recording");
+            waitFor(() -> main.call(() -> findButton(activity.getWindow().getDecorView(), "Aufzeichnung stoppen") != null), "REQ-025.7 stop button in Live");
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Aufzeichnung stoppen").performClick(); return null; });
+            waitFor(() -> service.snapshot().optString("recording").isEmpty(), "REQ-025.7 the Live button stopped the recording");
+            service.deleteRecording(recorded);
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Aufnahmen").performClick(); return null; });
+            waitFor(() -> main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "DAUER-AUFZEICHNUNG")), "recordings tab");
+            require(main.call(() -> !hasTextContaining(activity.getWindow().getDecorView(), "AUFNAHMEPROFIL") && findButton(activity.getWindow().getDecorView(), "Aufzeichnung starten") == null), "REQ-025.7 no recording profile on the recordings tab");
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Live").performClick(); return null; });
+
+            // REQ-025.6: a built-in preset (former recording profile) selects its signals, without a vehicle preset
+            service.setSignals(new JSONArray()); waitFor(() -> service.snapshot().optJSONArray("selected").length() == 0, "selection cleared");
+            service.applySignalPreset(ObdService.BUILTIN + "engine-drive");
+            waitFor(() -> service.snapshot().optString("message").startsWith("Vorlage angewendet"), "REQ-025.6 built-in preset applied: " + service.snapshot().optString("message"));
+            String chosenNow = service.snapshot().optJSONArray("selected").toString();
+            require(chosenNow.contains("engine.rpm") && chosenNow.contains("vehicle.speed"), "REQ-025.6 the built-in preset selected its signals: " + chosenNow);
+            service.setSignals(original);
         } finally {
             Dialog active = screen.activeSignalSelector;
             if (active != null) main.call(() -> { active.dismiss(); return null; });
@@ -221,6 +240,10 @@ public final class SignalSelectorAcceptance {
         return null;
     }
 
+    private static Button findButton(View root, String label) {
+        for (Button button : findAll(root, Button.class)) if (label.contentEquals(button.getText())) return button;
+        return null;
+    }
     private static Button requireButton(View root, String label) {
         for (Button button : findAll(root, Button.class)) if (label.contentEquals(button.getText())) return button;
         throw new AssertionError("Missing button: " + label);

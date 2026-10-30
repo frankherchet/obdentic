@@ -20,7 +20,7 @@ import java.util.concurrent.FutureTask;
  */
 final class PendingFeedbackAcceptance {
     private static final PendingActions.Spec NEVER = new PendingActions.Spec("rec.start","Aufzeichnung starten","Aufzeichnung wird gestartet …",60000,(n,b)->false);
-    private static final String START = "Aufzeichnung starten", START_PENDING = "Aufzeichnung wird gestartet …", STOP = "Aufzeichnung stoppen", STOP_PENDING = "Aufzeichnung wird gestoppt …";
+    private static final String START = "Gewählte Messwerte aufzeichnen", START_PENDING = "Aufzeichnung wird gestartet …", STOP = "Aufzeichnung stoppen", STOP_PENDING = "Aufzeichnung wird gestoppt …";
 
     /** Demo service ready and idle, the Activity in front. Returns the Activity that is current afterwards (REQ-021.6 recreates it). */
     static Activity run(Instrumentation inst, Activity activity, ObdService service) throws Exception {
@@ -28,7 +28,8 @@ final class PendingFeedbackAcceptance {
         PendingActions pending = service.pending;
         require(pending.signature().equals("[]") && service.snapshot().optString("recording").isEmpty(), "REQ-021 precondition: nothing pending, nothing recording");
         until(() -> MainActivity.resumed == activity, "Activity in front");
-        click(inst, "Aufnahmen"); // the recording buttons live on this tab
+        service.setSignals(new org.json.JSONArray().put("engine.rpm")); until(() -> service.snapshot().optJSONArray("selected").length() == 1 && !service.snapshot().optBoolean("busy"), "a selection to record");
+        click(inst, "Live"); // REQ-025.7: the recording button lives on the Live tab
 
         // REQ-021.1/.5: a pending button is disabled, shows the pending text and an indicator, and says so to accessibility services.
         pending.start(NEVER,"",service.snapshot(),SystemClock.elapsedRealtime());
@@ -44,7 +45,7 @@ final class PendingFeedbackAcceptance {
         require(service.snapshot().optString("recording").isEmpty() && pending.signature().equals("[rec.start]"), "REQ-021.4 a tap while pending starts no recording: "+service.snapshot().optString("recording"));
 
         // REQ-021.6: the pending state survives tab switches and Activity recreation.
-        click(inst, "Live"); click(inst, "Aufnahmen");
+        click(inst, "Aufnahmen"); click(inst, "Live");
         require(awaitButton(inst, START_PENDING) != null, "REQ-021.6 pending after a tab switch");
         inst.runOnMainSync(activity::recreate);
         until(() -> MainActivity.resumed != null && MainActivity.resumed != activity, "recreated Activity in front");
