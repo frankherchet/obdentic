@@ -194,23 +194,24 @@ fn classify_normalized(
         };
         (status, None, None)
     } else {
-        let payload = matching[0].payload();
-        if matching
+        let payloads = matching
             .iter()
-            .skip(1)
-            .any(|response| response.payload() != payload)
-        {
-            errors.push(format!(
-                "conflicting ECU identification payloads from responder {expected_value}"
-            ));
-            (IdentificationResultStatus::Malformed, None, None)
-        } else if has_expected_error {
-            errors.push(format!(
-                "responder {expected_value} produced malformed ECU identification framing"
-            ));
-            (IdentificationResultStatus::Malformed, None, None)
-        } else {
-            match candidate
+            .map(|response| response.payload())
+            .collect::<Vec<_>>();
+        match decisive_identification_payload(&payloads) {
+            None => {
+                errors.push(format!(
+                    "conflicting ECU identification payloads from responder {expected_value}"
+                ));
+                (IdentificationResultStatus::Malformed, None, None)
+            }
+            Some(_) if has_expected_error => {
+                errors.push(format!(
+                    "responder {expected_value} produced malformed ECU identification framing"
+                ));
+                (IdentificationResultStatus::Malformed, None, None)
+            }
+            Some(payload) => match candidate
                 .operation()
                 .validate_response(payload, candidate.semantic())
             {
@@ -226,7 +227,7 @@ fn classify_normalized(
                     errors.push(error.to_string());
                     (IdentificationResultStatus::Malformed, None, None)
                 }
-            }
+            },
         }
     };
 
@@ -235,7 +236,28 @@ fn classify_normalized(
     )
 }
 
-fn status_for_nrc(nrc: u8) -> IdentificationResultStatus {
+/// Shared by live and replay classification. NRC 0x21 (busyRepeatRequest) is
+/// intermediate: it never decides a status while a final response exists.
+pub(crate) fn is_busy_response(payload: &[u8]) -> bool {
+    payload == [0x7f, 0x22, 0x21]
+}
+
+/// Picks the payload that decides a status from one expected responder's
+/// responses in arrival order. The last non-busy payload wins; if only busy
+/// responses arrived, the last busy one decides. Returns `None` when there is
+/// no response or when final responses disagree.
+pub(crate) fn decisive_identification_payload<'a>(payloads: &[&'a [u8]]) -> Option<&'a [u8]> {
+    let mut finals = payloads
+        .iter()
+        .copied()
+        .filter(|payload| !is_busy_response(payload));
+    let Some(first) = finals.next() else {
+        return payloads.last().copied();
+    };
+    finals.all(|payload| payload == first).then_some(first)
+}
+
+pub(crate) fn status_for_nrc(nrc: u8) -> IdentificationResultStatus {
     match nrc {
         // serviceNotSupported and requestOutOfRange are the bounded evidence
         // used here for an explicitly unsupported standard identification read.
@@ -414,6 +436,88 @@ mod tests {
         assert_eq!(b_f188.status(), IdentificationResultStatus::Unsupported);
         assert_eq!(b_f189.status(), IdentificationResultStatus::Supported);
         assert_ne!(a_f188.expected_responder(), b_f188.expected_responder());
+    }
+
+    // REQ-023.7
+    #[test]
+    fn req_023_7_busy_responses_before_final_response_are_intermediate() {
+        let plan = plan();
+        let f188 = candidate(&plan, 0xf188);
+        let ecu = mapping("7E0", "7E8", Confidence::Verified);
+        let busy = [0x7f, 0x22, 0x21];
+
+        let positive = classify_normalized(
+            &plan,
+            &f188,
+            &ecu,
+            vec![
+                response(&ecu, &busy),
+                response(&ecu, &busy),
+                response(&ecu, &[0x62, 0xf1, 0x88, b'A']),
+            ],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let busy_then_nrc = classify_normalized(
+            &plan,
+            &f188,
+            &ecu,
+            vec![response(&ecu, &busy), response(&ecu, &[0x7f, 0x22, 0x31])],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let only_busy = classify_normalized(
+            &plan,
+            &f188,
+            &ecu,
+            vec![
+                response(&ecu, &busy),
+                response(&ecu, &busy),
+                response(&ecu, &busy),
+            ],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let conflicting_final = classify_normalized(
+            &plan,
+            &f188,
+            &ecu,
+            vec![
+                response(&ecu, &busy),
+                response(&ecu, &[0x62, 0xf1, 0x88, b'A']),
+                response(&ecu, &[0x62, 0xf1, 0x88, b'B']),
+            ],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(positive.status(), IdentificationResultStatus::Supported);
+        assert_eq!(positive.value(), Some(&b"A"[..]));
+        assert_eq!(positive.nrc(), None);
+        assert_eq!(positive.responses().len(), 3);
+        assert_eq!(
+            busy_then_nrc.status(),
+            IdentificationResultStatus::Unsupported
+        );
+        assert_eq!(busy_then_nrc.nrc(), Some(0x31));
+        assert_eq!(
+            only_busy.status(),
+            IdentificationResultStatus::NegativeResponse
+        );
+        assert_eq!(only_busy.nrc(), Some(0x21));
+        assert_eq!(only_busy.value(), None);
+        assert_eq!(
+            conflicting_final.status(),
+            IdentificationResultStatus::Malformed
+        );
     }
 
     #[test]

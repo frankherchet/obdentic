@@ -3,6 +3,7 @@ use crate::{
         EcuIdentificationPlan, IdentificationCandidate, IdentificationObservation,
         IdentificationResponseEvidence, IdentificationResultStatus,
     },
+    ecu_identification_discovery::{decisive_identification_payload, status_for_nrc},
     effective_knowledge::{EffectiveVehicleKnowledge, ObservedEcuFacts},
     elm::{ReadEvidence, ReadEvidenceError},
     knowledge_db::{
@@ -469,11 +470,9 @@ pub(super) fn identification_observation(
         errors.push(error);
     }
     let (status, nrc, value) = match payload.as_deref() {
-        Some(response) if response.starts_with(&[0x7f, 0x22]) && response.len() == 3 => (
-            identification_status_for_nrc(response[2]),
-            Some(response[2]),
-            None,
-        ),
+        Some(response) if response.starts_with(&[0x7f, 0x22]) && response.len() == 3 => {
+            (status_for_nrc(response[2]), Some(response[2]), None)
+        }
         Some(response) => match definition.validate_response(response) {
             Ok(value) => (
                 IdentificationResultStatus::Supported,
@@ -1140,7 +1139,7 @@ fn classify_replay_response(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let mut payloads = matching
+    let payloads = matching
         .iter()
         .map(|response| {
             response
@@ -1152,13 +1151,8 @@ fn classify_replay_response(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    payloads.sort();
-    payloads.dedup();
-    if payloads.len() > 1 {
-        return Err("conflicting discovery responses from the expected ECU".into());
-    }
-    let payload = payloads.into_iter().next();
-    let Some(payload) = payload else {
+    let payload_refs = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    if payload_refs.is_empty() {
         return Ok(ReplayIdentification {
             status: IdentificationResultStatus::Unavailable,
             nrc: None,
@@ -1166,17 +1160,20 @@ fn classify_replay_response(
             error: Some("no response observed".into()),
             responses: responses.to_vec(),
         });
+    }
+    let Some(payload) = decisive_identification_payload(&payload_refs) else {
+        return Err("conflicting discovery responses from the expected ECU".into());
     };
     if payload.starts_with(&[0x7f, 0x22]) && payload.len() == 3 {
         return Ok(ReplayIdentification {
-            status: identification_status_for_nrc(payload[2]),
+            status: status_for_nrc(payload[2]),
             nrc: Some(payload[2]),
             value: None,
             error: None,
             responses: matching,
         });
     }
-    match definition.validate_response(&payload) {
+    match definition.validate_response(payload) {
         Ok(value) => Ok(ReplayIdentification {
             status: IdentificationResultStatus::Supported,
             nrc: None,
@@ -1191,14 +1188,6 @@ fn classify_replay_response(
             error: Some(error),
             responses: matching,
         }),
-    }
-}
-
-fn identification_status_for_nrc(nrc: u8) -> IdentificationResultStatus {
-    match nrc {
-        0x11 | 0x31 => IdentificationResultStatus::Unsupported,
-        0x22 | 0x33 | 0x7e | 0x7f => IdentificationResultStatus::Unavailable,
-        _ => IdentificationResultStatus::NegativeResponse,
     }
 }
 
@@ -1359,6 +1348,75 @@ mod tests {
         let raw_status = catalog.semantic("dpf.service_regeneration_status").unwrap();
         assert!(raw_status.unit().is_none());
         assert_eq!(signal_json(&target, raw_status)["unit"], "");
+    }
+
+    // REQ-023.7
+    #[test]
+    fn req_023_7_replay_busy_responses_before_final_response_match_live_classification() {
+        let catalog = catalog();
+        let definition = catalog
+            .definition("uds.f187.manufacturer_spare_part_number")
+            .unwrap();
+        let target = CandidateTarget::from_catalog(
+            catalog
+                .ecu_targets()
+                .iter()
+                .find(|target| target.id() == "vag.ecu_target.7e0")
+                .unwrap(),
+            "frankherchet/obdentic-knowledge",
+        )
+        .unwrap();
+        let reply = |payload: &[u8]| json!({"responder": "7E8", "payload": payload});
+        let busy = [0x7f, 0x22, 0x21];
+
+        let positive = classify_replay_response(
+            definition,
+            &target,
+            &[
+                reply(&busy),
+                reply(&busy),
+                reply(&[0x62, 0xf1, 0x87, b'A', b'B', b'C']),
+            ],
+        )
+        .unwrap();
+        let busy_then_nrc = classify_replay_response(
+            definition,
+            &target,
+            &[reply(&busy), reply(&[0x7f, 0x22, 0x31])],
+        )
+        .unwrap();
+        let only_busy = classify_replay_response(
+            definition,
+            &target,
+            &[reply(&busy), reply(&busy), reply(&busy)],
+        )
+        .unwrap();
+        let conflicting_final = classify_replay_response(
+            definition,
+            &target,
+            &[
+                reply(&busy),
+                reply(&[0x62, 0xf1, 0x87, b'A', b'B', b'C']),
+                reply(&[0x62, 0xf1, 0x87, b'X', b'Y', b'Z']),
+            ],
+        );
+
+        assert_eq!(positive.status, IdentificationResultStatus::Supported);
+        assert_eq!(positive.value.as_deref(), Some(&b"ABC"[..]));
+        assert_eq!(positive.nrc, None);
+        assert_eq!(positive.responses.len(), 3);
+        assert_eq!(
+            busy_then_nrc.status,
+            IdentificationResultStatus::Unsupported
+        );
+        assert_eq!(busy_then_nrc.nrc, Some(0x31));
+        assert_eq!(
+            only_busy.status,
+            IdentificationResultStatus::NegativeResponse
+        );
+        assert_eq!(only_busy.nrc, Some(0x21));
+        assert_eq!(only_busy.value, None);
+        assert!(conflicting_final.is_err());
     }
 
     #[test]
