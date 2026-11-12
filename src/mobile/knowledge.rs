@@ -795,7 +795,7 @@ pub(super) fn replay_discovery(recorded: &Value) -> Result<Value, String> {
     }))
 }
 
-pub(super) fn decode_read_result(
+pub(crate) fn decode_read_result(
     catalog: &KnowledgeCatalog,
     target_id: &str,
     definition: &KnowledgeDefinition,

@@ -10,11 +10,13 @@ use crate::{
         CaptureDefinitionReference, CaptureEvent, CaptureKnowledgeContext, CaptureValue,
     },
     capture_format::ParsedCapture,
-    knowledge_db::KnowledgePin,
+    knowledge_db::{KnowledgeCatalog, KnowledgeDefinition, KnowledgePin},
+    mobile::knowledge::decode_read_result,
     prepare_read,
     telemetry::TelemetryState,
     Transaction,
 };
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayIssueKind {
@@ -118,6 +120,8 @@ impl CaptureReplay {
         let mut decoded = Vec::<(u64, Transaction)>::new();
         let mut recorded_interpretations = Vec::new();
         let mut issues = Vec::new();
+        // Loaded on the first Knowledge read only, so OBD-II-only replays stay cheap.
+        let mut knowledge: Option<Result<KnowledgeCatalog, String>> = None;
 
         for event in &capture.events {
             match event {
@@ -144,6 +148,57 @@ impl CaptureReplay {
                         provenance: provenance.clone(),
                         definition: definition.as_deref().cloned(),
                     });
+                    // A read whose recorded definition is in the pinned Knowledge catalog is
+                    // checked by that definition, even when its semantic is also a standard
+                    // OBD-II signal (REQ-024.4). Other definitions keep the semantic path.
+                    let pinned = match definition.as_deref() {
+                        None => None,
+                        Some(reference) => {
+                            let catalog = knowledge
+                                .get_or_insert_with(|| {
+                                    KnowledgeCatalog::embedded_pinned()
+                                        .map_err(|error| error.to_string())
+                                })
+                                .as_ref()
+                                .ok();
+                            catalog.and_then(|catalog| {
+                                catalog
+                                    .definition(reference.definition_id().unwrap_or_default())
+                                    .filter(|definition| definition.semantic() == semantic)
+                                    .map(|definition| (catalog, definition))
+                            })
+                        }
+                    };
+                    if let Some((catalog, definition)) = pinned {
+                        match replay_knowledge_read(
+                            catalog,
+                            definition,
+                            request_payload,
+                            response_payload,
+                        ) {
+                            Ok(decoded) => {
+                                if !knowledge_decode_matches(value, unit, &decoded) {
+                                    issues.push(ReplayIssue {
+                                        at_us: *finished_us,
+                                        semantic: semantic.clone(),
+                                        kind: ReplayIssueKind::RecordedDecodeChanged,
+                                        detail: format!(
+                                            "recorded={} {} current={decoded}",
+                                            capture_value_text(value),
+                                            unit,
+                                        ),
+                                    });
+                                }
+                            }
+                            Err((kind, detail)) => issues.push(ReplayIssue {
+                                at_us: *finished_us,
+                                semantic: semantic.clone(),
+                                kind,
+                                detail,
+                            }),
+                        }
+                        continue;
+                    }
                     let request = match prepare_read(semantic) {
                         Ok(request) => request,
                         Err(error) => {
@@ -291,6 +346,50 @@ impl CaptureReplay {
     }
 }
 
+/// Decodes a recorded Knowledge read with its pinned definition.
+/// Returns the Knowledge decode result (`value`, `unit`) on success.
+fn replay_knowledge_read(
+    catalog: &KnowledgeCatalog,
+    definition: &KnowledgeDefinition,
+    request_payload: &[u8],
+    response_payload: &[u8],
+) -> Result<Value, (ReplayIssueKind, String)> {
+    let expected = definition.operation().request_bytes();
+    if request_payload != expected.as_slice() {
+        return Err((
+            ReplayIssueKind::RequestChanged,
+            format!(
+                "recorded request {request_payload:?} differs from definition {} request {expected:?}",
+                definition.id()
+            ),
+        ));
+    }
+    // The target is not recorded in CLI captures; decode_read_result only echoes it.
+    let decoded = decode_read_result(catalog, "", definition, Some(response_payload), None, true);
+    match decoded.get("value") {
+        Some(_) => Ok(decoded),
+        None => Err((
+            ReplayIssueKind::DecodeFailed,
+            decoded
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Knowledge read did not decode")
+                .to_owned(),
+        )),
+    }
+}
+
+fn knowledge_decode_matches(recorded: &CaptureValue, unit: &str, decoded: &Value) -> bool {
+    let value_matches = match (recorded, decoded.get("value")) {
+        (CaptureValue::Number(recorded), Some(Value::Number(current))) => {
+            current.as_f64() == Some(*recorded)
+        }
+        (CaptureValue::Text(recorded), Some(Value::String(current))) => recorded == current,
+        _ => false,
+    };
+    value_matches && decoded.get("unit").and_then(Value::as_str) == Some(unit)
+}
+
 fn recorded_decode_changed(value: &CaptureValue, unit: &str, transaction: &Transaction) -> bool {
     unit != transaction.unit()
         || match value {
@@ -425,6 +524,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replay.matches_knowledge_pin(&different_pin), Some(false));
+    }
+
+    #[test]
+    fn req_024_4_cli_replay_redecodes_knowledge_read_by_definition_not_semantic() {
+        // Synthetic VAG oil temperature read: DID 0x11BE, 0x0BB8 * 0.1 - 273.1 C.
+        // engine.oil_temperature is also a standard OBD-II signal (PID 5C), which
+        // must not be used to interpret this Knowledge read. The recorded value is
+        // the exact f64 the Knowledge linear decoder produces for this payload.
+        let mut recorded = successful_read(
+            "engine.oil_temperature",
+            1_000_000,
+            vec![0x22, 0x11, 0xbe],
+            vec![0x62, 0x11, 0xbe, 0x0b, 0xb8],
+            26.899_999_999_999_977,
+            "°C",
+        );
+        if let CaptureEvent::ReadSucceeded { definition, .. } = &mut recorded {
+            *definition = Some(Box::new(
+                CaptureDefinitionReference::new(
+                    Some("vag.ea189.oil.oil_temperature".into()),
+                    Some(1),
+                    Some("low".into()),
+                    Some("community".into()),
+                    Some("knowledge".into()),
+                )
+                .unwrap(),
+            ));
+        }
+        let replay = CaptureReplay::from_capture(&capture(vec![recorded]));
+
+        assert!(
+            replay.issues().is_empty(),
+            "unexpected issues: {:?}",
+            replay.issues()
+        );
+    }
+
+    #[test]
+    fn req_024_4_cli_replay_reports_knowledge_value_changed_by_definition_decode() {
+        let mut recorded = successful_read(
+            "engine.oil_temperature",
+            1_000_000,
+            vec![0x22, 0x11, 0xbe],
+            vec![0x62, 0x11, 0xbe, 0x0b, 0xb8],
+            100.0,
+            "°C",
+        );
+        if let CaptureEvent::ReadSucceeded { definition, .. } = &mut recorded {
+            *definition = Some(Box::new(
+                CaptureDefinitionReference::new(
+                    Some("vag.ea189.oil.oil_temperature".into()),
+                    Some(1),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ));
+        }
+        let replay = CaptureReplay::from_capture(&capture(vec![recorded]));
+
+        assert_eq!(replay.issues().len(), 1);
+        assert_eq!(
+            replay.issues()[0].kind(),
+            ReplayIssueKind::RecordedDecodeChanged
+        );
     }
 
     #[test]
