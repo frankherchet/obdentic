@@ -158,9 +158,11 @@ impl<E: Exchange> MobileCore<E> {
                 .get("semantic")
                 .and_then(Value::as_str)
                 .ok_or("recording semantic missing")?;
+            // A Knowledge read always replays by its definition, even when its
+            // semantic is also a standard OBD-II signal (REQ-024.4).
             let request = match crate::prepare_read(semantic) {
-                Ok(request) => request,
-                Err(_) => return knowledge::replay_read(&recorded),
+                Ok(request) if recorded.get("definition_id").is_none() => request,
+                _ => return knowledge::replay_read(&recorded),
             };
             let response: Vec<u8> = serde_json::from_value(
                 recorded
@@ -1608,6 +1610,35 @@ mod tests {
         assert_eq!(rejected["data"]["status"], "unavailable");
         assert_eq!(rejected["data"]["nrc"], 49);
         assert!(rejected["data"]["value"].is_null());
+    }
+
+    #[test]
+    fn req_024_4_replay_knowledge_read_sharing_obd_semantic_uses_its_definition() {
+        // Synthetic: 0x0E2F = 3631 -> 3631 * 0.1 - 273.1 = 90.0 °C. Not a real capture.
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let revision = crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+            .unwrap()
+            .pin()
+            .revision()
+            .to_owned();
+        let recording = json!({
+            "knowledge_repository":"frankherchet/obdentic-knowledge",
+            "knowledge_revision":revision,
+            "semantic":"engine.oil_temperature",
+            "definition_id":"vag.ea189.oil.oil_temperature",
+            "target_id":"vag.ecu_target.7e0",
+            "request":[34,17,190],
+            "response":[98,17,190,14,47],
+            "observations":[{"selected_responder":"7E8","responses":[{"responder":"7E8","payload":[98,17,190,14,47]}]}]
+        });
+
+        let replay = run(&mut core, "replay.read", &recording.to_string());
+
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert!((replay["data"]["value"].as_f64().unwrap() - 90.0).abs() < 1e-9);
+        assert_eq!(replay["data"]["unit"], "°C");
+        assert_eq!(replay["data"]["validation"], "not_validated");
+        assert_eq!(replay["data"]["replay"], true);
     }
 
     #[test]
