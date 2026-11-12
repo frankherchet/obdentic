@@ -236,21 +236,23 @@ fn classify_normalized(
     )
 }
 
-/// Shared by live and replay classification. NRC 0x21 (busyRepeatRequest) is
-/// intermediate: it never decides a status while a final response exists.
-pub(crate) fn is_busy_response(payload: &[u8]) -> bool {
-    payload == [0x7f, 0x22, 0x21]
+/// Shared by live and replay classification. NRC 0x21 (busyRepeatRequest) and
+/// NRC 0x78 (responsePending) are intermediate: they never decide a status
+/// while a final response exists.
+pub(crate) fn is_intermediate_response(payload: &[u8]) -> bool {
+    matches!(payload, [0x7f, 0x22, 0x21] | [0x7f, 0x22, 0x78])
 }
 
 /// Picks the payload that decides a status from one expected responder's
-/// responses in arrival order. The last non-busy payload wins; if only busy
-/// responses arrived, the last busy one decides. Returns `None` when there is
-/// no response or when final responses disagree.
+/// responses in arrival order. All non-intermediate payloads must agree and
+/// one of them decides; if only intermediate responses arrived, the last one
+/// decides. Returns `None` when there is no response or when final responses
+/// disagree.
 pub(crate) fn decisive_identification_payload<'a>(payloads: &[&'a [u8]]) -> Option<&'a [u8]> {
     let mut finals = payloads
         .iter()
         .copied()
-        .filter(|payload| !is_busy_response(payload));
+        .filter(|payload| !is_intermediate_response(payload));
     let Some(first) = finals.next() else {
         return payloads.last().copied();
     };
@@ -518,6 +520,87 @@ mod tests {
             conflicting_final.status(),
             IdentificationResultStatus::Malformed
         );
+    }
+
+    // REQ-023.8
+    #[test]
+    fn req_023_8_response_pending_before_final_response_is_intermediate() {
+        let plan = plan();
+        let f187 = candidate(&plan, 0xf187);
+        let ecu = mapping("7E0", "7E8", Confidence::Verified);
+        let pending = [0x7f, 0x22, 0x78];
+        let final_value = [0x62, 0xf1, 0x87, b'A', b'B', b'C'];
+
+        let pending_then_positive = classify_normalized(
+            &plan,
+            &f187,
+            &ecu,
+            vec![response(&ecu, &pending), response(&ecu, &final_value)],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let pending_then_nrc = classify_normalized(
+            &plan,
+            &f187,
+            &ecu,
+            vec![
+                response(&ecu, &pending),
+                response(&ecu, &[0x7f, 0x22, 0x31]),
+            ],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let only_pending = classify_normalized(
+            &plan,
+            &f187,
+            &ecu,
+            vec![response(&ecu, &pending), response(&ecu, &pending)],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let mixed_busy_pending_positive = classify_normalized(
+            &plan,
+            &f187,
+            &ecu,
+            vec![
+                response(&ecu, &[0x7f, 0x22, 0x21]),
+                response(&ecu, &pending),
+                response(&ecu, &final_value),
+            ],
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pending_then_positive.status(),
+            IdentificationResultStatus::Supported
+        );
+        assert_eq!(pending_then_positive.value(), Some(&b"ABC"[..]));
+        assert_eq!(pending_then_positive.nrc(), None);
+        assert_eq!(
+            pending_then_nrc.status(),
+            IdentificationResultStatus::Unsupported
+        );
+        assert_eq!(pending_then_nrc.nrc(), Some(0x31));
+        assert_eq!(
+            only_pending.status(),
+            IdentificationResultStatus::NegativeResponse
+        );
+        assert_eq!(only_pending.nrc(), Some(0x78));
+        assert_eq!(only_pending.value(), None);
+        assert_eq!(
+            mixed_busy_pending_positive.status(),
+            IdentificationResultStatus::Supported
+        );
+        assert_eq!(mixed_busy_pending_positive.value(), Some(&b"ABC"[..]));
     }
 
     #[test]
