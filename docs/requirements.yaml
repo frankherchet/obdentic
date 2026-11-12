@@ -512,6 +512,8 @@ requirements:
         text: The discovery writes its own recording with all TX/RX; replay and the desktop mobile report re-derive the same ECU list offline without adapter traffic.
       - id: REQ-023.7
         text: For a standard identification read, a busy response (NRC 0x21, busyRepeatRequest) from the expected responder is intermediate and sends no new request; the last non-busy response from that responder decides the status (positive value as supported, NRC per the existing rules), only busy responses end as negative_response with NRC 0x21, and live and replay classify the same recorded responses identically.
+      - id: REQ-023.8
+        text: For a standard identification read, a responsePending response (NRC 0x78) from the expected responder is intermediate exactly like a busy response (NRC 0x21); the final response from that responder decides the status (disagreeing final responses are malformed), only responsePending responses end as negative_response with NRC 0x78, and live and replay classify the same recorded responses identically.
 
   - id: REQ-024
     title: Offer Knowledge-defined DID signals of identified ECUs as live signals

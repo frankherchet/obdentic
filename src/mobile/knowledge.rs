@@ -1419,6 +1419,76 @@ mod tests {
         assert!(conflicting_final.is_err());
     }
 
+    // REQ-023.8
+    #[test]
+    fn req_023_8_replay_response_pending_before_final_response_match_live_classification() {
+        let catalog = catalog();
+        let definition = catalog
+            .definition("uds.f187.manufacturer_spare_part_number")
+            .unwrap();
+        let target = CandidateTarget::from_catalog(
+            catalog
+                .ecu_targets()
+                .iter()
+                .find(|target| target.id() == "vag.ecu_target.7e0")
+                .unwrap(),
+            "frankherchet/obdentic-knowledge",
+        )
+        .unwrap();
+        let reply = |payload: &[u8]| json!({"responder": "7E8", "payload": payload});
+        let pending = [0x7f, 0x22, 0x78];
+        let final_value = [0x62, 0xf1, 0x87, b'A', b'B', b'C'];
+
+        let pending_then_positive =
+            classify_replay_response(definition, &target, &[reply(&pending), reply(&final_value)])
+                .unwrap();
+        let pending_then_nrc = classify_replay_response(
+            definition,
+            &target,
+            &[reply(&pending), reply(&[0x7f, 0x22, 0x31])],
+        )
+        .unwrap();
+        let only_pending =
+            classify_replay_response(definition, &target, &[reply(&pending), reply(&pending)])
+                .unwrap();
+        let mixed_busy_pending_positive = classify_replay_response(
+            definition,
+            &target,
+            &[
+                reply(&[0x7f, 0x22, 0x21]),
+                reply(&pending),
+                reply(&final_value),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            pending_then_positive.status,
+            IdentificationResultStatus::Supported
+        );
+        assert_eq!(pending_then_positive.value.as_deref(), Some(&b"ABC"[..]));
+        assert_eq!(pending_then_positive.nrc, None);
+        assert_eq!(
+            pending_then_nrc.status,
+            IdentificationResultStatus::Unsupported
+        );
+        assert_eq!(pending_then_nrc.nrc, Some(0x31));
+        assert_eq!(
+            only_pending.status,
+            IdentificationResultStatus::NegativeResponse
+        );
+        assert_eq!(only_pending.nrc, Some(0x78));
+        assert_eq!(only_pending.value, None);
+        assert_eq!(
+            mixed_busy_pending_positive.status,
+            IdentificationResultStatus::Supported
+        );
+        assert_eq!(
+            mixed_busy_pending_positive.value.as_deref(),
+            Some(&b"ABC"[..])
+        );
+    }
+
     #[test]
     fn req_026_2_knowledge_results_preserve_nrc_and_timeout_as_not_answered() {
         let catalog = catalog();
