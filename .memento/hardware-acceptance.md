@@ -2,15 +2,11 @@
 title: Finish bundled hardware acceptance
 type: todo
 created: 2026-10-23
-updated: 2026-10-28
+updated: 2026-11-13
 ---
 
 Real-vehicle acceptance stays open in issue #178. Do not assume the adapter and vehicle are available; ask before any live session.
 
-Verified on the vehicle so far (2026-10-24/28): the VIN vehicle record, PID 0xA6 not advertised (expected for EA189), recording export and pull, auto-reconnect after a BLE drop, and the Firebase update path. All experimental features (EA189 DPF/extended/ash jobs, ash test #182, VW cluster odometer) were removed in #230, so they need no vehicle check anymore.
+Confirmed on the vehicle by 2026-11-12: VIN record, PID 0xA6 not advertised (expected for EA189), export and pull, auto-reconnect, Firebase updates, automatic `…-live-auto.jsonl` with handshake, the availability check and default-session learning, Knowledge oil temperature and DPF values in Live, sealed and exported app logs, BLE abort with stack trace and GATT status, and F187 identification on the engine ECU (#85 comment). Removed experimental jobs (#230) stay removed.
 
-The replacement software is Knowledge-based ECU discovery (#85 / REQ-023), normal live values (#246), the default-session candidate learning run (#249), and the explicit UDS session switch (#251, ADR 0003). Do not revive the removed jobs.
-
-**Next step:** bundle manual inventory after polling (#215/#221), reconnect after app restart, faster polling (#231), the live view (#232) and discovery, default-session learning, reference-tool comparison of Knowledge values, recording/replay and first stationary UDS activation into #178 after vehicle availability is confirmed. The user wants as much testing as practical on 2026-10-29, without artificial waiting. Applicability remains draft manufacturer/engine-role matching until real identification evidence supports narrowing it. Pull recordings with `tools/pull-recordings.sh`; keep evidence private. Delete this memo when #178 and #85 hardware acceptance are complete.
-
-**v0.5.0 (released 2026-10-29) adds software that only the vehicle can confirm** (epic #253): at the next vehicle session check that (1) a `…-live-auto.jsonl` appears on connect and contains the handshake, (2) the automatic availability check (about 25 s) runs for a new vehicle and the oil temperature DID (`engine.oil_temperature@vag.ecu_target.7e0`) and the DPF signals answer, (3) `logs/app-*.log` is sealed per connection and exported with "Alle exportieren", and (4) the BLE abort from 2026-10-24/28 now leaves a stack trace and GATT status in the app log. Sessions of 2026-10-24..29 never exercised Knowledge signals live.
+**Next step:** the user drives the test plan posted on #178 on 2026-11-13 (comment "Testplan nächste Fahrt (v0.5.5)": cold start + DTC scan, ≥30 min warm-up/thermostat, DPF, turbo/EGR, warm idle rail, reference-tool comparison). Then pull with `tools/pull-recordings.sh`, rerun the coverage analysis (all Knowledge definitions vs. reads/availability per semantic), and report back on #283 (F192 from 74F), #290, #292, #293, thermostat and regeneration. Keep evidence private. Delete this memo when #178 and #85 hardware acceptance are complete.

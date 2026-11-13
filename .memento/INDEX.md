@@ -5,4 +5,4 @@
 - [Cost-efficient model delegation](worker-model-preference.md) — preference — Haiku/Sonnet (Codex: GPT-6 Luna xhigh) for fitting tasks; Opus integrates and reviews
 - [Bundle vehicle acceptance](bundle-vehicle-acceptance.md) — preference — minimize separate trips to the vehicle
 - [Local extracted profile archive](local-profile-archive.md) — reference — complete Car Scanner source archive stays local
-- [Finish bundled hardware acceptance](hardware-acceptance.md) — todo — #178/#85 hardware gate; Knowledge learning and stationary UDS, old #182 retired
+- [Finish bundled hardware acceptance](hardware-acceptance.md) — todo — test plan for next drive on #178; F187 confirmed; report on #283/#290/#292/#293
