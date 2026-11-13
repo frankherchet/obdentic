@@ -34,16 +34,19 @@ final class ResumeRecordingAcceptance {
             waitFor(() -> service.snapshot().optString("phase").equals("ready") && !service.snapshot().optBoolean("busy") && service.snapshot().optJSONObject("availability").optJSONArray("entries") != null, "first connection with its automatic survey done");
 
             service.startRecording("engine-drive"); waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "named recording before the loss");
-            String first = service.snapshot().getString("recording");
+            String first = service.snapshot().getString("recording"); Set<String> beforeLoss = names(recordings);
             service.setAutoConnect(true); link[0].up = false;
             waitFor(() -> service.snapshot().optString("recording").isEmpty(), "the loss ends the named recording");
-            waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "REQ-020.8 the named recording continues after the automatic reconnection although ECU identification runs");
-            waitFor(() -> !service.snapshot().optBoolean("busy"), "jobs after the reconnection finished");
+            waitFor(() -> !service.snapshot().optString("recording").isEmpty() && !service.snapshot().optBoolean("busy"), "REQ-020.8 the named recording continues after the automatic reconnection although ECU identification runs");
             String second = service.snapshot().getString("recording");
+            SystemClock.sleep(1500);
+            require(second.equals(service.snapshot().optString("recording")), "REQ-020.8 no automatic job of the reconnection ends the continued recording: " + service.snapshot().optString("recording"));
             String content = new String(Files.readAllBytes(new File(recordings, second).toPath()), StandardCharsets.UTF_8);
             require(!second.equals(first) && new JSONObject(content.split("\n")[0]).optString("profile").equals("engine-drive"), "REQ-020.8 the continued recording is a new file with the same profile: " + second);
-            require(content.contains("\"action\":\"ecu.discover\""), "REQ-020.7 the automatic ECU identification of the reconnection lands in the continued recording");
             require(!service.snapshot().optString("message").contains("Zuerst laufenden Auftrag beenden"), "REQ-020.8 the resume is not rejected as busy");
+            Set<String> created = names(recordings); created.removeAll(beforeLoss); String auto = "";
+            for (String n : created) if (n.endsWith("-auto.jsonl")) auto += new String(Files.readAllBytes(new File(recordings, n).toPath()), StandardCharsets.UTF_8);
+            require(auto.contains("\"action\":\"ecu.discover\""), "REQ-020.7 the automatic ECU identification of the reconnection ran, in the automatic recording, before the resume: " + created);
         } finally {
             ObdService.autoSurvey = false;
             service.setAutoConnect(false); service.disconnect(); service.connector = savedConnector; service.vehicles = savedStore; service.permissionOverride = savedPermission; service.bluetoothOverride = savedBluetooth;

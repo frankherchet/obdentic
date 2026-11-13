@@ -89,7 +89,7 @@ final class AppLogAcceptance {
             service.stopRecording(); waitFor(() -> service.snapshot().optString("recording").isEmpty(), "named recording stopped");
             service.runJob("uds.enable"); waitFor(() -> service.snapshot().optJSONObject("uds").optBoolean("active"), "extended session active");
             waitFor(() -> link[0].commands.contains("7E0:3E80"), "tester present sent"); SystemClock.sleep(2500);
-            link[0].tickFails = true; waitFor(() -> link[0].commands.stream().filter(c -> c.equals("7E0:3E80")).count() >= 3, "failing tester present"); SystemClock.sleep(500);
+            link[0].tickFails = true; waitFor(() -> new ArrayList<>(link[0].commands).stream().filter(c -> c.equals("7E0:3E80")).count() >= 3, "failing tester present"); SystemClock.sleep(500);
             service.runJob("uds.disable"); waitFor(() -> !service.snapshot().optJSONObject("uds").optBoolean("active") && !service.snapshot().optBoolean("busy"), "extended session left");
             String all = ""; for (File f : AppLog.sealed()) all += read(f); if (new File(work, "app.log").exists()) all += read(new File(work, "app.log"));
             require(all.contains("INFO msg UDS nur mit echtem Adapter; vor dem Einschalten Aufnahme stoppen"), "REQ-029.7 the refusal is in the log: " + all);
