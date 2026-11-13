@@ -1172,7 +1172,7 @@ where
                 error,
                 observations: Vec::new(),
             })?;
-        match targeted_payload(&responses, expected) {
+        match targeted_did_payload(&responses, expected) {
             Ok(payload) => Ok(ReadEvidence {
                 payload,
                 observations: vec![responses.observation_for_target(expected, None)],
@@ -1532,6 +1532,33 @@ fn targeted_payload(
     responses: &DiagnosticResponses,
     expected: &ResponderIdentity,
 ) -> Result<Vec<u8>, String> {
+    targeted_payload_with(responses, expected, DiagnosticResponses::select)
+}
+
+/// UDS 0x22 reads: NRC 0x21/0x78 from the expected responder are intermediate
+/// (REQ-023.7, REQ-023.8); the shared classifier picks the decisive payload.
+fn targeted_did_payload(
+    responses: &DiagnosticResponses,
+    expected: &ResponderIdentity,
+) -> Result<Vec<u8>, String> {
+    targeted_payload_with(responses, expected, |responses, target| {
+        let payloads = responses
+            .as_slice()
+            .iter()
+            .filter(|response| response.responder.as_ref() == Some(target))
+            .map(|response| response.payload.as_slice())
+            .collect::<Vec<_>>();
+        crate::ecu_identification_discovery::decisive_identification_payload(&payloads)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| format!("conflicting responses from responder {}", target.as_str()))
+    })
+}
+
+fn targeted_payload_with(
+    responses: &DiagnosticResponses,
+    expected: &ResponderIdentity,
+    select: impl FnOnce(&DiagnosticResponses, &ResponderIdentity) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
     let expected_observed = responses
         .as_slice()
         .iter()
@@ -1548,7 +1575,7 @@ fn targeted_payload(
             ));
         }
     }
-    responses.select(expected)
+    select(responses, expected)
 }
 
 pub(crate) async fn read_elm_responses<E>(
