@@ -35,8 +35,11 @@ actions still open in replay; those actions are skipped and never sent.
 **Verfügbarkeit (REQ-030):** UDS DIDs are not advertised by the ECU, so the app measures them. The
 job `knowledge.availability` (Diagnose tab, "Verfügbarkeit prüfen") sends one targeted `22` read
 per default-session Knowledge signal of the identified ECUs (about 25 s, hard limit 90 s, no
-session change) and classifies each as answered, rejected (with the NRC) or not answered,
-keeping no value. It runs automatically after ECU identification for a newly created vehicle record
+session change) and classifies each as answered, rejected (with the NRC) or not answered.
+Answered entries also carry the raw response, the decoded value and unit, and an `implausible` flag
+with the range when the value lies outside the definition's `plausible_range` (REQ-030.8). The job
+also reads each catalog Mode 01 PID the vehicle advertises as supported once from the engine
+target (REQ-030.9); `obdentic-mobile-report` prints a per-entry table and status counts (REQ-030.10). It runs automatically after ECU identification for a newly created vehicle record
 and after every "Fahrzeug und Steuergeräte erfassen" job, writes into the running automatic recording
 (its own recording only when none runs) and is stored
 with the vehicle record (never exported or shared). Replay restores the statuses from the recording.

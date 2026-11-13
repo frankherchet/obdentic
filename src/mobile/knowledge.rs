@@ -841,6 +841,120 @@ pub(crate) fn decode_read_result(
     result
 }
 
+/// REQ-030.8: one availability entry of a Knowledge signal, decoded from its raw response with the
+/// definition's decoder. Live reads and replay build it through this one function.
+pub(super) fn availability_entry(
+    catalog: &KnowledgeCatalog,
+    key: &str,
+    target_id: &str,
+    definition_id: &str,
+    response: Option<&[u8]>,
+    error: Option<&str>,
+) -> Result<Value, String> {
+    let definition = catalog
+        .definition(definition_id)
+        .ok_or_else(|| format!("unknown Knowledge definition: {definition_id}"))?;
+    let decoded = decode_learning_result(catalog, target_id, definition, response, error);
+    let mut entry = json!({"key":key,"target":target_id,"definition_id":definition_id,
+        "status":decoded["status"],"response":response});
+    match decoded["status"].as_str() {
+        Some("answered") => {
+            entry["value"] = decoded["value"].clone();
+            entry["unit"] = decoded["unit"].clone();
+            if let (Some(value), Some(range)) =
+                (decoded["value"].as_f64(), definition.plausible_range())
+            {
+                if value < range.minimum() || value > range.maximum() {
+                    entry["implausible"] = json!(true);
+                    entry["plausible_range"] =
+                        json!({"minimum":range.minimum(),"maximum":range.maximum()});
+                }
+            }
+        }
+        Some("rejected") => entry["nrc"] = decoded["nrc"].clone(),
+        _ => {
+            entry["reason"] = json!(decoded["error"].as_str().unwrap_or("no usable answer"));
+        }
+    }
+    Ok(entry)
+}
+
+/// REQ-030.10: recomputes every entry of a recorded availability result from its recorded response.
+pub(super) fn replay_availability(recorded: &Value) -> Result<Value, String> {
+    let catalog = KnowledgeCatalog::embedded_pinned().map_err(|error| error.to_string())?;
+    require_revision(recorded, &catalog)?;
+    let entries = recorded
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or("availability recording entries missing")?;
+    let mut decoded = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let key = entry
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or("availability entry key missing")?;
+        let response: Option<Vec<u8>> = entry
+            .get("response")
+            .filter(|response| !response.is_null())
+            .map(|response| serde_json::from_value(response.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let reason = entry.get("reason").and_then(Value::as_str);
+        decoded.push(match entry.get("definition_id").and_then(Value::as_str) {
+            Some(definition_id) => availability_entry(
+                &catalog,
+                key,
+                entry
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .ok_or("availability entry target missing")?,
+                definition_id,
+                response.as_deref(),
+                reason,
+            )?,
+            None => mode01_entry(
+                key,
+                entry.get("target").and_then(Value::as_str),
+                response,
+                reason,
+            ),
+        });
+    }
+    let mut result = recorded.clone();
+    result["entries"] = json!(decoded);
+    result["replay"] = json!(true);
+    Ok(result)
+}
+
+/// REQ-030.9: availability entry of a standard Mode 01 PID; the value is decoded with the catalog decoder.
+pub(super) fn mode01_entry(
+    key: &str,
+    target: Option<&str>,
+    response: Option<Vec<u8>>,
+    reason: Option<&str>,
+) -> Value {
+    let mut entry = json!({"key":key,"target":target});
+    let decoded = match response {
+        Some(response) => crate::prepare_read(key)
+            .and_then(|request| request.complete("replay", response.clone()))
+            .map(|transaction| (response, transaction)),
+        None => Err(reason.unwrap_or("no usable answer").to_owned()),
+    };
+    match decoded {
+        Ok((response, transaction)) => {
+            entry["status"] = json!("answered");
+            entry["response"] = json!(response);
+            entry["value"] = json!(transaction.value());
+            entry["unit"] = json!(transaction.unit());
+        }
+        Err(reason) => {
+            entry["status"] = json!("not_answered");
+            entry["reason"] = json!(reason);
+        }
+    }
+    entry
+}
+
 pub(super) fn decode_learning_result(
     catalog: &KnowledgeCatalog,
     target_id: &str,

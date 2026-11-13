@@ -507,15 +507,16 @@ fn req_030_1_2_3_availability_reads_each_default_did_once_and_classifies_the_ans
     assert_eq!(data["truncated"], false);
     assert!(data["knowledge_revision"].as_str().unwrap().len() >= 7);
     let entries = data["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), default_keys.len());
+    assert_eq!(
+        entries.len(),
+        default_keys.len() + 1,
+        "plus the advertised Mode 01 PID"
+    );
     let entry = |key: &str| entries.iter().find(|entry| entry["key"] == key).unwrap();
     assert_eq!(
         entry("engine.oil_temperature@vag.ecu_target.7e0")["status"],
         "answered"
     );
-    assert!(entry("engine.oil_temperature@vag.ecu_target.7e0")
-        .get("value")
-        .is_none());
     let rejected = entries
         .iter()
         .find(|entry| entry["status"] == "rejected")
@@ -534,9 +535,115 @@ fn req_030_1_2_3_availability_reads_each_default_did_once_and_classifies_the_ans
         .map(|command| command.wire)
         .collect::<Vec<_>>();
     assert!(
-        services.iter().all(|wire| wire.starts_with("22")),
+        services
+            .iter()
+            .all(|wire| wire.starts_with("22") || wire == "010C\r"),
         "{services:?}"
     );
+}
+
+const OIL: &str = "engine.oil_temperature@vag.ecu_target.7e0";
+const THROTTLE: &str = "air.throttle_valve_adaptation_actual@vag.ecu_target.7e0";
+const ASH: &str = "dpf.oil_ash_volume@vag.ecu_target.7e0";
+const BROKEN: &str = "air.charge_limit_overcharge@vag.ecu_target.7e0";
+
+fn answered_sweep() -> (MobileCore<FakeExchange>, Arc<Mutex<LinkState>>, Value) {
+    let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    discover(&mut core);
+    {
+        let mut link = state.lock().unwrap();
+        for (did, payload) in [
+            (0x11BE, vec![0x62, 0x11, 0xBE, 0x04, 0x00]), // -170.7 C, below the range
+            (0x12FC, vec![0x62, 0x12, 0xFC, 0x27, 0x10]), // 100.00 %, inside the range
+            (0x1153, vec![0x62, 0x11, 0x53, 0x01, 0xF4]), // 5.00 l, no range defined
+            (0x1356, vec![0x62, 0x13, 0x56, 0x01]),       // wrong length
+        ] {
+            link.did_replies
+                .insert(did, VecDeque::from([Reply::Payload(payload)]));
+        }
+        link.commands.clear();
+    }
+    let result = run(&mut core, "knowledge.availability", "");
+    assert_eq!(result["ok"], true, "{result}");
+    (core, state, result["data"].clone())
+}
+
+fn entry_of<'a>(data: &'a Value, key: &str) -> &'a Value {
+    data["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == key)
+        .unwrap_or_else(|| panic!("no entry {key}"))
+}
+
+#[test]
+// REQ-030.8
+fn req_030_8_answered_entries_carry_response_value_unit_and_implausible_flag() {
+    let (_, _, data) = answered_sweep();
+    let oil = entry_of(&data, OIL);
+    assert_eq!(oil["status"], "answered");
+    assert_eq!(oil["response"], json!([0x62, 0x11, 0xBE, 0x04, 0x00]));
+    assert!(
+        (oil["value"].as_f64().unwrap() + 170.7).abs() < 1e-6,
+        "{oil}"
+    );
+    assert_eq!(oil["unit"], "°C");
+    assert_eq!(oil["implausible"], true);
+    assert_eq!(
+        oil["plausible_range"],
+        json!({"minimum":-60.0,"maximum":300.0})
+    );
+
+    let throttle = entry_of(&data, THROTTLE);
+    assert_eq!(throttle["status"], "answered");
+    assert!((throttle["value"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+    assert!(throttle.get("implausible").is_none(), "{throttle}");
+
+    let ash = entry_of(&data, ASH);
+    assert!((ash["value"].as_f64().unwrap() - 5.0).abs() < 1e-6);
+    assert_eq!(ash["unit"], "l");
+    assert!(ash.get("implausible").is_none(), "{ash}");
+
+    let broken = entry_of(&data, BROKEN);
+    assert_eq!(broken["status"], "not_answered");
+    assert!(broken.get("value").is_none());
+    assert!(broken["reason"].is_string());
+}
+
+#[test]
+// REQ-030.9
+fn req_030_9_advertised_mode_01_pids_are_read_once_from_the_engine_target() {
+    let (_, state, data) = answered_sweep();
+    let rpm = entry_of(&data, "engine.rpm");
+    assert_eq!(rpm["status"], "answered");
+    assert_eq!(rpm["response"], json!([0x41, 0x0C, 0x1A, 0xF8]));
+    assert_eq!(rpm["value"], 1726.0);
+    assert_eq!(rpm["unit"], "rpm");
+    // 0100 reports only PID 0x0C: it is the one Mode 01 request sent, to the validated engine target.
+    let mode01 = commands(&state)
+        .into_iter()
+        .filter(|command| command.wire.starts_with("01"))
+        .collect::<Vec<_>>();
+    assert_eq!(mode01.len(), 1);
+    assert_eq!(mode01[0].wire, "010C\r");
+    assert_eq!(mode01[0].target, "7E0");
+}
+
+#[test]
+// REQ-030.8, REQ-030.9, REQ-030.10
+fn req_030_10_replay_reproduces_values_without_adapter_traffic() {
+    let (mut core, state, data) = answered_sweep();
+    clear_commands(&state);
+    let replay = run(
+        &mut core,
+        "replay.knowledge.availability",
+        &data.to_string(),
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["data"]["replay"], true);
+    assert_eq!(replay["data"]["entries"], data["entries"]);
+    assert!(commands(&state).is_empty());
 }
 
 #[test]

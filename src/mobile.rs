@@ -143,6 +143,11 @@ impl<E: Exchange> MobileCore<E> {
         if action == "replay.adapter.throughput" {
             return throughput::replay(argument);
         }
+        if action == "replay.knowledge.availability" {
+            let recorded: Value =
+                serde_json::from_str(argument).map_err(|error| error.to_string())?;
+            return knowledge::replay_availability(&recorded);
+        }
         if action == "replay.ecu.discover" || action == "replay.knowledge.learn" {
             let recorded: Value =
                 serde_json::from_str(argument).map_err(|error| error.to_string())?;
@@ -610,6 +615,8 @@ impl<E: Exchange> MobileCore<E> {
         }
         let repository = knowledge.catalog.pin().repository().to_owned();
         let revision = knowledge.catalog.pin().revision().to_owned();
+        let catalog = knowledge.catalog.clone();
+        let engine_target_id = self.knowledge_engine_target_id(knowledge);
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| error.to_string())?
@@ -622,14 +629,20 @@ impl<E: Exchange> MobileCore<E> {
                 break;
             }
             match self.read_signal(&key) {
-                Ok(read) if read["status"] == "available" => {
-                    entries.push(json!({"key":key,"status":"answered"}));
+                Ok(read) => {
+                    let response = read["response"]
+                        .is_array()
+                        .then(|| serde_json::from_value::<Vec<u8>>(read["response"].clone()).ok())
+                        .flatten();
+                    entries.push(knowledge::availability_entry(
+                        &catalog,
+                        &key,
+                        read["target_id"].as_str().unwrap_or_default(),
+                        read["definition_id"].as_str().unwrap_or_default(),
+                        response.as_deref(),
+                        read["error"].as_str(),
+                    )?);
                 }
-                Ok(read) if read["nrc"].is_number() => {
-                    entries.push(json!({"key":key,"status":"rejected","nrc":read["nrc"]}));
-                }
-                Ok(read) => entries.push(json!({"key":key,"status":"not_answered",
-                    "reason":read["error"].as_str().unwrap_or("no usable answer")})),
                 Err(error) => {
                     let fatal = crate::scheduler::is_fatal_runtime_error(&error);
                     entries.push(json!({"key":key,"status":"not_answered","reason":error}));
@@ -638,6 +651,45 @@ impl<E: Exchange> MobileCore<E> {
                         break;
                     }
                 }
+            }
+        }
+        // REQ-030.9: every Mode 01 PID the vehicle advertises, one request each to the engine target.
+        let pids = match (&engine_target_id, self.session.as_ref()) {
+            (Some(_), Some(session)) if !stopped => crate::supported_signals()
+                .iter()
+                .map(|signal| signal.metadata())
+                .filter(|meta| session.supported().supports_pid(meta.request[1]))
+                .map(|meta| meta.semantic)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        for semantic in pids {
+            if started.elapsed().saturating_add(Duration::from_secs(11)) > limit {
+                truncated = true;
+                break;
+            }
+            let read = self.read_signal(semantic);
+            let fatal = read
+                .as_ref()
+                .err()
+                .is_some_and(|error| crate::scheduler::is_fatal_runtime_error(error));
+            entries.push(match &read {
+                Ok(read) => knowledge::mode01_entry(
+                    semantic,
+                    engine_target_id.as_deref(),
+                    serde_json::from_value(read["response"].clone()).ok(),
+                    None,
+                ),
+                Err(error) => knowledge::mode01_entry(
+                    semantic,
+                    engine_target_id.as_deref(),
+                    None,
+                    Some(error),
+                ),
+            });
+            if fatal {
+                stopped = true;
+                break;
             }
         }
         let restore_error = self.restore_functional_addressing().err();
