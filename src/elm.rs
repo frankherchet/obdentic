@@ -169,6 +169,13 @@ impl PidSupport {
         match self.pages.get(index) {
             Some(bitmap) if bitmap & (1 << (32 - offset)) != 0 => SignalSupportStatus::Supported,
             Some(_) => SignalSupportStatus::Unsupported,
+            // Discovery stops after the first page whose continuation bit
+            // (the LSB, PID 0x20/0x40/...) is 0. Pages past that point were
+            // never queried because the ECU said the range is unsupported.
+            // Any other unanswered page (highest-page cap) stays Unknown.
+            None if self.pages.last().is_some_and(|last| last & 1 == 0) => {
+                SignalSupportStatus::Unsupported
+            }
             None => SignalSupportStatus::Unknown,
         }
     }
@@ -2968,6 +2975,59 @@ fn normalize_isotp_responses(
 mod tests {
     use super::*;
     use crate::test_support::ScriptedExchange;
+
+    #[tokio::test]
+    async fn req_014_5_pids_after_a_cleared_continuation_bit_are_unsupported() {
+        let mut exchange =
+            ScriptedExchange::new(["410080000001\r>", "412000000001\r>", "4140CCD20000\r>"]);
+
+        let support = discover_pid_support(&mut exchange, 0x60).await.unwrap();
+
+        assert_eq!(exchange.commands(), ["0100\r", "0120\r", "0140\r"]);
+        assert_eq!(support.status(0x41), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x61), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0x62), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0x63), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0xe1), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0x00), SignalSupportStatus::Unknown);
+    }
+
+    #[test]
+    fn req_014_5_unset_continuation_bit_marks_every_later_page_unsupported() {
+        let support = PidSupport {
+            pages: vec![0x8000_0000],
+            discovery: Vec::new(),
+        };
+
+        assert_eq!(support.status(0x01), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x02), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0x21), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0x62), SignalSupportStatus::Unsupported);
+        assert_eq!(support.status(0x00), SignalSupportStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn req_014_5_set_continuation_bit_with_unqueried_next_page_stays_unknown() {
+        let mut exchange = ScriptedExchange::new(["410080000001\r>"]);
+
+        let support = discover_pid_support(&mut exchange, 0x00).await.unwrap();
+
+        assert_eq!(exchange.commands(), ["0100\r"]);
+        assert_eq!(support.status(0x01), SignalSupportStatus::Supported);
+        assert_eq!(support.status(0x21), SignalSupportStatus::Unknown);
+        assert_eq!(support.status(0x62), SignalSupportStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn req_014_5_failed_next_page_leaves_no_support_pages_so_status_is_unknown() {
+        let mut exchange = ScriptedExchange::new(["410080000001\r>", "NO DATA\r>"]);
+
+        assert!(discover_pid_support(&mut exchange, 0x60).await.is_err());
+        assert_eq!(
+            PidSupport::default().status(0x62),
+            SignalSupportStatus::Unknown
+        );
+    }
 
     #[tokio::test]
     async fn req_027_4_session_transport_has_only_closed_commands_and_reuses_target() {

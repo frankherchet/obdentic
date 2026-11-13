@@ -275,6 +275,8 @@ requirements:
         text: A live connection always performs full support discovery and inventory; stored support never skips discovery or decides whether a read is sent, and the current observation replaces the stored support.
       - id: REQ-014.4
         text: A newly created record without a stored selection receives the existing default selection of supported signals.
+      - id: REQ-014.5
+        text: A signal whose PID lies in a support page that discovery did not query because the previous answered page's continuation bit is 0 is reported as unsupported in the live inventory, not unknown; a page left unqueried for any other reason stays unknown.
 
   - id: REQ-015
     title: Read the odometer through the standard OBD PID

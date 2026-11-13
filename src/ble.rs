@@ -1906,6 +1906,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn req_014_5_inventory_marks_pids_after_a_cleared_continuation_bit_unsupported() {
+        let exchange =
+            ScriptedExchange::new(["410080000001\r>", "412000000001\r>", "4140CCD20000\r>"]);
+        let session = DiagnosticSession::from_exchange(exchange, true)
+            .await
+            .unwrap();
+
+        let inventory = session.signal_support();
+        let status = |semantic: &str| {
+            inventory
+                .iter()
+                .find(|signal| signal.semantic == semantic)
+                .unwrap()
+                .status
+        };
+
+        assert_eq!(
+            status("engine.actual_torque_percent"),
+            SignalSupportStatus::Unsupported
+        );
+        assert_eq!(
+            status("engine.driver_demand_torque_percent"),
+            SignalSupportStatus::Unsupported
+        );
+        assert_eq!(
+            status("engine.reference_torque"),
+            SignalSupportStatus::Unsupported
+        );
+    }
+
+    #[tokio::test]
     async fn support_discovery_preserves_each_responder_and_payload() {
         let mut exchange = ScriptedExchange::new(vec![
             "7E9 06 41 00 00 00 00 00\r7E8 06 41 00 80 00 00 00\r>",
