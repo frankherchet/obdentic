@@ -207,6 +207,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("#256 a Knowledge signal sharing its semantic with a standard PID has its own id, status and value; the unsupported PID is not polled");
             AvailabilityAcceptance.run(service,getTargetContext());
             passed("Availability check (REQ-030): starts automatically for a new vehicle and after every inventory job, ECU identification on every reconnect of a known vehicle without a new check (REQ-030.7), one closed 0x22 read per default-session signal, answered/rejected(NRC) classification without values, stored with the vehicle, own recording, replay restores the statuses without traffic, never in demo");
+            ResumeRecordingAcceptance.run(service,getTargetContext());
+            passed("#302 the named recording continues after an automatic reconnect while the automatic ECU identification runs, and the identification lands in it (REQ-020.8)");
             AutoDtcAcceptance.run(service,getTargetContext());
             passed("Automatic fault-code scan (REQ-034): stored (Mode 03) and pending (Mode 07) codes once after inventory and the automatic survey, also on reconnect, setting off and demo never scan, no clearing service, TX/RX in the running automatic recording, replay shows both without traffic, a failed scan stays an explicit result and keeps the connection");
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){

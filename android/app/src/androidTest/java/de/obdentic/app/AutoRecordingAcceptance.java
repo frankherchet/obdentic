@@ -113,7 +113,8 @@ final class AutoRecordingAcceptance {
             require(exportDir.mkdirs(), "test setup: export folder"); service.exportTarget = new AppLogAcceptance.DirTarget(exportDir);
             String exported = service.snapshot().optString("autoRecording");
             service.exportCurrent();
-            waitFor(() -> new File(exportDir, exported).isFile() && !service.snapshot().optString("autoRecording").equals(exported) && !service.snapshot().optString("autoRecording").isEmpty(), "export now");
+            // sealed logs are copied after the recordings, so wait for both
+            waitFor(() -> new File(exportDir, exported).isFile() && exportDir.list((d, n) -> n.matches("app-.*\\.log")).length > 0 && !service.snapshot().optString("autoRecording").equals(exported) && !service.snapshot().optString("autoRecording").isEmpty(), "export now");
             require(new JSONObject(lastLine(new File(dir, exported))).optString("reason").equals("rotated"), "REQ-028.11 the running file ends as rotated");
             require(new JSONObject(lastLine(new File(exportDir, exported))).optString("reason").equals("rotated"), "REQ-028.11 the exported copy is complete");
             String[] logs = exportDir.list((d, n) -> n.matches("app-.*\\.log"));

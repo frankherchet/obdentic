@@ -432,7 +432,7 @@ requirements:
       - id: REQ-020.6
         text: The user can switch automatic connection off and on; it is on by default, and the setting stays across app restarts.
       - id: REQ-020.7
-        text: After an automatic connection, only the existing read-only initialization, inventory and ECU identification (REQ-030.7) run automatically, with the normal vehicle-record handling; no other job is repeated.
+        text: After an automatic connection, only the existing read-only initialization, inventory, ECU identification (REQ-030.7) and, unless switched off, the fault-code scan (REQ-034.1) run automatically, with the normal vehicle-record handling; no other job, in particular no earlier manual job, is repeated.
       - id: REQ-020.8
         text: A recording interrupted by connection loss stays saved as a partial recording; after the automatic reconnection a new recording with the same profile starts automatically, while a test sequence is never restarted automatically.
       - id: REQ-020.9

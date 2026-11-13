@@ -194,13 +194,12 @@ public final class ObdService extends Service {
         });
         return true;
     }
-    /** REQ-020.1/.8: worker thread, right after initialize and inventory. Remembers the adapter; continues an interrupted recording as a new one. */
+    /** REQ-020.1: worker thread, right after initialize and inventory. Remembers the adapter. */
     private void connected(String address) {
         AppLog.i("conn","ready "+address);
         sessionAddress=address; getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString(KNOWN,address).commit();
-        policy.success(); String resume=pendingProfile; pendingProfile="";
+        policy.success();
         foreground();
-        if(!resume.isEmpty()) startRecording(resume); // queued behind this task, so busy is clear by then
     }
     /** REQ-028.5: "Dauer-Aufzeichnung", on by default. */
     public static boolean autoRecordEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO_REC,true); }
@@ -295,7 +294,7 @@ public final class ObdService extends Service {
         // REQ-030.7: ECU identification on every connection (Knowledge signals live in the session); REQ-030.4: availability for a new vehicle only
         scanFor=inventory.optBoolean("ok") && autoScanWanted() ? token : -1; // REQ-034.1: only after a successful inventory, only for this connection
         if(knowledge && autoSurvey && mode.equals("live")) { chain.clear(); if(outcome.equals("created")) chain.add(AVAILABILITY); worker.execute(() -> runJob("ecu.discover")); }
-        else startPendingScan(token);
+        else if(!startPendingScan(token)) resumePending(token);
         readOdometer(inventory.optJSONObject("data"),outcome);
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
@@ -404,7 +403,7 @@ public final class ObdService extends Service {
         set("phase","error"); message(text); closeRecording("error",text);
         long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
         if(delay < 0) { pendingProfile=""; stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock(); return; }
-        if(established) pendingProfile=resume;
+        if(established && !resume.isEmpty()) pendingProfile=resume; // a loss before the resume started keeps the pending profile
         String note=established ? "Verbindung verloren" : "Adapter nicht erreichbar", blocked=environmentBlocker();
         foreground(); // stays a foreground service while waiting, so the retry may start in the background
         if(blocked != null) { policy.block(); message(note+" · "+blocked+" · Automatische Verbindung wartet"); releaseWakeLock(); return; } // REQ-020.9
@@ -575,12 +574,14 @@ public final class ObdService extends Service {
             if(succeeded[0] && action.equals("inventory") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add("ecu.discover"); chain.add(AVAILABILITY); scanFor=autoScanWanted() ? token : -1; } // REQ-030.4, REQ-034.1
         } catch(Throwable e) { fail(token,e); } finally { knowledgeJob=false; udsJob=false; if(token==generation) { busy=false; changed(); }
             String next=succeeded[0] && token==generation ? chain.poll() : null;
-            if(next==null) { chain.clear(); startPendingScan(token); } // REQ-034.1: a failed survey job does not skip the scan; a failed scan is only its own result
+            if(next==null) { chain.clear(); if(!startPendingScan(token)) resumePending(token); } // REQ-034.1: a failed survey job does not skip the scan; a failed scan is only its own result
             else if(!worker.isShutdown()) worker.execute(() -> runJob(next)); } });
     }
     private boolean autoScanWanted() { return autoScan && mode.equals("live") && autoDtcEnabled(this); }
     /** REQ-034.1: runs the scan waiting for this connection only, and only while the live conditions still hold (never in demo/replay or a later connection). */
-    private void startPendingScan(int token) { if(scanFor!=token || token!=generation) return; scanFor=-1; if(autoScanWanted() && !worker.isShutdown()) worker.execute(() -> runJob("dtc.scan")); }
+    private boolean startPendingScan(int token) { if(scanFor!=token || token!=generation) return false; scanFor=-1; if(!autoScanWanted() || worker.isShutdown()) return false; worker.execute(() -> runJob("dtc.scan")); return true; }
+    /** REQ-020.8: the interrupted named recording continues only after the automatic jobs of the reconnection, which would otherwise end it (Knowledge jobs write their own file) or keep the service busy. */
+    private void resumePending(int token) { if(token!=generation || !mode.equals("live") || pendingProfile.isEmpty()) return; String resume=pendingProfile; pendingProfile=""; startRecording(resume); }
     /** REQ-022: action name and recording profile of the adapter throughput job (not a polling profile). */
     public static final String THROUGHPUT="adapter.throughput", THROUGHPUT_PROFILE="adapter-throughput", AVAILABILITY="knowledge.availability";
     /** REQ-022.1: the German reason why the throughput job cannot start now, or null. Live and ready only. */
