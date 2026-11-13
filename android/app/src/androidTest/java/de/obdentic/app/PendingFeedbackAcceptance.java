@@ -64,18 +64,22 @@ final class PendingFeedbackAcceptance {
         require(pending.signature().equals("[]"), "REQ-021.3 pending cleared on expiry");
         Button usable = awaitButton(inst, START);
         require(onMain(inst,() -> usable.isEnabled()), "REQ-021.3 button usable again after expiry");
-        require(((MainActivity)current).lastAnnouncement.equals("Keine Rückmeldung · Aufzeichnung starten"), "REQ-021.5 expiry announced: "+((MainActivity)current).lastAnnouncement);
+        awaitAnnouncement(inst, current, "Keine Rückmeldung · Aufzeichnung starten", "REQ-021.5 expiry announced");
 
-        // REQ-021.1/.2/.5: a real start and stop through the button.
-        inst.runOnMainSync(usable::performClick);
-        require(((MainActivity)current).lastAnnouncement.equals(START_PENDING), "REQ-021.1/.5 the tap announces the pending text");
+        // REQ-021.1/.2/.5: a real start and stop through the button. The pending text is read in the same main-thread turn as the tap,
+        // because the 500 ms refresh replaces it with the final state as soon as the service reports the recording.
+        String[] tapped = {""};
+        inst.runOnMainSync(() -> { usable.performClick(); tapped[0] = ((MainActivity)current).lastAnnouncement; });
+        require(START_PENDING.equals(tapped[0]), "REQ-021.1/.5 the tap announces the pending text: "+tapped[0]);
         until(() -> !service.snapshot().optString("recording").isEmpty(), "demo recording started");
         String name = service.snapshot().getString("recording");
         Button stop = awaitButton(inst, STOP);
         require(!pending.isPending("rec.start") && onMain(inst,() -> stop.isEnabled()), "REQ-021.2 start observed: pending ended, stop label shown and usable");
-        require(!((MainActivity)current).lastAnnouncement.equals(START_PENDING), "REQ-021.5 final state announced: "+((MainActivity)current).lastAnnouncement);
-        inst.runOnMainSync(stop::performClick);
-        require(((MainActivity)current).lastAnnouncement.equals(STOP_PENDING), "REQ-021.1/.5 stop announces the pending text");
+        String finalAnnouncement = announcement(inst, current);
+        require(!START_PENDING.equals(finalAnnouncement), "REQ-021.5 final state announced: "+finalAnnouncement);
+        String[] stopTapped = {""};
+        inst.runOnMainSync(() -> { stop.performClick(); stopTapped[0] = ((MainActivity)current).lastAnnouncement; });
+        require(STOP_PENDING.equals(stopTapped[0]), "REQ-021.1/.5 stop announces the pending text: "+stopTapped[0]);
         until(() -> service.snapshot().optString("recording").isEmpty(), "demo recording stopped");
         Button restart = awaitButton(inst, START);
         require(!pending.isPending("rec.stop") && onMain(inst,() -> restart.isEnabled()), "REQ-021.2 stop observed: pending ended, start label shown and usable");
@@ -115,6 +119,16 @@ final class PendingFeedbackAcceptance {
         Button[] found = new Button[1];
         until(() -> { MainActivity a = MainActivity.resumed; return a != null && onMain(inst,() -> (found[0] = findButton(a.getWindow().getDecorView(),text)) != null); }, "button "+text);
         return found[0];
+    }
+    /** The Activity's last announcement, read on the main thread (the 500 ms refresh writes it there). */
+    private static String announcement(Instrumentation inst, Activity a) throws Exception {
+        FutureTask<String> task = new FutureTask<>(() -> ((MainActivity)a).lastAnnouncement); inst.runOnMainSync(task); return task.get();
+    }
+    /** Waits until the announcement equals the expected text; a failure shows the last value that was seen. */
+    private static void awaitAnnouncement(Instrumentation inst, Activity a, String expected, String name) throws Exception {
+        String[] last = {""};
+        try { until(() -> expected.equals(last[0] = announcement(inst, a)), name); }
+        catch(AssertionError e) { throw new AssertionError(name+": last announcement \""+last[0]+"\""); }
     }
     private static Button findButton(View view, String text) {
         if(view instanceof Button && text.contentEquals(((Button)view).getText())) return (Button)view;
