@@ -13,7 +13,7 @@ use crate::{
     },
     runtime_state::Activity,
     safety::{OperationRequest, SafetyPolicy},
-    signal_read::{decode, Decoder, Evidence, OutcomeState, SignalOutcome, SignalRoute},
+    signal_read::{self, decode, Decoder, Evidence, OutcomeState, SignalOutcome, SignalRoute},
     throughput,
     topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
@@ -160,15 +160,11 @@ impl<E: Exchange> MobileCore<E> {
         }
         if action == "replay.read" {
             let mut recorded: Value = serde_json::from_str(argument).map_err(|e| e.to_string())?;
-            let semantic = recorded
-                .get("semantic")
-                .and_then(Value::as_str)
-                .ok_or("recording semantic missing")?;
-            // A Knowledge read always replays by its definition, even when its
-            // semantic is also a standard OBD-II signal (REQ-024.4).
-            let request = match crate::prepare_read(semantic) {
-                Ok(request) if recorded.get("definition_id").is_none() => request,
-                _ => return knowledge::replay_read(&recorded),
+            // The key decides the route: a Knowledge read always replays by its definition, even when its
+            // semantic is also a standard OBD-II signal (REQ-024.4, REQ-024.6).
+            let key = signal_read::key_of_recording(&recorded)?;
+            let SignalRoute::Standard(request) = SignalRoute::of(&key) else {
+                return knowledge::replay_read(&recorded, &key);
             };
             let response: Vec<u8> = serde_json::from_value(
                 recorded
@@ -177,10 +173,21 @@ impl<E: Exchange> MobileCore<E> {
                     .ok_or("recording response missing")?,
             )
             .map_err(|e| e.to_string())?;
-            let transaction = request.complete("replay", response)?;
-            recorded["value"] = json!(transaction.value());
-            recorded["unit"] = json!(transaction.unit());
-            recorded["replay"] = json!(true);
+            let outcome = decode(
+                &key,
+                Decoder::Standard {
+                    request,
+                    source: "replay",
+                },
+                Evidence {
+                    response: Some(response),
+                    error: None,
+                },
+            );
+            let decoded = outcome.read_json(true)?;
+            for field in ["key", "value", "unit", "replay"] {
+                recorded[field] = decoded[field].clone();
+            }
             return Ok(recorded);
         }
         if !matches!(
@@ -1751,6 +1758,60 @@ mod tests {
         assert_eq!(replay["data"]["unit"], "°C");
         assert_eq!(replay["data"]["validation"], "not_validated");
         assert_eq!(replay["data"]["replay"], true);
+    }
+
+    #[test]
+    fn req_024_6_old_recordings_without_key_replay_unchanged_and_get_a_derived_key() {
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let revision = crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+            .unwrap()
+            .pin()
+            .revision()
+            .to_owned();
+        let pid =
+            json!({"semantic":"engine.rpm","response":[65,12,26,248],"value":0,"timestamp_ms":7});
+        let replay = run(&mut core, "replay.read", &pid.to_string());
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["data"]["value"], 1726.0);
+        assert_eq!(replay["data"]["timestamp_ms"], 7);
+        assert_eq!(replay["data"]["key"], "engine.rpm");
+
+        let mut recording = json!({
+            "knowledge_repository":"frankherchet/obdentic-knowledge",
+            "knowledge_revision":revision,
+            "semantic":"engine.oil_temperature",
+            "definition_id":"vag.ea189.oil.oil_temperature",
+            "target_id":"vag.ecu_target.7e0",
+            "request":[34,17,190],
+            "response":[98,17,190,14,47],
+            "observations":[{"selected_responder":"7E8","responses":[{"responder":"7E8","payload":[98,17,190,14,47]}]}]
+        });
+        let replay = run(&mut core, "replay.read", &recording.to_string());
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(
+            replay["data"]["key"],
+            "engine.oil_temperature@vag.ecu_target.7e0"
+        );
+        assert!((replay["data"]["value"].as_f64().unwrap() - 90.0).abs() < 1e-9);
+
+        // A recorded key that contradicts the record's own definition or target fails closed.
+        recording["key"] = json!("engine.oil_temperature@vag.ecu_target.7e1");
+        let replay = run(&mut core, "replay.read", &recording.to_string());
+        assert_eq!(replay["ok"], false, "{replay}");
+
+        let availability = json!({
+            "knowledge_repository":"frankherchet/obdentic-knowledge",
+            "knowledge_revision":revision,
+            "entries":[{"key":"air.charge_limit_overcharge","status":"not_answered","reason":"no route"}]
+        });
+        let replay = run(
+            &mut core,
+            "replay.knowledge.availability",
+            &availability.to_string(),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["data"]["entries"][0]["status"], "not_answered");
+        assert_eq!(replay["data"]["entries"][0]["reason"], "no route");
     }
 
     #[test]

@@ -625,6 +625,34 @@ fn req_030_8_answered_entries_carry_response_value_unit_and_implausible_flag() {
 }
 
 #[test]
+// REQ-024.6
+fn req_024_6_same_evidence_same_outcome_live_replay_and_sweep() {
+    let (mut core, state, sweep) = answered_sweep();
+    state.lock().unwrap().did_replies.insert(
+        0x11BE,
+        VecDeque::from([Reply::Payload(vec![0x62, 0x11, 0xBE, 0x04, 0x00])]),
+    );
+    for key in [OIL, "engine.rpm"] {
+        let live = run(&mut core, "read", key);
+        assert_eq!(live["ok"], true, "{live}");
+        let replay = run(&mut core, "replay.read", &live["data"].to_string());
+        assert_eq!(replay["ok"], true, "{replay}");
+        let entry = entry_of(&sweep, key);
+        for view in [&live["data"], &replay["data"], entry] {
+            assert_eq!(view["key"], key, "{view}");
+            assert_eq!(view["value"], entry["value"], "{view}");
+            assert_eq!(view["unit"], entry["unit"], "{view}");
+        }
+        let replayed_sweep = run(
+            &mut core,
+            "replay.knowledge.availability",
+            &sweep.to_string(),
+        );
+        assert_eq!(entry_of(&replayed_sweep["data"], key), entry);
+    }
+}
+
+#[test]
 // REQ-030.9
 fn req_030_9_advertised_mode_01_pids_are_read_once_from_the_engine_target() {
     let (_, state, data) = answered_sweep();

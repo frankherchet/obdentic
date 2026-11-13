@@ -182,7 +182,9 @@ impl CaptureReplay {
                         None => semantic.clone(),
                     };
                     let decoder = match (SignalRoute::of(&key), pinned) {
-                        (SignalRoute::Standard(request), _) => Decoder::Standard { request, source },
+                        (SignalRoute::Standard(request), _) => {
+                            Decoder::Standard { request, source }
+                        }
                         (SignalRoute::Knowledge { .. }, Some((catalog, definition))) => {
                             Decoder::Knowledge {
                                 definition,
@@ -264,7 +266,9 @@ impl CaptureReplay {
                         ),
                         (OutcomeState::NotAnswered { reason }, _) => issue(
                             ReplayIssueKind::DecodeFailed,
-                            reason.clone().unwrap_or_else(|| "Knowledge read did not decode".into()),
+                            reason
+                                .clone()
+                                .unwrap_or_else(|| "Knowledge read did not decode".into()),
                         ),
                     }
                 }

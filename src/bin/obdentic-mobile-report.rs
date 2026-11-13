@@ -101,11 +101,13 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                 if decoded["ok"] != true {
                     issues.push(format!("{action}: {}", decoded["error"]));
                 } else if action == "read" {
-                    let semantic = decoded["data"]["semantic"]
+                    // REQ-024.6: replay always sets the signal key, so two signals that share a
+                    // semantic keep separate last values.
+                    let key = decoded["data"]["key"]
                         .as_str()
-                        .ok_or("read without semantic")?
+                        .ok_or("read without key")?
                         .to_string();
-                    values.insert(semantic, decoded["data"].clone());
+                    values.insert(key, decoded["data"].clone());
                 } else if action == "adapter.throughput" {
                     jobs.push(
                         json!({"action":action,"at":event["at"],"data":decoded["data"],
@@ -185,6 +187,35 @@ mod tests {
         assert_eq!(value["mode"], "demo");
         assert_eq!(value["complete"], false);
         assert_eq!(value["issues"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn req_024_6_report_keeps_signals_sharing_a_semantic_apart() {
+        let revision = obdentic::knowledge_db::KnowledgeCatalog::embedded_pinned()
+            .unwrap()
+            .pin()
+            .revision()
+            .to_owned();
+        // Synthetic: standard PID 5C and the Knowledge oil temperature share one semantic.
+        let pid = json!({"type":"action","action":"read","result":{"ok":true,
+            "data":{"semantic":"engine.oil_temperature","response":[65,92,120]}}});
+        let knowledge = json!({"type":"action","action":"read","result":{"ok":true,"data":{
+            "knowledge_repository":"frankherchet/obdentic-knowledge","knowledge_revision":revision,
+            "semantic":"engine.oil_temperature","definition_id":"vag.ea189.oil.oil_temperature",
+            "target_id":"vag.ecu_target.7e0","request":[34,17,190],"response":[98,17,190,14,47],
+            "observations":[{"selected_responder":"7E8","responses":[{"responder":"7E8","payload":[98,17,190,14,47]}]}]}}});
+        let recording = format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session","schema":"OBDENTIC-MOBILE","version":1,"mode":"live"}),
+            pid,
+            knowledge
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        let values = report["last_values"].as_object().unwrap();
+        assert_eq!(values.len(), 2, "{report}");
+        assert_eq!(values["engine.oil_temperature"]["value"], 80.0);
+        let knowledge = &values["engine.oil_temperature@vag.ecu_target.7e0"];
+        assert!((knowledge["value"].as_f64().unwrap() - 90.0).abs() < 1e-9);
     }
 
     #[test]

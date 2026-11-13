@@ -539,7 +539,7 @@ pub(super) fn target_from_catalog(
     CandidateTarget::from_catalog(target, catalog.pin().repository())
 }
 
-pub(super) fn replay_read(recorded: &Value) -> Result<Value, String> {
+pub(super) fn replay_read(recorded: &Value, key: &str) -> Result<Value, String> {
     let catalog = KnowledgeCatalog::embedded_pinned().map_err(|error| error.to_string())?;
     require_revision(recorded, &catalog)?;
     let semantic = recorded
@@ -586,6 +586,7 @@ pub(super) fn replay_read(recorded: &Value) -> Result<Value, String> {
     }
     let response = recorded_evidence_payload(recorded, &target, definition)?;
     let mut result = knowledge_outcome(
+        key,
         &catalog,
         target_id,
         definition,
@@ -641,6 +642,7 @@ pub(super) fn replay_learning(recorded: &Value) -> Result<Value, String> {
         let response = recorded_evidence_payload(result, &target, definition)?;
         decoded.push(
             knowledge_outcome(
+                &signal_key(semantic, target_id),
                 &catalog,
                 target_id,
                 definition,
@@ -1111,6 +1113,7 @@ pub(super) fn read_evidence_json(result: &Result<ReadEvidence, ReadEvidenceError
 
 /// The Knowledge read of `resolved` decoded by the one signal-read module; its key is `<semantic>@<target>`.
 pub(crate) fn knowledge_outcome(
+    key: &str,
     catalog: &KnowledgeCatalog,
     target_id: &str,
     definition: &KnowledgeDefinition,
@@ -1118,7 +1121,7 @@ pub(crate) fn knowledge_outcome(
     error: Option<&str>,
 ) -> SignalOutcome {
     decode(
-        &signal_key(definition.semantic(), target_id),
+        key,
         Decoder::Knowledge {
             definition,
             target_id,
@@ -1137,6 +1140,7 @@ pub(super) fn read_outcome(
     result: &Result<ReadEvidence, ReadEvidenceError>,
 ) -> SignalOutcome {
     knowledge_outcome(
+        &signal_key(resolved.definition.semantic(), &resolved.target_id),
         catalog,
         &resolved.target_id,
         &resolved.definition,

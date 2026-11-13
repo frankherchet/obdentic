@@ -481,7 +481,6 @@ fn decode_value(decoder: &KnowledgeDecoder, payload: &[u8]) -> Result<Value, Str
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,9 +517,8 @@ mod tests {
             .unwrap();
         let did = definition.operation().did();
         let head = [0x62, (did >> 8) as u8, did as u8];
-        let keys = |value: &Value| -> Vec<String> {
-            value.as_object().unwrap().keys().cloned().collect()
-        };
+        let keys =
+            |value: &Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
         let read_keys = [
             "did",
             "definition_id",
@@ -579,7 +577,8 @@ mod tests {
         assert_eq!(negative["status"], "rejected");
         assert_eq!(negative["nrc"], 0x31);
         assert!(negative["value"].is_null());
-        let missing = knowledge_outcome(&catalog, definition, None, Some("timeout")).learning_json();
+        let missing =
+            knowledge_outcome(&catalog, definition, None, Some("timeout")).learning_json();
         assert_eq!(missing["status"], "not_answered");
         assert!(missing["value"].is_null());
     }

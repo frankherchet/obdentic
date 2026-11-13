@@ -79,8 +79,10 @@ OBDentic runtime
 A pure reducer applies typed events, while effects such as BLE I/O and persistence happen outside the reducer. This makes runtime history replayable and auditable.
 
 Android's serialized `MobileCore` consumes the same pinned Knowledge catalog.
-`mobile/knowledge.rs` resolves identified ECU facts, performs deterministic DID
-decoding and replays discovery/learning evidence; `mobile/uds.rs` owns the closed
+`signal_read.rs` routes every signal key (PID or `semantic@target`) and decodes its
+evidence for live reads, replay, the availability sweep and CLI capture replay
+([ADR 0004](docs/adr/0004-signal-key-routes-decoding.md)); `mobile/knowledge.rs`
+resolves identified ECU facts and replays discovery/learning evidence; `mobile/uds.rs` owns the closed
 extended-session lifecycle. Both use the existing `ElmSession` transport and
 typed safety policy. Android owns BLE lifetime, private vehicle records and
 presentation, including the ECU/group selector; it cannot supply diagnostic bytes.
