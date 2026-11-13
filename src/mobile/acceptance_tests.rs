@@ -18,6 +18,8 @@ use std::{
 #[derive(Clone)]
 enum Reply {
     Payload(Vec<u8>),
+    /// Several frames from the same responder in one adapter answer.
+    Frames(Vec<Vec<u8>>),
     NoData,
     Error(String),
 }
@@ -95,7 +97,13 @@ impl Exchange for FakeExchange {
                 .get(&state.target)
                 .cloned()
                 .unwrap_or_default();
-            let reply = if did == 0xF187 {
+            let queued = state
+                .did_replies
+                .get_mut(&did)
+                .and_then(VecDeque::pop_front);
+            let reply = if let Some(reply) = queued {
+                reply
+            } else if did == 0xF187 {
                 match state
                     .presence
                     .get(&state.target)
@@ -113,12 +121,6 @@ impl Exchange for FakeExchange {
                     }
                     Presence::NoData => Reply::NoData,
                 }
-            } else if let Some(reply) = state
-                .did_replies
-                .get_mut(&did)
-                .and_then(VecDeque::pop_front)
-            {
-                reply
             } else if state.identification_dids.contains(&did) && target_is_present(&state) {
                 Reply::Payload(vec![0x62, (did >> 8) as u8, did as u8, b'1', b'2', b'3'])
             } else {
@@ -126,6 +128,7 @@ impl Exchange for FakeExchange {
             };
             return match reply {
                 Reply::Payload(payload) => Ok(frame(&expected, &payload)),
+                Reply::Frames(frames) => Ok(frames_reply(&expected, &frames)),
                 Reply::NoData => Ok("NO DATA\r>".into()),
                 Reply::Error(error) => Err(error),
             };
@@ -157,9 +160,18 @@ fn frame(responder: &str, payload: &[u8]) -> String {
     format!("{responder} {:02X}{bytes}\r>", payload.len())
 }
 
+fn frames_reply(responder: &str, frames: &[Vec<u8>]) -> String {
+    let lines = frames
+        .iter()
+        .map(|payload| frame(responder, payload).trim_end_matches('>').to_owned())
+        .collect::<String>();
+    format!("{lines}>")
+}
+
 fn reply_frame(reply: &Reply, responder: &str) -> String {
     match reply {
         Reply::Payload(payload) => frame(responder, payload),
+        Reply::Frames(frames) => frames_reply(responder, frames),
         Reply::NoData => "NO DATA\r>".into(),
         Reply::Error(error) => panic!("unexpected configured transport error: {error}"),
     }
@@ -922,4 +934,143 @@ fn req_024_4_malformed_offline_replay_does_not_touch_active_vehicle_session() {
     assert_eq!(replay["ok"], false, "{replay}");
     assert!(commands(&state).is_empty());
     assert_eq!(replay["uds"]["active"], true);
+}
+
+const BUSY: [u8; 3] = [0x7F, 0x22, 0x21];
+const PENDING: [u8; 3] = [0x7F, 0x22, 0x78];
+const F187_ABC: [u8; 6] = [0x62, 0xF1, 0x87, b'A', b'B', b'C'];
+const F187_XYZ: [u8; 6] = [0x62, 0xF1, 0x87, b'X', b'Y', b'Z'];
+
+/// One evidence table shared by the live mobile path and its replay.
+type Case = (&'static str, Vec<Vec<u8>>, &'static str, Option<u8>);
+
+fn intermediate_cases() -> Vec<Case> {
+    vec![
+        (
+            "busy then positive",
+            vec![BUSY.to_vec(), F187_ABC.to_vec()],
+            "supported",
+            None,
+        ),
+        (
+            "pending then positive",
+            vec![PENDING.to_vec(), F187_ABC.to_vec()],
+            "supported",
+            None,
+        ),
+        (
+            "busy then out of range",
+            vec![BUSY.to_vec(), vec![0x7F, 0x22, 0x31]],
+            "unsupported",
+            None,
+        ),
+        (
+            "only busy",
+            vec![BUSY.to_vec(), BUSY.to_vec()],
+            "negative_response",
+            Some(0x21),
+        ),
+        (
+            "conflicting finals",
+            vec![BUSY.to_vec(), F187_ABC.to_vec(), F187_XYZ.to_vec()],
+            "malformed",
+            None,
+        ),
+    ]
+}
+
+#[test]
+// REQ-023.7, REQ-023.8
+fn req_023_7_8_live_mobile_discovery_and_replay_agree_on_intermediate_responses() {
+    for (name, frames, status, nrc) in intermediate_cases() {
+        let (mut live, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+        state
+            .lock()
+            .unwrap()
+            .did_replies
+            .insert(0xF187, VecDeque::from([Reply::Frames(frames.clone())]));
+        let live_result = discover(&mut live);
+        let live_observation = &live_result["targets"][0]["observations"][0];
+        assert_eq!(live_result["targets"][0]["target_id"], "vag.ecu_target.7e0");
+        assert_eq!(
+            live_observation["status"], status,
+            "live {name}: {live_result}"
+        );
+        assert_eq!(
+            live_observation["responses"].as_array().unwrap().len(),
+            frames.len()
+        );
+        if let Some(nrc) = nrc {
+            assert_eq!(live_observation["nrc"], nrc, "live {name}");
+        }
+
+        let catalog = KnowledgeCatalog::embedded_pinned().unwrap();
+        let recording = json!({
+            "knowledge_repository": catalog.pin().repository(),
+            "knowledge_revision": catalog.pin().revision(),
+            "targets": [{"target_id": "vag.ecu_target.7e0", "observations": [{
+                "semantic": "ecu.manufacturer_spare_part_number",
+                "definition_id": "uds.f187.manufacturer_spare_part_number",
+                "request": [0x22, 0xF1, 0x87],
+                "responses": frames
+                    .iter()
+                    .map(|payload| json!({"responder": "7E8", "payload": payload}))
+                    .collect::<Vec<_>>()
+            }]}]
+        });
+        let mut replay = MobileCore::new(FakeExchange(state)).unwrap();
+        let replayed = run(&mut replay, "replay.ecu.discover", &recording.to_string());
+        assert_eq!(replayed["ok"], true, "replay {name}: {replayed}");
+        assert_eq!(
+            replayed["data"]["targets"][0]["observations"][0]["status"], status,
+            "replay {name}"
+        );
+    }
+}
+
+#[test]
+// REQ-023.7, REQ-023.8
+fn req_023_7_8_live_knowledge_read_and_replay_use_the_decisive_response() {
+    let (mut live, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    discover(&mut live);
+    let definition = live
+        .knowledge
+        .as_ref()
+        .unwrap()
+        .learning_candidates()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.definition.semantic() == "air.intercooler_outlet_temperature")
+        .unwrap()
+        .definition;
+    let did = definition.operation().did();
+    let mut positive = vec![0x62, (did >> 8) as u8, did as u8];
+    positive.resize(
+        positive.len() + definition.response().exact_payload_length().unwrap(),
+        0,
+    );
+    state.lock().unwrap().did_replies.insert(
+        did,
+        VecDeque::from([Reply::Frames(vec![BUSY.to_vec(), positive])]),
+    );
+    let learned = run(&mut live, "knowledge.learn", "");
+    assert_eq!(learned["ok"], true, "{learned}");
+    let answered = |result: &Value| {
+        result["data"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["definition_id"] == definition.id() && item["status"] == "answered")
+            .count()
+    };
+    assert_eq!(answered(&learned), 1, "live {learned}");
+
+    let mut replay = MobileCore::new(FakeExchange(state)).unwrap();
+    let replayed = run(
+        &mut replay,
+        "replay.knowledge.learn",
+        &learned["data"].to_string(),
+    );
+    assert_eq!(replayed["ok"], true, "{replayed}");
+    assert_eq!(answered(&replayed), 1, "replay {replayed}");
 }

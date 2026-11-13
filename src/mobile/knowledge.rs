@@ -470,6 +470,12 @@ pub(super) fn identification_observation(
         errors.push(error);
     }
     let (status, nrc, value) = match payload.as_deref() {
+        None if errors
+            .last()
+            .is_some_and(|error| error.starts_with("conflicting responses")) =>
+        {
+            (IdentificationResultStatus::Malformed, None, None)
+        }
         Some(response) if response.starts_with(&[0x7f, 0x22]) && response.len() == 3 => {
             (status_for_nrc(response[2]), Some(response[2]), None)
         }
@@ -1161,12 +1167,16 @@ fn recorded_evidence_payload(
             }
         }
     }
-    payloads.sort();
-    payloads.dedup();
-    if payloads.len() > 1 {
-        return Err("conflicting Knowledge responses from the expected ECU".into());
-    }
-    let evidence = payloads.pop();
+    let payload_refs = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let evidence = if payload_refs.is_empty() {
+        None
+    } else {
+        Some(
+            decisive_identification_payload(&payload_refs)
+                .ok_or("conflicting Knowledge responses from the expected ECU")?
+                .to_vec(),
+        )
+    };
     let recorded = item
         .get("response")
         .filter(|response| !response.is_null())
@@ -1276,7 +1286,13 @@ fn classify_replay_response(
         });
     }
     let Some(payload) = decisive_identification_payload(&payload_refs) else {
-        return Err("conflicting discovery responses from the expected ECU".into());
+        return Ok(ReplayIdentification {
+            status: IdentificationResultStatus::Malformed,
+            nrc: None,
+            value: None,
+            error: Some("conflicting discovery responses from the expected ECU".into()),
+            responses: matching,
+        });
     };
     if payload.starts_with(&[0x7f, 0x22]) && payload.len() == 3 {
         return Ok(ReplayIdentification {
@@ -1530,7 +1546,10 @@ mod tests {
         );
         assert_eq!(only_busy.nrc, Some(0x21));
         assert_eq!(only_busy.value, None);
-        assert!(conflicting_final.is_err());
+        assert_eq!(
+            conflicting_final.unwrap().status,
+            IdentificationResultStatus::Malformed
+        );
     }
 
     // REQ-023.8
