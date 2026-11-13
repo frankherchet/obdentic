@@ -194,13 +194,12 @@ public final class ObdService extends Service {
         });
         return true;
     }
-    /** REQ-020.1/.8: worker thread, right after initialize and inventory. Remembers the adapter; continues an interrupted recording as a new one. */
+    /** REQ-020.1: worker thread, right after initialize and inventory. Remembers the adapter. */
     private void connected(String address) {
         AppLog.i("conn","ready "+address);
         sessionAddress=address; getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString(KNOWN,address).commit();
-        policy.success(); String resume=pendingProfile; pendingProfile="";
+        policy.success();
         foreground();
-        if(!resume.isEmpty()) startRecording(resume); // queued behind this task, so busy is clear by then
     }
     /** REQ-028.5: "Dauer-Aufzeichnung", on by default. */
     public static boolean autoRecordEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO_REC,true); }
@@ -294,6 +293,8 @@ public final class ObdService extends Service {
         boolean knowledge=inventory.optJSONObject("data")!=null && !inventory.optJSONObject("data").isNull("knowledge_manufacturer");
         // REQ-030.7: ECU identification on every connection (Knowledge signals live in the session); REQ-030.4: availability for a new vehicle only
         scanFor=inventory.optBoolean("ok") && autoScanWanted() ? token : -1; // REQ-034.1: only after a successful inventory, only for this connection
+        // REQ-020.8: queued before the automatic jobs, which would otherwise keep the service busy and reject the resume
+        String resume=pendingProfile; pendingProfile=""; if(!resume.isEmpty() && mode.equals("live")) startRecording(resume);
         if(knowledge && autoSurvey && mode.equals("live")) { chain.clear(); if(outcome.equals("created")) chain.add(AVAILABILITY); worker.execute(() -> runJob("ecu.discover")); }
         else startPendingScan(token);
         readOdometer(inventory.optJSONObject("data"),outcome);
