@@ -91,6 +91,7 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                     "adapter.throughput" => "replay.adapter.throughput",
                     "ecu.discover" => "replay.ecu.discover",
                     "knowledge.learn" => "replay.knowledge.learn",
+                    "knowledge.availability" => "replay.knowledge.availability",
                     _ => continue,
                 };
                 let decoded: Value = serde_json::from_str(
@@ -110,6 +111,12 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                         json!({"action":action,"at":event["at"],"data":decoded["data"],
                         "summary":obdentic::throughput::summary_lines(&decoded["data"])}),
                     );
+                } else if action == "knowledge.availability" {
+                    let (table, counts) = availability_table(&decoded["data"]);
+                    jobs.push(
+                        json!({"action":action,"at":event["at"],"data":decoded["data"],
+                        "table":table,"counts":counts}),
+                    );
                 } else {
                     jobs.push(json!({"action":action,"at":event["at"],"data":decoded["data"]}));
                 }
@@ -126,6 +133,27 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
         "complete":complete,"outcome":outcome,"event_count":events,"tx_count":tx,"rx_count":rx,
         "last_values":values,"diagnostic_jobs":jobs,"issues":issues,
         "note":"Values and diagnostic facts are recomputed from recorded responses. Original evidence remains in the source file."}))
+}
+
+/// REQ-030.10: one row per availability entry (key, target, status, NRC or reason, value, unit,
+/// implausible) plus the number of entries per status.
+fn availability_table(data: &Value) -> (Vec<Value>, BTreeMap<String, u32>) {
+    let mut counts = BTreeMap::new();
+    let table = data["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            *counts
+                .entry(entry["status"].as_str().unwrap_or("unknown").to_owned())
+                .or_insert(0) += 1;
+            json!({"key":entry["key"],"target":entry["target"],"status":entry["status"],
+                "detail":if entry["nrc"].is_null() {&entry["reason"]} else {&entry["nrc"]},
+                "value":entry["value"],"unit":entry["unit"],
+                "implausible":entry["implausible"] == true})
+        })
+        .collect();
+    (table, counts)
 }
 
 fn main() {
@@ -237,5 +265,40 @@ mod tests {
         assert_eq!(report["outcome"]["reason"], "rotated");
         assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
         assert_eq!(report["last_values"]["engine.rpm"]["value"], 2000.0);
+    }
+
+    #[test]
+    fn req_030_10_availability_table_and_counts_are_rederived_from_recorded_responses() {
+        let catalog = obdentic::knowledge_db::KnowledgeCatalog::embedded_pinned().unwrap();
+        let data = json!({"knowledge_repository":catalog.pin().repository(),
+            "knowledge_revision":catalog.pin().revision(),"entries":[
+            {"key":"engine.oil_temperature@vag.ecu_target.7e0","target":"vag.ecu_target.7e0",
+             "definition_id":"vag.ea189.oil.oil_temperature","status":"answered",
+             "response":[98,17,190,4,0],"value":999.0},
+            {"key":"dpf.oil_ash_volume@vag.ecu_target.7e0","target":"vag.ecu_target.7e0",
+             "definition_id":"vag.ea189.dpf.oil_ash_volume","status":"rejected",
+             "response":[127,34,49],"nrc":49},
+            {"key":"engine.rpm","target":"vag.ecu_target.7e0","status":"answered",
+             "response":[65,12,26,248]}]});
+        let recording = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"session","schema":"OBDENTIC-MOBILE","version":1,"mode":"live"}"#,
+            json!({"type":"action","action":"knowledge.availability","result":{"ok":true,"data":data}}),
+            r#"{"type":"session_end","reason":"stopped"}"#
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
+        let job = &report["diagnostic_jobs"][0];
+        assert_eq!(job["counts"], json!({"answered":2,"rejected":1}));
+        let rows = job["table"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!((rows[0]["value"].as_f64().unwrap() + 170.7).abs() < 1e-6);
+        assert_eq!(rows[0]["unit"], "°C");
+        assert_eq!(rows[0]["implausible"], true);
+        assert_eq!(rows[1]["status"], "rejected");
+        assert_eq!(rows[1]["detail"], 49);
+        assert_eq!(rows[1]["implausible"], false);
+        assert_eq!(rows[2]["value"], 1726.0);
+        assert_eq!(rows[2]["target"], "vag.ecu_target.7e0");
     }
 }

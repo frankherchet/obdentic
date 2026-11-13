@@ -67,6 +67,7 @@ public class MainActivity extends Activity {
         AUTO_CONNECT=new PendingActions.Spec("auto.connect","Automatisch verbinden","Ändere automatische Verbindung …",10000,(n,b)->n.optBoolean("autoConnect")!=b.optBoolean("autoConnect")||msg(n,b)),
         AUTO_STOP=new PendingActions.Spec("auto.stop","Automatische Verbindung stoppen","Stoppe automatische Verbindung …",10000,(n,b)->!n.optBoolean("autoPending")||msg(n,b)),
         AUTO_RECORD=new PendingActions.Spec("auto.record","Dauer-Aufzeichnung","Ändere Dauer-Aufzeichnung …",10000,(n,b)->n.optBoolean("autoRecord")!=b.optBoolean("autoRecord")),
+        AUTO_DTC=new PendingActions.Spec("auto.dtc","Fehlerspeicher beim Verbinden lesen","Ändere Einstellung …",10000,(n,b)->n.optBoolean("autoDtc")!=b.optBoolean("autoDtc")),
         AUTO_RECORD_DELETE=new PendingActions.Spec("auto.record.delete","Automatische Aufnahmen löschen","Lösche automatische Aufnahmen …",60000,MainActivity::msg),
         AUTO_EXPORT=new PendingActions.Spec("auto.export","Automatischer Export","Ändere automatischen Export …",10000,(n,b)->n.optBoolean("autoExport")!=b.optBoolean("autoExport")),
         EXPORT_NOW=new PendingActions.Spec("export.now","Jetzt exportieren","Exportiere …",60000,MainActivity::msg),
@@ -344,11 +345,17 @@ public class MainActivity extends Activity {
         smallNote(c,"Nur Knowledge-Messwerte des identifizierten Steuergeräts · Rückkehr zur Standard-Sitzung nach dem Ausschalten und vor funktionalen OBD-Anfragen.",MUTED);
     }
     private void showDtcs(JSONObject dtcs){
-        LinearLayout c=card();note(c,"GESPEICHERTE FEHLERCODES",ACCENT);JSONArray observations=dtcs.optJSONArray("observations");
+        showDtcSection("GESPEICHERTE FEHLERCODES","Keine gespeicherten Fehlercodes",dtcs);
+        JSONObject pending=dtcs.optJSONObject("pending");
+        if(pending!=null)showDtcSection("ANSTEHENDE FEHLERCODES","Keine anstehenden Fehlercodes",pending); // REQ-034.2: Mode 07
+    }
+    private void showDtcSection(String heading,String none,JSONObject dtcs){
+        LinearLayout c=card();note(c,heading,ACCENT);JSONArray observations=dtcs.optJSONArray("observations");
+        if(dtcs.has("error"))note(c,"Fehler: "+dtcs.optString("error"),0xffffa79c);
         if(observations==null||observations.length()==0)note(c,"Keine Steuergeräte-Antworten",MUTED);
         else for(int i=0;i<observations.length();i++){JSONObject item=observations.optJSONObject(i);if(item==null)continue;String responder=displayResponder(item.optString("responder",""));String error=item.optString("error","");JSONArray codes=item.optJSONArray("codes");
             if(!error.isEmpty())note(c,responder+" · Fehler: "+error,0xffffa79c);
-            else if(item.optBoolean("no_dtcs")||(codes!=null&&codes.length()==0))note(c,responder+" · Keine gespeicherten Fehlercodes",TEXT);
+            else if(item.optBoolean("no_dtcs")||(codes!=null&&codes.length()==0))note(c,responder+" · "+none,TEXT);
             else if(codes!=null){StringBuilder values=new StringBuilder();for(int j=0;j<codes.length();j++){if(j>0)values.append(", ");values.append(codes.optString(j));}note(c,responder+" · "+values,TEXT);}
             else note(c,responder+" · Keine auswertbaren Codes",MUTED);
         }
@@ -469,6 +476,8 @@ public class MainActivity extends Activity {
         LinearLayout auto=card();note(auto,"AUTOMATISCH VERBINDEN",ACCENT);
         note(auto,known.isEmpty()?"Noch kein Adapter bekannt · wird nach der ersten erfolgreichen Verbindung gemerkt":"Bekannter Adapter: "+known+" · Verbindung beim Start und nach Abbruch, Pausen 2, 5, 10 s, dann alle 30 s",known.isEmpty()?MUTED:TEXT);
         actionButton(auto,AUTO_CONNECT,"","Automatisch verbinden: "+(autoOn?"an":"aus"),true,()->perform(AUTO_CONNECT,"",()->service().setAutoConnect(!autoOn)));
+        boolean dtcOn=state.optBoolean("autoDtc",true);
+        actionButton(auto,AUTO_DTC,"","Fehlerspeicher beim Verbinden lesen: "+(dtcOn?"an":"aus"),true,()->perform(AUTO_DTC,"",()->service().setAutoDtc(!dtcOn)));
         if(state.optBoolean("autoPending")||service().pending.isPending(AUTO_STOP.key))actionButton(auto,AUTO_STOP,"","Automatische Verbindung stoppen",true,()->perform(AUTO_STOP,"",()->service().stopAutoConnect()));
         JSONArray devices=array("devices");if(devices.length()==0)note(c,"Noch keine Adapter gefunden. Adapter mit Strom versorgen, Bluetooth einschalten und Suche starten.",MUTED);
         for(int i=0;i<devices.length();i++){JSONObject d=devices.optJSONObject(i);if(d==null)continue;String address=d.optString("address"),name=d.optString("name","Bluetooth-Gerät");LinearLayout device=card();note(device,name,TEXT);note(device,address+" · "+d.optInt("rssi")+" dBm",MUTED);actionButton(device,CONNECT,":"+address,"Verbinden",!state.optBoolean("busy"),()->perform(CONNECT,":"+address,()->service().connect(address)));}

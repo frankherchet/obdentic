@@ -35,8 +35,11 @@ actions still open in replay; those actions are skipped and never sent.
 **Verfügbarkeit (REQ-030):** UDS DIDs are not advertised by the ECU, so the app measures them. The
 job `knowledge.availability` (Diagnose tab, "Verfügbarkeit prüfen") sends one targeted `22` read
 per default-session Knowledge signal of the identified ECUs (about 25 s, hard limit 90 s, no
-session change) and classifies each as answered, rejected (with the NRC) or not answered,
-keeping no value. It runs automatically after ECU identification for a newly created vehicle record
+session change) and classifies each as answered, rejected (with the NRC) or not answered.
+Answered entries also carry the raw response, the decoded value and unit, and an `implausible` flag
+with the range when the value lies outside the definition's `plausible_range` (REQ-030.8). The job
+also reads each catalog Mode 01 PID the vehicle advertises as supported once from the engine
+target (REQ-030.9); `obdentic-mobile-report` prints a per-entry table and status counts (REQ-030.10). It runs automatically after ECU identification for a newly created vehicle record
 and after every "Fahrzeug und Steuergeräte erfassen" job, writes into the running automatic recording
 (its own recording only when none runs) and is stored
 with the vehicle record (never exported or shared). Replay restores the statuses from the recording.
@@ -118,6 +121,14 @@ a replay ends the attempts; none follow until the user connects or the app is st
 "Automatisch verbinden" on the Adapter tab (default on, persisted) switches the feature.
 With Bluetooth off or a permission missing no attempt is made, the status line says why, and
 attempts resume when Bluetooth turns on (or when the app returns to the foreground).
+
+**Fehlerspeicher beim Verbinden lesen (REQ-034):** after every successful inventory of a live
+connection (also after an automatic reconnect), once the automatic ECU identification and
+availability jobs are done, the app runs the existing read-only `dtc.scan` once: stored (Mode 03)
+and pending (Mode 07) codes per responder, or "keine Fehler"; a negative response, NO DATA or
+timeout stays an explicit result and never ends the connection. Its TX/RX goes into the running
+automatic recording and replay shows both lists without traffic. Switch on the Adapter tab
+(default on, persisted). Demo and replay never scan; nothing is ever cleared (no Mode 04).
 
 After an automatic connection only the existing initialization and inventory run, with the normal
 vehicle-record handling; no earlier job is repeated. A recording interrupted by the loss stays

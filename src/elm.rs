@@ -6,6 +6,7 @@ use std::{fmt, future::Future, time::Duration};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MODE03_COMMAND: &str = "03\r";
+const MODE07_COMMAND: &str = "07\r";
 const STALE_MODE01_RESPONSE_PREFIX: &str = "stale unrelated OBD-II Mode 01 response from responder";
 const IGNORED_MODE01_RESPONSE_PREFIX: &str =
     "ignored unrelated OBD-II Mode 01 response from responder";
@@ -1038,6 +1039,11 @@ where
         read_elm_mode03_responses(&mut self.exchange).await
     }
 
+    pub(crate) async fn read_pending_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
+        self.ensure_functional().await?;
+        read_elm_mode07_responses(&mut self.exchange).await
+    }
+
     pub(crate) async fn uds_session_command(
         &mut self,
         command: UdsSessionCommand,
@@ -1573,6 +1579,16 @@ where
     normalize_mode03_responses(&response)
 }
 
+pub(crate) async fn read_elm_mode07_responses<E>(
+    exchange: &mut E,
+) -> Result<DiagnosticResponses, String>
+where
+    E: ElmExchange,
+{
+    let response = exchange.exchange(MODE07_COMMAND, COMMAND_TIMEOUT).await?;
+    normalize_mode07_responses(&response)
+}
+
 pub(crate) async fn read_elm_ecu_identification_responses<E>(
     exchange: &mut E,
     request: &TargetedEcuIdentificationRequest,
@@ -2054,11 +2070,12 @@ fn push_mode03_payload(
     bytes: &[u8],
     line: &str,
     strict: bool,
+    positive: u8,
 ) {
     let start = if strict {
-        (bytes.first() == Some(&0x43)).then_some(0)
+        (bytes.first() == Some(&positive)).then_some(0)
     } else {
-        bytes.iter().position(|byte| *byte == 0x43)
+        bytes.iter().position(|byte| *byte == positive)
     };
     let Some(start) = start else {
         if !strict && !bytes.is_empty() {
@@ -2074,7 +2091,8 @@ fn push_mode03_payload(
         return;
     };
     let payload = bytes[start..].to_vec();
-    if payload != [0x43, 0x00] && (payload.len() < 3 || !(payload.len() - 1).is_multiple_of(2)) {
+    if payload != [positive, 0x00] && (payload.len() < 3 || !(payload.len() - 1).is_multiple_of(2))
+    {
         errors.push(DiagnosticResponseError {
             responder: responder.clone(),
             error: format!("malformed normalized Mode 03 payload: {line:?}"),
@@ -2087,6 +2105,15 @@ fn push_mode03_payload(
 }
 
 pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticResponses, String> {
+    normalize_dtc_responses(response, 0x43)
+}
+
+/// Mode 07 (pending codes) shares the Mode 03 framing; only the service byte differs.
+pub(crate) fn normalize_mode07_responses(response: &str) -> Result<DiagnosticResponses, String> {
+    normalize_dtc_responses(response, 0x47)
+}
+
+fn normalize_dtc_responses(response: &str, positive: u8) -> Result<DiagnosticResponses, String> {
     let mut matches = Vec::new();
     let mut errors = Vec::new();
     let mut assemblies: Vec<(Option<ResponderIdentity>, Mode03IsoTpAssembly)> = Vec::new();
@@ -2098,7 +2125,7 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
         }
         let upper = line.to_ascii_uppercase();
         let compact = upper.split_ascii_whitespace().collect::<String>();
-        if compact == "03"
+        if compact == format!("{:02X}", positive - 0x40)
             || upper.starts_with("SEARCHING")
             || (upper.starts_with("BUS INIT") && !upper.contains("ERROR"))
         {
@@ -2175,13 +2202,13 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
             } else if bytes.first().map(|byte| byte >> 4) == Some(0) {
                 let declared_len = (bytes[0] & 0x0f) as usize;
                 let payload = &bytes[1..];
-                if let Some(start) = payload.iter().position(|byte| *byte == 0x43) {
+                if let Some(start) = payload.iter().position(|byte| *byte == positive) {
                     matches.push(DiagnosticResponse {
                         responder: responder.clone(),
                         payload: payload[start..payload.len().min(start + declared_len)].to_vec(),
                     });
                 }
-            } else if let Some(start) = bytes.iter().position(|byte| *byte == 0x43) {
+            } else if let Some(start) = bytes.iter().position(|byte| *byte == positive) {
                 matches.push(DiagnosticResponse {
                     responder: responder.clone(),
                     payload: bytes[start..].to_vec(),
@@ -2203,7 +2230,7 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
                     continue;
                 }
                 if payload.len() < declared_len {
-                    if let Some(start) = payload.iter().position(|byte| *byte == 0x43) {
+                    if let Some(start) = payload.iter().position(|byte| *byte == positive) {
                         matches.push(DiagnosticResponse {
                             responder: responder.clone(),
                             payload: payload[start..].to_vec(),
@@ -2235,6 +2262,7 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
                     &payload[..declared_len],
                     line,
                     false,
+                    positive,
                 );
             }
             Some(1) => {
@@ -2351,6 +2379,7 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
                         &assembly.payload,
                         line,
                         true,
+                        positive,
                     );
                 }
             }
@@ -2378,7 +2407,15 @@ pub(crate) fn normalize_mode03_responses(response: &str) -> Result<DiagnosticRes
                     });
                     continue;
                 }
-                push_mode03_payload(&mut matches, &mut errors, responder, &bytes, line, false);
+                push_mode03_payload(
+                    &mut matches,
+                    &mut errors,
+                    responder,
+                    &bytes,
+                    line,
+                    false,
+                    positive,
+                );
             }
         }
     }

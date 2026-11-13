@@ -57,8 +57,10 @@ final class AvailabilityAcceptance {
             require("answered".equals(status(entries, OIL)), "REQ-030.2 the oil temperature DID answers: " + status(entries, OIL));
             JSONObject rejected = entry(entries, "dpf.oil_ash_volume@vag.ecu_target.7e0");
             require(rejected != null && "rejected".equals(rejected.optString("status")) && rejected.optInt("nrc") == 0x31, "REQ-030.2 a negative response is classified with its code: " + rejected);
-            require(entries.toString().indexOf("\"value\"") < 0, "REQ-030.2 no value is kept");
-            List<String> services = new ArrayList<>(); for (String c : link[0].commands) { String wire = c.substring(c.indexOf(':') + 1); if (!wire.startsWith("AT") && !wire.startsWith("01") && !wire.startsWith("09") && !wire.startsWith("03")) services.add(wire); }
+            require(!rejected.has("value"), "REQ-030.2 a negative response yields no value: " + rejected);
+            JSONObject oil = entry(entries, OIL);
+            require(oil != null && oil.has("value") && oil.has("unit") && oil.has("response"), "REQ-030.8 an answered entry carries response, value and unit: " + oil);
+            List<String> services = new ArrayList<>(); for (String c : link[0].commands) { String wire = c.substring(c.indexOf(':') + 1); if (!wire.startsWith("AT") && !wire.startsWith("01") && !wire.startsWith("09") && !wire.startsWith("03") && !wire.startsWith("07")) services.add(wire); }
             require(!link[0].commands.toString().contains(":1003") && services.stream().allMatch(w -> w.startsWith("22")), "REQ-030.1 only 0x22 reads and no session change: " + services);
 
             // REQ-030.5 / REQ-028.4: stored with the vehicle; the jobs write into the one running automatic recording

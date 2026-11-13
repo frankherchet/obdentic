@@ -31,7 +31,7 @@ public final class ObdService extends Service {
     /** Test seams (REQ-020): replace BLE as the live link and the Bluetooth/permission state. All null in the app. */
     public volatile Connector connector;
     public volatile Boolean permissionOverride, bluetoothOverride;
-    private static final String PREFS = "adapter", KNOWN = "known_address", AUTO = "auto", AUTO_REC = "auto_recording";
+    private static final String PREFS = "adapter", KNOWN = "known_address", AUTO = "auto", AUTO_REC = "auto_recording", AUTO_DTC = "auto_dtc";
     /** REQ-028: header profile of the automatic session recording, and the point where its file rotates. Fields are test seams. */
     static final String AUTO_PROFILE = "session-auto";
     public volatile long rotateBytes = 10L * 1024 * 1024, rotateMs = 30L * 60 * 1000;
@@ -47,6 +47,9 @@ public final class ObdService extends Service {
     private volatile boolean knowledgeJob;
     /** REQ-030.4: jobs queued behind the running one (ECU identification, then the availability check). Test seam: runners switch the automatic survey off. */
     public static volatile boolean autoSurvey = true;
+    /** Test seam like autoSurvey: the automatic fault-code scan (REQ-034); the user setting is separate. */
+    public static volatile boolean autoScan = true;
+    private volatile int scanFor=-1; // REQ-034.1: connection generation whose automatic scan waits behind its automatic jobs; -1 = none
     private final java.util.Deque<String> chain = new java.util.concurrent.ConcurrentLinkedDeque<>();
     private volatile boolean udsJob;
     private long core;
@@ -99,7 +102,7 @@ public final class ObdService extends Service {
     public final PendingActions pending = new PendingActions();
     public JSONObject snapshot() {
         synchronized(stateLock) { put(state,"busy",busy); put(state,"records",listRecords()); put(state,"vehicles",vehicles.snapshot());
-            put(state,"autoExport",RecordingExporter.auto(this)); put(state,"autoRecord",autoRecordEnabled(this)); put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
+            put(state,"autoExport",RecordingExporter.auto(this)); put(state,"autoRecord",autoRecordEnabled(this)); put(state,"autoDtc",autoDtcEnabled(this)); put(state,"autoConnect",policy.enabled()); put(state,"autoPending",policy.pending()); put(state,"knownAdapter",maskedAdapter());
             try { return new JSONObject(state.toString()); } catch(JSONException e) { return new JSONObject(); } }
     }
     private boolean permitted() {
@@ -206,6 +209,12 @@ public final class ObdService extends Service {
         message(on ? "Dauer-Aufzeichnung an" : "Dauer-Aufzeichnung aus");
         if(!on && !worker.isShutdown()) worker.execute(() -> { if(recordingProfile.equals(AUTO_PROFILE)) closeRecording("stopped","",false); });
     }
+    /** REQ-034.1: "Fehlerspeicher beim Verbinden lesen", on by default. */
+    public static boolean autoDtcEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO_DTC,true); }
+    public void setAutoDtc(boolean on) {
+        getSharedPreferences(PREFS,MODE_PRIVATE).edit().putBoolean(AUTO_DTC,on).commit();
+        message(on ? "Fehlerspeicher beim Verbinden lesen: an" : "Fehlerspeicher beim Verbinden lesen: aus");
+    }
     public static boolean autoConnectEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO,true); }
     /** The last successfully connected adapter's address, or "". App-private; never exported or shown in full. */
     public String knownAdapter() { return getSharedPreferences(PREFS,MODE_PRIVATE).getString(KNOWN,""); }
@@ -284,7 +293,9 @@ public final class ObdService extends Service {
         String outcome=observeVehicle(inventory.optJSONObject("data")), notice=vehicleNotice(outcome,inventory.optJSONObject("data"));
         boolean knowledge=inventory.optJSONObject("data")!=null && !inventory.optJSONObject("data").isNull("knowledge_manufacturer");
         // REQ-030.7: ECU identification on every connection (Knowledge signals live in the session); REQ-030.4: availability for a new vehicle only
+        scanFor=inventory.optBoolean("ok") && autoScanWanted() ? token : -1; // REQ-034.1: only after a successful inventory, only for this connection
         if(knowledge && autoSurvey && mode.equals("live")) { chain.clear(); if(outcome.equals("created")) chain.add(AVAILABILITY); worker.execute(() -> runJob("ecu.discover")); }
+        else startPendingScan(token);
         readOdometer(inventory.optJSONObject("data"),outcome);
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
@@ -561,10 +572,15 @@ public final class ObdService extends Service {
             String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
             succeeded[0]=result.optBoolean("ok");
-            if(succeeded[0] && action.equals("inventory") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add("ecu.discover"); chain.add(AVAILABILITY); } // REQ-030.4
+            if(succeeded[0] && action.equals("inventory") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add("ecu.discover"); chain.add(AVAILABILITY); scanFor=autoScanWanted() ? token : -1; } // REQ-030.4, REQ-034.1
         } catch(Throwable e) { fail(token,e); } finally { knowledgeJob=false; udsJob=false; if(token==generation) { busy=false; changed(); }
-            String next=succeeded[0] && token==generation ? chain.poll() : null; if(next==null) chain.clear(); else if(!worker.isShutdown()) worker.execute(() -> runJob(next)); } });
+            String next=succeeded[0] && token==generation ? chain.poll() : null;
+            if(next==null) { chain.clear(); startPendingScan(token); } // REQ-034.1: a failed survey job does not skip the scan; a failed scan is only its own result
+            else if(!worker.isShutdown()) worker.execute(() -> runJob(next)); } });
     }
+    private boolean autoScanWanted() { return autoScan && mode.equals("live") && autoDtcEnabled(this); }
+    /** REQ-034.1: runs the scan waiting for this connection only, and only while the live conditions still hold (never in demo/replay or a later connection). */
+    private void startPendingScan(int token) { if(scanFor!=token || token!=generation) return; scanFor=-1; if(autoScanWanted() && !worker.isShutdown()) worker.execute(() -> runJob("dtc.scan")); }
     /** REQ-022: action name and recording profile of the adapter throughput job (not a polling profile). */
     public static final String THROUGHPUT="adapter.throughput", THROUGHPUT_PROFILE="adapter-throughput", AVAILABILITY="knowledge.availability";
     /** REQ-022.1: the German reason why the throughput job cannot start now, or null. Live and ready only. */

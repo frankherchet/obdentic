@@ -410,9 +410,18 @@ impl SessionClient {
     }
 
     pub async fn read_stored_dtcs(&self) -> Result<DiagnosticResponses, String> {
+        self.read_dtcs(false).await
+    }
+
+    /// Mode 07 pending codes; read-only like Mode 03.
+    pub async fn read_pending_dtcs(&self) -> Result<DiagnosticResponses, String> {
+        self.read_dtcs(true).await
+    }
+
+    async fn read_dtcs(&self, pending: bool) -> Result<DiagnosticResponses, String> {
         let (reply, result) = oneshot::channel();
         self.sender
-            .send(SessionCommand::ReadStoredDtcs { reply })
+            .send(SessionCommand::ReadStoredDtcs { pending, reply })
             .await
             .map_err(|_| "diagnostic session is closed".to_string())?;
         result
@@ -479,6 +488,7 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
     },
     ReadStoredDtcs {
+        pending: bool,
         reply: oneshot::Sender<Result<DiagnosticResponses, String>>,
     },
     Shutdown {
@@ -644,13 +654,13 @@ async fn session_actor<E: AdapterLink + 'static>(
                     }
                 }
             }
-            SessionCommand::ReadStoredDtcs { reply } => {
+            SessionCommand::ReadStoredDtcs { pending, reply } => {
                 if let Some(error) = health.unhealthy() {
                     let _ = reply.send(Err(error.to_owned()));
                     continue;
                 }
                 let started = Instant::now();
-                match session.read_stored_dtcs().await {
+                match session.read_dtcs(pending).await {
                     Ok(responses) => {
                         service.observe(started.elapsed());
                         health.success();
@@ -989,8 +999,12 @@ impl<E: AdapterLink> DiagnosticSession<E> {
         self.elm_mut()?.read_functional_ecu_serials(&probe).await
     }
 
-    async fn read_stored_dtcs(&mut self) -> Result<DiagnosticResponses, String> {
-        self.elm_mut()?.read_stored_dtcs().await
+    async fn read_dtcs(&mut self, pending: bool) -> Result<DiagnosticResponses, String> {
+        if pending {
+            self.elm_mut()?.read_pending_dtcs().await
+        } else {
+            self.elm_mut()?.read_stored_dtcs().await
+        }
     }
 
     pub async fn identify(&mut self) -> Result<crate::identity::VehicleIdentity, String> {
@@ -1196,7 +1210,7 @@ mod tests {
                         let _ = reply
                             .send(Err("functional ECU serial test request not scripted".into()));
                     }
-                    SessionCommand::ReadStoredDtcs { reply } => {
+                    SessionCommand::ReadStoredDtcs { reply, .. } => {
                         let _ = reply.send(Err("stored DTC test request not scripted".into()));
                     }
                     SessionCommand::Shutdown { reply } => {
@@ -1239,7 +1253,7 @@ mod tests {
     async fn session_client_requests_stored_dtcs_without_a_protocol_argument() {
         let (sender, mut commands) = mpsc::channel(1);
         let actor = tokio::spawn(async move {
-            if let Some(SessionCommand::ReadStoredDtcs { reply }) = commands.recv().await {
+            if let Some(SessionCommand::ReadStoredDtcs { reply, .. }) = commands.recv().await {
                 let _ = reply.send(normalize_mode03_responses("7E8 03 43 01 0C\r>"));
             }
         });
