@@ -10,6 +10,8 @@ use std::fmt;
 pub const MODE03_REQUEST: [u8; 1] = [0x03];
 /// Positive response service byte for OBD-II Mode 03.
 pub const MODE03_POSITIVE_RESPONSE: u8 = 0x43;
+/// Positive response service byte for OBD-II Mode 07 (pending codes); same layout as Mode 03.
+pub const MODE07_POSITIVE_RESPONSE: u8 = 0x47;
 
 /// The first letter of a standardized five-character OBD-II DTC.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -260,7 +262,16 @@ pub fn decode_mode03(evidence: &[ResponseEvidence]) -> DtcScanResult {
 
 /// Decode one normalized positive Mode 03 payload.
 pub fn decode_mode03_payload(payload: &[u8]) -> Result<DtcResponse, DtcDecodeError> {
-    if payload.first().copied() != Some(MODE03_POSITIVE_RESPONSE) {
+    decode_payload(payload, MODE03_POSITIVE_RESPONSE)
+}
+
+/// Decode one normalized positive Mode 07 payload (same layout as Mode 03).
+pub fn decode_mode07_payload(payload: &[u8]) -> Result<DtcResponse, DtcDecodeError> {
+    decode_payload(payload, MODE07_POSITIVE_RESPONSE)
+}
+
+fn decode_payload(payload: &[u8], positive: u8) -> Result<DtcResponse, DtcDecodeError> {
+    if payload.first().copied() != Some(positive) {
         return Err(if !payload.is_empty() {
             DtcDecodeError::UnknownResponse
         } else {
@@ -268,7 +279,7 @@ pub fn decode_mode03_payload(payload: &[u8]) -> Result<DtcResponse, DtcDecodeErr
         });
     }
 
-    if payload == [MODE03_POSITIVE_RESPONSE, 0x00] {
+    if payload == [positive, 0x00] {
         return Ok(DtcResponse::NoDtcs);
     }
 
@@ -317,6 +328,16 @@ mod tests {
 
     fn response(value: Option<&str>, payload: &[u8]) -> ResponseEvidence {
         ResponseEvidence::new(value.map(responder), payload.to_vec())
+    }
+
+    #[test]
+    fn req_034_2_mode07_pending_payload_uses_the_mode03_layout() {
+        assert_eq!(
+            decode_mode07_payload(&[0x47, 0x02, 0x01]).unwrap().dtcs()[0].to_string(),
+            "P0201"
+        );
+        assert!(decode_mode07_payload(&[0x47, 0x00]).unwrap().is_no_dtcs());
+        assert!(decode_mode07_payload(&[0x43, 0x02, 0x01]).is_err());
     }
 
     #[test]

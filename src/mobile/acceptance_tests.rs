@@ -79,6 +79,7 @@ impl Exchange for FakeExchange {
             "0100\r" => return Ok(frame("7E8", &[0x41, 0x00, 0x00, 0x10, 0x00, 0x00])),
             "010C\r" => return Ok(frame("7E8", &[0x41, 0x0C, 0x1A, 0xF8])),
             "03\r" => return Ok(frame("7E8", &[0x43, 0x00])),
+            "07\r" => return Ok(frame("7E8", &[0x47, 0x00])),
             "1003\r" => return Ok(reply_frame(&state.enter_reply, "7E8")),
             "1001\r" => return Ok(reply_frame(&state.leave_reply, "7E8")),
             "3E80\r" => return Ok(frame("7E8", &[0x7E, 0x00])),

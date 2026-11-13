@@ -231,22 +231,16 @@ impl<E: Exchange> MobileCore<E> {
             "uds.tick" => Ok(self.tick_uds()),
             "dtc.scan" => {
                 self.disable_uds()?;
-                let responses = self
-                    .runtime
-                    .block_on(self.session.as_mut().unwrap().read_stored_dtcs())?;
-                let observations: Vec<_> = responses.as_slice().iter().map(|response| {
-                    match crate::dtc::decode_mode03_payload(&response.payload) {
-                        Ok(decoded) => json!({"responder":response.responder.as_ref().map(|r|r.as_str()),
-                            "codes":decoded.dtcs().iter().map(ToString::to_string).collect::<Vec<_>>(),
-                            "no_dtcs":decoded.is_no_dtcs()}),
-                        Err(error) => json!({"responder":response.responder.as_ref().map(|r|r.as_str()),"error":error.to_string()}),
-                    }
-                }).collect();
-                Ok(
-                    json!({"observations":observations,"raw_response":responses.raw_response(),
-                    "responses":diagnostic_evidence(&responses),
-                    "errors":diagnostic_errors(&responses)}),
-                )
+                let session = self.session.as_mut().unwrap();
+                let responses = self.runtime.block_on(session.read_stored_dtcs())?;
+                // Pending codes (Mode 07) never fail the scan; the failure is part of the result.
+                let pending = match self.runtime.block_on(session.read_pending_dtcs()) {
+                    Ok(pending) => dtc_section(&pending, crate::dtc::decode_mode07_payload),
+                    Err(error) => json!({"error":error}),
+                };
+                let mut scan = dtc_section(&responses, crate::dtc::decode_mode03_payload);
+                scan["pending"] = pending;
+                Ok(scan)
             }
             _ => unreachable!(),
         }
@@ -1175,39 +1169,55 @@ fn diagnostic_errors(responses: &crate::elm::DiagnosticResponses) -> Value {
         .collect::<Vec<_>>())
 }
 
-fn replay_dtc_scan(argument: &str) -> Result<Value, String> {
-    let recorded: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
-    let raw_response = recorded
-        .get("raw_response")
-        .and_then(Value::as_str)
-        .filter(|raw| !raw.trim().is_empty())
-        .ok_or("recording raw_response missing")?;
-    let responses = crate::elm::normalize_mode03_responses(raw_response)?;
+/// Observations, raw evidence and errors of one DTC read (Mode 03 or Mode 07).
+fn dtc_section(
+    responses: &crate::elm::DiagnosticResponses,
+    decode: fn(&[u8]) -> Result<crate::dtc::DtcResponse, crate::dtc::DtcDecodeError>,
+) -> Value {
     let observations: Vec<_> = responses
         .as_slice()
         .iter()
-        .map(
-            |response| match crate::dtc::decode_mode03_payload(&response.payload) {
-                Ok(decoded) => json!({
-                    "responder":response.responder.as_ref().map(|r|r.as_str()),
-                    "codes":decoded.dtcs().iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    "no_dtcs":decoded.is_no_dtcs()
-                }),
-                Err(error) => json!({
-                    "responder":response.responder.as_ref().map(|r|r.as_str()),
-                    "error":error.to_string()
-                }),
-            },
-        )
+        .map(|response| match decode(&response.payload) {
+            Ok(decoded) => json!({
+                "responder":response.responder.as_ref().map(|r|r.as_str()),
+                "codes":decoded.dtcs().iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "no_dtcs":decoded.is_no_dtcs()
+            }),
+            Err(error) => json!({
+                "responder":response.responder.as_ref().map(|r|r.as_str()),
+                "error":error.to_string()
+            }),
+        })
         .collect();
-
-    Ok(json!({
+    json!({
         "observations":observations,
-        "raw_response":raw_response,
-        "responses":diagnostic_evidence(&responses),
-        "errors":diagnostic_errors(&responses),
-        "replay":true
-    }))
+        "raw_response":responses.raw_response(),
+        "responses":diagnostic_evidence(responses),
+        "errors":diagnostic_errors(responses)
+    })
+}
+
+fn replay_dtc_scan(argument: &str) -> Result<Value, String> {
+    let recorded: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
+    let raw = |value: &Value| {
+        value
+            .get("raw_response")
+            .and_then(Value::as_str)
+            .filter(|raw| !raw.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let raw_response = raw(&recorded).ok_or("recording raw_response missing")?;
+    let responses = crate::elm::normalize_mode03_responses(&raw_response)?;
+    let mut scan = dtc_section(&responses, crate::dtc::decode_mode03_payload);
+    scan["replay"] = json!(true);
+    // Recordings without a pending section (older ones) replay as before.
+    if let Some(raw_pending) = recorded.get("pending").and_then(raw) {
+        let pending = crate::elm::normalize_mode07_responses(&raw_pending)?;
+        let mut section = dtc_section(&pending, crate::dtc::decode_mode07_payload);
+        section["replay"] = json!(true);
+        scan["pending"] = section;
+    }
+    Ok(scan)
 }
 
 fn catalog() -> Value {
@@ -1549,12 +1559,53 @@ mod tests {
     }
     #[test]
     fn dtc_scan_preserves_negative_result() {
-        let mut core = core(&[("03\r", "7E8 03 43 01 0C\r>")]);
+        let mut core = core(&[("03\r", "7E8 03 43 01 0C\r>"), ("07\r", "7E8 02 47 00\r>")]);
         assert_eq!(run(&mut core, "initialize", "")["ok"], true);
         let scan = run(&mut core, "dtc.scan", "");
         assert_eq!(scan["data"]["observations"][0]["codes"][0], "P010C");
         assert_eq!(run(&mut core, "dtc.scan", "04")["ok"], false);
     }
+    #[test]
+    fn req_034_2_scan_reads_stored_and_pending_codes_and_keeps_failures_explicit() {
+        let mut core = core(&[
+            ("03\r", "7E8 03 43 01 0C\r>"),
+            ("07\r", "7E8 03 47 02 01\r>"),
+            ("03\r", "7E8 02 43 00\r>"),
+            ("07\r", "NO DATA\r>"),
+        ]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+        let scan = run(&mut core, "dtc.scan", "");
+        assert_eq!(scan["data"]["observations"][0]["codes"][0], "P010C");
+        let pending = &scan["data"]["pending"];
+        assert_eq!(pending["observations"][0]["responder"], "7E8");
+        assert_eq!(pending["observations"][0]["codes"][0], "P0201");
+        assert_eq!(pending["raw_response"], "7E8 03 47 02 01\r>");
+
+        let scan = run(&mut core, "dtc.scan", "");
+        assert_eq!(scan["data"]["observations"][0]["no_dtcs"], true);
+        assert!(!scan["data"]["pending"]["errors"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn req_034_3_replay_shows_stored_and_pending_codes_without_traffic() {
+        let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();
+        let recorded = json!({
+            "raw_response":"7E8 03 43 01 0C\r>",
+            "pending":{"raw_response":"7E8 03 47 02 01\r>"}
+        });
+        let replay = run(&mut core, "replay.dtc.scan", &recorded.to_string());
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["data"]["observations"][0]["codes"][0], "P010C");
+        assert_eq!(
+            replay["data"]["pending"]["observations"][0]["codes"][0],
+            "P0201"
+        );
+        assert_eq!(replay["data"]["pending"]["replay"], true);
+    }
+
     #[test]
     fn offline_replay_redecodes_raw_response_without_vehicle_traffic() {
         let mut core = MobileCore::new(Script(VecDeque::new())).unwrap();

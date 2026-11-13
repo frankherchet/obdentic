@@ -122,6 +122,14 @@ a replay ends the attempts; none follow until the user connects or the app is st
 With Bluetooth off or a permission missing no attempt is made, the status line says why, and
 attempts resume when Bluetooth turns on (or when the app returns to the foreground).
 
+**Fehlerspeicher beim Verbinden lesen (REQ-034):** after every successful inventory of a live
+connection (also after an automatic reconnect), once the automatic ECU identification and
+availability jobs are done, the app runs the existing read-only `dtc.scan` once: stored (Mode 03)
+and pending (Mode 07) codes per responder, or "keine Fehler"; a negative response, NO DATA or
+timeout stays an explicit result and never ends the connection. Its TX/RX goes into the running
+automatic recording and replay shows both lists without traffic. Switch on the Adapter tab
+(default on, persisted). Demo and replay never scan; nothing is ever cleared (no Mode 04).
+
 After an automatic connection only the existing initialization and inventory run, with the normal
 vehicle-record handling; no earlier job is repeated. A recording interrupted by the loss stays
 saved as a partial recording (`session_end` reason `error`); after the reconnection a new recording
