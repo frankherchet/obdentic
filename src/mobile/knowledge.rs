@@ -849,7 +849,7 @@ pub(crate) fn decode_read_result(
 
 /// REQ-030.8: one availability entry of a Knowledge signal, decoded from its raw response with the
 /// definition's decoder. Live reads and replay build it through this one function.
-pub(super) fn availability_entry(
+pub(crate) fn availability_entry(
     catalog: &KnowledgeCatalog,
     key: &str,
     target_id: &str,
@@ -933,7 +933,7 @@ pub(super) fn replay_availability(recorded: &Value) -> Result<Value, String> {
 }
 
 /// REQ-030.9: availability entry of a standard Mode 01 PID; the value is decoded with the catalog decoder.
-pub(super) fn mode01_entry(
+pub(crate) fn mode01_entry(
     key: &str,
     target: Option<&str>,
     response: Option<Vec<u8>>,
@@ -961,7 +961,7 @@ pub(super) fn mode01_entry(
     entry
 }
 
-pub(super) fn decode_learning_result(
+pub(crate) fn decode_learning_result(
     catalog: &KnowledgeCatalog,
     target_id: &str,
     definition: &KnowledgeDefinition,
