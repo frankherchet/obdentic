@@ -750,3 +750,20 @@ requirements:
     acceptance:
       - id: REQ-033.1
         text: The debug tab shows the session's TX/RX log as one window at least as tall as the visible screen, without a card or title around it, and after every new line it scrolls so the newest line (bottom) is visible.
+
+  - id: REQ-034
+    title: Read the engine fault codes automatically on every connection
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-11-13: issue #296, request by @frankherchet"
+    description: >
+      The driver sees stored and pending engine fault codes without starting a job,
+      and every live recording contains them.
+    acceptance:
+      - id: REQ-034.1
+        text: In a live session the read-only fault-code scan ("dtc.scan") starts automatically once after each successful inventory of a connection, also after an automatic reconnect, after the automatic ECU identification and availability jobs of that connection; it does not start in demo or replay, after a failed inventory, or when the setting "Fehlerspeicher beim Verbinden lesen" is off (default on).
+      - id: REQ-034.2
+        text: The scan reads stored codes (Mode 03) and pending codes (Mode 07) from the engine responders with the existing closed requests and decoder, shows per responder the codes or "keine Fehler", and keeps a negative response, NO DATA or timeout as an explicit result instead of an empty list; it never sends Mode 04 or any other clearing service.
+      - id: REQ-034.3
+        text: The automatic scan writes its TX/RX into the running automatic recording, and replay of that recording shows the same stored and pending codes without adapter traffic; a failed scan never ends the connection or blocks polling.
