@@ -182,12 +182,24 @@ Ordinary CLI use, capture, TUI, MCP and AI-assisted diagnosis must remain unable
 
 The explicitly user-started, read-only UDS extended-session job is a separate,
 closed exception for session management (ADR 0003). It can send only `10 03`,
-`10 01`, `3E 80`, and Knowledge-listed `22` reads to one identified ECU. It
-does not grant a mutating service capability. Profiles, layouts, MCP calls,
-AI prompts and Knowledge cannot activate it. The core enforces its timeout,
-target and service restrictions, and attempts to return to the default session
-before functional operations or shutdown. If that return cannot be confirmed,
-further vehicle operations stop until reconnection; a lost link stops keepalive.
+`10 01`, `3E 80`, Knowledge-listed `22` reads to one identified ECU and, in
+mixed polling, the user's selected standard Mode 01 reads through the existing
+validated engine target. Selected Mode 01 polling continues during the session;
+other functional operations still leave it first. It does not grant a mutating
+service capability. This change retains the existing explicit switch; #291 will
+implement the approved automatic activation of the session by component presets
+when necessary, which this change does not implement. Approved component presets
+differ from arbitrary profile data, and their activation safeguards and criteria
+are still to be refined. Profiles, layouts, MCP calls, AI prompts and Knowledge
+cannot activate it or elevate privilege. Successful standard reads keep the
+session; a rejected, unanswered or malformed read ends it. Knowledge reads of
+another ECU and a missing or mismatched engine target also return it to default.
+The core enforces its timeout (ten minutes after activation), target and
+service restrictions, preserves raw evidence and the session state of every
+read, and attempts to return to the default session before other functional
+operations or shutdown. If that return cannot be confirmed, further vehicle
+operations stop until reconnection; a lost link stops keepalive. ECU behaviour
+under mixed polling requires separate vehicle acceptance.
 
 ### Initial allowed mutation goal
 

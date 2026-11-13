@@ -48,6 +48,9 @@ struct LinkState {
     did_replies: BTreeMap<u16, VecDeque<Reply>>,
     enter_reply: Reply,
     leave_reply: Reply,
+    /// Queued answers to `010C` and `3E80`; the defaults apply when the queue is empty.
+    mode01_replies: VecDeque<Reply>,
+    tester_replies: VecDeque<Reply>,
 }
 
 struct FakeExchange(Arc<Mutex<LinkState>>);
@@ -69,6 +72,18 @@ impl Exchange for FakeExchange {
         }
         if command.starts_with("ATCRA") {
             return Ok("OK\r>".into());
+        }
+        if let Some(queue) = match command {
+            "010C\r" => Some(&mut state.mode01_replies),
+            "3E80\r" => Some(&mut state.tester_replies),
+            _ => None,
+        } {
+            if let Some(reply) = queue.pop_front() {
+                return match reply {
+                    Reply::Error(error) => Err(error),
+                    reply => Ok(reply_frame(&reply, "7E8")),
+                };
+            }
         }
         match command {
             "ATI\r" => return Ok("ELM327\r>".into()),
@@ -217,6 +232,8 @@ fn setup(
         did_replies: BTreeMap::new(),
         enter_reply: Reply::Payload(vec![0x50, 0x03, 0, 0x32, 1, 0xF4]),
         leave_reply: Reply::Payload(vec![0x50, 0x01]),
+        mode01_replies: VecDeque::new(),
+        tester_replies: VecDeque::new(),
     }));
     let mut core = MobileCore::new(FakeExchange(state.clone())).unwrap();
     assert_eq!(run(&mut core, "initialize", "")["ok"], true);
@@ -962,6 +979,267 @@ fn req_024_4_malformed_offline_replay_does_not_touch_active_vehicle_session() {
     assert_eq!(replay["ok"], false, "{replay}");
     assert!(commands(&state).is_empty());
     assert_eq!(replay["uds"]["active"], true);
+}
+
+const SESSION_SIGNAL: &str = "air.intercooler_outlet_temperature";
+const RPM_RESPONSE: [u8; 4] = [0x41, 0x0C, 0x1A, 0xF8];
+
+fn session_definition(core: &MobileCore<FakeExchange>) -> crate::knowledge_db::KnowledgeDefinition {
+    core.knowledge
+        .as_ref()
+        .unwrap()
+        .learning_candidates()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.definition.semantic() == SESSION_SIGNAL)
+        .unwrap()
+        .definition
+}
+
+/// An active extended session on the engine target with `answers` all-zero session DID replies queued;
+/// the command log starts empty.
+fn active_session(answers: usize) -> (MobileCore<FakeExchange>, Arc<Mutex<LinkState>>) {
+    let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    discover(&mut core);
+    let definition = session_definition(&core);
+    let did = definition.operation().did();
+    let mut positive = vec![0x62, (did >> 8) as u8, did as u8];
+    positive.resize(
+        positive.len() + definition.response().exact_payload_length().unwrap(),
+        0,
+    );
+    state.lock().unwrap().did_replies.insert(
+        did,
+        (0..answers)
+            .map(|_| Reply::Payload(positive.clone()))
+            .collect(),
+    );
+    let enabled = run(&mut core, "uds.enable", "");
+    assert_eq!(enabled["data"]["active"], true, "{enabled}");
+    clear_commands(&state);
+    (core, state)
+}
+
+fn wires(state: &Arc<Mutex<LinkState>>) -> Vec<String> {
+    commands(state)
+        .into_iter()
+        .map(|command| command.wire)
+        .collect()
+}
+
+fn contains_payload(observations: &Value, payload: &[u8]) -> bool {
+    observations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|observation| observation["responses"].as_array().into_iter().flatten())
+        .any(|response| response["payload"] == json!(payload))
+}
+
+#[test]
+// REQ-027.6
+fn req_027_6_standard_and_session_reads_alternate_in_one_active_session() {
+    let (mut core, state) = active_session(2);
+    let mut recordings = Vec::new();
+    for _ in 0..2 {
+        let standard = run(&mut core, "read", "engine.rpm");
+        assert_eq!(standard["ok"], true, "{standard}");
+        assert_eq!(standard["data"]["value"].as_f64(), Some(1726.0));
+        assert_eq!(standard["data"]["uds"]["active"], true);
+        assert_eq!(standard["data"]["uds_state_after_read"]["state"], "active");
+        assert!(contains_payload(
+            &standard["data"]["observations"],
+            &RPM_RESPONSE
+        ));
+        recordings.push(standard["data"].clone());
+        let session = run(&mut core, "read", SESSION_SIGNAL);
+        assert_eq!(session["ok"], true, "{session}");
+        assert_eq!(session["data"]["uds"]["active"], true);
+    }
+    assert!(core.uds.is_active());
+
+    let log = commands(&state);
+    // Serialized alternation on the engine target, with no session change or functional reinitialization.
+    let reads: Vec<&str> = log
+        .iter()
+        .map(|command| command.wire.as_str())
+        .filter(|wire| *wire == "010C\r" || wire.starts_with("22"))
+        .collect();
+    assert_eq!(reads.len(), 4, "{reads:?}");
+    assert_eq!(reads[0], "010C\r");
+    assert!(reads[1].starts_with("22"));
+    assert_eq!(reads[2], "010C\r");
+    assert!(reads[3].starts_with("22"));
+    for command in &log {
+        assert!(
+            !matches!(command.wire.as_str(), "1003\r" | "1001\r" | "ATZ\r"),
+            "unexpected {:?}",
+            command.wire
+        );
+        assert_eq!(command.target, "7E0", "{:?}", command.wire);
+    }
+    assert!(!log.iter().any(|command| command.wire == "ATSH 7DF\r"));
+
+    // The recording of a standard read replays offline, without traffic or a session change.
+    clear_commands(&state);
+    let replay = run(&mut core, "replay.read", &recordings[0].to_string());
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["data"]["value"].as_f64(), Some(1726.0));
+    assert_eq!(replay["data"]["replay"], true);
+    assert_eq!(replay["data"]["uds"]["active"], true);
+    assert!(commands(&state).is_empty());
+    assert!(core.uds.is_active());
+}
+
+#[test]
+// REQ-027.6, REQ-027.3
+fn req_027_6_failed_standard_read_returns_to_default_and_keeps_evidence() {
+    let failures = [
+        Reply::Payload(vec![0x7F, 0x01, 0x12]),
+        Reply::NoData,
+        Reply::Error("link lost".into()),
+    ];
+    for failure in failures {
+        let (mut core, state) = active_session(1);
+        state.lock().unwrap().mode01_replies.push_back(failure);
+
+        let failed = run(&mut core, "read", "engine.rpm");
+
+        assert_eq!(failed["ok"], false, "{failed}");
+        assert_eq!(failed["uds"]["active"], false, "{failed}");
+        assert_eq!(failed["uds"]["state"], "inactive", "{failed}");
+        assert_eq!(failed["uds_at_request"]["active"], true, "{failed}");
+        assert!(failed["observations"].is_array(), "{failed}");
+        assert!(contains_payload(
+            &failed["uds_session_observations"],
+            &[0x50, 0x01]
+        ));
+        let log = wires(&state);
+        let read = log.iter().position(|wire| wire == "010C\r").unwrap();
+        let leave = log.iter().position(|wire| wire == "1001\r").unwrap();
+        assert!(read < leave, "{log:?}");
+
+        // The next selected read is an ordinary default-session read to the engine target.
+        clear_commands(&state);
+        let next = run(&mut core, "read", "engine.rpm");
+        assert_eq!(next["ok"], true, "{next}");
+        assert_eq!(next["data"]["uds"]["active"], false);
+        assert!(!wires(&state)
+            .iter()
+            .any(|wire| matches!(wire.as_str(), "1003\r" | "ATZ\r")));
+        let session = run(&mut core, "read", SESSION_SIGNAL);
+        assert_eq!(session["ok"], false, "{session}");
+    }
+}
+
+#[test]
+// REQ-027.6, REQ-027.4
+fn req_027_6_missing_engine_target_ends_the_session_without_a_read() {
+    let (mut core, state) = active_session(1);
+    core.engine = None;
+
+    let result = run(&mut core, "read", "engine.rpm");
+
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("validated engine target"),
+        "{result}"
+    );
+    assert_eq!(result["uds_at_request"]["active"], true, "{result}");
+    assert_eq!(result["uds"]["active"], false, "{result}");
+    assert!(contains_payload(
+        &result["uds_session_observations"],
+        &[0x50, 0x01]
+    ));
+    let log = wires(&state);
+    assert!(log.iter().any(|wire| wire == "1001\r"), "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|wire| matches!(wire.as_str(), "010C\r" | "ATZ\r")),
+        "{log:?}"
+    );
+}
+
+#[test]
+// REQ-027.6, REQ-027.4
+fn req_027_6_session_on_another_request_address_ends_without_a_read() {
+    let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    discover(&mut core);
+    // The identified, validated engine target is 7E0/7E8. Open the session on 7E1 through the session
+    // state directly, so the check compares two different, otherwise valid targets.
+    let definition = session_definition(&core);
+    let other = RequestTarget::concrete(
+        ProtocolContext::new(Protocol::Obd2, AddressingContext::Physical),
+        RequestAddress::new("elm-header", "7E1"),
+    );
+    let responder = crate::elm::ResponderIdentity::ElmHeader("7E8".into());
+    let _ = core.runtime.block_on(core.uds.enable(
+        core.session.as_mut().unwrap(),
+        other,
+        responder,
+        &[&definition],
+        Instant::now(),
+    ));
+    assert!(core.uds.is_active());
+    assert!(!core.uds_matches_validated_engine());
+    clear_commands(&state);
+
+    let result = run(&mut core, "read", "engine.rpm");
+
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("validated engine target"),
+        "{result}"
+    );
+    assert_eq!(result["uds_at_request"]["target"], "7E1", "{result}");
+    assert_eq!(result["uds"]["active"], false, "{result}");
+    let log = commands(&state);
+    let leave = log.iter().find(|command| command.wire == "1001\r").unwrap();
+    assert_eq!(leave.target, "7E1");
+    assert!(
+        !log.iter()
+            .any(|command| matches!(command.wire.as_str(), "010C\r" | "ATZ\r")),
+        "{:?}",
+        wires(&state)
+    );
+}
+
+#[test]
+// REQ-027.6, REQ-027.2
+fn req_027_6_failed_keepalive_never_falls_back_to_an_ordinary_read() {
+    let (mut core, state) = active_session(0);
+    state
+        .lock()
+        .unwrap()
+        .tester_replies
+        .push_back(Reply::Error("link lost".into()));
+    // Tester present is due two seconds after activation.
+    std::thread::sleep(Duration::from_millis(2100));
+
+    let result = run(&mut core, "read", "engine.rpm");
+
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(result["error"].as_str().unwrap().contains("link lost"));
+    assert_eq!(result["uds"]["active"], false, "{result}");
+    assert_eq!(result["uds_at_request"]["active"], true, "{result}");
+    assert!(contains_payload(
+        &result["uds_session_observations"],
+        &[0x50, 0x01]
+    ));
+    let log = wires(&state);
+    assert!(log.iter().any(|wire| wire == "3E80\r"), "{log:?}");
+    assert!(log.iter().any(|wire| wire == "1001\r"), "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|wire| matches!(wire.as_str(), "010C\r" | "ATZ\r")),
+        "{log:?}"
+    );
 }
 
 const BUSY: [u8; 3] = [0x7F, 0x22, 0x21];

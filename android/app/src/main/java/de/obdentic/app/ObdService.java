@@ -601,11 +601,13 @@ public final class ObdService extends Service {
         }
         if(busy || !phase().equals("ready") || core==0) return;
         Link active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
-        JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
         int token=generation;
         try {
+            // REQ-027.2/.6: the session's tester present is due every poll, before and independent of any read; the core sends it at most every 2 s
             JSONObject uds; synchronized(stateLock) { uds=state.optJSONObject("uds"); }
             if(uds!=null && uds.optBoolean("active")) execute("uds.tick","");
+            // Read the selection only now: a tick that ended the session has already removed the UDS signals from it
+            JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
             if(selected.length()==0) return;
             long now=SystemClock.elapsedRealtime(); String semantic; long wait;
             synchronized(due) {
@@ -613,8 +615,7 @@ public final class ObdService extends Service {
                 for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i);
                     boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
                         for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j);
-                            if(candidate.equals(signal.optString("semantic")) && (signal.optString("status").equals("unsupported")
-                                || (uds!=null && uds.optBoolean("active") && !signal.has("definition_id")))) unsupported=true;
+                            if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true;
                         }
                     }
                     if(!unsupported) eligible.add(candidate);

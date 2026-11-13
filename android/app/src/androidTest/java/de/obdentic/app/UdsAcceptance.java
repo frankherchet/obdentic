@@ -75,6 +75,8 @@ public final class UdsAcceptance {
             waitFor(() -> service.snapshot().optJSONObject("uds").optBoolean("active"), "extended session active");
             waitFor(() -> main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "UDS erweiterte Sitzung aktiv")),
                 "persistent UDS header visible");
+            require(!main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "pausiert")),
+                "REQ-027.6 the session header does not claim that OBD2 is paused");
             require(fake[0].commands.contains("7E0:1003"), "REQ-027.1 exactly the closed 10 03 activation command is sent to engine target");
 
             JSONObject candidate = firstSessionSignal(service.snapshot().optJSONArray("signals"));
@@ -99,11 +101,64 @@ public final class UdsAcceptance {
                 "REQ-027.2 selected candidate uses a targeted 0x22 read");
             waitFor(() -> fake[0].commands.contains("7E0:3E80"), "tester-present reached the target ECU");
 
+            // REQ-027.6: selected standard PIDs and the selected UDS DID are polled together; the session is neither left nor re-armed
+            final int mixedFrom = fake[0].commands.size();
+            final long mixedAt = System.currentTimeMillis();
+            final JSONArray mixed = new JSONArray(service.snapshot().optJSONArray("selected").toString());
+            if (!contains(mixed, "engine.rpm")) mixed.put("engine.rpm"); // never twice, whatever the earlier selection was
+            service.setSignals(mixed);
+            waitFor(() -> contains(service.snapshot().optJSONArray("selected"), "engine.rpm") && contains(service.snapshot().optJSONArray("selected"), semantic),
+                "REQ-027.6 the standard PID joins the UDS selection while the session is active");
+            waitFor(() -> service.snapshot().optJSONObject("uds").optBoolean("active")
+                && hasFreshValue(service.snapshot().optJSONArray("values"), "engine.rpm", mixedAt) && hasFreshValue(service.snapshot().optJSONArray("values"), semantic, mixedAt),
+                "REQ-027.6 a new successful engine.rpm value and a new UDS value are decoded while the session is active");
+            waitFor(() -> alternations(fake[0].commands, mixedFrom, "010C") >= 3 && count(fake[0].commands, mixedFrom, "3E80") >= 2,
+                "REQ-027.6 Mode 01 and 0x22 reads interleave while tester present keeps recurring");
+            final List<String> mixedWindow = since(fake[0].commands, mixedFrom);
+            require(indexOf(mixedWindow, "1001") < 0 && indexOf(mixedWindow, "1003") < 0,
+                "REQ-027.6 polling a standard PID neither leaves nor re-arms the extended session: " + mixedWindow);
+            require(service.snapshot().optJSONObject("uds").optBoolean("active"), "REQ-027.6 the extended session stays active while standard PIDs are polled");
+            waitFor(() -> main.call(() -> hasText(activity.getWindow().getDecorView(), "OBD2")), "REQ-027.6 the standard tile is labelled OBD2 next to the UDS tile");
+            require(!main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "pausiert")), "REQ-027.6 no tile claims that OBD2 is paused");
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Diagnose").performClick(); return null; });
+            // The persistent header is one text; the Diagnose card adds its own status line and its note and button, which exist only there
+            waitFor(() -> main.call(() -> countTextStarting(activity.getWindow().getDecorView(), "UDS erweiterte Sitzung aktiv") >= 2
+                && hasTextContaining(activity.getWindow().getDecorView(), "Modus 01")
+                && findButtonOrNull(activity.getWindow().getDecorView(), "Standard-Sitzung wiederherstellen") != null), "REQ-027.6 the Diagnose session card shows its own status, Mode 01 note and switch-off button");
+            require(!main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "pausiert")), "REQ-027.6 Diagnose does not claim that OBD2 is paused");
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Live").performClick(); return null; });
+
+            // REQ-027.3/.6: another functional job still leaves the session first; the OBD2 selection keeps polling, only the UDS signal goes
+            final int jobFrom = fake[0].commands.size();
+            service.runJob("dtc.scan");
+            waitFor(() -> !service.snapshot().optBoolean("busy") && !service.snapshot().optJSONObject("uds").optBoolean("active")
+                && service.snapshot().optJSONObject("diagnostics").length() > 0, "DTC job finished after leaving the extended session");
+            final List<String> jobWindow = since(fake[0].commands, jobFrom);
+            final int left = indexOf(jobWindow, "1001"), scan = indexOf(jobWindow, "03");
+            require(left >= 0 && scan > left, "REQ-027.3 the DTC read is preceded by 10 01: " + jobWindow);
+            require(contains(service.snapshot().optJSONArray("selected"), "engine.rpm") && !contains(service.snapshot().optJSONArray("selected"), semantic),
+                "REQ-027.6 the OBD2 selection survives the session while the UDS signal is removed");
+            final int afterJob = fake[0].commands.size();
+            final long afterJobAt = System.currentTimeMillis();
+            waitFor(() -> count(fake[0].commands, afterJob, "010C") >= 2 && hasFreshValue(service.snapshot().optJSONArray("values"), "engine.rpm", afterJobAt),
+                "REQ-027.6 the OBD2 selection keeps polling after the session ended with a new successful value");
+            require(count(fake[0].commands, jobFrom + left, "3E80") == 0, "REQ-027.2 no tester present once the session has ended");
+
+            // The session is explicit: switch it on again and select the UDS signal next to the standard one
+            final long reactivatedAt = System.currentTimeMillis();
+            service.runJob("uds.enable");
+            waitFor(() -> service.snapshot().optJSONObject("uds").optBoolean("active") && !service.snapshot().optBoolean("busy"), "extended session activated again explicitly");
+            service.setSignals(mixed);
+            waitFor(() -> service.snapshot().optJSONObject("uds").optBoolean("active")
+                && hasFreshValue(service.snapshot().optJSONArray("values"), "engine.rpm", reactivatedAt) && hasFreshValue(service.snapshot().optJSONArray("values"), semantic, reactivatedAt),
+                "REQ-027.6 new successful values of both kinds after the explicit re-activation");
+
             service.startRecording("live-selection");
             waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "selected UDS signal recording starts");
             filename[0] = service.snapshot().optString("recording");
             File evidence = new File(recordings, filename[0]);
             waitFor(() -> hasReadAction(evidence, semantic), "partial recording includes a selected UDS DID read");
+            waitFor(() -> hasSessionMarkedRead(evidence, "engine.rpm"), "REQ-027.6 the recording marks the session state of the Mode 01 read");
             service.disconnect();
             waitFor(() -> service.snapshot().optString("phase").equals("disconnected")
                 && service.snapshot().optString("recording").isEmpty(), "disconnect closes the partial recording");
@@ -208,6 +263,26 @@ public final class UdsAcceptance {
         return false;
     }
 
+    /** A value row written after {@code since} (wall clock) that decoded successfully: a number, no error. */
+    private static boolean hasFreshValue(JSONArray values, String semantic, long since) {
+        for (int i = 0; values != null && i < values.length(); i++) {
+            JSONObject value = values.optJSONObject(i);
+            if (value == null || !semantic.equals(value.optString("semantic")) || value.optLong("updatedAt", 0) <= since) continue;
+            if (!value.has("value") || value.isNull("value") || value.has("error") || value.optBoolean("replay")) continue;
+            if (Double.isFinite(value.optDouble("value", Double.NaN))) return true;
+        }
+        return false;
+    }
+
+    private static int countTextStarting(View view, String prefix) {
+        int n = view instanceof TextView && view.getVisibility() == View.VISIBLE && ((TextView) view).getText().toString().startsWith(prefix) ? 1 : 0;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) n += countTextStarting(group.getChildAt(i), prefix);
+        }
+        return n;
+    }
+
     private static boolean hasReplayValue(JSONArray values, String semantic) {
         for (int i = 0; values != null && i < values.length(); i++) {
             JSONObject value = values.optJSONObject(i);
@@ -222,6 +297,55 @@ public final class UdsAcceptance {
             for (String command : commands) if (command.startsWith("7E0:22") && !command.equals("7E0:22F187")) return true;
             return false;
         }
+    }
+
+    private static List<String> since(List<String> commands, int from) {
+        synchronized (commands) { return new ArrayList<>(commands.subList(Math.min(from, commands.size()), commands.size())); }
+    }
+
+    /** The compact command of a recorded "target:command" entry. */
+    private static String body(String entry) { return entry.substring(entry.indexOf(':') + 1); }
+
+    private static int indexOf(List<String> window, String compact) {
+        for (int i = 0; i < window.size(); i++) if (body(window.get(i)).equals(compact)) return i;
+        return -1;
+    }
+
+    private static int count(List<String> commands, int from, String compact) {
+        int n = 0;
+        for (String entry : since(commands, from)) if (body(entry).equals(compact)) n++;
+        return n;
+    }
+
+    /** How often the stream switches between the given Mode 01 read and a targeted 0x22 read (identification F187 excluded). */
+    private static int alternations(List<String> commands, int from, String standard) {
+        char last = 0;
+        int changes = 0;
+        for (String entry : since(commands, from)) {
+            String command = body(entry);
+            char kind = command.equals(standard) ? 'S' : command.startsWith("22") && !command.equals("22F187") ? 'U' : 0;
+            if (kind == 0) continue;
+            if (last != 0 && kind != last) changes++;
+            last = kind;
+        }
+        return changes;
+    }
+
+    private static boolean hasSessionMarkedRead(File file, String semantic) throws Exception {
+        if (!file.isFile()) return false;
+        try (BufferedReader input = new BufferedReader(new FileReader(file))) {
+            String line;
+            while ((line = input.readLine()) != null) {
+                JSONObject event;
+                try { event = new JSONObject(line); } catch (org.json.JSONException partial) { continue; } // the writer may be mid-line
+                if (!"action".equals(event.optString("type")) || !"read".equals(event.optString("action")) || !semantic.equals(event.optString("argument"))) continue;
+                JSONObject result = event.optJSONObject("result");
+                JSONObject uds = result == null ? null : result.optJSONObject("uds");
+                if (uds == null && result != null && result.optJSONObject("data") != null) uds = result.optJSONObject("data").optJSONObject("uds");
+                if (uds != null && uds.optBoolean("active")) return true;
+            }
+        }
+        return false;
     }
 
     private static boolean hasReadAction(File file, String semantic) throws Exception {
