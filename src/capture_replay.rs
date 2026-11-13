@@ -10,9 +10,11 @@ use crate::{
         CaptureDefinitionReference, CaptureEvent, CaptureKnowledgeContext, CaptureValue,
     },
     capture_format::ParsedCapture,
-    knowledge_db::{KnowledgeCatalog, KnowledgeDefinition, KnowledgePin},
-    mobile::knowledge::decode_read_result,
+    knowledge_db::{KnowledgeCatalog, KnowledgePin},
     prepare_read,
+    signal_read::{
+        decode, signal_key, Decoder, Evidence, OutcomeState, SignalReadError, SignalRoute,
+    },
     telemetry::TelemetryState,
     Transaction,
 };
@@ -169,90 +171,106 @@ impl CaptureReplay {
                             })
                         }
                     };
-                    if let Some((catalog, definition)) = pinned {
-                        match replay_knowledge_read(
-                            catalog,
-                            definition,
-                            request_payload,
-                            response_payload,
-                        ) {
-                            Ok(decoded) => {
-                                if !knowledge_decode_matches(value, unit, &decoded) {
-                                    issues.push(ReplayIssue {
-                                        at_us: *finished_us,
-                                        semantic: semantic.clone(),
-                                        kind: ReplayIssueKind::RecordedDecodeChanged,
-                                        detail: format!(
-                                            "recorded={} {} current={decoded}",
-                                            capture_value_text(value),
-                                            unit,
-                                        ),
-                                    });
-                                }
-                            }
-                            Err((kind, detail)) => issues.push(ReplayIssue {
-                                at_us: *finished_us,
-                                semantic: semantic.clone(),
-                                kind,
-                                detail,
-                            }),
+                    // One key per signal: `<semantic>@<local ECU id>` for a pinned Knowledge definition,
+                    // the plain semantic otherwise. The one signal-read rule routes and decodes it.
+                    let local_ecu_id = definition
+                        .as_deref()
+                        .and_then(CaptureDefinitionReference::local_ecu_id)
+                        .unwrap_or_default();
+                    let key = match pinned {
+                        Some(_) => signal_key(semantic, local_ecu_id),
+                        None => semantic.clone(),
+                    };
+                    let decoder = match (SignalRoute::of(&key), pinned) {
+                        (SignalRoute::Standard(request), _) => {
+                            Decoder::Standard { request, source }
                         }
-                        continue;
-                    }
-                    let request = match prepare_read(semantic) {
-                        Ok(request) => request,
-                        Err(error) => {
+                        (SignalRoute::Knowledge { .. }, Some((catalog, definition))) => {
+                            Decoder::Knowledge {
+                                definition,
+                                target_id: local_ecu_id,
+                                pin: catalog.pin(),
+                            }
+                        }
+                        (SignalRoute::Knowledge { .. }, None) => {
                             issues.push(ReplayIssue {
                                 at_us: *finished_us,
                                 semantic: semantic.clone(),
                                 kind: ReplayIssueKind::UnsupportedSemantic,
-                                detail: error,
+                                detail: prepare_read(semantic).err().unwrap_or_default(),
                             });
                             continue;
                         }
                     };
-                    if request_payload.as_slice() != request.bytes().as_slice() {
+                    if let Err(SignalReadError::RequestChanged(detail)) =
+                        decoder.verify_request(request_payload)
+                    {
                         issues.push(ReplayIssue {
                             at_us: *finished_us,
                             semantic: semantic.clone(),
                             kind: ReplayIssueKind::RequestChanged,
-                            detail: format!(
-                                "recorded request {:?} differs from current semantic request {:?}",
-                                request_payload,
-                                request.bytes()
-                            ),
+                            detail,
                         });
                         continue;
                     }
-                    let transaction = match request.complete(source, response_payload.clone()) {
-                        Ok(transaction) => {
-                            transaction.with_timestamp_ms(u128::from(*finished_us / 1_000))
-                        }
-                        Err(error) => {
-                            issues.push(ReplayIssue {
-                                at_us: *finished_us,
-                                semantic: semantic.clone(),
-                                kind: ReplayIssueKind::DecodeFailed,
-                                detail: error,
-                            });
-                            continue;
-                        }
-                    };
-                    if recorded_decode_changed(value, unit, &transaction) {
+                    let mut outcome = decode(
+                        &key,
+                        decoder,
+                        Evidence {
+                            response: Some(response_payload.clone()),
+                            error: None,
+                        },
+                    );
+                    let mut issue = |kind, detail| {
                         issues.push(ReplayIssue {
                             at_us: *finished_us,
                             semantic: semantic.clone(),
-                            kind: ReplayIssueKind::RecordedDecodeChanged,
-                            detail: format!(
-                                "recorded={} {} current={:.6} {}",
-                                capture_value_text(value),
-                                unit,
-                                transaction.value(),
-                                transaction.unit()
-                            ),
-                        });
+                            kind,
+                            detail,
+                        })
+                    };
+                    match (&outcome.state, outcome.transaction.take()) {
+                        (OutcomeState::Value { .. }, Some(transaction)) => {
+                            let transaction =
+                                transaction.with_timestamp_ms(u128::from(*finished_us / 1_000));
+                            if recorded_decode_changed(value, unit, &transaction) {
+                                issue(
+                                    ReplayIssueKind::RecordedDecodeChanged,
+                                    format!(
+                                        "recorded={} {} current={:.6} {}",
+                                        capture_value_text(value),
+                                        unit,
+                                        transaction.value(),
+                                        transaction.unit()
+                                    ),
+                                );
+                            }
+                            decoded.push((*finished_us, transaction));
+                        }
+                        (OutcomeState::Value { value: current, .. }, None) => {
+                            if !knowledge_decode_matches(value, unit, current, &outcome.unit) {
+                                issue(
+                                    ReplayIssueKind::RecordedDecodeChanged,
+                                    format!(
+                                        "recorded={} {} current={current} {}",
+                                        capture_value_text(value),
+                                        unit,
+                                        outcome.unit
+                                    ),
+                                );
+                            }
+                        }
+                        (OutcomeState::Rejected { .. }, _) => issue(
+                            ReplayIssueKind::DecodeFailed,
+                            "negative response".to_owned(),
+                        ),
+                        (OutcomeState::NotAnswered { reason }, _) => issue(
+                            ReplayIssueKind::DecodeFailed,
+                            reason
+                                .clone()
+                                .unwrap_or_else(|| "Knowledge read did not decode".into()),
+                        ),
                     }
-                    decoded.push((*finished_us, transaction));
                 }
                 CaptureEvent::ReadFailed {
                     timing: Some(timing),
@@ -346,48 +364,20 @@ impl CaptureReplay {
     }
 }
 
-/// Decodes a recorded Knowledge read with its pinned definition.
-/// Returns the Knowledge decode result (`value`, `unit`) on success.
-fn replay_knowledge_read(
-    catalog: &KnowledgeCatalog,
-    definition: &KnowledgeDefinition,
-    request_payload: &[u8],
-    response_payload: &[u8],
-) -> Result<Value, (ReplayIssueKind, String)> {
-    let expected = definition.operation().request_bytes();
-    if request_payload != expected.as_slice() {
-        return Err((
-            ReplayIssueKind::RequestChanged,
-            format!(
-                "recorded request {request_payload:?} differs from definition {} request {expected:?}",
-                definition.id()
-            ),
-        ));
-    }
-    // The target is not recorded in CLI captures; decode_read_result only echoes it.
-    let decoded = decode_read_result(catalog, "", definition, Some(response_payload), None, true);
-    match decoded.get("value") {
-        Some(_) => Ok(decoded),
-        None => Err((
-            ReplayIssueKind::DecodeFailed,
-            decoded
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("Knowledge read did not decode")
-                .to_owned(),
-        )),
-    }
-}
-
-fn knowledge_decode_matches(recorded: &CaptureValue, unit: &str, decoded: &Value) -> bool {
-    let value_matches = match (recorded, decoded.get("value")) {
-        (CaptureValue::Number(recorded), Some(Value::Number(current))) => {
+fn knowledge_decode_matches(
+    recorded: &CaptureValue,
+    unit: &str,
+    current: &Value,
+    current_unit: &str,
+) -> bool {
+    let value_matches = match (recorded, current) {
+        (CaptureValue::Number(recorded), Value::Number(current)) => {
             current.as_f64() == Some(*recorded)
         }
-        (CaptureValue::Text(recorded), Some(Value::String(current))) => recorded == current,
+        (CaptureValue::Text(recorded), Value::String(current)) => recorded == current,
         _ => false,
     };
-    value_matches && decoded.get("unit").and_then(Value::as_str) == Some(unit)
+    value_matches && current_unit == unit
 }
 
 fn recorded_decode_changed(value: &CaptureValue, unit: &str, transaction: &Transaction) -> bool {

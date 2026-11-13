@@ -538,6 +538,8 @@ requirements:
         text: Recordings contain the raw request and response of Knowledge signal reads with the Knowledge revision, and replay re-decodes them offline with the same decoder.
       - id: REQ-024.5
         text: Definitions with a session requirement other than the default session are never polled as ordinary live signals; only the explicitly activated, ECU-scoped REQ-027 session may offer them.
+      - id: REQ-024.6
+        text: Every read result, live or replayed, carries its signal key (the semantic for a standard PID, semantic@target for a Knowledge signal), and live reading, mobile replay, CLI capture replay, the full sweep and obdentic-mobile-report choose the decoder from that key by the same rule, so two signals with the same semantic (different ECUs, or a Knowledge signal sharing a PID's semantic) never overwrite or decode as each other.
 
   - id: REQ-025
     title: Select live signals in a selector structured by ECU and group

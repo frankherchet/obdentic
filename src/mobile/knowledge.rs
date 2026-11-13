@@ -6,9 +6,10 @@ use crate::{
     ecu_identification_discovery::{decisive_identification_payload, status_for_nrc},
     effective_knowledge::{EffectiveVehicleKnowledge, ObservedEcuFacts},
     elm::{ReadEvidence, ReadEvidenceError},
-    knowledge_db::{
-        AsciiTrim, Endian, HardwareValidationStatus, KnowledgeCatalog, KnowledgeDecoder,
-        KnowledgeDefinition, KnowledgeEcuTarget,
+    knowledge_db::{KnowledgeCatalog, KnowledgeDefinition, KnowledgeEcuTarget},
+    signal_read::{
+        decode, hardware_validation, signal_key, validation_label, Decoder, Evidence,
+        SignalOutcome, SignalRoute,
     },
     topology::{
         AddressingContext, Confidence, Protocol, ProtocolContext, Provenance, RequestAddress,
@@ -222,19 +223,24 @@ impl MobileKnowledge {
     pub(super) fn select_signal(
         &self,
         key: &str,
+        route: &SignalRoute,
         can_read: impl Fn(&CandidateTarget, &KnowledgeDefinition) -> bool,
     ) -> Result<ResolvedDid, String> {
-        let (semantic, only_target) = match key.rsplit_once('@') {
-            Some((semantic, target)) => (semantic, Some(target)),
-            None => (key, None),
+        let SignalRoute::Knowledge {
+            semantic,
+            target_id: only_target,
+        } = route
+        else {
+            return Err(format!("not a Knowledge signal: {key}"));
         };
         let effective = self.effective()?;
         let mut found = Vec::new();
         for ecu in effective.ecus() {
-            let Some(resolution) = ecu.semantic(semantic) else {
+            let Some(resolution) = ecu.semantic(semantic.as_str()) else {
                 continue;
             };
             if only_target
+                .as_deref()
                 .is_some_and(|only| self.candidate(ecu.ecu_id()).is_none_or(|t| t.id != only))
             {
                 continue;
@@ -341,12 +347,6 @@ fn target_facts(target: &EcuState) -> ObservedEcuFacts {
             )
         })
         .expect("pinned target ids and normalized fields are validated")
-}
-
-/// #256: the identity of a live signal. A Knowledge semantic can coincide with a standard PID or with
-/// the same semantic of another ECU, so a Knowledge signal is addressed as `<semantic>@<target id>`.
-pub(super) fn signal_key(semantic: &str, target_id: &str) -> String {
-    format!("{semantic}@{target_id}")
 }
 
 fn signal_json(target: &CandidateTarget, definition: &KnowledgeDefinition) -> Value {
@@ -539,7 +539,7 @@ pub(super) fn target_from_catalog(
     CandidateTarget::from_catalog(target, catalog.pin().repository())
 }
 
-pub(super) fn replay_read(recorded: &Value) -> Result<Value, String> {
+pub(super) fn replay_read(recorded: &Value, key: &str) -> Result<Value, String> {
     let catalog = KnowledgeCatalog::embedded_pinned().map_err(|error| error.to_string())?;
     require_revision(recorded, &catalog)?;
     let semantic = recorded
@@ -585,14 +585,15 @@ pub(super) fn replay_read(recorded: &Value) -> Result<Value, String> {
         }
     }
     let response = recorded_evidence_payload(recorded, &target, definition)?;
-    let mut result = decode_read_result(
+    let mut result = knowledge_outcome(
+        key,
         &catalog,
         target_id,
         definition,
-        response.as_deref(),
+        response,
         recorded.get("error").and_then(Value::as_str),
-        true,
-    );
+    )
+    .read_json(true)?;
     for field in [
         "observations",
         "uds",
@@ -639,13 +640,17 @@ pub(super) fn replay_learning(recorded: &Value) -> Result<Value, String> {
         validate_applicability(&catalog, target_id, definition)?;
         let target = target_from_catalog(&catalog, target_id)?;
         let response = recorded_evidence_payload(result, &target, definition)?;
-        decoded.push(decode_learning_result(
-            &catalog,
-            target_id,
-            definition,
-            response.as_deref(),
-            result.get("error").and_then(Value::as_str),
-        ));
+        decoded.push(
+            knowledge_outcome(
+                &signal_key(semantic, target_id),
+                &catalog,
+                target_id,
+                definition,
+                response,
+                result.get("error").and_then(Value::as_str),
+            )
+            .learning_json(),
+        );
     }
     Ok(json!({
         "knowledge_repository":catalog.pin().repository(),
@@ -801,90 +806,6 @@ pub(super) fn replay_discovery(recorded: &Value) -> Result<Value, String> {
     }))
 }
 
-pub(crate) fn decode_read_result(
-    catalog: &KnowledgeCatalog,
-    target_id: &str,
-    definition: &KnowledgeDefinition,
-    response: Option<&[u8]>,
-    error: Option<&str>,
-    replay: bool,
-) -> Value {
-    let parsed = decode_definition(definition, response);
-    let (status, nrc, value, decode_error) = match parsed {
-        Ok(Some(value)) => ("available", None, value, None),
-        Ok(None) => ("unavailable", None, Value::Null, None),
-        Err(DecodeFailure::NegativeResponse(nrc)) => (
-            "unavailable",
-            Some(nrc),
-            Value::Null,
-            Some("negative response".to_owned()),
-        ),
-        Err(DecodeFailure::Invalid(error)) => ("unavailable", None, Value::Null, Some(error)),
-    };
-    let mut result = json!({
-        "knowledge_repository":catalog.pin().repository(),
-        "knowledge_revision":catalog.pin().revision(),
-        "target_id":target_id,
-        "semantic":definition.semantic(),
-        "definition_id":definition.id(),
-        "did":definition.operation().did(),
-        "request":[0x22,(definition.operation().did()>>8) as u8,definition.operation().did() as u8],
-        "response":response,
-        "status":status,
-        "nrc":nrc,
-        "unit":definition.unit().unwrap_or(""),
-        "validation":hardware_validation(definition),
-        "validation_label":validation_label(hardware_validation(definition)),
-        "replay":replay
-    });
-    if status == "available" {
-        result["value"] = value;
-    } else {
-        result["error"] = json!(decode_error
-            .or_else(|| error.map(str::to_owned))
-            .unwrap_or_else(|| "Knowledge DID unavailable".into()));
-    }
-    result
-}
-
-/// REQ-030.8: one availability entry of a Knowledge signal, decoded from its raw response with the
-/// definition's decoder. Live reads and replay build it through this one function.
-pub(super) fn availability_entry(
-    catalog: &KnowledgeCatalog,
-    key: &str,
-    target_id: &str,
-    definition_id: &str,
-    response: Option<&[u8]>,
-    error: Option<&str>,
-) -> Result<Value, String> {
-    let definition = catalog
-        .definition(definition_id)
-        .ok_or_else(|| format!("unknown Knowledge definition: {definition_id}"))?;
-    let decoded = decode_learning_result(catalog, target_id, definition, response, error);
-    let mut entry = json!({"key":key,"target":target_id,"definition_id":definition_id,
-        "status":decoded["status"],"response":response});
-    match decoded["status"].as_str() {
-        Some("answered") => {
-            entry["value"] = decoded["value"].clone();
-            entry["unit"] = decoded["unit"].clone();
-            if let (Some(value), Some(range)) =
-                (decoded["value"].as_f64(), definition.plausible_range())
-            {
-                if value < range.minimum() || value > range.maximum() {
-                    entry["implausible"] = json!(true);
-                    entry["plausible_range"] =
-                        json!({"minimum":range.minimum(),"maximum":range.maximum()});
-                }
-            }
-        }
-        Some("rejected") => entry["nrc"] = decoded["nrc"].clone(),
-        _ => {
-            entry["reason"] = json!(decoded["error"].as_str().unwrap_or("no usable answer"));
-        }
-    }
-    Ok(entry)
-}
-
 /// REQ-030.10: recomputes every entry of a recorded availability result from its recorded response.
 pub(super) fn replay_availability(recorded: &Value) -> Result<Value, String> {
     let catalog = KnowledgeCatalog::embedded_pinned().map_err(|error| error.to_string())?;
@@ -906,210 +827,59 @@ pub(super) fn replay_availability(recorded: &Value) -> Result<Value, String> {
             .transpose()
             .map_err(|error| error.to_string())?;
         let reason = entry.get("reason").and_then(Value::as_str);
-        decoded.push(match entry.get("definition_id").and_then(Value::as_str) {
-            Some(definition_id) => availability_entry(
-                &catalog,
-                key,
-                entry
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .ok_or("availability entry target missing")?,
-                definition_id,
-                response.as_deref(),
-                reason,
-            )?,
-            None => mode01_entry(
-                key,
-                entry.get("target").and_then(Value::as_str),
-                response,
-                reason,
-            ),
-        });
+        let target = entry.get("target").and_then(Value::as_str);
+        let evidence = Evidence {
+            response,
+            error: reason.map(str::to_owned),
+        };
+        decoded.push(
+            match (
+                SignalRoute::of(key),
+                entry.get("definition_id").and_then(Value::as_str),
+            ) {
+                (SignalRoute::Standard(request), _) => {
+                    let mut outcome = decode(
+                        key,
+                        Decoder::Standard {
+                            request,
+                            source: "replay",
+                        },
+                        evidence,
+                    );
+                    outcome.target_id = target.map(str::to_owned);
+                    outcome.sweep_entry()
+                }
+                (SignalRoute::Knowledge { .. }, Some(definition_id)) => {
+                    let definition = catalog
+                        .definition(definition_id)
+                        .ok_or_else(|| format!("unknown Knowledge definition: {definition_id}"))?;
+                    let target = target.ok_or("availability entry target missing")?;
+                    decode(
+                        key,
+                        Decoder::Knowledge {
+                            definition,
+                            target_id: target,
+                            pin: catalog.pin(),
+                        },
+                        evidence,
+                    )
+                    .sweep_entry()
+                }
+                // A read that failed before any ECU was addressed never had a definition.
+                (SignalRoute::Knowledge { .. }, None) if evidence.response.is_none() => {
+                    json!({"key":key,"target":target,"status":"not_answered",
+                        "reason":evidence.error.as_deref().unwrap_or("no usable answer")})
+                }
+                (SignalRoute::Knowledge { .. }, None) => {
+                    return Err("availability entry definition_id missing".into())
+                }
+            },
+        );
     }
     let mut result = recorded.clone();
     result["entries"] = json!(decoded);
     result["replay"] = json!(true);
     Ok(result)
-}
-
-/// REQ-030.9: availability entry of a standard Mode 01 PID; the value is decoded with the catalog decoder.
-pub(super) fn mode01_entry(
-    key: &str,
-    target: Option<&str>,
-    response: Option<Vec<u8>>,
-    reason: Option<&str>,
-) -> Value {
-    let mut entry = json!({"key":key,"target":target});
-    let decoded = match response {
-        Some(response) => crate::prepare_read(key)
-            .and_then(|request| request.complete("replay", response.clone()))
-            .map(|transaction| (response, transaction)),
-        None => Err(reason.unwrap_or("no usable answer").to_owned()),
-    };
-    match decoded {
-        Ok((response, transaction)) => {
-            entry["status"] = json!("answered");
-            entry["response"] = json!(response);
-            entry["value"] = json!(transaction.value());
-            entry["unit"] = json!(transaction.unit());
-        }
-        Err(reason) => {
-            entry["status"] = json!("not_answered");
-            entry["reason"] = json!(reason);
-        }
-    }
-    entry
-}
-
-pub(super) fn decode_learning_result(
-    catalog: &KnowledgeCatalog,
-    target_id: &str,
-    definition: &KnowledgeDefinition,
-    response: Option<&[u8]>,
-    error: Option<&str>,
-) -> Value {
-    let parsed = decode_definition(definition, response);
-    let (status, nrc, value, error) = match parsed {
-        Ok(Some(value)) => ("answered", None, value, None),
-        Ok(None) => ("not_answered", None, Value::Null, error.map(str::to_owned)),
-        Err(DecodeFailure::NegativeResponse(nrc)) => ("rejected", Some(nrc), Value::Null, None),
-        Err(DecodeFailure::Invalid(error)) => ("not_answered", None, Value::Null, Some(error)),
-    };
-    let mut result = json!({
-        "knowledge_repository":catalog.pin().repository(),
-        "knowledge_revision":catalog.pin().revision(),
-        "target_id":target_id,
-        "semantic":definition.semantic(),
-        "definition_id":definition.id(),
-        "did":definition.operation().did(),
-        "request":[0x22,(definition.operation().did()>>8) as u8,definition.operation().did() as u8],
-        "response":response,
-        "status":status,
-        "nrc":nrc,
-        "unit":definition.unit().unwrap_or(""),
-        "validation":"unconfirmed",
-        "validation_state":hardware_validation(definition),
-        "validation_label":validation_label(hardware_validation(definition)),
-        "observations":[]
-    });
-    if status == "answered" {
-        result["value"] = value;
-    } else if let Some(error) = error {
-        result["error"] = json!(error);
-    }
-    result
-}
-
-enum DecodeFailure {
-    NegativeResponse(u8),
-    Invalid(String),
-}
-
-fn decode_definition(
-    definition: &KnowledgeDefinition,
-    response: Option<&[u8]>,
-) -> Result<Option<Value>, DecodeFailure> {
-    let Some(response) = response else {
-        return Ok(None);
-    };
-    if response.starts_with(&[0x7f, 0x22]) {
-        return if response.len() == 3 {
-            Err(DecodeFailure::NegativeResponse(response[2]))
-        } else {
-            Err(DecodeFailure::Invalid(
-                "malformed UDS negative response".into(),
-            ))
-        };
-    }
-    let payload = definition
-        .validate_response(response)
-        .map_err(DecodeFailure::Invalid)?;
-    decode_value(definition.decoder(), payload)
-        .map(Some)
-        .map_err(DecodeFailure::Invalid)
-}
-
-fn decode_value(decoder: &KnowledgeDecoder, payload: &[u8]) -> Result<Value, String> {
-    match decoder {
-        KnowledgeDecoder::OpaqueBytes => Ok(json!(payload)),
-        KnowledgeDecoder::Ascii { trim } => {
-            if !payload.is_ascii() {
-                return Err("Knowledge ASCII decoder received non-ASCII bytes".into());
-            }
-            let trim_byte = |byte: u8| match trim {
-                AsciiTrim::None => false,
-                AsciiTrim::Space => byte == b' ',
-                AsciiTrim::Nul => byte == 0,
-                AsciiTrim::SpaceAndNul => matches!(byte, 0 | b' '),
-            };
-            let end = payload
-                .iter()
-                .rposition(|byte| !trim_byte(*byte))
-                .map_or(0, |index| index + 1);
-            let payload = &payload[..end];
-            if payload.is_empty() || payload.iter().any(u8::is_ascii_control) {
-                return Err("Knowledge ASCII decoder received empty or control bytes".into());
-            }
-            Ok(json!(
-                std::str::from_utf8(payload).map_err(|error| error.to_string())?
-            ))
-        }
-        KnowledgeDecoder::LinearInteger {
-            width_bytes,
-            endian,
-            signed,
-            scale,
-            offset,
-        } => {
-            if payload.len() != usize::from(*width_bytes) {
-                return Err(format!(
-                    "Knowledge linear decoder expected {width_bytes} bytes, received {}",
-                    payload.len()
-                ));
-            }
-            let mut raw = 0u64;
-            match endian {
-                Endian::Big => {
-                    for byte in payload {
-                        raw = (raw << 8) | u64::from(*byte);
-                    }
-                }
-                Endian::Little => {
-                    for (shift, byte) in payload.iter().enumerate() {
-                        raw |= u64::from(*byte) << (shift * 8);
-                    }
-                }
-            }
-            let bit_count = u32::from(*width_bytes) * 8;
-            let integer = if *signed && raw & (1u64 << (bit_count - 1)) != 0 {
-                (raw as i128) - (1i128 << bit_count)
-            } else {
-                raw as i128
-            };
-            let value = (integer as f64) * scale + offset;
-            if !value.is_finite() {
-                return Err("Knowledge linear decoder produced a non-finite value".into());
-            }
-            Ok(json!(value))
-        }
-    }
-}
-
-fn hardware_validation(definition: &KnowledgeDefinition) -> &'static str {
-    match definition.hardware_validation().status() {
-        HardwareValidationStatus::NotValidated => "not_validated",
-        HardwareValidationStatus::Validated => "validated",
-        HardwareValidationStatus::NotApplicable => "not_applicable",
-    }
-}
-
-fn validation_label(validation: &str) -> &'static str {
-    match validation {
-        "not_validated" => "nicht abgeglichen",
-        "validated" => "validiert",
-        "not_applicable" => "nicht anwendbar",
-        _ => "unbekannt",
-    }
 }
 
 fn identification_status(status: IdentificationResultStatus) -> &'static str {
@@ -1341,49 +1111,67 @@ pub(super) fn read_evidence_json(result: &Result<ReadEvidence, ReadEvidenceError
         .collect()
 }
 
+/// The Knowledge read of `resolved` decoded by the one signal-read module; its key is `<semantic>@<target>`.
+pub(crate) fn knowledge_outcome(
+    key: &str,
+    catalog: &KnowledgeCatalog,
+    target_id: &str,
+    definition: &KnowledgeDefinition,
+    response: Option<Vec<u8>>,
+    error: Option<&str>,
+) -> SignalOutcome {
+    decode(
+        key,
+        Decoder::Knowledge {
+            definition,
+            target_id,
+            pin: catalog.pin(),
+        },
+        Evidence {
+            response,
+            error: error.map(str::to_owned),
+        },
+    )
+}
+
+pub(super) fn read_outcome(
+    catalog: &KnowledgeCatalog,
+    resolved: &ResolvedDid,
+    result: &Result<ReadEvidence, ReadEvidenceError>,
+) -> SignalOutcome {
+    knowledge_outcome(
+        &signal_key(resolved.definition.semantic(), &resolved.target_id),
+        catalog,
+        &resolved.target_id,
+        &resolved.definition,
+        result.as_ref().ok().map(|read| read.payload.clone()),
+        result.as_ref().err().map(|error| error.error.as_str()),
+    )
+}
+
 pub(super) fn learning_result(
     catalog: &KnowledgeCatalog,
     resolved: &ResolvedDid,
     result: Result<ReadEvidence, ReadEvidenceError>,
 ) -> Value {
-    let response = result.as_ref().ok().map(|read| read.payload.as_slice());
-    let error = result.as_ref().err().map(|error| error.error.as_str());
-    let mut decoded = decode_learning_result(
-        catalog,
-        &resolved.target_id,
-        &resolved.definition,
-        response,
-        error,
-    );
-    decoded["request"] = json!([
-        0x22,
-        (resolved.definition.operation().did() >> 8) as u8,
-        resolved.definition.operation().did() as u8
-    ]);
+    let mut decoded = read_outcome(catalog, resolved, &result).learning_json();
     decoded["observations"] = json!(read_evidence_json(&result));
     decoded
 }
 
-pub(super) fn read_result(
-    catalog: &KnowledgeCatalog,
-    resolved: &ResolvedDid,
-    result: Result<ReadEvidence, ReadEvidenceError>,
-) -> Value {
-    let response = result.as_ref().ok().map(|read| read.payload.as_slice());
-    let error = result.as_ref().err().map(|error| error.error.as_str());
-    let mut decoded = decode_read_result(
-        catalog,
-        &resolved.target_id,
-        &resolved.definition,
-        response,
-        error,
-        false,
+/// The evidence fields a live read adds to its result next to the decoded outcome.
+pub(super) fn read_extras(
+    result: &Result<ReadEvidence, ReadEvidenceError>,
+) -> serde_json::Map<String, Value> {
+    let mut extras = serde_json::Map::new();
+    extras.insert("observations".into(), json!(read_evidence_json(result)));
+    extras.insert(
+        "timestamp_ms".into(),
+        json!(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis())),
     );
-    decoded["observations"] = json!(read_evidence_json(&result));
-    decoded["timestamp_ms"] = json!(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis()));
-    decoded
+    extras
 }
 
 pub(super) fn definition_read_request(
@@ -1406,45 +1194,6 @@ mod tests {
 
     fn catalog() -> KnowledgeCatalog {
         KnowledgeCatalog::embedded_pinned().unwrap()
-    }
-
-    #[test]
-    fn req_024_2_knowledge_decoder_handles_signed_scaled_and_ascii_values() {
-        assert_eq!(
-            decode_value(
-                &KnowledgeDecoder::LinearInteger {
-                    width_bytes: 2,
-                    endian: Endian::Big,
-                    signed: true,
-                    scale: 0.01,
-                    offset: 0.0,
-                },
-                &[0xff, 0x9c],
-            )
-            .unwrap(),
-            json!(-1.0)
-        );
-        assert_eq!(
-            decode_value(
-                &KnowledgeDecoder::Ascii {
-                    trim: AsciiTrim::SpaceAndNul
-                },
-                b"part  \0",
-            )
-            .unwrap(),
-            json!("part")
-        );
-        assert!(decode_value(
-            &KnowledgeDecoder::LinearInteger {
-                width_bytes: 2,
-                endian: Endian::Big,
-                signed: false,
-                scale: 1.0,
-                offset: 0.0,
-            },
-            &[0x01],
-        )
-        .is_err());
     }
 
     #[test]
@@ -1620,32 +1369,5 @@ mod tests {
             mixed_busy_pending_positive.value.as_deref(),
             Some(&b"ABC"[..])
         );
-    }
-
-    #[test]
-    fn req_026_2_knowledge_results_preserve_nrc_and_timeout_as_not_answered() {
-        let catalog = catalog();
-        let definition = catalog
-            .definition("vag.ea189_session.air.intercooler_outlet_temperature")
-            .unwrap();
-        let negative = decode_learning_result(
-            &catalog,
-            "vag.ecu_target.7e0",
-            definition,
-            Some(&[0x7f, 0x22, 0x31]),
-            None,
-        );
-        assert_eq!(negative["status"], "rejected");
-        assert_eq!(negative["nrc"], 0x31);
-        assert!(negative["value"].is_null());
-        let missing = decode_learning_result(
-            &catalog,
-            "vag.ecu_target.7e0",
-            definition,
-            None,
-            Some("timeout"),
-        );
-        assert_eq!(missing["status"], "not_answered");
-        assert!(missing["value"].is_null());
     }
 }
