@@ -49,7 +49,7 @@ public final class ObdService extends Service {
     public static volatile boolean autoSurvey = true;
     /** Test seam like autoSurvey: the automatic fault-code scan (REQ-034); the user setting is separate. */
     public static volatile boolean autoScan = true;
-    private volatile boolean scanPending; // REQ-034.1: the automatic scan waits behind the automatic jobs of this connection
+    private volatile int scanFor=-1; // REQ-034.1: connection generation whose automatic scan waits behind its automatic jobs; -1 = none
     private final java.util.Deque<String> chain = new java.util.concurrent.ConcurrentLinkedDeque<>();
     private volatile boolean udsJob;
     private long core;
@@ -293,9 +293,9 @@ public final class ObdService extends Service {
         String outcome=observeVehicle(inventory.optJSONObject("data")), notice=vehicleNotice(outcome,inventory.optJSONObject("data"));
         boolean knowledge=inventory.optJSONObject("data")!=null && !inventory.optJSONObject("data").isNull("knowledge_manufacturer");
         // REQ-030.7: ECU identification on every connection (Knowledge signals live in the session); REQ-030.4: availability for a new vehicle only
-        scanPending=inventory.optBoolean("ok") && autoScanWanted(); // REQ-034.1: only after a successful inventory
+        scanFor=inventory.optBoolean("ok") && autoScanWanted() ? token : -1; // REQ-034.1: only after a successful inventory, only for this connection
         if(knowledge && autoSurvey && mode.equals("live")) { chain.clear(); if(outcome.equals("created")) chain.add(AVAILABILITY); worker.execute(() -> runJob("ecu.discover")); }
-        else if(scanPending) { scanPending=false; worker.execute(() -> runJob("dtc.scan")); }
+        else startPendingScan(token);
         readOdometer(inventory.optJSONObject("data"),outcome);
         if(inventory.optJSONObject("data")!=null) set("vehicle",inventory.optJSONObject("data"));
         set("phase","ready");
@@ -572,13 +572,15 @@ public final class ObdService extends Service {
             String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
             succeeded[0]=result.optBoolean("ok");
-            if(succeeded[0] && action.equals("inventory") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add("ecu.discover"); chain.add(AVAILABILITY); scanPending=autoScanWanted(); } // REQ-030.4, REQ-034.1
+            if(succeeded[0] && action.equals("inventory") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add("ecu.discover"); chain.add(AVAILABILITY); scanFor=autoScanWanted() ? token : -1; } // REQ-030.4, REQ-034.1
         } catch(Throwable e) { fail(token,e); } finally { knowledgeJob=false; udsJob=false; if(token==generation) { busy=false; changed(); }
             String next=succeeded[0] && token==generation ? chain.poll() : null;
-            if(next==null) { chain.clear(); if(scanPending && token==generation && !worker.isShutdown()) { scanPending=false; worker.execute(() -> runJob("dtc.scan")); } } // REQ-034.1: a failed survey job does not skip the scan; a failed scan is only its own result
+            if(next==null) { chain.clear(); startPendingScan(token); } // REQ-034.1: a failed survey job does not skip the scan; a failed scan is only its own result
             else if(!worker.isShutdown()) worker.execute(() -> runJob(next)); } });
     }
     private boolean autoScanWanted() { return autoScan && mode.equals("live") && autoDtcEnabled(this); }
+    /** REQ-034.1: runs the scan waiting for this connection only, and only while the live conditions still hold (never in demo/replay or a later connection). */
+    private void startPendingScan(int token) { if(scanFor!=token || token!=generation) return; scanFor=-1; if(autoScanWanted() && !worker.isShutdown()) worker.execute(() -> runJob("dtc.scan")); }
     /** REQ-022: action name and recording profile of the adapter throughput job (not a polling profile). */
     public static final String THROUGHPUT="adapter.throughput", THROUGHPUT_PROFILE="adapter-throughput", AVAILABILITY="knowledge.availability";
     /** REQ-022.1: the German reason why the throughput job cannot start now, or null. Live and ready only. */
