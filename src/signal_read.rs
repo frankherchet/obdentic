@@ -81,7 +81,6 @@ pub(crate) fn key_of_recording(recorded: &Value) -> Result<String, String> {
 }
 
 pub(crate) struct Evidence {
-    pub(crate) request: Vec<u8>,
     pub(crate) response: Option<Vec<u8>>,
     pub(crate) error: Option<String>,
 }
@@ -98,9 +97,35 @@ pub(crate) enum Decoder<'a> {
     },
 }
 
+impl Decoder<'_> {
+    fn request(&self) -> Vec<u8> {
+        match self {
+            Self::Standard { request, .. } => request.bytes().to_vec(),
+            Self::Knowledge { definition, .. } => definition.operation().request_bytes().to_vec(),
+        }
+    }
+
+    /// A recorded request must be the one the decoder's signal issues today; otherwise the recorded
+    /// response belongs to a different question and is not decoded.
+    pub(crate) fn verify_request(&self, recorded: &[u8]) -> Result<(), SignalReadError> {
+        let expected = self.request();
+        if recorded == expected.as_slice() {
+            return Ok(());
+        }
+        Err(SignalReadError::RequestChanged(match self {
+            Self::Standard { .. } => format!(
+                "recorded request {recorded:?} differs from current semantic request {expected:?}"
+            ),
+            Self::Knowledge { definition, .. } => format!(
+                "recorded request {recorded:?} differs from definition {} request {expected:?}",
+                definition.id()
+            ),
+        }))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum SignalReadError {
-    /// The evidence's request is not the one the decoder's definition issues.
     RequestChanged(String),
 }
 
@@ -143,27 +168,14 @@ pub(crate) struct SignalOutcome {
     definition: Option<DefinitionFacts>,
 }
 
-pub(crate) fn decode(
-    key: &str,
-    decoder: Decoder<'_>,
-    evidence: Evidence,
-) -> Result<SignalOutcome, SignalReadError> {
-    let Evidence {
-        request,
-        response,
-        error,
-    } = evidence;
+pub(crate) fn decode(key: &str, decoder: Decoder<'_>, evidence: Evidence) -> SignalOutcome {
+    let request = decoder.request();
+    let Evidence { response, error } = evidence;
     match decoder {
         Decoder::Standard {
             request: read,
             source,
         } => {
-            if request.as_slice() != read.bytes() {
-                return Err(SignalReadError::RequestChanged(format!(
-                    "recorded request {request:?} differs from current semantic request {:?}",
-                    read.bytes()
-                )));
-            }
             let (transaction, state) = match response
                 .as_ref()
                 .map(|response| read.complete(source, response.clone()))
@@ -183,7 +195,7 @@ pub(crate) fn decode(
                 ),
                 None => (None, OutcomeState::NotAnswered { reason: error }),
             };
-            Ok(SignalOutcome {
+            SignalOutcome {
                 key: key.to_owned(),
                 semantic: read.semantic().to_owned(),
                 target_id: None,
@@ -193,20 +205,13 @@ pub(crate) fn decode(
                 transaction,
                 request,
                 definition: None,
-            })
+            }
         }
         Decoder::Knowledge {
             definition,
             target_id,
             pin,
         } => {
-            let expected = definition.operation().request_bytes();
-            if request.as_slice() != expected {
-                return Err(SignalReadError::RequestChanged(format!(
-                    "recorded request {request:?} differs from definition {} request {expected:?}",
-                    definition.id()
-                )));
-            }
             let state = match decode_definition(definition, response.as_deref()) {
                 Ok(Some(value)) => {
                     let implausible = match (value.as_f64(), definition.plausible_range()) {
@@ -225,7 +230,7 @@ pub(crate) fn decode(
                     reason: Some(reason),
                 },
             };
-            Ok(SignalOutcome {
+            SignalOutcome {
                 key: key.to_owned(),
                 semantic: definition.semantic().to_owned(),
                 target_id: Some(target_id.to_owned()),
@@ -241,7 +246,7 @@ pub(crate) fn decode(
                     repository: pin.repository().to_owned(),
                     revision: pin.revision().to_owned(),
                 }),
-            })
+            }
         }
     }
 }
@@ -480,19 +485,9 @@ fn decode_value(decoder: &KnowledgeDecoder, payload: &[u8]) -> Result<Value, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{knowledge_db::KnowledgeCatalog, mobile::knowledge};
+    use crate::knowledge_db::KnowledgeCatalog;
 
     const TARGET: &str = "vag.ecu_target.7e0";
-
-    fn without_key(mut value: Value) -> Value {
-        value.as_object_mut().unwrap().remove("key");
-        value
-    }
-
-    fn without_timestamp(mut value: Value) -> Value {
-        value.as_object_mut().unwrap().remove("timestamp_ms");
-        value
-    }
 
     fn knowledge_outcome(
         catalog: &KnowledgeCatalog,
@@ -508,117 +503,120 @@ mod tests {
                 pin: catalog.pin(),
             },
             Evidence {
-                request: definition.operation().request_bytes().to_vec(),
                 response: response.map(<[u8]>::to_vec),
                 error: error.map(str::to_owned),
             },
         )
-        .unwrap()
     }
 
-    fn responses(definition: &KnowledgeDefinition) -> Vec<Option<Vec<u8>>> {
+    // REQ-024.6: the views keep the field-for-field shape of the former per-context decoders.
+    #[test]
+    fn req_024_6_views_keep_their_json_shape() {
+        let catalog = KnowledgeCatalog::embedded_pinned().unwrap();
+        let definition = catalog
+            .definition("vag.ea189_session.air.intercooler_outlet_temperature")
+            .unwrap();
         let did = definition.operation().did();
         let head = [0x62, (did >> 8) as u8, did as u8];
-        vec![
-            Some([&head[..], &[0x04, 0x00]].concat()),
-            Some([&head[..], &[0x01]].concat()),
-            Some(vec![0x7f, 0x22, 0x31]),
-            Some(vec![0x7f, 0x22]),
-            None,
-        ]
+        let keys = |value: &Value| -> Vec<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        let read_keys = [
+            "did",
+            "definition_id",
+            "error",
+            "key",
+            "knowledge_repository",
+            "knowledge_revision",
+            "nrc",
+            "replay",
+            "request",
+            "response",
+            "semantic",
+            "status",
+            "target_id",
+            "unit",
+            "validation",
+            "validation_label",
+        ];
+        let rejected = knowledge_outcome(&catalog, definition, Some(&[0x7f, 0x22, 0x31]), None);
+        let read = rejected.read_json(false).unwrap();
+        assert_eq!(read["status"], "unavailable");
+        assert_eq!(read["nrc"], 0x31);
+        assert_eq!(read["error"], "negative response");
+        assert_eq!(read["replay"], false);
+        assert_eq!(read["request"], json!([0x22, head[1], head[2]]));
+        let mut expected = read_keys.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys(&read), expected);
+        let timed_out = knowledge_outcome(&catalog, definition, None, Some("timeout"));
+        assert_eq!(timed_out.read_json(true).unwrap()["error"], "timeout");
+        assert_eq!(timed_out.learning_json()["status"], "not_answered");
+        assert_eq!(timed_out.learning_json()["validation"], "unconfirmed");
+        assert_eq!(timed_out.sweep_entry()["reason"], "timeout");
+        assert!(timed_out.sweep_entry()["response"].is_null());
+        let silent = knowledge_outcome(&catalog, definition, None, None);
+        assert_eq!(
+            silent.read_json(false).unwrap()["error"],
+            "Knowledge DID unavailable"
+        );
+        assert!(silent.learning_json().get("error").is_none());
+        assert_eq!(silent.sweep_entry()["reason"], "no usable answer");
+        let learning = rejected.learning_json();
+        assert_eq!(learning["status"], "rejected");
+        assert!(learning.get("error").is_none());
+        assert_eq!(rejected.sweep_entry()["nrc"], 0x31);
     }
 
-    // REQ-024.6: the views reproduce the former per-context decoders field for field.
     #[test]
-    fn req_024_6_views_equal_the_former_knowledge_decoders() {
+    fn req_026_2_knowledge_results_preserve_nrc_and_timeout_as_not_answered() {
         let catalog = KnowledgeCatalog::embedded_pinned().unwrap();
-        let oil = catalog
-            .definitions_for_semantic("engine.oil_temperature")
-            .first()
-            .unwrap()
-            .id()
-            .to_owned();
-        for id in [
-            "vag.ea189_session.air.intercooler_outlet_temperature",
-            oil.as_str(),
-        ] {
-            let definition = catalog.definition(id).unwrap();
-            for response in responses(definition) {
-                for error in [None, Some("timeout")] {
-                    let outcome =
-                        knowledge_outcome(&catalog, definition, response.as_deref(), error);
-                    let old_read = knowledge::decode_read_result(
-                        &catalog,
-                        TARGET,
-                        definition,
-                        response.as_deref(),
-                        error,
-                        true,
-                    );
-                    assert_eq!(
-                        without_timestamp(without_key(outcome.read_json(true).unwrap())),
-                        without_timestamp(old_read),
-                        "{id} {response:?} {error:?}"
-                    );
-                    assert_eq!(
-                        without_key(outcome.learning_json()),
-                        knowledge::decode_learning_result(
-                            &catalog,
-                            TARGET,
-                            definition,
-                            response.as_deref(),
-                            error
-                        ),
-                        "{id} {response:?} {error:?}"
-                    );
-                    assert_eq!(
-                        outcome.sweep_entry(),
-                        knowledge::availability_entry(
-                            &catalog,
-                            "k",
-                            TARGET,
-                            id,
-                            response.as_deref(),
-                            error
-                        )
-                        .unwrap(),
-                        "{id} {response:?} {error:?}"
-                    );
-                }
-            }
-        }
+        let definition = catalog
+            .definition("vag.ea189_session.air.intercooler_outlet_temperature")
+            .unwrap();
+        let negative = knowledge_outcome(&catalog, definition, Some(&[0x7f, 0x22, 0x31]), None)
+            .learning_json();
+        assert_eq!(negative["status"], "rejected");
+        assert_eq!(negative["nrc"], 0x31);
+        assert!(negative["value"].is_null());
+        let missing = knowledge_outcome(&catalog, definition, None, Some("timeout")).learning_json();
+        assert_eq!(missing["status"], "not_answered");
+        assert!(missing["value"].is_null());
     }
 
     #[test]
-    fn req_024_6_standard_sweep_entry_equals_the_former_mode_01_entry() {
+    fn req_024_6_standard_outcome_keeps_the_pid_shapes() {
         let request = prepare_read("engine.rpm").unwrap();
-        for response in [
-            Some(vec![0x41, 0x0C, 0x1A, 0xF8]),
-            Some(vec![0x41, 0x0C]),
-            None,
-        ] {
-            for reason in [None, Some("no answer")] {
-                let mut outcome = decode(
-                    "engine.rpm",
-                    Decoder::Standard {
-                        request,
-                        source: "test",
-                    },
-                    Evidence {
-                        request: request.bytes().to_vec(),
-                        response: response.clone(),
-                        error: reason.map(str::to_owned),
-                    },
-                )
-                .unwrap();
-                outcome.target_id = Some("t".into());
-                assert_eq!(
-                    outcome.sweep_entry(),
-                    knowledge::mode01_entry("engine.rpm", Some("t"), response.clone(), reason),
-                    "{response:?} {reason:?}"
-                );
-            }
-        }
+        let outcome = |response: Option<Vec<u8>>| {
+            decode(
+                "engine.rpm",
+                Decoder::Standard {
+                    request,
+                    source: "test",
+                },
+                Evidence {
+                    response,
+                    error: None,
+                },
+            )
+        };
+        let answered = outcome(Some(vec![0x41, 0x0C, 0x1A, 0xF8]));
+        let read = answered.read_json(false).unwrap();
+        assert_eq!(read["value"], 1726.0);
+        assert_eq!(read["unit"], "rpm");
+        assert_eq!(read["key"], "engine.rpm");
+        assert!(read.get("replay").is_none());
+        assert_eq!(answered.read_json(true).unwrap()["replay"], true);
+        let entry = answered.sweep_entry();
+        assert_eq!(entry["status"], "answered");
+        assert_eq!(entry["response"], json!([0x41, 0x0C, 0x1A, 0xF8]));
+        assert!(entry["target"].is_null());
+        // An undecodable PID fails the read and leaves no response in its sweep entry.
+        let broken = outcome(Some(vec![0x41, 0x0C]));
+        assert!(broken.read_json(false).is_err());
+        let entry = broken.sweep_entry();
+        assert_eq!(entry["status"], "not_answered");
+        assert!(entry.get("response").is_none());
     }
 
     #[test]
@@ -662,19 +660,15 @@ mod tests {
     #[test]
     fn req_024_6_changed_request_is_reported_not_decoded() {
         let request = prepare_read("engine.rpm").unwrap();
-        let changed = decode(
-            "engine.rpm",
-            Decoder::Standard {
-                request,
-                source: "test",
-            },
-            Evidence {
-                request: vec![0x01, 0xFF],
-                response: Some(vec![0x41, 0x0C, 0x1A, 0xF8]),
-                error: None,
-            },
-        );
-        assert!(matches!(changed, Err(SignalReadError::RequestChanged(_))));
+        let decoder = Decoder::Standard {
+            request,
+            source: "test",
+        };
+        assert!(decoder.verify_request(&request.bytes()).is_ok());
+        assert!(matches!(
+            decoder.verify_request(&[0x01, 0xFF]),
+            Err(SignalReadError::RequestChanged(_))
+        ));
     }
 
     #[test]

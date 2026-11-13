@@ -4,7 +4,7 @@ pub(crate) mod uds;
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     elm::{
@@ -13,6 +13,7 @@ use crate::{
     },
     runtime_state::Activity,
     safety::{OperationRequest, SafetyPolicy},
+    signal_read::{decode, Decoder, Evidence, OutcomeState, SignalOutcome, SignalRoute},
     throughput,
     topology::{
         AddressingContext, Confidence, EcuRole, Protocol, ProtocolContext, Provenance,
@@ -246,115 +247,22 @@ impl<E: Exchange> MobileCore<E> {
         }
     }
 
-    fn read_signal(&mut self, semantic: &str) -> Result<Value, String> {
-        let request = match crate::prepare_read(semantic) {
-            Ok(request) => request,
-            Err(error) => {
-                let Some(knowledge) = self.knowledge.as_ref() else {
-                    return Err(error);
-                };
-                let resolved = knowledge.select_signal(semantic, |target, definition| {
-                    self.uds_can_read(target, definition)
-                })?;
-                let catalog = knowledge.catalog.clone();
-                if resolved.definition.requires_extended_session() {
-                    if !self.uds_can_read(&resolved.candidate, &resolved.definition) {
-                        return Err("Knowledge DID is not enabled for this ECU session".into());
-                    }
-                    let keepalive = self.tick_uds();
-                    if !keepalive["active"].as_bool().unwrap_or(false)
-                        || !keepalive["error"].is_null()
-                    {
-                        return Err(keepalive["error"]
-                            .as_str()
-                            .unwrap_or("UDS session is no longer active")
-                            .to_owned());
-                    }
-                    let uds_at_request = self.uds_snapshot();
-                    let outcome = self.runtime.block_on(self.uds.read(
-                        self.session.as_mut().ok_or("session unavailable")?,
-                        &resolved.definition,
-                        Instant::now(),
-                    ));
-                    let result = match outcome.evidence {
-                        Some(mut evidence) => {
-                            evidence.observations = outcome.read_observations.clone();
-                            Ok(evidence)
-                        }
-                        None => Err(crate::elm::ReadEvidenceError {
-                            error: outcome
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "Knowledge DID was not answered".into()),
-                            observations: outcome.read_observations.clone(),
-                        }),
-                    };
-                    self.uds_error = outcome.error.clone();
-                    let mut result = knowledge::read_result(&catalog, &resolved, result);
-                    result["uds"] = uds_at_request;
-                    result["uds_state_after_read"] = self.uds_snapshot();
-                    result["uds_state_after_read"]["state"] = json!(outcome.status.as_str());
-                    let cleanup_observations = outcome
-                        .observations
-                        .get(outcome.read_observations.len()..)
-                        .unwrap_or_default();
-                    result["uds_session_observations"] =
-                        json!(response_observations_json(cleanup_observations));
-                    if result["status"] == "unavailable" && self.uds.is_active() {
-                        self.disable_uds()?;
-                    } else if result["status"] == "unavailable"
-                        && outcome.status == uds::UdsSessionStatus::Inactive
-                    {
-                        if let Err(error) = self.restore_functional_addressing() {
-                            result["functional_restore_error"] = json!(error);
-                        }
-                    }
-                    return Ok(result);
-                }
-                let uds_at_request =
-                    if self.uds.is_active() && self.uds_target_matches(&resolved.candidate) {
-                        let keepalive = self.tick_uds();
-                        if !keepalive["error"].is_null() {
-                            return Err(keepalive["error"]
-                                .as_str()
-                                .unwrap_or("UDS session maintenance failed")
-                                .to_owned());
-                        }
-                        self.uds_snapshot()
-                    } else {
-                        self.disable_uds()?;
-                        self.uds_snapshot()
-                    };
-                SafetyPolicy::read_only()
-                    .authorize_activity(
-                        Activity::Diagnose,
-                        OperationRequest::knowledge_read(&resolved.definition)
-                            .map_err(|error| error.to_string())?,
-                    )
-                    .map_err(|error| error.to_string())?;
-                let (definition, target, responder) = knowledge::definition_read_request(&resolved);
-                let result = self.runtime.block_on(
-                    self.session
-                        .as_mut()
-                        .ok_or("session unavailable")?
-                        .read_knowledge_with_evidence(&definition, &target, &responder),
-                );
-                let mut result = knowledge::read_result(&catalog, &resolved, result);
-                result["uds"] = uds_at_request;
-                let mut session_observations = Value::Null;
-                if result["status"] == "unavailable" && self.uds.is_active() {
-                    let cleanup = self.disable_uds_outcome();
-                    session_observations = cleanup["observations"].clone();
-                    if let Some(error) = cleanup["error"].as_str() {
-                        result["uds_cleanup_error"] = json!(error);
-                    }
-                }
-                result["uds_state_after_read"] = self.uds_snapshot();
-                if !session_observations.is_null() {
-                    result["uds_session_observations"] = session_observations;
-                }
-                return Ok(result);
-            }
+    fn read_signal(&mut self, key: &str) -> Result<Value, String> {
+        let (outcome, extras) = self.read_outcome(key)?;
+        let mut result = outcome.read_json(false)?;
+        result
+            .as_object_mut()
+            .expect("read results are objects")
+            .extend(extras);
+        Ok(result)
+    }
+
+    /// One live read of a signal key: routing and decoding belong to `signal_read`; transport, UDS session
+    /// handling and the read-only authorisation stay here. The map holds the evidence fields of the result.
+    fn read_outcome(&mut self, key: &str) -> Result<(SignalOutcome, Map<String, Value>), String> {
+        let request = match SignalRoute::of(key) {
+            SignalRoute::Standard(request) => request,
+            route => return self.read_knowledge_outcome(key, &route),
         };
         self.disable_uds()?;
         let read = if self.engine.is_some() {
@@ -365,7 +273,7 @@ impl<E: Exchange> MobileCore<E> {
                 .supported()
                 .supports_pid(request.pid())
             {
-                return Err(format!("vehicle does not advertise support for {semantic}"));
+                return Err(format!("vehicle does not advertise support for {key}"));
             }
             let targeted = self.targeted_read(request)?;
             self.runtime.block_on(
@@ -383,15 +291,137 @@ impl<E: Exchange> MobileCore<E> {
             )
         }
         .map_err(|error| error.error)?;
-        let transaction = request.complete("user", read.payload)?;
-        let mut result = json!({
-            "semantic":transaction.semantic(),"value":transaction.value(),
-            "unit":transaction.unit(),"timestamp_ms":transaction.timestamp_ms(),
-            "response":transaction.response(),
-            "observations":response_observations_json(&read.observations)
-        });
-        result["uds"] = self.uds_snapshot();
-        Ok(result)
+        let mut extras = Map::new();
+        extras.insert(
+            "observations".into(),
+            json!(response_observations_json(&read.observations)),
+        );
+        extras.insert("uds".into(), self.uds_snapshot());
+        let outcome = decode(
+            key,
+            Decoder::Standard {
+                request,
+                source: "user",
+            },
+            Evidence {
+                response: Some(read.payload),
+                error: None,
+            },
+        );
+        Ok((outcome, extras))
+    }
+
+    fn read_knowledge_outcome(
+        &mut self,
+        key: &str,
+        route: &SignalRoute,
+    ) -> Result<(SignalOutcome, Map<String, Value>), String> {
+        let Some(knowledge) = self.knowledge.as_ref() else {
+            return Err(format!("read-only core rejected unsupported signal: {key}"));
+        };
+        let resolved = knowledge.select_signal(key, route, |target, definition| {
+            self.uds_can_read(target, definition)
+        })?;
+        let catalog = knowledge.catalog.clone();
+        if resolved.definition.requires_extended_session() {
+            if !self.uds_can_read(&resolved.candidate, &resolved.definition) {
+                return Err("Knowledge DID is not enabled for this ECU session".into());
+            }
+            let keepalive = self.tick_uds();
+            if !keepalive["active"].as_bool().unwrap_or(false) || !keepalive["error"].is_null() {
+                return Err(keepalive["error"]
+                    .as_str()
+                    .unwrap_or("UDS session is no longer active")
+                    .to_owned());
+            }
+            let uds_at_request = self.uds_snapshot();
+            let outcome = self.runtime.block_on(self.uds.read(
+                self.session.as_mut().ok_or("session unavailable")?,
+                &resolved.definition,
+                Instant::now(),
+            ));
+            let result = match outcome.evidence {
+                Some(mut evidence) => {
+                    evidence.observations = outcome.read_observations.clone();
+                    Ok(evidence)
+                }
+                None => Err(crate::elm::ReadEvidenceError {
+                    error: outcome
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Knowledge DID was not answered".into()),
+                    observations: outcome.read_observations.clone(),
+                }),
+            };
+            self.uds_error = outcome.error.clone();
+            let signal = knowledge::read_outcome(&catalog, &resolved, &result);
+            let mut extras = knowledge::read_extras(&result);
+            extras.insert("uds".into(), uds_at_request);
+            let mut after_read = self.uds_snapshot();
+            after_read["state"] = json!(outcome.status.as_str());
+            extras.insert("uds_state_after_read".into(), after_read);
+            let cleanup_observations = outcome
+                .observations
+                .get(outcome.read_observations.len()..)
+                .unwrap_or_default();
+            extras.insert(
+                "uds_session_observations".into(),
+                json!(response_observations_json(cleanup_observations)),
+            );
+            let answered = matches!(signal.state, OutcomeState::Value { .. });
+            if !answered && self.uds.is_active() {
+                self.disable_uds()?;
+            } else if !answered && outcome.status == uds::UdsSessionStatus::Inactive {
+                if let Err(error) = self.restore_functional_addressing() {
+                    extras.insert("functional_restore_error".into(), json!(error));
+                }
+            }
+            return Ok((signal, extras));
+        }
+        let uds_at_request = if self.uds.is_active() && self.uds_target_matches(&resolved.candidate)
+        {
+            let keepalive = self.tick_uds();
+            if !keepalive["error"].is_null() {
+                return Err(keepalive["error"]
+                    .as_str()
+                    .unwrap_or("UDS session maintenance failed")
+                    .to_owned());
+            }
+            self.uds_snapshot()
+        } else {
+            self.disable_uds()?;
+            self.uds_snapshot()
+        };
+        SafetyPolicy::read_only()
+            .authorize_activity(
+                Activity::Diagnose,
+                OperationRequest::knowledge_read(&resolved.definition)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        let (definition, target, responder) = knowledge::definition_read_request(&resolved);
+        let result = self.runtime.block_on(
+            self.session
+                .as_mut()
+                .ok_or("session unavailable")?
+                .read_knowledge_with_evidence(&definition, &target, &responder),
+        );
+        let signal = knowledge::read_outcome(&catalog, &resolved, &result);
+        let mut extras = knowledge::read_extras(&result);
+        extras.insert("uds".into(), uds_at_request);
+        let mut session_observations = Value::Null;
+        if !matches!(signal.state, OutcomeState::Value { .. }) && self.uds.is_active() {
+            let cleanup = self.disable_uds_outcome();
+            session_observations = cleanup["observations"].clone();
+            if let Some(error) = cleanup["error"].as_str() {
+                extras.insert("uds_cleanup_error".into(), json!(error));
+            }
+        }
+        extras.insert("uds_state_after_read".into(), self.uds_snapshot());
+        if !session_observations.is_null() {
+            extras.insert("uds_session_observations".into(), session_observations);
+        }
+        Ok((signal, extras))
     }
 
     fn discover_ecus(&mut self) -> Result<Value, String> {
@@ -609,7 +639,6 @@ impl<E: Exchange> MobileCore<E> {
         }
         let repository = knowledge.catalog.pin().repository().to_owned();
         let revision = knowledge.catalog.pin().revision().to_owned();
-        let catalog = knowledge.catalog.clone();
         let engine_target_id = self.knowledge_engine_target_id(knowledge);
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -622,21 +651,8 @@ impl<E: Exchange> MobileCore<E> {
                 truncated = true;
                 break;
             }
-            match self.read_signal(&key) {
-                Ok(read) => {
-                    let response = read["response"]
-                        .is_array()
-                        .then(|| serde_json::from_value::<Vec<u8>>(read["response"].clone()).ok())
-                        .flatten();
-                    entries.push(knowledge::availability_entry(
-                        &catalog,
-                        &key,
-                        read["target_id"].as_str().unwrap_or_default(),
-                        read["definition_id"].as_str().unwrap_or_default(),
-                        response.as_deref(),
-                        read["error"].as_str(),
-                    )?);
-                }
+            match self.read_outcome(&key) {
+                Ok((outcome, _)) => entries.push(outcome.sweep_entry()),
                 Err(error) => {
                     let fatal = crate::scheduler::is_fatal_runtime_error(&error);
                     entries.push(json!({"key":key,"status":"not_answered","reason":error}));
@@ -662,25 +678,18 @@ impl<E: Exchange> MobileCore<E> {
                 truncated = true;
                 break;
             }
-            let read = self.read_signal(semantic);
-            let fatal = read
-                .as_ref()
-                .err()
-                .is_some_and(|error| crate::scheduler::is_fatal_runtime_error(error));
-            entries.push(match &read {
-                Ok(read) => knowledge::mode01_entry(
-                    semantic,
-                    engine_target_id.as_deref(),
-                    serde_json::from_value(read["response"].clone()).ok(),
-                    None,
+            let (entry, fatal) = match self.read_outcome(semantic) {
+                Ok((mut outcome, _)) => {
+                    outcome.target_id = engine_target_id.clone();
+                    (outcome.sweep_entry(), false)
+                }
+                Err(error) => (
+                    json!({"key":semantic,"target":engine_target_id,"status":"not_answered",
+                        "reason":error}),
+                    crate::scheduler::is_fatal_runtime_error(&error),
                 ),
-                Err(error) => knowledge::mode01_entry(
-                    semantic,
-                    engine_target_id.as_deref(),
-                    None,
-                    Some(error),
-                ),
-            });
+            };
+            entries.push(entry);
             if fatal {
                 stopped = true;
                 break;
