@@ -56,6 +56,8 @@ pub struct MobileCore<E> {
     knowledge: Option<knowledge::MobileKnowledge>,
     uds: uds::UdsSessionState,
     uds_error: Option<String>,
+    /// Raw evidence of the read that just failed, emitted next to the error of the closing envelope.
+    failure_evidence: Map<String, Value>,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -72,6 +74,7 @@ impl<E: Exchange> MobileCore<E> {
             knowledge: None,
             uds: uds::UdsSessionState::default(),
             uds_error: None,
+            failure_evidence: Map::new(),
         })
     }
 
@@ -112,20 +115,28 @@ impl<E: Exchange> MobileCore<E> {
 
     /// No caller-supplied wire bytes, addresses or write capabilities are accepted.
     pub fn execute(&mut self, action: &str, argument: &str) -> String {
+        self.failure_evidence.clear();
         let mut result = self.dispatch(action, argument);
         let offline_action =
             action.starts_with("replay.") || matches!(action, "vin.describe" | "catalog");
         if result.is_err() && self.uds.is_active() && !offline_action {
             let cleanup = self.disable_uds_outcome();
-            if cleanup["state"] == "indeterminate" {
+            self.stage_session_observations(&cleanup["observations"]);
+            // A cleanup error is reported even when the session is inactive again (functional restore failed).
+            if let Some(cleanup_error) = cleanup["error"].as_str() {
                 let original = result.as_ref().err().cloned().unwrap_or_default();
-                let cleanup_error = cleanup["error"].as_str().unwrap_or("UDS cleanup failed");
                 result = Err(format!("{original}; {cleanup_error}"));
             }
         }
         let mut envelope = match result {
             Ok(data) => json!({"ok":true,"data":data}),
-            Err(error) => json!({"ok":false,"error":error}),
+            Err(error) => {
+                let mut envelope = json!({"ok":false,"error":error});
+                for (name, value) in std::mem::take(&mut self.failure_evidence) {
+                    envelope[name] = value;
+                }
+                envelope
+            }
         };
         envelope["uds"] = self.uds_snapshot();
         envelope.to_string()
@@ -256,12 +267,20 @@ impl<E: Exchange> MobileCore<E> {
 
     fn read_signal(&mut self, key: &str) -> Result<Value, String> {
         let (outcome, extras) = self.read_outcome(key)?;
-        let mut result = outcome.read_json(false)?;
-        result
-            .as_object_mut()
-            .expect("read results are objects")
-            .extend(extras);
-        Ok(result)
+        match outcome.read_json(false) {
+            Ok(mut result) => {
+                result
+                    .as_object_mut()
+                    .expect("read results are objects")
+                    .extend(extras);
+                Ok(result)
+            }
+            // An undecodable standard read is an error; its raw evidence stays in the error envelope.
+            Err(error) => {
+                self.stage_failure(extras);
+                Err(error)
+            }
+        }
     }
 
     /// One live read of a signal key: routing and decoding belong to `signal_read`; transport, UDS session
@@ -271,17 +290,45 @@ impl<E: Exchange> MobileCore<E> {
             SignalRoute::Standard(request) => request,
             route => return self.read_knowledge_outcome(key, &route),
         };
-        self.disable_uds()?;
-        let read = if self.engine.is_some() {
-            if !self
+        // REQ-027.6: selected Mode 01 reads continue inside an active extended session, but only when the
+        // session addresses exactly the validated engine target. Anything else ends the session without a read.
+        let in_session = self.uds.is_active();
+        if in_session {
+            // The state at request, before keepalive, expiry or cleanup change it.
+            let at_request = self.uds_snapshot();
+            self.failure_evidence
+                .insert("uds_at_request".into(), at_request);
+            if !self.uds_matches_validated_engine() {
+                return Err(self.end_session_without_read(
+                    "active UDS session does not match the validated engine target; Mode 01 read not sent",
+                ));
+            }
+        } else {
+            self.disable_uds()?;
+        }
+        if self.engine.is_some()
+            && !self
                 .session
                 .as_ref()
                 .ok_or("session unavailable")?
                 .supported()
                 .supports_pid(request.pid())
-            {
-                return Err(format!("vehicle does not advertise support for {key}"));
+        {
+            return Err(format!("vehicle does not advertise support for {key}"));
+        }
+        if in_session {
+            // Keepalive and expiry first. A failed or ended session never falls through to a functional read.
+            let keepalive = self.tick_uds();
+            if !keepalive["error"].is_null() || !self.uds.is_active() {
+                self.stage_session_observations(&keepalive["observations"]);
+                return Err(keepalive["error"]
+                    .as_str()
+                    .unwrap_or("UDS extended session ended; Mode 01 read not sent")
+                    .to_owned());
             }
+        }
+        let uds_at_request = self.uds_snapshot();
+        let read = if self.engine.is_some() {
             let targeted = self.targeted_read(request)?;
             self.runtime.block_on(
                 self.session
@@ -296,14 +343,32 @@ impl<E: Exchange> MobileCore<E> {
                     .ok_or("session unavailable")?
                     .read_with_evidence(request),
             )
-        }
-        .map_err(|error| error.error)?;
+        };
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => {
+                let mut extras = Map::new();
+                extras.insert(
+                    "observations".into(),
+                    json!(response_observations_json(&error.observations)),
+                );
+                extras.insert("uds".into(), uds_at_request);
+                if in_session {
+                    extras.insert("uds_state_after_read".into(), self.uds_snapshot());
+                }
+                self.stage_failure(extras);
+                return Err(error.error);
+            }
+        };
         let mut extras = Map::new();
         extras.insert(
             "observations".into(),
             json!(response_observations_json(&read.observations)),
         );
-        extras.insert("uds".into(), self.uds_snapshot());
+        extras.insert("uds".into(), uds_at_request);
+        if in_session {
+            extras.insert("uds_state_after_read".into(), self.uds_snapshot());
+        }
         let outcome = decode(
             key,
             Decoder::Standard {
@@ -316,6 +381,45 @@ impl<E: Exchange> MobileCore<E> {
             },
         );
         Ok((outcome, extras))
+    }
+
+    /// Keep the raw evidence of a failed read for the error envelope. The envelope's own `uds` is the state
+    /// after cleanup, so the state at request moves to `uds_at_request`.
+    fn stage_failure(&mut self, extras: Map<String, Value>) {
+        for (name, value) in extras {
+            match name.as_str() {
+                "uds" => self.failure_evidence.insert("uds_at_request".into(), value),
+                "uds_session_observations" => {
+                    self.stage_session_observations(&value);
+                    None
+                }
+                _ => self.failure_evidence.insert(name, value),
+            };
+        }
+    }
+
+    /// Session-control observations (keepalive, expiry or cleanup) accumulate in order.
+    fn stage_session_observations(&mut self, observations: &Value) {
+        let Some(observations) = observations.as_array().filter(|list| !list.is_empty()) else {
+            return;
+        };
+        let staged = self
+            .failure_evidence
+            .entry("uds_session_observations")
+            .or_insert_with(|| json!([]));
+        if let Some(list) = staged.as_array_mut() {
+            list.extend(observations.iter().cloned());
+        }
+    }
+
+    /// Fail closed: return to the default session, keep the evidence and report why no read was sent.
+    fn end_session_without_read(&mut self, reason: &str) -> String {
+        let cleanup = self.disable_uds_outcome();
+        self.stage_session_observations(&cleanup["observations"]);
+        match cleanup["error"].as_str() {
+            Some(error) => format!("{reason}; {error}"),
+            None => reason.to_owned(),
+        }
     }
 
     fn read_knowledge_outcome(
@@ -783,6 +887,31 @@ impl<E: Exchange> MobileCore<E> {
             && target.role == "engine"
             && active.target.as_deref() == Some(target.header().as_str())
             && active.responder.as_deref() == Some(target.response_header().as_str())
+    }
+
+    /// The active session addresses exactly the validated, identified engine OBD target (request and
+    /// expected responder). Standard Mode 01 reads may share the session only then.
+    fn uds_matches_validated_engine(&self) -> bool {
+        let Ok((target, responder)) = self.engine_target() else {
+            return false;
+        };
+        let Some(address) = target.address() else {
+            return false;
+        };
+        let identified = self
+            .knowledge
+            .as_ref()
+            .is_some_and(|knowledge| self.knowledge_engine_target_id(knowledge).is_some());
+        let active = self.uds.snapshot();
+        identified
+            && active
+                .target
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(address.value()))
+            && active
+                .responder
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(responder.as_str()))
     }
 
     fn uds_target_matches(&self, target: &knowledge::CandidateTarget) -> bool {

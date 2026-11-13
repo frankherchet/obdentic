@@ -31,6 +31,10 @@ public final class SignalSelectorAcceptance {
             "REQ-027.2 session-flagged VAG signal is labelled UDS even when the base protocol is VW");
         require("VW".equals(MainActivity.signalProtocolLabel(new JSONObject().put("protocol", "VW"), true)),
             "REQ-027.2 ordinary VAG Knowledge signal keeps its VW label");
+        require("OBD2".equals(MainActivity.signalProtocolLabel(new JSONObject().put("ecu", "OBD-Standard"), true)),
+            "REQ-027.6 a standard signal in an active session is labelled OBD2, not paused");
+        require(MainActivity.signalProtocolLabel(new JSONObject().put("ecu", "OBD-Standard"), false).isEmpty(),
+            "REQ-027.6 a standard signal outside a session keeps no extra label");
         File path = File.createTempFile("signal-selector-", ".json", context.getCacheDir());
         path.delete();
         try {

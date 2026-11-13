@@ -593,18 +593,21 @@ requirements:
       On explicit user action in the Diagnose tab, the app switches one identified ECU
       into the UDS extended diagnostic session, keeps it alive with tester present,
       offers that ECU's session-flagged Knowledge DIDs as UDS-marked read-only signals,
-      and always returns to the default session.
+      polls them together with the user's selected standard Mode 01 PIDs, and always
+      returns to the default session.
     acceptance:
       - id: REQ-027.1
         text: The switch is offered only in a ready live session for an identified ECU with session-flagged Knowledge DIDs; activating it sends exactly 10 03 to that ECU's validated target and shows a persistent "UDS erweiterte Sitzung aktiv" indicator.
       - id: REQ-027.2
         text: While active, tester present 3E 80 is sent to that target at most every 2 seconds and only then; session-flagged DIDs of that ECU become selectable and are marked UDS, distinct from OBD2 signals.
       - id: REQ-027.3
-        text: The app sends 10 01 and removes the UDS signals when the user switches off, on disconnect, demo or replay, after 10 minutes, before any functional operation, and on any error; a lost link stops tester present.
+        text: The app sends 10 01 (when possible) and removes the UDS signals when the user switches off, on disconnect, demo or replay, 10 minutes after activation, before any other functional operation (DTC read, adapter throughput, session-candidate learning, sweep), before Knowledge reads of another ECU, when the validated engine target is missing or mismatched (without sending a Mode 01 read), and on any error, including a rejected, unanswered or malformed read of either kind; successful selected Mode 01 reads and ordinary Knowledge DID reads of the same engine ECU neither trigger the return nor are paused; a lost link stops tester present.
       - id: REQ-027.4
-        text: In extended session the app sends to the vehicle only 10 03, 10 01, 3E 80 and 0x22 reads of Knowledge-listed DIDs; SecurityAccess, RoutineControl, InputOutputControl, WriteDataByIdentifier, ECUReset, communication or DTC control and caller-provided services, addresses or DIDs are impossible.
+        text: In extended session the app sends to the vehicle only 10 03, 10 01, 3E 80, 0x22 reads of Knowledge-listed DIDs and 01 xx reads of the user's selected standard PIDs through the existing validated engine target; SecurityAccess, RoutineControl, InputOutputControl, WriteDataByIdentifier, ECUReset, communication or DTC control and caller-provided services, addresses or DIDs are impossible.
       - id: REQ-027.5
         text: A negative response to 10 03 leaves the ECU in the default session, shows the response code and offers no UDS signals; recordings mark the session state of every read and replay re-decodes them offline.
+      - id: REQ-027.6
+        text: While the session is active, the selected standard Mode 01 PIDs and selected UDS DIDs are polled together; each value is shown with its own outcome (decoded, rejected with its response code, or not answered) and is never filled in or carried over, due tester-present maintenance is attempted between reads, and the recording keeps the raw bytes of both kinds of read with the session state; the indicator and recorded state are the app's view, not ECU-confirmed, because the keepalive reply is suppressed. Successful standard reads keep the session; a rejected, unanswered or malformed read of either kind ends it as in REQ-027.3. When the session ends the OBD2 selection keeps polling and only the UDS signals disappear.
 
   - id: REQ-028
     title: Record every live session automatically with bounded storage

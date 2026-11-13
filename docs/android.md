@@ -183,13 +183,31 @@ disconnects the adapter to interrupt the pending exchange and keeps a partial
 recording; reconnect before starting another job.
 
 "UDS: erweiterte Sitzung" explicitly activates the closed engine-ECU session
-described in ADR 0003. The persistent indicator shows when it is active; OBD2
-polling pauses while Knowledge DID reads remain available. Session candidates
-are marked UDS and disappear when it ends. The core sends tester present while
-active and ends the session after ten minutes, before ordinary functional
-operations or on errors. On normal disconnect it attempts `10 01`; link loss
-stops keepalive. An unconfirmed return blocks operations until reconnect. First
-vehicle use is stationary, with engine off or idling, under the separate #178 gate.
+described in ADR 0003 (amended for mixed polling). This change retains that
+explicit switch. The approved component presets that activate the session
+automatically when necessary will be implemented in #291, not by this change;
+they differ from arbitrary profile data, and their safeguards and criteria are
+still to be refined. Selecting UDS signals alone does not switch the session.
+The persistent indicator shows the app's view of the session; it is not proof
+from the ECU, because the keepalive reply is suppressed. While active, the
+selected standard Mode 01 PIDs and the selected UDS DIDs are polled together in
+one serialized loop; OBD2 polling no longer pauses. Session candidates are
+marked UDS and disappear when it ends, while the OBD2 selection keeps polling.
+Successful standard reads keep the session; a rejected, unanswered or malformed
+read of either type is shown as such, never filled in, and ends the session
+(return to default when possible). Ordinary Knowledge DIDs of the same engine
+ECU may continue; Knowledge reads of another ECU exit the session first. A
+missing or mismatched validated engine target returns the session to default
+without a Mode 01 read. Recordings keep raw bytes and mark the session state of
+every read, Mode 01 included. The core sends tester present at most every 2 s
+while active (due maintenance is attempted between reads) and ends the session
+ten minutes after activation, before other functional operations (DTC reads,
+adapter throughput, candidate learning, sweeps) or on errors. Selected Mode 01
+polling is not such an operation. On normal disconnect it attempts `10 01`; link
+loss stops keepalive. An unconfirmed return blocks operations until reconnect.
+Whether the ECU keeps answering Mode 01 in the extended session and how the
+interleaved timing behaves is not yet vehicle-validated; first vehicle use is
+stationary, with engine off or idling, under the separate #178 gate.
 
 ## Adapter throughput (Diagnose)
 
