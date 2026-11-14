@@ -61,6 +61,10 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Private signal presets, persisted ECU/learning results, UDS demo gate and simulated UDS activation, mixed Mode 01 + UDS polling in the active session (interleaved reads, tester present keeps recurring, session neither left nor re-armed, no 'OBD2 paused' text), another job (DTC read) leaving the session while the OBD2 selection keeps polling, explicit re-activation, session-marked recording, default-session return before disconnect and offline replay");
             AvailabilityUiAcceptance.run(this::onMain, activity, service, getTargetContext());
             passed("Availability in the selector and on tiles (REQ-031): measured states, hidden-count and 'Nur verfügbare' filter, every signal selectable, tiles state their reason instead of a dash");
+            SmartAnalysisAcceptance.run();
+            passed("REQ-036 smart analysis state machine on a supplied clock: DPF > cooling > turbo > rail > EGR, one-shot triggers re-arm, three-minute rotation, missing trigger signals reported as unavailable and never read as zero");
+            ComponentPresetsAcceptance.run();
+            passed("REQ-035 component presets (DPF, EGR, cooling, turbo, rail): semantics resolve to unique live keys, standard key wins, unavailable/ambiguous/session-only/pending-UDS semantics reported with their reason, no vehicle traffic");
 
             service.setSignals(new JSONArray());waitIdle();
             JSONArray catalog=state.getJSONArray("signals");
@@ -211,6 +215,10 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("#302 the named recording continues after an automatic reconnect while the automatic ECU identification runs, and the identification lands in it (REQ-020.8)");
             AutoDtcAcceptance.run(service,getTargetContext());
             passed("Automatic fault-code scan (REQ-034): stored (Mode 03) and pending (Mode 07) codes once after inventory and the automatic survey, also on reconnect, setting off and demo never scan, no clearing service, TX/RX in the running automatic recording, replay shows both without traffic, a failed scan stays an explicit result and keeps the connection");
+            ComponentSmartAcceptance.run(service,getTargetContext());
+            passed("#291/#297 component preset and smart analysis through the service: component preset applied by id with automatic extended session only when needed, one-time smart start/stop, set changes with reason, trigger ages and unavailable triggers in the snapshot, replay shows the recorded set changes, no traffic beyond reads");
+            smartAndComponentUiText();
+            passed("#291/#297 UI text: a replay that ends with the stop event (empty set) shows the recorded history and the stop reason instead of 'no smart analysis', a replay without events says so, an active smart run shows the component label and reason, a named recording of the selection is refused with a reason while smart is active (not in replay or when inactive), every unselected component entry is listed with its own reason and detail rather than counted");
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
                 public String text(String tab) throws Exception { return tabText(activity,tab); }
                 public Boolean enabled(String label,boolean expected) throws Exception { 
@@ -274,6 +282,50 @@ public final class AcceptanceRunner extends Instrumentation {
         } finally { legacy.delete(); }
         service.setDemo();
         waitFor(() -> "ready".equals(service.snapshot().optString("phase"))&&!service.snapshot().optBoolean("busy"),"return from legacy replay to demo");
+    }
+    /** The pure texts behind the Live tab's smart and component cards (MainActivity): no vehicle, no service state. */
+    private void smartAndComponentUiText() throws Exception {
+        JSONArray changes=new JSONArray()
+            .put(new JSONObject().put("at",1000L).put("change","start").put("set","dpf").put("previous_set","").put("reason","dpf: request").put("remaining_ms",-1))
+            .put(new JSONObject().put("at",2000L).put("change","stop").put("set","").put("previous_set","dpf").put("reason","Smart-Analyse beendet").put("remaining_ms",-1));
+        JSONObject stopped=new JSONObject().put("mode","replay").put("smart",new JSONObject().put("active",false).put("component","").put("replay",true).put("reason","").put("changes",changes));
+        String history=MainActivity.smartSummaryText(stopped);
+        require(!history.contains("keine Smart-Analyse")&&history.contains("beendet")&&history.contains("Smart-Analyse beendet"),"replay ending with the stop event shows the recorded history and the stop reason: "+history);
+        String none=MainActivity.smartSummaryText(new JSONObject().put("mode","replay").put("smart",new JSONObject().put("active",false).put("changes",new JSONArray())));
+        require(none.contains("keine Smart-Analyse"),"replay without smart events says so: "+none);
+        JSONObject live=new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",true).put("component","dpf").put("reason","dpf: request").put("remaining_ms",-1).put("selected_count",5).put("changes",changes));
+        String active=MainActivity.smartSummaryText(live);
+        require(active.contains(MainActivity.componentLabel("dpf"))&&active.contains("dpf: request")&&active.startsWith("Aktiv"),"active smart run shows component and reason: "+active);
+        require(MainActivity.smartRecordingBlocker(live)!=null,"named recording refused while smart is active");
+        require(MainActivity.smartRecordingBlocker(new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",false)))==null,"named recording allowed when smart is inactive");
+        require(MainActivity.smartRecordingBlocker(stopped.put("mode","replay"))==null,"replay never blocked by the live gate");
+        JSONObject component=new JSONObject().put("id","dpf").put("entries",new JSONArray()
+            .put(new JSONObject().put("semantic","engine.rpm").put("status","selected"))
+            .put(new JSONObject().put("semantic","dpf.surface_temperature").put("status","session_excluded"))
+            .put(new JSONObject().put("semantic","engine.egr.commanded").put("status","unsupported").put("detail","PID nicht gemeldet")));
+        java.util.List<String> lines=MainActivity.componentUnavailableLines(component,new JSONArray());
+        require(lines.size()==2&&lines.get(0).contains("erweiterte Sitzung")&&lines.get(1).contains("nicht unterstützt")&&lines.get(1).contains("PID nicht gemeldet"),"each unselected entry is listed with its own reason: "+lines);
+        JSONArray cylinders=new JSONArray(),titled=new JSONArray();
+        for(int i=1;i<=4;i++){cylinders.put(new JSONObject().put("semantic","injection.quantity_deviation_cylinder"+i).put("status","missing"));titled.put(new JSONObject().put("semantic","injection.quantity_deviation_cylinder"+i).put("title","Mengenabweichung Einspritzung Zylinder "+i));}
+        java.util.List<String> unnamed=MainActivity.componentUnavailableLines(new JSONObject().put("entries",cylinders),new JSONArray());
+        java.util.HashSet<String> distinct=new java.util.HashSet<>(unnamed);
+        require(unnamed.size()==4&&distinct.size()==4,"unavailable cylinders 1..4 have distinct labels without a catalog (full semantic, no truncation): "+unnamed);
+        java.util.List<String> named=MainActivity.componentUnavailableLines(new JSONObject().put("entries",cylinders),titled);
+        require(named.get(0).startsWith("Mengenabweichung Einspritzung Zylinder 1")&&new java.util.HashSet<>(named).size()==4,"a unique catalog title is shown in full, never cut to 24 characters: "+named);
+        JSONObject withReasons=new JSONObject().put("id","rail").put("unavailable",new JSONArray().put("fuel.metering_valve_duty")).put("reasons",new JSONObject().put("fuel.metering_valve_duty","ambiguous"));
+        java.util.List<String> reasoned=MainActivity.componentUnavailableLines(withReasons,new JSONArray());
+        require(reasoned.size()==1&&reasoned.get(0).contains("mehrdeutig"),"the service's reason per semantic is rendered: "+reasoned);
+        String regen="dpf.field_regeneration_request_status";
+        require("Regenerationsanforderung (Rohwert)".equals(MainActivity.semanticLabel(regen,new JSONArray())),"the raw DPF request has its exact label, never a confirmed regeneration");
+        JSONObject trigger=new JSONObject().put("missing",new JSONArray().put(regen)).put("unavailable",new JSONArray().put(regen).put("dpf.surface_temperature"))
+            .put("reasons",new JSONObject().put("dpf.surface_temperature","session_excluded"))
+            .put("triggers",new JSONArray().put(new JSONObject().put("semantic",regen).put("state","stale").put("age_ms",42000L)));
+        String gone=MainActivity.smartUnavailableText(trigger,new JSONArray());
+        require(gone.indexOf("Regenerationsanforderung (Rohwert)")==gone.lastIndexOf("Regenerationsanforderung (Rohwert)")&&gone.contains("dpf.surface_temperature")&&gone.contains("erweiterte Sitzung"),"a missing trigger is not repeated and the unavailable set entry has its reason: "+gone);
+        String triggerText=MainActivity.smartTriggerText(trigger,new JSONArray());
+        require(triggerText.contains("Regenerationsanforderung (Rohwert)")&&triggerText.contains("veraltet")&&triggerText.contains("vor 42 s"),"trigger line shows label, state and sample age: "+triggerText);
+        String empty=MainActivity.smartSummaryText(new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",true).put("component","").put("reason","rotation: none available").put("remaining_ms",0).put("changes",new JSONArray())));
+        require(empty.contains("kein Satz verfügbar")&&!empty.contains("Zeitablauf in etwa")&&!empty.contains("0,0 s"),"an empty smart set shows 'none available', not a 0 s countdown: "+empty);
     }
     private void job(String action) throws Exception {
         waitIdle(); service.runJob(action); waitIdle();

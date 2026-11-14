@@ -186,12 +186,15 @@ closed exception for session management (ADR 0003). It can send only `10 03`,
 mixed polling, the user's selected standard Mode 01 reads through the existing
 validated engine target. Selected Mode 01 polling continues during the session;
 other functional operations still leave it first. It does not grant a mutating
-service capability. This change retains the existing explicit switch; #291 will
-implement the approved automatic activation of the session by component presets
-when necessary, which this change does not implement. Approved component presets
-differ from arbitrary profile data, and their activation safeguards and criteria
-are still to be refined. Profiles, layouts, MCP calls, AI prompts and Knowledge
-cannot activate it or elevate privilege. Successful standard reads keep the
+service capability. The existing explicit switch stays. In addition, the
+explicit apply of one of the five OBDentic-owned component presets (dpf, egr,
+cooling, turbo, rail; #291) may activate this same closed session once per
+apply when a preset entry exists only as a session-flagged DID of that ECU; it
+is never retried and never happens at start, connection, restore, for vehicle
+presets or profiles, in demo or replay, or from the user-started smart analysis
+(#297), which stays in the default session. Profiles, layouts, MCP calls, AI
+prompts and Knowledge cannot define or change a component preset, activate the
+session or elevate privilege. Successful standard reads keep the
 session; a rejected, unanswered or malformed read ends it. Knowledge reads of
 another ECU and a missing or mismatched engine target also return it to default.
 The core enforces its timeout (ten minutes after activation), target and
@@ -199,7 +202,8 @@ service restrictions, preserves raw evidence and the session state of every
 read, and attempts to return to the default session before other functional
 operations or shutdown. If that return cannot be confirmed, further vehicle
 operations stop until reconnection; a lost link stops keepalive. ECU behaviour
-under mixed polling requires separate vehicle acceptance.
+under mixed polling, preset activation and smart analysis requires separate
+vehicle acceptance (#178).
 
 ### Initial allowed mutation goal
 

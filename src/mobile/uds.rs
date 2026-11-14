@@ -497,19 +497,38 @@ impl UdsSessionState {
     }
 }
 
+/// True only when the expected responder gave one unequivocal, final negative
+/// response to the session request (`7F 10 <NRC>`, NRC not busyRepeatRequest
+/// 0x21 or responsePending 0x78). Pending, busy, mixed, conflicting, empty or
+/// foreign-responder evidence is not definitive: the ECU may still have
+/// entered the extended session, so the caller must attempt to return to the
+/// default session and fail closed if that is unconfirmed (#291, #310).
 fn has_expected_negative_session_response(
     observations: &[ResponseObservation],
     expected: &ResponderIdentity,
 ) -> bool {
-    observations.iter().any(|observation| {
-        observation.responses.iter().any(|response| {
-            response
-                .responder
-                .as_deref()
-                .is_some_and(|responder| responder.eq_ignore_ascii_case(expected.as_str()))
-                && matches!(response.payload.as_slice(), [0x7F, 0x10, _])
-        })
-    })
+    let mut final_rejection: Option<&[u8]> = None;
+    for response in observations
+        .iter()
+        .flat_map(|observation| &observation.responses)
+    {
+        let from_expected = response
+            .responder
+            .as_deref()
+            .is_some_and(|responder| responder.eq_ignore_ascii_case(expected.as_str()));
+        let is_final_nrc = matches!(
+            response.payload.as_slice(),
+            [0x7F, 0x10, nrc] if !matches!(nrc, 0x21 | 0x78)
+        );
+        if !from_expected
+            || !is_final_nrc
+            || final_rejection.is_some_and(|first| first != response.payload.as_slice())
+        {
+            return false;
+        }
+        final_rejection = Some(response.payload.as_slice());
+    }
+    final_rejection.is_some()
 }
 
 fn authorize_candidate(
@@ -840,5 +859,153 @@ mod tests {
         assert_eq!(spy.commands().len(), 3);
         state.on_reconnect();
         assert_eq!(state.status, UdsSessionStatus::Inactive);
+    }
+
+    /// #291/#310, REQ-027.1/REQ-027.3: responsePending (7F 10 78) is not a
+    /// definitive refusal. The ECU may still enter the session, so the app must
+    /// send 10 01 and may only report inactive once 50 01 confirms it.
+    #[tokio::test]
+    async fn req_027_1_req_027_3_issue_291_310_pending_activation_attempts_confirmed_cleanup() {
+        let catalog = crate::knowledge_db::KnowledgeCatalog::embedded_pinned().unwrap();
+        let candidates = candidates(&catalog);
+        let activation_replies = [
+            ("pending alone", "7E8 03 7F 10 78\r>"),
+            (
+                "pending then positive",
+                "7E8 03 7F 10 78\r7E8 06 50 03 00 32 01 F4\r>",
+            ),
+            (
+                "pending then final negative",
+                "7E8 03 7F 10 78\r7E8 03 7F 10 22\r>",
+            ),
+            (
+                "positive then pending",
+                "7E8 06 50 03 00 32 01 F4\r7E8 03 7F 10 78\r>",
+            ),
+            ("busy repeat", "7E8 03 7F 10 21\r>"),
+        ];
+        for (name, activation) in activation_replies {
+            let exchange = ScriptedExchange::new(["OK\r>", "OK\r>", activation, "7E8 02 50 01\r>"]);
+            let spy = exchange.spy();
+            let mut session = ElmSession::new(exchange);
+            let (target, responder) = target_and_responder();
+            let mut state = UdsSessionState::default();
+
+            let outcome = state
+                .enable(&mut session, target, responder, &candidates, Instant::now())
+                .await;
+
+            assert_eq!(
+                spy.commands().last().map(String::as_str),
+                Some("1001\r"),
+                "{name}: must request the default session"
+            );
+            assert_eq!(outcome.status, UdsSessionStatus::Inactive, "{name}");
+            assert!(!outcome.active, "{name}");
+            assert!(outcome.signals.is_empty(), "{name}");
+            assert!(outcome.error.is_some(), "{name}");
+            assert_eq!(
+                outcome.observations.last().unwrap().responses[0].payload,
+                [0x50, 0x01],
+                "{name}: inactive only after confirmed 50 01"
+            );
+        }
+    }
+
+    /// #291/#310, REQ-027.1/REQ-027.3: when the default-session return after an
+    /// uncertain activation is not confirmed, the state is indeterminate and no
+    /// further session or Knowledge traffic is sent.
+    #[tokio::test]
+    async fn req_027_1_req_027_3_issue_291_310_unconfirmed_cleanup_after_pending_blocks_operations()
+    {
+        let catalog = crate::knowledge_db::KnowledgeCatalog::embedded_pinned().unwrap();
+        let candidates = candidates(&catalog);
+        let activation_replies = [
+            ("pending alone", "7E8 03 7F 10 78\r>"),
+            (
+                "pending then positive",
+                "7E8 03 7F 10 78\r7E8 06 50 03 00 32 01 F4\r>",
+            ),
+        ];
+        let cleanup_failures = [
+            ("adapter error", "ERROR\r>"),
+            ("cleanup refused", "7E8 03 7F 10 22\r>"),
+            ("cleanup pending", "7E8 03 7F 10 78\r>"),
+            ("no cleanup answer", "NO DATA\r>"),
+        ];
+        for (name, activation) in activation_replies {
+            for (failure_name, cleanup) in cleanup_failures {
+                let exchange = ScriptedExchange::new(["OK\r>", "OK\r>", activation, cleanup]);
+                let spy = exchange.spy();
+                let mut session = ElmSession::new(exchange);
+                let (target, responder) = target_and_responder();
+                let (retry_target, retry_responder) = target_and_responder();
+                let mut state = UdsSessionState::default();
+                let start = Instant::now();
+
+                let outcome = state
+                    .enable(&mut session, target, responder, &candidates, start)
+                    .await;
+
+                let label = format!("{name} / {failure_name}");
+                assert_eq!(outcome.status, UdsSessionStatus::Indeterminate, "{label}");
+                assert!(!outcome.active, "{label}");
+                assert!(outcome.signals.is_empty(), "{label}");
+                assert!(outcome.error.is_some(), "{label}");
+                let sent = spy.commands();
+                assert_eq!(&sent[2..], ["1003\r", "1001\r"], "{label}");
+
+                let retry = state
+                    .enable(
+                        &mut session,
+                        retry_target,
+                        retry_responder,
+                        &candidates,
+                        start,
+                    )
+                    .await;
+                state
+                    .tick(&mut session, start + EXTENDED_SESSION_LIMIT)
+                    .await;
+                let disabled = state.disable(&mut session, start).await;
+                let read = state.read(&mut session, candidates[0], start).await;
+
+                assert_eq!(retry.status, UdsSessionStatus::Indeterminate, "{label}");
+                assert_eq!(disabled.status, UdsSessionStatus::Indeterminate, "{label}");
+                assert_eq!(read.status, UdsSessionStatus::Indeterminate, "{label}");
+                assert!(read.evidence.is_none(), "{label}");
+                assert!(!state.can_read(candidates[0]), "{label}");
+                assert_eq!(spy.commands(), sent, "{label}: no further traffic");
+            }
+        }
+    }
+
+    /// #291/#310: an ordinary final NRC remains a definitive refusal; no
+    /// speculative cleanup is sent.
+    #[tokio::test]
+    async fn req_027_1_issue_291_310_final_negative_activation_remains_definitive() {
+        let catalog = crate::knowledge_db::KnowledgeCatalog::embedded_pinned().unwrap();
+        let candidates = candidates(&catalog);
+        for nrc in ["12", "22", "33"] {
+            let reply = format!("7E8 03 7F 10 {nrc}\r>");
+            let exchange = ScriptedExchange::new(["OK\r>", "OK\r>", reply.as_str()]);
+            let spy = exchange.spy();
+            let mut session = ElmSession::new(exchange);
+            let (target, responder) = target_and_responder();
+            let mut state = UdsSessionState::default();
+
+            let outcome = state
+                .enable(&mut session, target, responder, &candidates, Instant::now())
+                .await;
+
+            assert_eq!(outcome.status, UdsSessionStatus::Inactive, "NRC {nrc}");
+            assert!(outcome.signals.is_empty(), "NRC {nrc}");
+            assert!(outcome.error.is_some(), "NRC {nrc}");
+            assert_eq!(
+                spy.commands(),
+                ["ATSH 7E0\r", "ATCRA 7E8\r", "1003\r"],
+                "NRC {nrc}: no cleanup needed"
+            );
+        }
     }
 }

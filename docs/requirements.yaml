@@ -537,7 +537,7 @@ requirements:
       - id: REQ-024.4
         text: Recordings contain the raw request and response of Knowledge signal reads with the Knowledge revision, and replay re-decodes them offline with the same decoder.
       - id: REQ-024.5
-        text: Definitions with a session requirement other than the default session are never polled as ordinary live signals; only the explicitly activated, ECU-scoped REQ-027 session may offer them.
+        text: "Definitions with a session requirement other than the default session are never polled as ordinary live signals and their metadata never becomes an ordinary selectable catalog entry before the REQ-027 session is active; only the explicitly activated, ECU-scoped REQ-027 session (by its switch, or by the explicit apply of an OBDentic component preset as in REQ-035.3) may offer them."
       - id: REQ-024.6
         text: Every read result, live or replayed, carries its signal key (the semantic for a standard PID, semantic@target for a Knowledge signal), and live reading, mobile replay, CLI capture replay, the full sweep and obdentic-mobile-report choose the decoder from that key by the same rule, so two signals with the same semantic (different ECUs, or a Knowledge signal sharing a PID's semantic) never overwrite or decode as each other.
 
@@ -562,7 +562,7 @@ requirements:
       - id: REQ-025.5
         text: The selection cannot be changed while a recording runs, as before.
       - id: REQ-025.6
-        text: "\"Preset anwenden\" offers built-in presets - the former recording profiles of the catalog, with German names - in every mode except replay and without a vehicle record, followed by the vehicle's own presets in a live session; a built-in preset selects its signals like a stored preset, skipping unsupported ones."
+        text: "\"Preset anwenden\" offers built-in presets - the former recording profiles of the catalog and the five OBDentic component presets of REQ-035, with German names - in every mode except replay and without a vehicle record, followed by the vehicle's own presets in a live session; a built-in preset selects its signals like a stored preset, skipping unsupported ones."
       - id: REQ-025.7
         text: The recordings tab has no recording-profile chooser and no start/stop button; a recording of the Live selection is started with "Gewählte Messwerte aufzeichnen" and stopped with "Aufzeichnung stoppen" on the same button in the Live tab.
 
@@ -597,7 +597,7 @@ requirements:
       returns to the default session.
     acceptance:
       - id: REQ-027.1
-        text: The switch is offered only in a ready live session for an identified ECU with session-flagged Knowledge DIDs; activating it sends exactly 10 03 to that ECU's validated target and shows a persistent "UDS erweiterte Sitzung aktiv" indicator.
+        text: "The switch is offered only in a ready live session for an identified ECU with session-flagged Knowledge DIDs; activating it - by the switch or by the explicit apply of an OBDentic component preset (REQ-035.3), and by nothing else - sends exactly 10 03 to that ECU's validated target and shows a persistent \"UDS erweiterte Sitzung aktiv\" indicator."
       - id: REQ-027.2
         text: While active, tester present 3E 80 is sent to that target at most every 2 seconds and only then; session-flagged DIDs of that ECU become selectable and are marked UDS, distinct from OBD2 signals.
       - id: REQ-027.3
@@ -608,6 +608,8 @@ requirements:
         text: A negative response to 10 03 leaves the ECU in the default session, shows the response code and offers no UDS signals; recordings mark the session state of every read and replay re-decodes them offline.
       - id: REQ-027.6
         text: While the session is active, the selected standard Mode 01 PIDs and selected UDS DIDs are polled together; each value is shown with its own outcome (decoded, rejected with its response code, or not answered) and is never filled in or carried over, due tester-present maintenance is attempted between reads, and the recording keeps the raw bytes of both kinds of read with the session state; the indicator and recorded state are the app's view, not ECU-confirmed, because the keepalive reply is suppressed. Successful standard reads keep the session; a rejected, unanswered or malformed read of either kind ends it as in REQ-027.3. When the session ends the OBD2 selection keeps polling and only the UDS signals disappear.
+      - id: REQ-027.7
+        text: "No profile, layout, stored vehicle preset, Knowledge entry, MCP call, AI prompt, smart analysis (REQ-036), demo, replay, connection or reconnect can activate the session; the only activations are the explicit switch and the explicit apply of a component preset (REQ-035.3), which use this same closed operation with its target, timeout, tester-present, return and error rules and add no service."
 
   - id: REQ-028
     title: Record every live session automatically with bounded storage
@@ -772,3 +774,51 @@ requirements:
         text: The scan reads stored codes (Mode 03) and pending codes (Mode 07) from the engine responders with the existing closed requests and decoder, shows per responder the codes or "keine Fehler", and keeps a negative response, NO DATA or timeout as an explicit result instead of an empty list; it never sends Mode 04 or any other clearing service.
       - id: REQ-034.3
         text: The automatic scan writes its TX/RX into the running automatic recording, and replay of that recording shows the same stored and pending codes without adapter traffic; a failed scan never ends the connection or blocks polling.
+
+  - id: REQ-035
+    title: Apply built-in component presets that resolve against the connected vehicle's Knowledge
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-11-14: issue #291, decisions by @frankherchet; ADR 0003 amendment 2026-11-14"
+    description: >
+      A driver or tester applies one of five OBDentic-owned component presets
+      (dpf, egr, cooling, turbo, rail) and gets a selection whose signals together
+      answer one diagnostic question. Each preset entry is resolved against the
+      effective Knowledge of the connected vehicle; entries that cannot be resolved
+      are shown as unavailable with a reason, never silently dropped. When an entry
+      exists only as a session-flagged DID, the explicit apply may activate the
+      existing, bounded REQ-027 session; nothing else can.
+    acceptance:
+      - id: REQ-035.1
+        text: "\"Preset anwenden\" offers exactly five built-in component presets with German names and the OBDentic-owned ids dpf, egr, cooling, turbo and rail, each with 5 to 12 signal entries, under the conditions of REQ-025.6; the entries name only a standard-PID semantic or the original meaning of a Knowledge signal, never a raw command, service byte, address or DID, and Knowledge, profiles, vehicle presets, MCP calls and AI prompts cannot add, change or define a component preset."
+      - id: REQ-035.2
+        text: "Each entry is resolved against the effective Knowledge of the connected vehicle (identified ECUs, applicable definitions) and the catalog. When a standard PID has the same meaning it is preferred; otherwise a Knowledge signal resolves to the ordinary catalog entry whose semantic field holds its unique signal key (semantic@target) and whose meaning field holds the original semantic, and selection, reading, recording and replay use that key (REQ-024.6). An entry with more than one applicable Knowledge match and no preferred standard PID selects none and is reported as ambiguous, and metadata of session-flagged definitions are not ordinary catalog entries and are neither selectable nor read before the REQ-027 session is active. After applying, every entry shows its own status (selected, not supported by the vehicle, no matching Knowledge, ECU not identified, ambiguous, rejected or not answered per REQ-031, or needs UDS session) and how many entries are available; an unavailable entry is never silently dropped, never shows a value or zero, is not requested from the vehicle, and has its status in its content description."
+      - id: REQ-035.3
+        text: "Applying selects the available entries like a stored preset (REQ-025.4) within the limit of 32, is refused while a recording runs (REQ-025.5) and in replay, and sends no traffic by itself; only the explicit apply of a component preset in a ready live session, when an entry exists solely as a session-flagged DID of the one ECU for which REQ-027 offers the session (entries of other ECUs stay unavailable), activates the existing REQ-027 session for that ECU once per apply: exactly 10 03 to that ECU's validated target, the persistent indicator, a limit of 10 minutes, tester present at most every 2 seconds, the return rules of REQ-027.3, and no service or read beyond REQ-027.4. It never happens at app start, connection, reconnect, selection restore, on applying a vehicle preset or recording profile, from Knowledge, profile or layout data, MCP or AI, from smart analysis (REQ-036), in demo or replay, or while a job runs, and it is never retried or repeated after an end or expiry."
+      - id: REQ-035.4
+        text: "When the activation is refused or fails (preconditions not met, negative response with its code, no answer) the preset still selects its default-session entries, marks the UDS entries unavailable with the reason and stays in the default session; when the session ends (user switch-off, expiry after 10 minutes, error, disconnect, other functional operation, another ECU) the UDS entries become unavailable with that reason, 10 01 is sent when possible, the OBD2 selection keeps polling and an unconfirmed return stops operations until reconnection as in REQ-027. A recording marks the applied preset id, the resolution result and status of every entry, the Knowledge revision, that the activation was requested by a preset and the session state of every read, and replay shows the same statuses and values and re-decodes with the pinned decoder without adapter traffic."
+
+  - id: REQ-036
+    title: Run a user-started smart analysis that switches component signal sets while driving
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-11-14: issue #297, decisions by @frankherchet"
+    description: >
+      The user starts the smart analysis once; while driving, the app watches
+      trigger readings continuously and, in the default session only, switches
+      among the five component sets of REQ-035 by priority, bounded windows and
+      rotation, so one drive covers several components without phone interaction.
+      Every set change is visible and recorded with its time.
+    acceptance:
+      - id: REQ-036.1
+        text: "The smart analysis is started and stopped only by the user in a ready live session, never automatically, after a reconnect or in demo or replay, and is refused with a visible reason while an extended session, a job, a named recording or a test sequence runs. Starting it is one action: it continues the running automatic recording or, when the setting \"Dauer-Aufzeichnung\" is off, starts one itself, and if no recording can be started or written it fails visibly with the reason and does not run; stopping it leaves the user's setting unchanged and ends a recording that was started only for the analysis. It ends on stop, disconnect, error, loss of the recording or the start of such work. It stays in the default session (it never sends 10 03 or another session change and never activates the REQ-027 session), is read-only with at most 32 selected signals through the existing reads of REQ-024 and standard PIDs, treats session-only signals as unavailable, needs no confirmation, dialog or input while driving, and a lost link ends it while the recording stays partial."
+      - id: REQ-036.2
+        text: "Every set contains the available signals of its component preset plus all available trigger readings - the raw dpf.field_regeneration_request_status, engine coolant temperature, vehicle.accelerator_pedal_e, vehicle speed, engine rpm and engine load - within the limit of 32, so all triggers are evaluated continuously in every set and rotation step. A trigger reading that is unsupported, unavailable, rejected, unanswered or older than 10 seconds is shown as such and the triggers depending on it as not evaluable; such a reading is never treated as 0, as a crossing, as a release or as a condition that holds, does not start, extend or re-arm a window, and ends a window that needs it for its continuing condition (dpf, turbo pressed) with the reason unavailable; evaluation uses only consecutive fresh readings."
+      - id: REQ-036.3
+        text: "The windows are edge-triggered and bounded. dpf: while the raw dpf.field_regeneration_request_status is other than 0 until the first fresh reading of 0, shown and recorded as \"Regenerationsanforderung (Rohwert)\" and never as a confirmed regeneration. cooling: an upward crossing of 80 °C between two consecutive fresh readings (a first reading at or above 80 is none) starts 10 minutes. turbo: accelerator_pedal_e above 80 % while it lasts and for 20 seconds after the first fresh reading at or below 80 %, pressing again continues it. rail: speed 0, coolant temperature at least 80 °C and rpm 500 to 1100 (inclusive) starts 3 minutes. egr: speed 50 to 80 km/h and engine load 15 to 60 % (inclusive) in consecutive fresh readings for 30 seconds without interruption, then 3 minutes. cooling, rail and egr re-arm only after their condition has become false."
+      - id: REQ-036.4
+        text: "The priority is dpf > cooling > turbo > rail > egr: the set read is the highest-priority set with a valid window, a higher window interrupts a lower one, windows keep their own time while interrupted, a lower window still valid resumes when the higher ends and an expired one does not. While no window is valid the app rotates through the five sets in that order, 3 minutes each, skipping and reporting sets without an available entry, and after a window ends the rotation continues with a new 3-minute step."
+      - id: REQ-036.5
+        text: "The Live tab shows the active set, the reason (trigger, rotation, resumption), the remaining time and the latest changes; every set change (start, trigger, interruption, resumption, expiry, rotation, unavailability, stop) is written into the analysis recording with wallclock time, monotonic offset, set, reason, the trigger readings behind it and the time stamps of the reading and the change, continues across the file rotation of REQ-028.3, and replay shows the same changes and readings without adapter traffic; the latency from trigger reading to changed selection depends on the serial adapter and is reported, not promised. The analysis publishes no vehicle evidence: no trigger reading or value ever appears in the operational app log (REQ-029), whose lines for the analysis, including its user-visible messages, name only sets and reasons; trigger values stay in the private recording and in memory, nothing is exported, shared, uploaded, added to the Knowledge or evidence stores or offered to MCP or AI automatically, and its triggers, windows and sets are OBDentic-owned, not Knowledge, profile or vehicle data."
