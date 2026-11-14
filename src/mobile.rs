@@ -837,15 +837,50 @@ impl<E: Exchange> MobileCore<E> {
             }
             value["knowledge_repository"] = json!(knowledge.catalog.pin().repository());
             value["knowledge_revision"] = json!(knowledge.catalog.pin().revision());
+            value["session_candidates"] = json!(self.session_candidates(knowledge));
             value["uds_candidates"] = json!(self
                 .knowledge_engine_target_id(knowledge)
                 .and_then(|target_id| knowledge.learning_candidate_count_for(&target_id).ok())
                 .unwrap_or(0));
         } else {
+            value["session_candidates"] = json!([]);
             value["uds_candidates"] = json!(0);
         }
         value["uds"] = self.uds_snapshot();
         value
+    }
+
+    /// REQ-035: metadata of the engine's applicable session-flagged Knowledge signals, listed whether or not
+    /// the extended session is active so a component preset can tell the user that a signal needs it. This is
+    /// information only: the entries are never part of `signals` before the session is active, and the read
+    /// path refuses them through the same `can_read` gate. `active` states whether the signal is selectable now.
+    fn session_candidates(&self, knowledge: &knowledge::MobileKnowledge) -> Vec<Value> {
+        let Some(engine_id) = self.knowledge_engine_target_id(knowledge) else {
+            return Vec::new();
+        };
+        let active = self.uds.snapshot();
+        // The same gate as the selectable catalog: only these are readable right now.
+        let readable = knowledge
+            .signal_catalog(|target, definition| {
+                self.uds.can_read(definition)
+                    && active.target.as_deref() == Some(target.header().as_str())
+                    && active.responder.as_deref() == Some(target.response_header().as_str())
+            })
+            .unwrap_or_default();
+        let Ok(all) = knowledge.signal_catalog(|_, _| true) else {
+            return Vec::new();
+        };
+        all.into_iter()
+            .filter(|signal| {
+                signal["extended_session_required"] == true
+                    && signal["target_id"].as_str() == Some(engine_id.as_str())
+            })
+            .map(|mut signal| {
+                let selectable = readable.iter().any(|item| item["key"] == signal["key"]);
+                signal["active"] = json!(selectable);
+                signal
+            })
+            .collect()
     }
 
     fn uds_snapshot(&self) -> Value {

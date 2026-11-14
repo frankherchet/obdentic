@@ -18,6 +18,8 @@ The UI never accepts raw commands, addresses or mutation capabilities.
   Live → Messwerte auswählen → Preset anwenden (REQ-025.6); unsupported signals are skipped.
   There is no recording-profile chooser: "Gewählte Messwerte aufzeichnen" in Live starts a
   recording of the selection and the same button stops it (REQ-025.7).
+- Five OBDentic component presets ("dpf", "egr", "cooling", "turbo", "rail", German names) in the same
+  "Preset anwenden" list (REQ-035) and the user-started smart analysis (REQ-036), see below.
 - Private recording, foreground connected-device service, screen-off operation,
   explicit export, offline replay and timestamped raw TX/RX.
 - Confirmed deletion of completed internal recordings; active recordings and loaded
@@ -183,11 +185,9 @@ disconnects the adapter to interrupt the pending exchange and keeps a partial
 recording; reconnect before starting another job.
 
 "UDS: erweiterte Sitzung" explicitly activates the closed engine-ECU session
-described in ADR 0003 (amended for mixed polling). This change retains that
-explicit switch. The approved component presets that activate the session
-automatically when necessary will be implemented in #291, not by this change;
-they differ from arbitrary profile data, and their safeguards and criteria are
-still to be refined. Selecting UDS signals alone does not switch the session.
+described in ADR 0003 (amended for mixed polling). The explicit switch stays; the
+explicit apply of a component preset may also activate it (REQ-035.3, below).
+Selecting UDS signals alone does not switch the session.
 The persistent indicator shows the app's view of the session; it is not proof
 from the ECU, because the keepalive reply is suppressed. While active, the
 selected standard Mode 01 PIDs and the selected UDS DIDs are polled together in
@@ -208,6 +208,64 @@ loss stops keepalive. An unconfirmed return blocks operations until reconnect.
 Whether the ECU keeps answering Mode 01 in the extended session and how the
 interleaved timing behaves is not yet vehicle-validated; first vehicle use is
 stationary, with engine off or idling, under the separate #178 gate.
+
+**Komponenten-Presets (REQ-035).** "Preset anwenden" also offers five built-in presets
+owned by OBDentic - `dpf`, `egr`, `cooling`, `turbo`, `rail`, each with 5 to 12 entries.
+Knowledge, profiles, vehicle presets, MCP calls and AI cannot add or change one. An entry
+names a standard-PID semantic or the original meaning of a Knowledge signal, never a command
+or DID. It is resolved against the effective Knowledge of the connected vehicle: a Knowledge
+signal becomes the ordinary catalog entry whose semantic field holds its unique key
+(`semantic@target`) and whose meaning field keeps the original semantic; selecting, reading,
+recording and replay use that key. An ambiguous entry selects nothing. After applying, every
+entry shows its own status and "x von y verfügbar" (not supported by the vehicle, no matching
+Knowledge, ECU not identified, ambiguous, rejected, not answered, needs UDS session); an
+unavailable entry is never dropped, never shows a value or zero and is not requested.
+Session-flagged definitions are not ordinary selectable entries before the session is active.
+Applying is refused while a recording runs and in replay.
+
+Only the explicit apply in a ready live session may activate the session automatically,
+once per apply, when an entry exists solely as a session-flagged DID of the engine ECU
+(entries of other ECUs stay unavailable). It is the closed operation above (exactly `10 03`,
+indicator, tester present at most every 2 s, ten minutes, no additional service) and never
+runs at start, connection, reconnect, restore, for vehicle presets or profiles, in demo or
+replay, while a job runs or from smart analysis; it is never retried. If it is refused or
+fails, the default-session entries are still selected and the UDS entries show the reason; when
+the session ends or expires the UDS entries become unavailable with that reason, the OBD2
+selection keeps polling, and `10 01` is attempted. The recording carries the preset id,
+the per-entry resolution, that a preset requested the activation and the session state of
+every read; replay shows the same offline. Behaviour on the vehicle (answers, activation,
+cycle time of up to 12 signals) is not validated and belongs to the separate #178 gate.
+
+**Smart-Analyse (REQ-036).** The user starts and stops it in the Live tab in a ready live
+session; one action starts it. It continues the running automatic recording or, with
+"Dauer-Aufzeichnung" off, starts one itself and fails visibly if none can be written; stopping
+leaves the setting unchanged. It is never automatic and is refused (with the
+reason) in demo, replay, while an extended session, a job, a named recording or a test
+sequence runs. It stays in the default session, sends no session change and needs no
+interaction while driving. Every set is the available signals of one component preset plus
+all available trigger readings (raw `dpf.field_regeneration_request_status`, coolant
+temperature, `vehicle.accelerator_pedal_e`, speed, rpm, load), within 32 signals. Missing,
+stale (older than 10 s) or unavailable readings are shown as such and never treated as zero,
+a crossing, a release or a holding condition; they do not start or extend a window.
+
+| Window | Starts / lasts |
+|---|---|
+| `dpf` | raw regeneration request status ≠ 0 until a fresh 0; shown as "Regenerationsanforderung (Rohwert)", not a confirmed regeneration |
+| `cooling` | upward crossing of 80 °C between consecutive fresh readings; 10 min; re-arms after the condition is false |
+| `turbo` | pedal > 80 % and 20 s after the first fresh reading ≤ 80 % |
+| `rail` | speed 0, coolant ≥ 80 °C, rpm 500..1100; 3 min; re-arms after the condition is false |
+| `egr` | speed 50..80 km/h and load 15..60 % without interruption for 30 s, then 3 min; re-arms after the condition is false |
+
+Priority is dpf > cooling > turbo > rail > egr: a higher window interrupts a lower one, windows
+keep their own time while interrupted, a still-valid lower window resumes and an expired one does
+not. With no valid window the sets rotate in that order, 3 min each. Each set change (with time,
+reason and the trigger readings behind it) is shown in the Live tab, written into the running
+automatic recording (across file rotation) and replayed offline. The latency from trigger
+reading to changed selection depends on the serial adapter and is reported, not promised.
+Results stay in the private recording and the app's memory: no trigger value ever goes into
+the app log (only set names and reasons), and nothing is exported, shared or published as
+vehicle evidence automatically. Behaviour while driving is not validated and belongs to the
+separate #178 gate.
 
 ## Adapter throughput (Diagnose)
 

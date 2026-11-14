@@ -965,6 +965,213 @@ fn req_027_5_negative_activation_stays_off_and_never_offers_candidates() {
         .any(|command| command.wire == "1001\r"));
 }
 
+fn catalog_data(core: &mut MobileCore<FakeExchange>) -> Value {
+    let catalog = run(core, "catalog", "");
+    assert_eq!(catalog["ok"], true, "{catalog}");
+    catalog["data"].clone()
+}
+
+fn has_semantic(list: &Value, semantic: &str) -> bool {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .any(|signal| signal["semantic"] == semantic)
+}
+
+#[test]
+// REQ-035.1, REQ-035.2
+fn req_035_1_2_session_candidates_are_metadata_until_the_session_is_active() {
+    let (mut core, state, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    discover(&mut core);
+    let key = "dpf.surface_temperature@vag.ecu_target.7e0";
+
+    let inactive = catalog_data(&mut core);
+    let candidates = inactive["session_candidates"].as_array().unwrap();
+    assert_eq!(candidates.len() as u64, inactive["uds_candidates"]);
+    assert!(!candidates.is_empty());
+    let surface = candidates
+        .iter()
+        .find(|signal| signal["semantic"] == "dpf.surface_temperature")
+        .expect("the DPF surface temperature is an applicable engine session candidate");
+    assert_eq!(surface["key"], key);
+    assert_eq!(surface["target_id"], "vag.ecu_target.7e0");
+    assert_eq!(
+        surface["definition_id"],
+        "vag.ea189_session.dpf.surface_temperature"
+    );
+    assert_eq!(surface["extended_session_required"], true);
+    assert_eq!(surface["active"], false);
+    assert!(candidates
+        .iter()
+        .all(|signal| signal["extended_session_required"] == true
+            && signal["target_id"] == "vag.ecu_target.7e0"
+            && signal["active"] == false));
+    for candidate in candidates {
+        assert!(
+            !inactive["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|signal| signal["key"] == candidate["key"]),
+            "inactive candidate must not be selectable: {candidate}"
+        );
+    }
+
+    // Safe inactive gate: neither the key nor the bare semantic reads, and no DID goes on the wire.
+    clear_commands(&state);
+    for argument in [key, "dpf.surface_temperature"] {
+        let refused = run(&mut core, "read", argument);
+        assert_eq!(refused["ok"], false, "{refused}");
+    }
+    assert!(diagnostic_dids(&state).is_empty());
+
+    // A refused activation keeps the candidates as metadata only.
+    state.lock().unwrap().enter_reply = Reply::Payload(vec![0x7F, 0x10, 0x22]);
+    assert_eq!(run(&mut core, "uds.enable", "")["data"]["active"], false);
+    let refused = catalog_data(&mut core);
+    assert_eq!(
+        refused["session_candidates"].as_array().unwrap().len(),
+        candidates.len()
+    );
+    assert!(!has_semantic(
+        &refused["signals"],
+        "dpf.surface_temperature"
+    ));
+
+    // Active session: the same signals become selectable with the same key, flagged active.
+    state.lock().unwrap().enter_reply = Reply::Payload(vec![0x50, 0x03, 0, 0x32, 1, 0xF4]);
+    assert_eq!(run(&mut core, "uds.enable", "")["data"]["active"], true);
+    let active = catalog_data(&mut core);
+    let live = active["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|signal| signal["key"] == key)
+        .expect("active session signal is selectable");
+    assert_eq!(live["extended_session_required"], true);
+    let active_candidates = active["session_candidates"].as_array().unwrap();
+    assert_eq!(active_candidates.len(), candidates.len());
+    assert!(active_candidates
+        .iter()
+        .all(|signal| signal["active"] == true));
+
+    // Leaving the session removes them from the selectable catalog again; the metadata stays.
+    assert_eq!(run(&mut core, "uds.disable", "")["data"]["active"], false);
+    let after = catalog_data(&mut core);
+    assert!(!has_semantic(&after["signals"], "dpf.surface_temperature"));
+    assert_eq!(
+        after["session_candidates"].as_array().unwrap().len(),
+        candidates.len()
+    );
+}
+
+#[test]
+// REQ-035.1, REQ-035.3
+fn req_035_3_component_preset_semantics_exist_in_the_effective_catalog() {
+    // Mirrors the semantics of ComponentPresets.java: standard PIDs, default-session Knowledge, session-only.
+    let standard = [
+        "engine.rpm",
+        "engine.egr.commanded",
+        "engine.egr.error",
+        "engine.maf",
+        "engine.intake_manifold_pressure",
+        "engine.barometric_pressure",
+        "engine.load",
+        "engine.coolant_temperature",
+        "engine.oil_temperature",
+        "vehicle.ambient_air_temperature",
+        "vehicle.speed",
+    ];
+    let knowledge = [
+        "dpf.differential_pressure",
+        "dpf.differential_pressure_offset",
+        "dpf.soot_mass_calculated",
+        "dpf.soot_mass_measured",
+        "dpf.distance_since_regeneration",
+        "dpf.time_since_regeneration",
+        "dpf.field_regeneration_request_status",
+        "dpf.field_regeneration_lock_status",
+        "exhaust.temperature.pre_dpf",
+        "exhaust.temperature.post_dpf",
+        "egr.valve_duty",
+        "engine.boost_pressure_actual",
+        "engine.boost_pressure_commanded",
+        "boost.regulator_feedback",
+        "boost.turbine_actuator_activation",
+        "pedal.accelerator_sensor_1",
+        "cooling.radiator_outlet_temperature_actual",
+        "cooling.radiator_outlet_temperature_commanded",
+        "cooling.fan1_duty",
+        "cooling.fan2_duty",
+        "engine.rail_pressure_actual",
+        "engine.rail_pressure_commanded",
+        "fuel.rail_pressure_control_deviation",
+        "fuel.metering_valve_duty",
+        "fuel.pressure_regulator_duty",
+        "injection.quantity_deviation_cylinder1",
+        "injection.quantity_deviation_cylinder2",
+        "injection.quantity_deviation_cylinder3",
+        "injection.quantity_deviation_cylinder4",
+    ];
+    let session = [
+        "dpf.surface_temperature",
+        "egr.low_pressure_closing",
+        "air.intercooler_outlet_temperature",
+    ];
+    let (mut core, _, _) = setup(false, &[(0x7E0, Presence::Positive)]);
+    discover(&mut core);
+    let data = catalog_data(&mut core);
+    for semantic in standard {
+        assert!(has_semantic(&data["signals"], semantic), "{semantic}");
+    }
+    for semantic in knowledge {
+        let signal = data["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["semantic"] == semantic && signal["key"].is_string())
+            .unwrap_or_else(|| panic!("{semantic} is a default-session Knowledge signal"));
+        assert_eq!(signal["extended_session_required"], false, "{semantic}");
+        assert!(signal["key"].as_str().unwrap().starts_with(semantic));
+    }
+    for semantic in session {
+        assert!(
+            has_semantic(&data["session_candidates"], semantic),
+            "{semantic}"
+        );
+        assert!(
+            !data["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|signal| signal["semantic"] == semantic && signal["key"].is_string()),
+            "{semantic} is not selectable while the session is inactive"
+        );
+    }
+}
+
+#[test]
+// REQ-035.2
+fn req_035_2_without_knowledge_or_engine_there_are_no_session_candidates() {
+    let mut core = MobileCore::new(FakeExchange(Arc::new(Mutex::new(LinkState {
+        commands: Vec::new(),
+        target: "7DF".into(),
+        responders: BTreeMap::new(),
+        presence: BTreeMap::new(),
+        all_present: false,
+        identification_dids: BTreeSet::new(),
+        did_replies: BTreeMap::new(),
+        enter_reply: Reply::NoData,
+        leave_reply: Reply::NoData,
+        mode01_replies: VecDeque::new(),
+        tester_replies: VecDeque::new(),
+    }))))
+    .unwrap();
+    let data = catalog_data(&mut core);
+    assert_eq!(data["session_candidates"], json!([]));
+    assert_eq!(data["uds_candidates"], 0);
+}
+
 #[test]
 // REQ-024.4, REQ-027.5
 fn req_024_4_malformed_offline_replay_does_not_touch_active_vehicle_session() {
