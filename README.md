@@ -89,6 +89,13 @@ presentation, including the ECU/group selector; it cannot supply diagnostic byte
 See [Android workbench](docs/android.md), [Knowledge loading](docs/knowledge-db.md)
 and [ADR 0003](docs/adr/0003-uds-extended-session-reads.md).
 
+In a ready live session the Android app marks a measurement gap ("Keine aktuellen Messwerte")
+once a selected signal has produced a value and none arrives for 10 seconds while reads are
+attempted. It asserts no ignition or connection state, probes one known-working selected
+signal every 5 seconds, recovers automatically on the first finite value, and records the gap
+(carried across file rotation, shown in offline replay and the mobile report). Real-vehicle
+behaviour awaits hardware acceptance; see [Android workbench](docs/android.md).
+
 ## What works today
 
 The repository already contains the main building blocks of the generic read-only path:

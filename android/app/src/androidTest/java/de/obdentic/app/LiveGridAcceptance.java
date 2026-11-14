@@ -1,6 +1,9 @@
 package de.obdentic.app;
 
 import android.app.Activity;
+import android.app.Instrumentation;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ScrollView;
@@ -12,7 +15,44 @@ import org.json.JSONArray;
 final class LiveGridAcceptance {
     interface OnMain { <T> T call(java.util.concurrent.Callable<T> c) throws Exception; }
 
-    static void run(OnMain main, ObdService service, Activity activity) throws Exception {
+    /**
+     * #239 is a portrait-phone criterion ("8 tiles on the first portrait screen"); in landscape the 3-column grid
+     * legitimately has fewer rows above the fold. A phone lying on its side must not decide the result, so the
+     * Activity is pinned to portrait for the check only (its own requested orientation: no system setting, no lock)
+     * and released afterwards. Both changes recreate the Activity; returns the one that is current afterwards.
+     */
+    static Activity run(Instrumentation inst, OnMain main, ObdService service, Activity activity) throws Exception {
+        Activity portrait = activity;
+        boolean pinned = !isPortrait(main, activity);
+        if (pinned) {
+            inst.runOnMainSync(() -> activity.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT));
+            portrait = awaitOther(main, activity, 10000);
+            require(portrait != null && isPortrait(main, portrait), "#239 the Activity can be shown in portrait");
+        }
+        verify(main, service, portrait);
+        if (!pinned) return portrait;
+        final Activity pinnedActivity = portrait;
+        inst.runOnMainSync(() -> pinnedActivity.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED));
+        Activity released = awaitOther(main, pinnedActivity, 5000); // stays the same when the phone itself is upright
+        return released != null ? released : pinnedActivity;
+    }
+
+    private static boolean isPortrait(OnMain main, Activity activity) throws Exception {
+        return main.call(() -> activity.getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT);
+    }
+
+    /** The resumed MainActivity once it is another instance than {@code old}, or null after {@code ms}. */
+    private static Activity awaitOther(OnMain main, Activity old, long ms) throws Exception {
+        long end = System.currentTimeMillis() + ms;
+        while (System.currentTimeMillis() < end) {
+            MainActivity now = MainActivity.resumed;
+            if (now != null && now != old && main.call(() -> now.getWindow().getDecorView().getWidth() > 0)) return now;
+            Thread.sleep(100);
+        }
+        return null;
+    }
+
+    private static void verify(OnMain main, ObdService service, Activity activity) throws Exception {
         require("".equals(MainActivity.staleText(10, false)) && "vor 11 s".equals(MainActivity.staleText(11, false)) && "".equals(MainActivity.staleText(99, true)), "#239 stale helper: only > 10 s and not replay shows 'vor N s'");
         JSONArray catalog = service.snapshot().getJSONArray("signals"), pick = new JSONArray();
         for (int i = 0; i < 8; i++) pick.put(catalog.getJSONObject(i).getString("semantic"));

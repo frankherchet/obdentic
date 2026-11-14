@@ -39,6 +39,7 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
     let mut smart_changes = Vec::new();
     let mut last_smart_offset = 0u64;
     let mut component_changes = Vec::new();
+    let mut gaps = Gaps::default();
     for (index, line) in reader.lines().enumerate() {
         if complete {
             complete = false;
@@ -104,6 +105,14 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
                     }
                     continue;
                 }
+                if action == "measurement.gap" {
+                    // REQ-037.3: a recorded live measurement gap is shown as recorded. It is
+                    // pure evidence: never replayed, never sent anywhere and never given a cause.
+                    if let Err(reason) = gaps.record(&event, &recorded["data"]) {
+                        issues.push(format!("measurement.gap: {reason}"));
+                    }
+                    continue;
+                }
                 if action == "component.apply" {
                     // REQ-035.4: the recorded component snapshot (set and Knowledge revision) is
                     // shown as recorded and never replayed through the core.
@@ -160,12 +169,14 @@ fn inspect(reader: impl BufRead) -> Result<Value, String> {
     if !complete {
         issues.push("interrupted recording: no session_end marker".into());
     }
+    let measurement_gaps = gaps.periods();
     Ok(json!({"schema":"OBDENTIC-MOBILE-REPORT","version":1,
         "mode":session["mode"],"profile":session["profile"],
         "complete":complete,"outcome":outcome,"event_count":events,"tx_count":tx,"rx_count":rx,
         "last_values":values,"diagnostic_jobs":jobs,"smart_snapshot":session["smart"],
         "smart_changes":smart_changes,"component_snapshot":session["component"],
-        "component_changes":component_changes,"issues":issues,
+        "component_changes":component_changes,"measurement_gap_events":gaps.events,
+        "measurement_gaps":measurement_gaps,"issues":issues,
         "note":"Values and diagnostic facts are recomputed from recorded responses. Original evidence remains in the source file."}))
 }
 
@@ -202,6 +213,86 @@ fn smart_change(event: &Value, data: &Value, last_offset: &mut u64) -> Result<Va
     change.insert("at".into(), event["at"].clone());
     change.insert("offset_us".into(), event["offset_us"].clone());
     Ok(Value::Object(change))
+}
+
+/// REQ-037.3: recorded measurement-gap events and the periods derived from them. A gap is only
+/// ever reported as observed: `start`/`resume` open a period ("no_values"), `end` closes it with
+/// the recorded outcome (`recovered` or `stopped`), and a period without an end stays `open`. A
+/// `resume` marks a gap that was already open when this file began (for example after a rotation);
+/// its start is not in this file and may not have been recorded at all, so no start time or
+/// duration is claimed for it: only this file's own timestamps are reported.
+#[derive(Default)]
+struct Gaps {
+    events: Vec<Value>,
+    closed: Vec<Value>,
+    open: Option<Value>,
+    last_offset: u64,
+}
+
+impl Gaps {
+    fn record(&mut self, event: &Value, data: &Value) -> Result<(), &'static str> {
+        let object = data.as_object().ok_or("data is not an object")?;
+        let change = object
+            .get("change")
+            .and_then(Value::as_str)
+            .ok_or("change is missing")?;
+        let reason = object
+            .get("reason")
+            .and_then(Value::as_str)
+            .ok_or("reason is missing")?;
+        match (change, reason) {
+            ("start" | "resume", "no_values") | ("end", "recovered" | "stopped") => {}
+            ("start" | "resume" | "end", _) => return Err("reason does not fit the change"),
+            _ => return Err("change is not a known change"),
+        }
+        // The recorder writes `at` as epoch milliseconds (number); a text time stamp from other
+        // writers stays accepted. Either is carried over verbatim.
+        let at = &event["at"];
+        if !(at.is_number() || at.as_str().is_some_and(|text| !text.is_empty())) {
+            return Err("at is missing");
+        }
+        let offset = event["offset_us"].as_u64().ok_or("offset_us is missing")?;
+        if offset < self.last_offset {
+            return Err("offset_us goes backwards");
+        }
+        match (change, self.open.is_some()) {
+            ("start", true) => return Err("start while a gap is already open"),
+            ("resume", true) => return Err("resume while a gap is already open"),
+            ("end", false) => return Err("end without an open gap"),
+            _ => {}
+        }
+        self.last_offset = offset;
+        let mut recorded = object.clone();
+        recorded.insert("at".into(), json!(at));
+        recorded.insert("offset_us".into(), json!(offset));
+        self.events.push(Value::Object(recorded));
+        if change == "end" {
+            let mut period = self.open.take().unwrap_or(Value::Null);
+            period["end_at"] = json!(at);
+            period["end_offset_us"] = json!(offset);
+            period["outcome"] = json!(reason);
+            if period["started_before_this_file"] == false {
+                let duration = offset - period["start_offset_us"].as_u64().unwrap_or(offset);
+                period["duration_us"] = json!(duration);
+                period["duration_ms"] = json!(duration / 1000);
+            }
+            self.closed.push(period);
+        } else {
+            self.open = Some(json!({"start_at":at,"start_offset_us":offset,
+                "started_before_this_file":change == "resume",
+                "end_at":null,"end_offset_us":null,"outcome":"open",
+                "duration_us":null,"duration_ms":null}));
+        }
+        Ok(())
+    }
+
+    fn periods(&self) -> Vec<Value> {
+        self.closed
+            .iter()
+            .chain(self.open.iter())
+            .cloned()
+            .collect()
+    }
 }
 
 /// REQ-030.10: one row per availability entry (key, target, status, NRC or reason, value, unit,
@@ -659,5 +750,201 @@ mod tests {
         // Known fields that were not recorded stay present as null.
         assert!(changes[0]["readings"].is_null());
         assert!(changes[0]["previous_set"].is_null());
+    }
+
+    fn gap_event(at: &str, offset_us: u64, change: &str, reason: &str) -> String {
+        json!({"type":"action","action":"measurement.gap","argument":"","at":at,
+            "offset_us":offset_us,
+            "result":{"ok":true,"data":{"change":change,"reason":reason}}})
+        .to_string()
+    }
+
+    const HEADER: &str =
+        r#"{"type":"session","schema":"OBDENTIC-MOBILE","version":1,"mode":"live"}"#;
+
+    #[test]
+    fn req_037_3_gap_start_and_recovery_report_timestamps_duration_and_outcome() {
+        let recording = format!(
+            "{HEADER}\n{}\n{}\n{{\"type\":\"wire\",\"direction\":\"RX\",\"text\":\"410C0C80\"}}\n{}\n{}\n",
+            gap_event("2026-11-14T10:00:10.000Z", 10_000_000, "start", "no_values"),
+            gap_event("2026-11-14T10:00:42.500Z", 42_500_000, "end", "recovered"),
+            gap_event("2026-11-14T10:01:00.000Z", 60_000_000, "start", "no_values"),
+            r#"{"type":"session_end","reason":"stopped"}"#
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["rx_count"], 1);
+        assert!(report["diagnostic_jobs"].as_array().unwrap().is_empty());
+        assert!(report["last_values"].as_object().unwrap().is_empty());
+        let events = report["measurement_gap_events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["change"], "start");
+        assert_eq!(events[0]["reason"], "no_values");
+        assert_eq!(events[1]["at"], "2026-11-14T10:00:42.500Z");
+        let gaps = report["measurement_gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[0]["start_at"], "2026-11-14T10:00:10.000Z");
+        assert_eq!(gaps[0]["end_at"], "2026-11-14T10:00:42.500Z");
+        assert_eq!(gaps[0]["duration_us"], 32_500_000);
+        assert_eq!(gaps[0]["duration_ms"], 32_500);
+        assert_eq!(gaps[0]["outcome"], "recovered");
+        assert_eq!(gaps[0]["started_before_this_file"], false);
+        // The gap still open at the end of the recording claims neither end nor duration.
+        assert_eq!(gaps[1]["outcome"], "open");
+        assert!(gaps[1]["end_at"].is_null());
+        assert!(gaps[1]["duration_ms"].is_null());
+    }
+
+    #[test]
+    fn req_037_3_stopped_gap_closes_without_claiming_recovery() {
+        let recording = format!(
+            "{HEADER}\n{}\n{}\n{}\n",
+            gap_event("2026-11-14T10:00:00.000Z", 0, "start", "no_values"),
+            gap_event("2026-11-14T10:00:12.000Z", 12_000_000, "end", "stopped"),
+            r#"{"type":"session_end","reason":"stopped"}"#
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
+        let gaps = report["measurement_gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["outcome"], "stopped");
+        assert_eq!(gaps[0]["duration_ms"], 12_000);
+    }
+
+    #[test]
+    fn req_037_3_rotated_file_carries_an_open_gap_through_resume() {
+        // A file that begins with a resume: the gap was already open when it began, so only
+        // this file's timestamps are reported and no duration is claimed from an unseen start.
+        let recording = format!(
+            "{HEADER}\n{}\n{}\n{}\n",
+            gap_event("2026-11-14T10:05:00.000Z", 1_000, "resume", "no_values"),
+            gap_event("2026-11-14T10:05:08.000Z", 8_001_000, "end", "recovered"),
+            r#"{"type":"session_end","reason":"stopped"}"#
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
+        let gaps = report["measurement_gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["started_before_this_file"], true);
+        assert_eq!(gaps[0]["start_at"], "2026-11-14T10:05:00.000Z");
+        assert_eq!(gaps[0]["outcome"], "recovered");
+        assert!(gaps[0]["duration_ms"].is_null());
+        // A resume that is never closed stays open (the recording was interrupted).
+        let open = format!(
+            "{HEADER}\n{}\n",
+            gap_event("2026-11-14T10:05:00.000Z", 1_000, "resume", "no_values")
+        );
+        let report = inspect(open.as_bytes()).unwrap();
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["measurement_gaps"][0]["outcome"], "open");
+        assert_eq!(report["measurement_gap_events"][0]["change"], "resume");
+    }
+
+    #[test]
+    fn req_037_3_old_recordings_without_gaps_report_empty_fields_and_keep_smart_events() {
+        let recording = concat!(
+            "{\"type\":\"session\",\"schema\":\"OBDENTIC-MOBILE\",\"version\":1,\"mode\":\"live\"}\n",
+            "{\"type\":\"action\",\"action\":\"read\",\"result\":{\"ok\":true,\"data\":{\"semantic\":\"engine.rpm\",\"response\":[65,12,12,128]}}}\n",
+            "{\"type\":\"session_end\",\"reason\":\"stopped\"}\n"
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
+        assert!(report["measurement_gaps"].as_array().unwrap().is_empty());
+        assert!(report["measurement_gap_events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(report["last_values"]["engine.rpm"]["value"], 800.0);
+        // Gap events beside smart events do not disturb either list or the raw evidence.
+        let mixed = format!(
+            "{HEADER}\n{}\n{}\n{}\n{}\n",
+            smart_event(
+                "2026-11-14T10:00:00.000Z",
+                5,
+                json!({"change":"start","set":"dpf","reason":"start"})
+            ),
+            gap_event("2026-11-14T10:00:01.000Z", 1_000_000, "start", "no_values"),
+            r#"{"type":"wire","direction":"TX","text":"010C"}"#,
+            r#"{"type":"session_end","reason":"stopped"}"#
+        );
+        let report = inspect(mixed.as_bytes()).unwrap();
+        assert!(report["issues"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["smart_changes"].as_array().unwrap().len(), 1);
+        assert_eq!(report["measurement_gaps"].as_array().unwrap().len(), 1);
+        assert_eq!(report["tx_count"], 1);
+    }
+
+    #[test]
+    fn req_037_3_malformed_or_inconsistent_gap_events_are_issues_and_never_gaps() {
+        let missing_offset = r#"{"type":"action","action":"measurement.gap","at":"2026-11-14T10:00:00.000Z","result":{"ok":true,"data":{"change":"start","reason":"no_values"}}}"#;
+        let recording = format!(
+            "{HEADER}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"action","action":"measurement.gap","result":{"ok":true,"data":[]}}"#,
+            r#"{"type":"action","action":"measurement.gap","result":{"ok":true,"data":{"reason":"no_values"}}}"#,
+            r#"{"type":"action","action":"measurement.gap","result":{"ok":false,"error":"refused"}}"#,
+            gap_event("2026-11-14T10:00:00.000Z", 100, "end", "recovered"),
+            gap_event("2026-11-14T10:00:00.001Z", 200, "start", "ignition_off"),
+            gap_event("2026-11-14T10:00:00.002Z", 300, "pause", "no_values"),
+            missing_offset,
+            gap_event("2026-11-14T10:00:00.003Z", 400, "start", "no_values"),
+            gap_event("2026-11-14T10:00:00.004Z", 500, "start", "no_values"),
+            gap_event("2026-11-14T10:00:00.005Z", 300, "end", "stopped"),
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert_eq!(
+            report["issues"],
+            json!([
+                "measurement.gap: data is not an object",
+                "measurement.gap: change is missing",
+                "measurement.gap: \"refused\"",
+                "measurement.gap: end without an open gap",
+                "measurement.gap: reason does not fit the change",
+                "measurement.gap: change is not a known change",
+                "measurement.gap: offset_us is missing",
+                "measurement.gap: start while a gap is already open",
+                "measurement.gap: offset_us goes backwards",
+                "interrupted recording: no session_end marker"
+            ])
+        );
+        let gaps = report["measurement_gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["start_offset_us"], 400);
+        assert_eq!(gaps[0]["outcome"], "open");
+    }
+
+    #[test]
+    fn req_037_3_recorder_epoch_millisecond_at_is_accepted_and_carried_over_verbatim() {
+        let gap = |at: u64, offset_us: u64, change: &str, reason: &str| {
+            json!({"type":"action","action":"measurement.gap","argument":"","at":at,
+                "offset_us":offset_us,
+                "result":{"ok":true,"data":{"change":change,"reason":reason}}})
+            .to_string()
+        };
+        let bad_at = r#"{"type":"action","action":"measurement.gap","at":true,"offset_us":99000000,"result":{"ok":true,"data":{"change":"start","reason":"no_values"}}}"#;
+        let recording = format!(
+            "{HEADER}\n{}\n{}\n{}\n{}\n",
+            gap(1_794_650_410_000, 10_000_000, "start", "no_values"),
+            gap(1_794_650_442_500, 42_500_000, "end", "recovered"),
+            bad_at,
+            r#"{"type":"session_end","reason":"stopped"}"#
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert_eq!(
+            report["issues"],
+            json!(["measurement.gap: at is missing"]),
+            "{report}"
+        );
+        let events = report["measurement_gap_events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["at"], 1_794_650_410_000u64);
+        assert_eq!(events[1]["at"], 1_794_650_442_500u64);
+        let gaps = report["measurement_gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["start_at"], 1_794_650_410_000u64);
+        assert_eq!(gaps[0]["end_at"], 1_794_650_442_500u64);
+        assert_eq!(gaps[0]["outcome"], "recovered");
+        assert_eq!(gaps[0]["duration_us"], 32_500_000);
+        assert_eq!(gaps[0]["duration_ms"], 32_500);
     }
 }

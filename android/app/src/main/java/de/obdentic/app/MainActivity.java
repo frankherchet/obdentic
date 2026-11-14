@@ -179,7 +179,7 @@ public class MainActivity extends Activity {
         if(!historyMode.equals(mode)){historyMode=mode;histories.clear();lastSamples.clear();}
         collectHistory();
         String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+state.optString("autoRecording")+state.optBoolean("autoRecord")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
-        if(tab==0)key+="|"+smartStructureKey()+"|"+state.opt("component");
+        if(tab==0)key+="|"+smartStructureKey()+"|"+state.opt("component")+"|"+gapStructureKey();
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
         if(tab==2)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+state.optString("recording")+"|"+state.optString("replayFile");
@@ -190,6 +190,7 @@ public class MainActivity extends Activity {
         updateUdsStatus();
         updateSmartStatus();
         announceSmartSet();
+        announceGap();
         if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText())){debugLog.setText(content);scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));}}
     }
     private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
@@ -211,6 +212,7 @@ public class MainActivity extends Activity {
         // REQ-025.7: the one place to start and stop a recording of the selection
         actionButton(body,recordingNow?REC_STOP:REC_START,"",recordingNow?"Aufzeichnung stoppen":"Gewählte Messwerte aufzeichnen",recordingNow||canRecordSelection,()->{if(recordingNow)perform(REC_STOP,"",()->service().stopRecording());else perform(REC_START,"",()->service().startRecording("live-selection"));});
         if(!state.optString("recording").isEmpty())note(body,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);
+        gapCard();
         JSONArray values=array("values");
         LinkedHashMap<String,JSONObject> shown=new LinkedHashMap<>();
         for(int i=0;i<selected.length();i++){String s=selected.optString(i);shown.put(s,signal(s));}
@@ -238,6 +240,41 @@ public class MainActivity extends Activity {
         if(!recordingNow&&smartRecordingBlocker(state)!=null)note(body,smartRecordingBlocker(state),MUTED);
         componentCard();
         JSONObject vehicle=state.optJSONObject("vehicle");if(vehicle!=null&&vehicle.length()>0){LinearLayout c=card();note(c,"FAHRZEUG",ACCENT);note(c,vehicle.optString("vin","Fahrzeug erfasst"),TEXT);JSONArray responders=vehicle.optJSONArray("responders");if(responders!=null)note(c,responders.length()+" Responder · Details unter Diagnose",MUTED);}
+    }
+    /** REQ-037: the headline when live reads (or the recorded ones) show no current value. Observation only; the cause is never named. */
+    public static String gapText(JSONObject state){JSONObject gap=state.optJSONObject("gap");return gap!=null&&gap.optBoolean("active")?MeasurementGap.TEXT:"";}
+    private static String gapClock(long at){return at>0?new java.text.SimpleDateFormat("HH:mm:ss",java.util.Locale.GERMANY).format(new java.util.Date(at)):"";}
+    /** The line under the headline, or for a replay that ended inside a gap. */
+    static String gapDetail(JSONObject state){
+        JSONObject gap=state.optJSONObject("gap");if(gap==null)return "";
+        boolean replay=gap.optBoolean("replay"),active=gap.optBoolean("active");String since=gapClock(gap.optLong("since"));
+        if(active)return replay?(gap.optBoolean("carried")?"Aus der Aufnahme · Die Lücke bestand bereits bei Aufnahmebeginn"+(since.isEmpty()?"":" ("+since+")"):"Aus der Aufnahme · beobachtet"+(since.isEmpty()?"":" seit "+since))+" · Ursache unbekannt":(since.isEmpty()?"":"Seit "+since+" · ")+"Ursache unbekannt · Es wird nur noch ein früher gelesener Messwert alle 5 s abgefragt; sobald wieder ein Wert eintrifft, läuft die Messung normal weiter.";
+        if(replay&&gap.optString("outcome").equals("stopped"))return "Aus der Aufnahme · Die Lücke wurde beendet, ohne dass eine Erholung beobachtet wurde";
+        return "";
+    }
+    /** Last changes of the gap, newest first; only observed outcomes. */
+    static String gapHistoryText(JSONObject state){
+        JSONObject gap=state.optJSONObject("gap");JSONArray changes=gap==null?null:gap.optJSONArray("changes");StringBuilder h=new StringBuilder();int shown=0;
+        for(int i=changes==null?-1:changes.length()-1;i>=0&&shown<5;i--){JSONObject c=changes.optJSONObject(i);if(c==null)continue;shown++;
+            String what=c.optString("change"),reason=c.optString("reason");
+            String label=what.equals("start")?"Keine aktuellen Messwerte":what.equals("resume")?"Lücke bestand bereits bei Aufnahmebeginn":reason.equals("recovered")?"Messwerte wieder eingetroffen":"Lücke beendet · keine Erholung beobachtet";
+            if(h.length()==0)h.append("LÜCKEN");h.append("\n• ").append(gapClock(c.optLong("at"))).append(" · ").append(label);}
+        return h.toString();
+    }
+    private String gapStructureKey(){JSONObject gap=state.optJSONObject("gap");JSONArray changes=gap==null?null:gap.optJSONArray("changes");return gap==null?"":gap.optBoolean("active")+"|"+gap.optBoolean("replay")+"|"+gap.optString("outcome")+"|"+(changes==null?0:changes.length());}
+    private void gapCard(){
+        String headline=gapText(state),history=gapHistoryText(state);if(headline.isEmpty()&&history.isEmpty())return;
+        LinearLayout c=card();
+        if(!headline.isEmpty()){TextView t=text(headline,16,0xffffca75);t.setTag("measurement-gap");t.setContentDescription(headline);c.addView(t);}
+        String detail=gapDetail(state);if(!detail.isEmpty()){TextView d=text(detail,12,MUTED);d.setTag("measurement-gap-detail");d.setPadding(0,dp(4),0,dp(4));c.addView(d);}
+        if(!history.isEmpty()){TextView h=text(history,12,MUTED);h.setTag("measurement-gap-history");h.setPadding(0,dp(4),0,dp(4));c.addView(h);}
+    }
+    private boolean lastGapActive;
+    /** One spoken notice when a live gap starts, and when it ends by recovery; any other ending (selection, session end, replay) is silent. */
+    private void announceGap(){
+        JSONObject gap=state.optJSONObject("gap");boolean replay=gap!=null&&gap.optBoolean("replay"),active=gap!=null&&gap.optBoolean("active")&&!replay;
+        if(active==lastGapActive)return;lastGapActive=active;
+        if(active)announce(MeasurementGap.TEXT);else if(!replay&&"recovered".equals(gap.optString("outcome")))announce("Messwerte wieder aktuell");
     }
     /** #297: one start/stop for the whole drive, then no interaction needed; component, reason, time left, last changes and the trigger readings with their age are shown (replay: the recorded set changes, read only). */
     private void smartCard(){

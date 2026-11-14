@@ -88,7 +88,7 @@ public final class AcceptanceRunner extends Instrumentation {
             final Activity liveActivity=activity;
             require(onMain(() -> hasText(liveActivity.getWindow().getDecorView(),"Drehzahl",true)),"#232 live card shows the short name Drehzahl");
             runOnMainSync(() -> FormatAcceptance.noSemanticIds(liveActivity.getWindow().getDecorView()));
-            LiveGridAcceptance.run(this::onMain, service, liveActivity);
+            activity = LiveGridAcceptance.run(this, this::onMain, service, liveActivity); // #239 pins portrait for the check; the Activity may be recreated
             service.setSignals(new JSONArray());
             waitIdle();
             passed("Live RPM/coolant readings and changing observation selection");
@@ -219,6 +219,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("#291/#297 component preset and smart analysis through the service: component preset applied by id with automatic extended session only when needed, one-time smart start/stop, set changes with reason, trigger ages and unavailable triggers in the snapshot, replay shows the recorded set changes, no traffic beyond reads");
             smartAndComponentUiText();
             passed("#291/#297 UI text: a replay that ends with the stop event (empty set) shows the recorded history and the stop reason instead of 'no smart analysis', a replay without events says so, an active smart run shows the component label and reason, a named recording of the selection is refused with a reason while smart is active (not in replay or when inactive), every unselected component entry is listed with its own reason and detail rather than counted");
+            MeasurementGapAcceptance.run(service,getTargetContext(),tab -> tabText(activity,tab));
+            passed("REQ-037 measurement gap (#314): rules on a supplied clock (10 s of attempted reads without a finite value, unsupported/never-successful/unselected signals never start one, a fast signal failing is no gap until the slow previously successful signal also failed or while it succeeds, 5 s probes of previously successful signals only, first finite value recovers, selection change and stop); real service against a fake adapter: values, individual unsupported and failing signals next to successes without a gap, sustained silence gives 'Keine aktuellen Messwerte' with no ignition/adapter/vehicle claim, probe cadence at most one per 5 s across a selection change and a job, recovery restores polling, unknown trigger values never zero; recording holds measurement.gap start / resume after a forced rotation / end recovered / end stopped, replay shows each file without traffic, older recordings open without a gap");
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
                 public String text(String tab) throws Exception { return tabText(activity,tab); }
                 public Boolean enabled(String label,boolean expected) throws Exception { 
