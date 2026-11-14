@@ -413,18 +413,60 @@ local user actions.
 
 Choose `Download/OBDentic` as the app's export folder; that is the script's
 default phone folder. Then pull everything that was exported into the untracked
-`evidence/phone/` directory:
+`evidence/phone/` directory, one folder per day:
 
 ```sh
-rtk tools/pull-recordings.sh            # copy new recordings, skip existing ones
-rtk tools/pull-recordings.sh --report   # also run obdentic-mobile-report on new files
+rtk tools/pull-recordings.sh            # copy new recordings and logs, skip existing ones
+rtk tools/pull-recordings.sh --report   # also run obdentic-mobile-report on new recordings
+rtk tools/pull-recordings.sh --dest evidence/phone-2   # other git-ignored destination, same layout
 ```
 
+```text
+evidence/phone/
+  2026-10-29/20261029-181530-123-live.jsonl
+  2026-10-29/app-20261029-120000-000.log
+  undatiert/legacy-name.jsonl          # no usable timestamp in the file name
+  konflikte/20261114T101500Z/<name>    # older version replaced by a different-size copy
+```
+
+**Layout.** The day folder comes from the timestamp the app wrote into the file name
+(`yyyyMMdd-HHmmss-SSS-…jsonl` recordings, `app-yyyyMMdd-HHmmss-SSS.log` app logs). That
+timestamp is the phone's local wall-clock time; the file name carries no time zone or
+offset, so the script applies none and does not guess one. A recording made shortly
+after local midnight therefore sits in the new day's folder, whatever the zone. A name
+without a valid timestamp (no date, year outside 1970–2099, month 13, 30 February, hour
+25 and the like) goes to `undatiert/`. File names and bytes are never changed.
+
+**Reimport and collisions.** A file that already exists in its day folder with the same
+size is skipped, so repeated pulls change nothing. Archives from before the day folders
+kept everything flat in `evidence/phone/`: a flat file with the same name and size also
+counts as present and is not imported again (migrate it into its day folder by hand if
+you want the new layout). A flat copy with a different size is left alone and the
+current version is pulled into its day folder. If the day folder holds a file of the same
+name but a different size (for example a partial recording that has grown), the new
+file is first pulled under a temporary name; only after that succeeds the old file is
+moved, unchanged, to `konflikte/<UTC timestamp>/<name>` (a numeric suffix keeps the
+folder unique) and the new one takes its place. A failed pull or a failed archive move
+keeps the old file in place. If the move of the new file fails after the old one was
+archived, the script tries to put the old file back; should that fail too, the old
+version remains in
+`konflikte/<UTC timestamp>/<name>` (the script names that path), so an existing file
+is never lost or deleted. The temporary name `<name>.pulling` is different: a
+failed new pull removes only its own partial temporary file, and a leftover
+`<name>.pulling` from an earlier interrupted run is never overwritten or removed. The
+script refuses it, reports that file as failed and keeps it until you move or delete
+it. The script never writes through symbolic
+links: it refuses a symlinked `--dest`, day folder, `undatiert/`, `konflikte/`,
+target file or `*.pulling` name, reports the file as failed and leaves the
+link and whatever it points to untouched. With `--report` the report runs on
+the actual local path of each newly pulled recording.
+
 The script reads from the phone only (`adb devices`, `shell ls/stat/test`, `pull`)
-and refuses destinations that git does not ignore. It needs exactly one adb device,
-skips files that already exist locally with the same name and size, and labels each
-copied file `complete` (it ends with `session_end`) or `partial`. Partial files are
-kept. `--source` and `--dest` override the phone folder and the git-ignored local
+and refuses destinations that git does not ignore (it checks the day folders,
+`undatiert/`, `konflikte/` and temporary names). It needs exactly one adb device
+and labels each copied recording `complete` (it ends with `session_end`) or
+`partial`; partial files are kept, and each copy is reported with its local path.
+`--source` and `--dest` override the phone folder and the git-ignored local
 directory. `tools/test-pull-recordings.sh` tests the script against a stubbed `adb`.
 It works with debug and release builds because it never uses `run-as`.
 

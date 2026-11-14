@@ -406,6 +406,10 @@ requirements:
         text: The script only reads from the phone and never writes, deletes or installs anything on it.
       - id: REQ-019.6
         text: With `--report`, the script runs `obdentic-mobile-report` on each newly pulled file and shows its result.
+      - id: REQ-019.7
+        text: The import groups timestamped recording and app-log filenames into YYYY-MM-DD subdirectories of the destination using the date in the phone-local filename; files without a usable filename date go into undatiert, and all original filenames and contents remain unchanged.
+      - id: REQ-019.8
+        text: If an imported filename already exists at the destination with a different size, the old file is retained in a uniquely named conflicts directory before the new copy replaces it; a failed pull leaves the old file intact.
 
   - id: REQ-020
     title: Connect automatically to the known adapter on start and after connection loss
