@@ -1,0 +1,17 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'de.obdentic.spike.siwc'
+    compileSdk 36
+    defaultConfig {
+        applicationId 'de.obdentic.spike.siwc'
+        minSdk 26
+        targetSdk 36
+        versionCode 1
+        versionName 'spike'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

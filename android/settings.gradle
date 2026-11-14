@@ -7,3 +7,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = 'OBDentic'
 include ':app'
+include ':spike-siwc'
