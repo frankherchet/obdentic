@@ -153,13 +153,14 @@ cargo run -- read engine.rpm --adapter "$ADAPTER_UUID"
 Record an observation session and inspect it offline:
 
 ```sh
+mkdir -p evidence/desktop
 cargo run -- capture \
   --adapter "$ADAPTER_UUID" \
   --profile engine-drive \
-  --record evidence/drive.jsonl
+  --record evidence/desktop/drive.jsonl
 
-cargo run -- capture inspect evidence/drive.jsonl
-cargo run -- capture capability evidence/drive.jsonl
+cargo run -- capture inspect evidence/desktop/drive.jsonl
+cargo run -- capture capability evidence/desktop/drive.jsonl
 ```
 
 To validate the seven already advertised, standards-derived Mode 01 additions
@@ -169,7 +170,7 @@ without overbooking the conservative session budget, use the dedicated profile:
 cargo run -- capture \
   --adapter "$ADAPTER_UUID" \
   --profile obd2-expansion-validation \
-  --record evidence/obd2-expansion-validation.jsonl
+  --record evidence/desktop/obd2-expansion-validation.jsonl
 ```
 
 Run the currently supported generic diagnostic job:
@@ -177,7 +178,7 @@ Run the currently supported generic diagnostic job:
 ```sh
 cargo run -- diagnose dtc.scan \
   --adapter "$ADAPTER_UUID" \
-  --record evidence/dtc-scan.jsonl
+  --record evidence/desktop/dtc-scan.jsonl
 ```
 
 `dtc.scan` is currently a strictly read-only generic stored-DTC workflow. DTC clearing is not executable on current `main`; the product goal allows it only as a future closed diagnostic job behind an explicit process-start capability, never as a generic write mode.
@@ -257,7 +258,7 @@ cargo run -- tui demo
 cargo run -- tui live --adapter "$ADAPTER_UUID"
 
 # Explore a recorded JSONL session without an adapter.
-cargo run -- tui capture evidence/12-drive.jsonl
+cargo run -- tui capture evidence/desktop/drive.jsonl
 
 cargo run -- layout save engine-overview engine-overview.tsv
 cargo run -- tui demo --layout engine-overview.tsv
