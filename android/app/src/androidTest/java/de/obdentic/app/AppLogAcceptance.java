@@ -89,7 +89,11 @@ final class AppLogAcceptance {
             service.stopRecording(); waitFor(() -> service.snapshot().optString("recording").isEmpty(), "named recording stopped");
             service.runJob("uds.enable"); waitFor(() -> service.snapshot().optJSONObject("uds").optBoolean("active"), "extended session active");
             waitFor(() -> link[0].commands.contains("7E0:3E80"), "tester present sent"); SystemClock.sleep(2500);
-            link[0].tickFails = true; waitFor(() -> new ArrayList<>(link[0].commands).stream().filter(c -> c.equals("7E0:3E80")).count() >= 3, "failing tester present"); SystemClock.sleep(500);
+            // Only a tester present sent after the failure is armed can fail, so count from here: an absolute count may already be met by earlier successful ones
+            long sentBefore = testerPresents(link[0]); link[0].tickFails = true;
+            waitFor(() -> testerPresents(link[0]) > sentBefore, "a tester present sent after the failure was armed");
+            waitFor(() -> !service.snapshot().optJSONObject("uds").optBoolean("active"), "the failing tester present ends the extended session");
+            for (long until = SystemClock.elapsedRealtime() + 5000; SystemClock.elapsedRealtime() < until && !allLogs(work).contains("WARN job uds.tick"); ) SystemClock.sleep(50); // the assertion below reports the full log if it never arrives
             service.runJob("uds.disable"); waitFor(() -> !service.snapshot().optJSONObject("uds").optBoolean("active") && !service.snapshot().optBoolean("busy"), "extended session left");
             String all = ""; for (File f : AppLog.sealed()) all += read(f); if (new File(work, "app.log").exists()) all += read(new File(work, "app.log"));
             require(all.contains("INFO msg UDS nur mit echtem Adapter; vor dem Einschalten Aufnahme stoppen"), "REQ-029.7 the refusal is in the log: " + all);
@@ -125,5 +129,7 @@ final class AppLogAcceptance {
         while (SystemClock.elapsedRealtime() < until) { if (condition.ready()) return; SystemClock.sleep(100); }
         throw new AssertionError("Timeout: " + name);
     }
+    private static long testerPresents(AvailabilityAcceptance.Link link) { return new ArrayList<>(link.commands).stream().filter(c -> c.equals("7E0:3E80")).count(); }
+    private static String allLogs(File work) throws IOException { String all = ""; for (File f : AppLog.sealed()) all += read(f); if (new File(work, "app.log").exists()) all += read(new File(work, "app.log")); return all; }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
 }

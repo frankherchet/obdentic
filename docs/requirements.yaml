@@ -826,3 +826,21 @@ requirements:
         text: "The priority is dpf > cooling > turbo > rail > egr: the set read is the highest-priority set with a valid window, a higher window interrupts a lower one, windows keep their own time while interrupted, a lower window still valid resumes when the higher ends and an expired one does not. While no window is valid the app rotates through the five sets in that order, 3 minutes each, skipping and reporting sets without an available entry, and after a window ends the rotation continues with a new 3-minute step."
       - id: REQ-036.5
         text: "The Live tab shows the active set, the reason (trigger, rotation, resumption), the remaining time and the latest changes; every set change (start, trigger, interruption, resumption, expiry, rotation, unavailability, stop) is written into the analysis recording with wallclock time, monotonic offset, set, reason, the trigger readings behind it and the time stamps of the reading and the change, continues across the file rotation of REQ-028.3, and replay shows the same changes and readings without adapter traffic; the latency from trigger reading to changed selection depends on the serial adapter and is reported, not promised. The analysis publishes no vehicle evidence: no trigger reading or value ever appears in the operational app log (REQ-029), whose lines for the analysis, including its user-visible messages, name only sets and reasons; trigger values stay in the private recording and in memory, nothing is exported, shared, uploaded, added to the Knowledge or evidence stores or offered to MCP or AI automatically, and its triggers, windows and sets are OBDentic-owned, not Knowledge, profile or vehicle data."
+
+  - id: REQ-037
+    title: Show and recover from gaps in live measurement
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-11-14: request by @frankherchet"
+    description: >
+      A driver can distinguish a period without usable live measurements from a
+      healthy stream, and the app reduces repeated reads while remaining able to
+      recover automatically without assuming why values are missing.
+    acceptance:
+      - id: REQ-037.1
+        text: "In a ready live session, after a selected signal has produced a finite value, if selected reads subsequently fail to produce any finite value for at least 10 seconds while reads are actually attempted, and each currently selected, eligible signal that previously produced a value has been attempted unsuccessfully since the last finite value, the app marks a measurement gap and shows 'Keine aktuellen Messwerte'; it does not claim the ignition is off or that the adapter or vehicle has disconnected. Unsupported, unselected or never-successful signals alone cannot start a gap. Any successful selected OBD or UDS measurement ends the gap and restores normal polling. Errors for individual signals alongside successful measurements do not start a gap."
+      - id: REQ-037.2
+        text: "While a gap is active the app probes a currently selected signal that previously returned a finite value at most once every 5 seconds, rather than continuing the full polling set; the first finite result ends the gap and restores normal polling. Selection changes, stop, reconnect, failure, jobs, and extended-session keepalive and cleanup remain safe and responsive; no new vehicle operation or background connection is introduced. Missing and stale trigger values remain unknown, never zero or proof that an event did not occur."
+      - id: REQ-037.3
+        text: "Each recorded gap has a timestamped start and, on recovery or recording stop, an end with only the observed outcome, not an inferred ignition state. An open gap is carried into a rotated file so each part is independently understandable. Offline Android replay and the mobile report show the gap without vehicle traffic, older recordings remain readable, and the raw request and response evidence remains available."

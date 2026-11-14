@@ -267,6 +267,53 @@ the app log (only set names and reasons), and nothing is exported, shared or pub
 vehicle evidence automatically. Behaviour while driving is not validated and belongs to the
 separate #178 gate.
 
+**Messlücken (REQ-037).** In a ready live session the Live tab shows "Keine aktuellen
+Messwerte" when selected reads have produced no finite value for at least 10 seconds while
+reads are actually being attempted, but only after a selected signal has produced a finite
+value at least once in the session. Unsupported, unselected or never-successful signals alone
+never start a gap, and individual signal errors next to successful measurements do not. The
+notice states only that no values arrive. It does not claim that the ignition is off or that
+the adapter or vehicle has disconnected: the cause is not known and the app does not infer it
+(no ignition state is asserted anywhere). Missing and stale trigger values stay unknown, never
+zero and never proof that an event did not occur.
+
+"Value" here means only a finite decoded result. It is not proof that the reading is plausible:
+a numeric sentinel that decodes to a finite number still ends or prevents a gap and can never
+establish vehicle health. Detecting malformed or implausible decoding is a separate concern
+(#293) and is not part of the gap logic.
+
+The 10 seconds are a minimum, not a promise. Detection also waits until every currently
+selected, previously successful, eligible signal has been attempted at least once without a
+finite result since the last finite value. This prevents false gaps with slow polling profiles
+(intervals of 15 to 30 seconds), so with such profiles a gap can be marked noticeably later
+than 10 seconds after the last value.
+
+While a gap is active the app stops polling the full selection. It probes one currently
+selected signal that already returned a finite value (the selected known-working signal) at
+most once every 5 seconds, using the ordinary read-only signal read: no new vehicle operation,
+no background connection and no changed session. The first finite result from any selected OBD
+or UDS measurement ends the gap and restores normal polling automatically; no user action is
+needed. Selection changes, stop, reconnect, failure, jobs and the extended-session keepalive
+and cleanup stay responsive and safe while a gap is open.
+
+Each gap is written into the running automatic recording as the existing action event
+`measurement.gap` (empty argument, result `{"ok":true,"data":{"change":…,"reason":…}}`; the
+record's own `at` and `offset_us` give the time). `start` with `no_values` opens a gap;
+`end` with `recovered` closes it on the first finite value; `end` with `stopped` closes it when
+the recording stops and claims no recovery. When the file rotates (REQ-028.3) during an open
+gap, the new file begins with `resume` and `no_values`, so every part is understandable on its
+own and the true start stays in the earlier file. The `start` timestamp is the time the gap
+was detected, not necessarily the exact moment of the last finite value or of the first failed
+read. A reported gap duration is therefore a lower bound and can miss the initial 10 seconds or
+more; the raw read events in the same recording allow offline correlation of the true last
+value and first failure. Offline replay and
+`obdentic-mobile-report` show the gaps from the recording without adapter traffic and keep the
+raw TX/RX evidence; recordings made before this change contain no such events and open as
+before. DPF priority in Smart-Analyse is unchanged and remains covered by its existing
+deterministic replay tests. Gap behaviour on a real vehicle (how long values are missing,
+whether the first probe recovers) is not validated and belongs to the separate #178 hardware
+acceptance; until then the thresholds above are the specified behaviour, not measured results.
+
 ## Adapter throughput (Diagnose)
 
 "Adapter-Leistung messen" in the Diagnose tab runs a closed, read-only job (`adapter.throughput`, REQ-022). It

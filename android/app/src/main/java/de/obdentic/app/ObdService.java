@@ -67,6 +67,15 @@ public final class ObdService extends Service {
     private volatile String recordingProfile = "";
     private final Map<String, Long> due = new HashMap<>(), intervals = new HashMap<>();
     private final Map<String, JSONObject> values = new LinkedHashMap<>();
+    /** REQ-037: live-reading gap. The tracker is thread-safe; the fields below are the published face of it (the writer thread reads gapOpen when a file rotates). */
+    private final MeasurementGap gap=new MeasurementGap();
+    private volatile boolean gapOpen;
+    private boolean fileGap; // guarded by recordLock: the open recording file holds a gap that has no end yet (separate from the live gap, which outlives files)
+    private volatile long gapSince;
+    private volatile int gapProbes;
+    private volatile String gapOutcome="";
+    private static final int GAP_CHANGES=20;
+    private final ArrayList<JSONObject> gapChanges=new ArrayList<>(); // guarded by stateLock
     public volatile VehicleStore vehicles;
     public void onCreate() {
         super.onCreate(); current = this; AppLog.init(this); AppLog.i("service","create");
@@ -80,6 +89,7 @@ public final class ObdService extends Service {
             for (String key : new String[]{"devices","signals","profiles","values","debug","selected","records"}) put(state,key,new JSONArray());
             put(state,"recording",""); put(state,"autoRecording",""); put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject());
             put(state,"smart",idleSmart()); put(state,"component",new JSONObject()); put(state,"sessionCandidates",new JSONArray()); put(state,"knowledge",new JSONObject());
+            put(state,"gap",idleGap());
         }
         NotificationManager manager = getSystemService(NotificationManager.class);
         manager.createNotificationChannel(new NotificationChannel("connection", "OBD-Verbindung", NotificationManager.IMPORTANCE_LOW));
@@ -283,7 +293,8 @@ public final class ObdService extends Service {
         }
         synchronized(due) { due.clear(); }
         fresh.clear();
-        synchronized(stateLock) { put(state,"smart",idleSmart()); put(state,"component",new JSONObject()); put(state,"sessionCandidates",new JSONArray()); }
+        synchronized(stateLock) { put(state,"smart",idleSmart()); put(state,"component",new JSONObject()); put(state,"sessionCandidates",new JSONArray()); gapChanges.clear(); put(state,"gap",idleGap()); }
+        gap.reset(); gapOpen=false; gapOutcome=""; gapProbes=0; // REQ-037.2: a fresh initialization starts without a gap and without a history of successful signals
     }
     private void initialize(int token) throws Exception {
         resetSessionData();
@@ -395,7 +406,7 @@ public final class ObdService extends Service {
             try { if(core!=0) execute("uds.disable",""); } catch(Exception ignored) { /* a lost link stops tester present */ }
             finally { if(active!=null) active.close(); }
         });
-        busy=false; worker.execute(() -> closeRecording("disconnected","Verbindung getrennt")); set("phase","disconnected"); message("Getrennt"); stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock();
+        busy=false; worker.execute(() -> { closeRecording("disconnected","Verbindung getrennt"); gapReset(); }); set("phase","disconnected"); message("Getrennt"); stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock();
         worker.execute(this::destroyCore);
     }
     private void fail(int token,Throwable error) {
@@ -405,7 +416,7 @@ public final class ObdService extends Service {
         AppLog.e("conn",(established?"session lost: ":"attempt failed: ")+text,error);
         String resume=established && !recordingProfile.equals(AUTO_PROFILE) ? ReconnectPolicy.resumeProfile(recordingProfile) : ""; // REQ-020.8: before the recording closes
         Link active=transport; transport=null; if(active!=null) active.close(); destroyCore();
-        set("phase","error"); message(text); closeRecording("error",text);
+        set("phase","error"); message(text); closeRecording("error",text); gapReset(); // the session ended: no gap carries over (a failed job leaves the session ready and keeps it)
         long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
         if(delay < 0) { pendingProfile=""; stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock(); return; }
         if(established && !resume.isEmpty()) pendingProfile=resume; // a loss before the resume started keeps the pending profile
@@ -545,7 +556,7 @@ public final class ObdService extends Service {
         if(uds && (!mode.equals("live") || (action.equals("uds.enable") && !snapshot().optString("recording").isEmpty()))) { message("UDS nur mit echtem Adapter; vor dem Einschalten Aufnahme stoppen"); return; }
         final String diagnosticVin;
         synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); diagnosticVin=vehicle==null?"":vehicle.optString("vin"); }
-        busy=true; udsJob=uds; changed(); int token=generation;
+        busy=true; udsJob=uds; gap.interrupt(); changed(); int token=generation; // REQ-037.1: a job pause restarts the failed-read timer
         final boolean[] succeeded={false};
         worker.execute(() -> { try {
             if(token!=generation) return;
@@ -614,6 +625,7 @@ public final class ObdService extends Service {
         if(wakeLock!=null && SystemClock.elapsedRealtime()-lastWakeRefresh>5*60*1000L && (phase().equals("ready") || phase().equals("connecting") || policy.state()==ReconnectPolicy.State.WAITING)) {
             wakeLock.acquire(10*60*1000L); lastWakeRefresh=SystemClock.elapsedRealtime();
         }
+        if(busy) gap.interrupt(); // reads are not being attempted: a pending window starts over (an open gap stays open)
         if(busy || !phase().equals("ready") || core==0) return;
         Link active=transport; if(mode.equals("live") && active!=null && !active.isOpen()) { fail(generation,new IOException("BLE-Verbindung beendet")); return; }
         int token=generation;
@@ -624,23 +636,27 @@ public final class ObdService extends Service {
             if(uds!=null && uds.optBoolean("active")) execute("uds.tick","");
             // Read the selection only now: a tick that ended the session has already removed the UDS signals from it
             JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
-            if(selected.length()==0) return;
-            long now=SystemClock.elapsedRealtime(); String semantic; long wait;
-            synchronized(due) {
-                java.util.List<String> eligible=new java.util.ArrayList<>();
-                for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i);
-                    boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
-                        for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j);
-                            if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true;
-                        }
+            long now=SystemClock.elapsedRealtime(); String semantic=null; long wait=-1; boolean probe=false, live=mode.equals("live");
+            java.util.List<String> eligible=new java.util.ArrayList<>();
+            for(int i=0;i<selected.length();i++) { String candidate=selected.optString(i);
+                boolean unsupported=false; synchronized(stateLock) { JSONArray catalog=state.optJSONArray("signals");
+                    for(int j=0;j<catalog.length();j++) { JSONObject signal=catalog.optJSONObject(j);
+                        if(candidate.equals(signal.optString("semantic")) && signal.optString("status").equals("unsupported")) unsupported=true;
                     }
-                    if(!unsupported) eligible.add(candidate);
                 }
-                semantic=PollSchedule.next(eligible,due,now); wait=PollSchedule.waitMs(eligible,due,now);
+                if(!unsupported) eligible.add(candidate);
             }
+            if(live) gapApply(gap.select(eligible)); // REQ-037.2: a selection change breaks a pending window; an open gap with nothing left to probe ends without recovery
+            if(selected.length()==0) return;
+            if(live && gap.active()) { semantic=gap.nextProbe(now); wait=gap.probeWait(now); probe=semantic!=null; } // REQ-037.2: during a gap only a previously successful selected signal, at most every 5 s
+            else synchronized(due) { semantic=PollSchedule.next(eligible,due,now); wait=PollSchedule.waitMs(eligible,due,now); }
             if(semantic!=null) {
-                JSONObject result=execute("read",semantic); if(token==generation) updateValue(semantic,result);
-                synchronized(due) { due.put(semantic,SystemClock.elapsedRealtime()+PollSchedule.period(intervals.get(semantic))); wait=0; }
+                if(probe) { gapProbes++; publishGap(); }
+                long started=SystemClock.elapsedRealtime();
+                JSONObject result=execute("read",semantic); long ended=SystemClock.elapsedRealtime();
+                if(token==generation) { updateValue(semantic,result); if(live) gapObserve(semantic,result,started,ended,eligible); }
+                synchronized(due) { due.put(semantic,SystemClock.elapsedRealtime()+PollSchedule.period(intervals.get(semantic))); }
+                wait=live && gap.active() ? gap.probeWait(SystemClock.elapsedRealtime()) : 0; // normal polling resumes right behind the first finite value
             }
             // Next read right behind this one (other queued work runs in between); the 500 ms tick only restarts an idle chain.
             if(wait>=0 && !worker.isShutdown()) { chained=true; worker.schedule(() -> { chained=false; poll(); },Math.min(wait,500),TimeUnit.MILLISECONDS); }
@@ -697,6 +713,7 @@ public final class ObdService extends Service {
             String name=new SimpleDateFormat("yyyyMMdd-HHmmss-SSS",Locale.ROOT).format(new Date())+"-"+mode+(auto?"-auto":"")+".jsonl";
             synchronized(recordLock) {
                 recordingOriginNanos=SystemClock.elapsedRealtimeNanos();
+                fileGap=false; // a new file holds no gap until gapResume or a start says so
                 writer=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory,name)),StandardCharsets.UTF_8));
                 recordingBytes=0; recordingStartedAt=SystemClock.elapsedRealtime();
                 set(auto?"autoRecording":"recording",name);
@@ -706,6 +723,7 @@ public final class ObdService extends Service {
                 record(header);
                 if(writer==null) return false;
                 if(smartOn) smartResume(); // REQ-036.5: every file of a running analysis starts with the set it continues
+                gapResume(); // REQ-037.3: every file of an open gap starts with it
             }
             recordingProfile=profileId;
             AppLog.i("rec","start "+name+" profile "+profileId);
@@ -721,6 +739,7 @@ public final class ObdService extends Service {
     private void closeRecording(String reason,String detail) { closeRecording(reason,detail,true); }
     private void closeRecording(String reason,String detail,boolean resumeAuto) {
         if(smart!=null) smartEnd("Aufzeichnung beendet: "+reason+(detail.isEmpty()?"":" ("+detail+")"),false); // the stop event precedes session_end
+        synchronized(recordLock) { for(int i=0;i<2 && fileGap && writer!=null;i++) recordGap("end","stopped"); } // REQ-037.3: this file ends inside the gap; no recovery is claimed (a rotation inside the write continues it, so once more)
         boolean wasAuto=recordingProfile.equals(AUTO_PROFILE);
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
         boolean completed=false; String closed; synchronized(stateLock) { closed=activeRecording(); }
@@ -871,6 +890,7 @@ public final class ObdService extends Service {
                         }
                         else if(action.equals("catalog")) { applyCatalog(result); continue; } // REQ-028.10: automatic files start before the handshake
                         else if(action.equals("smart.set")) { replaySmart(event); continue; } // REQ-036.5: shown from the file, never sent
+                        else if(action.equals("measurement.gap")) { replayGap(event); continue; } // REQ-037.3: shown from the file, never sent
                         else if(action.equals("component.apply")) { JSONObject applied=result.optJSONObject("data"); if(applied!=null) { put(applied,"replay",true); set("component",applied); } continue; }
                         else if(action.equals("initialize")) { JSONObject support=result.optJSONObject("data"); if(support!=null) { restoreVehicle(support); applySupport(support); } continue; }
                         else if(action.equals("inventory")) { restoreVehicle(result.optJSONObject("data")); if(result.optJSONObject("data")!=null) applySupport(result.optJSONObject("data")); }
@@ -1286,6 +1306,70 @@ public final class ObdService extends Service {
             put(current,"trigger_ages",ages); put(current,"triggers",rows);
         }
         JSONArray selected=data.optJSONArray("selected"); if(selected!=null) selectSignals(selected);
+        changed();
+    }
+    // ---- #314 (REQ-037): gap in live measurement ----------------------------------------------------------------------------
+    private static JSONObject idleGap() {
+        JSONObject idle=new JSONObject(); put(idle,"active",false); put(idle,"replay",false); put(idle,"text",""); put(idle,"probes",0); put(idle,"outcome",""); put(idle,"changes",new JSONArray());
+        return idle;
+    }
+    /** Shown to the user: only what was observed (no value arrived), never why. */
+    private void publishGap() {
+        synchronized(stateLock) {
+            boolean open=gapOpen; JSONObject view=new JSONObject(); put(view,"active",open); put(view,"replay",false); put(view,"text",open ? MeasurementGap.TEXT : "");
+            put(view,"probes",gapProbes); put(view,"outcome",gapOutcome); if(open) put(view,"since",gapSince); put(view,"changes",new JSONArray(gapChanges)); put(state,"gap",view);
+        }
+        changed();
+    }
+    private void gapObserve(String key,JSONObject result,long started,long ended,List<String> eligible) {
+        long pause=0; synchronized(due) { for(String candidate:eligible) pause=Math.max(pause,PollSchedule.period(intervals.get(candidate))); }
+        gapApply(gap.observe(key,MeasurementGap.finite(result),started,ended,MeasurementGap.pauseLimitMs(pause))); // quiet longer than one period (plus a slow read) means reads were not being attempted
+    }
+    /** Worker thread. State change and event are one step under recordLock (reentrant): a rotation inside the write, also one started by a wire callback, continues exactly this state in the new file. */
+    private void gapApply(MeasurementGap.Change change) {
+        synchronized(recordLock) {
+            switch(change) {
+                case START: gapSince=System.currentTimeMillis(); gapProbes=0; gapOutcome=""; gapOpen=true; AppLog.i("gap","start"); gapNote("start","no_values"); break;
+                case RECOVERED: gapOpen=false; gapOutcome="recovered"; AppLog.i("gap","end: recovered"); gapNote("end","recovered"); break;
+                case STOPPED: gapOpen=false; gapOutcome="stopped"; AppLog.i("gap","end: stopped"); gapNote("end","stopped"); break;
+                default: break;
+            }
+        }
+    }
+    private void gapNote(String change,String reason) {
+        JSONObject entry=new JSONObject(); put(entry,"at",System.currentTimeMillis()); put(entry,"change",change); put(entry,"reason",reason);
+        synchronized(stateLock) { gapChanges.add(entry); while(gapChanges.size()>GAP_CHANGES) gapChanges.remove(0); }
+        publishGap(); recordGap(change,reason);
+    }
+    /** The recorded contract: action measurement.gap, empty argument, result.data {change: start|resume|end, reason: no_values|recovered|stopped}; record() adds at and offset_us. */
+    private void recordGap(String change,String reason) {
+        JSONObject envelope=new JSONObject(), result=new JSONObject(), data=new JSONObject(); put(envelope,"type","action"); put(envelope,"action","measurement.gap"); put(envelope,"argument","");
+        put(data,"change",change); put(data,"reason",reason); put(result,"ok",true); put(result,"data",data); put(envelope,"result",result);
+        synchronized(recordLock) { fileGap=!change.equals("end"); record(envelope); } // before the write: a rotation inside it starts the next file (which sets its own state)
+    }
+    /** Writer thread or worker: a new file of a recording continues an open gap. */
+    private void gapResume() { if(gapOpen) recordGap("resume","no_values"); }
+    /** The session ended (disconnect, link failure) or starts fresh: the gap and its history are dropped; the recording already holds the end. */
+    private void gapReset() {
+        synchronized(recordLock) { gap.reset(); gapOpen=false; gapOutcome=""; gapProbes=0; }
+        synchronized(stateLock) { gapChanges.clear(); }
+        publishGap();
+    }
+    /** REQ-037.3: shows a recorded gap change from the file; nothing is sent. Unknown changes are ignored, older files simply have none. */
+    private void replayGap(JSONObject event) {
+        JSONObject result=event.optJSONObject("result"), data=result==null ? null : result.optJSONObject("data"); if(data==null) return;
+        String change=text(data,"change"), reason=text(data,"reason");
+        if(!change.equals("start") && !change.equals("resume") && !change.equals("end")) return;
+        long at=event.optLong("at");
+        synchronized(stateLock) {
+            JSONObject current=state.optJSONObject("gap");
+            if(current==null || !current.optBoolean("replay")) { current=idleGap(); put(current,"replay",true); put(state,"gap",current); }
+            boolean open=!change.equals("end"), wasOpen=current.optBoolean("active");
+            put(current,"active",open); put(current,"text",open ? MeasurementGap.TEXT : ""); put(current,"outcome",open ? "" : reason);
+            if(open) { if(!wasOpen) { put(current,"since",at); put(current,"carried",change.equals("resume")); } } else { current.remove("since"); current.remove("carried"); } // a resume means the gap already existed when this file began; when it began is unknown
+            JSONObject entry=new JSONObject(); put(entry,"at",at); put(entry,"change",change); put(entry,"reason",reason); put(entry,"mono_ms",event.optLong("offset_us")/1000);
+            JSONArray changes=current.optJSONArray("changes"); changes.put(entry); while(changes.length()>GAP_CHANGES) changes.remove(0);
+        }
         changed();
     }
     private final class Demo implements Link {
