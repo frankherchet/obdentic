@@ -258,7 +258,7 @@ public class MainActivity extends Activity {
     }
     private String smartStructureKey(){JSONObject smart=state.optJSONObject("smart");boolean replay=state.optString("mode","live").equals("replay");return smartActive(state)+"|"+replay+"|"+(smart!=null&&smart.optBoolean("replay"))+"|"+(replay||smartActive(state)?"":ObdService.smartBlocker(state));}
     /** Label of a component preset id; "" for none, the id itself when unknown. */
-    static String componentLabel(String id){
+    public static String componentLabel(String id){
         if(id.isEmpty())return "";
         JSONArray all=ComponentPresets.list();for(int i=0;i<all.length();i++){JSONObject preset=all.optJSONObject(i);if(preset!=null&&id.equals(preset.optString("id"))&&!preset.optString("label").isEmpty())return preset.optString("label");}
         return id;
@@ -267,9 +267,9 @@ public class MainActivity extends Activity {
     private static String triggerState(String s){switch(s){case "fresh":return "aktuell";case "stale":return "veraltet";case "missing":return "nicht gelesen";case "unavailable":return "nicht verfügbar";default:return s;}}
     private static String smartSet(String id){return id.isEmpty()?"kein Satz":componentLabel(id);}
     /** Why a named recording of the selection is not offered while smart analysis drives the selection (it records on its own), or null. */
-    static String smartRecordingBlocker(JSONObject state){return smartActive(state)&&!state.optString("mode","live").equals("replay")?"Während der Smart-Analyse nicht verfügbar: Sie zeichnet selbst auf, eine Aufzeichnung der Auswahl würde den vorherigen statt des angezeigten Satzes festhalten.":null;}
+    public static String smartRecordingBlocker(JSONObject state){return smartActive(state)&&!state.optString("mode","live").equals("replay")?"Während der Smart-Analyse nicht verfügbar: Sie zeichnet selbst auf, eine Aufzeichnung der Auswahl würde den vorherigen statt des angezeigten Satzes festhalten.":null;}
     /** The smart card's headline. A replay whose last event is the stop (empty set) still shows the recorded history and the stop reason. */
-    static String smartSummaryText(JSONObject state){
+    public static String smartSummaryText(JSONObject state){
         JSONObject smart=state.optJSONObject("smart");boolean replay=state.optString("mode","live").equals("replay"),active=smartActive(state);
         String component=smart==null?"":smart.optString("component");JSONArray changes=smart==null?null:smart.optJSONArray("changes");
         JSONObject last=changes==null||changes.length()==0?null:changes.optJSONObject(changes.length()-1);
@@ -323,7 +323,7 @@ public class MainActivity extends Activity {
         switch(status){case "missing":return "im Fahrzeug nicht vorhanden";case "unsupported":return "vom Fahrzeug nicht unterstützt";case "no_ecu":return "kein passendes Steuergerät erkannt";case "ambiguous":return "mehrdeutig (mehrere Steuergeräte), nicht geraten";case "rejected":return "Steuergerät lehnt die Abfrage ab";case "not_answered":return "Steuergerät antwortet nicht";case "session_excluded":return "braucht die erweiterte Sitzung, nicht angefordert";case "pending_uds":return "wartet auf die erweiterte UDS-Sitzung";case "uds_unavailable":return "erweiterte Sitzung nicht verfügbar";case "uds_ended":return "erweiterte Sitzung beendet";default:return status;}
     }
     /** Every entry of an applied component preset that is not selected, as "label · reason[ · detail]"; nothing is summarised into a count. */
-    static java.util.List<String> componentUnavailableLines(JSONObject component,JSONArray catalog){
+    public static java.util.List<String> componentUnavailableLines(JSONObject component,JSONArray catalog){
         ArrayList<String> lines=new ArrayList<>();if(component==null)return lines;
         JSONArray entries=component.optJSONArray("entries"),gone=component.optJSONArray("unavailable");JSONObject reasons=component.optJSONObject("reasons");
         LinkedHashMap<String,String[]> rows=new LinkedHashMap<>();
@@ -339,7 +339,7 @@ public class MainActivity extends Activity {
      * Display name of a semantic: the exact raw-DPF label, else the app's short name, else the catalog title when exactly one catalog signal
      * has this semantic and nobody else shares the title, else the full semantic id. Never a truncated title, so labels stay distinct.
      */
-    static String semanticLabel(String semantic,JSONArray catalog){
+    public static String semanticLabel(String semantic,JSONArray catalog){
         if(semantic.equals("dpf.field_regeneration_request_status"))return REGEN_REQUEST_LABEL;
         String mapped=SignalNames.shortName(semantic,"\u0000");if(!mapped.equals("\u0000"))return mapped;
         String title="";int matches=0,sameTitle=0;
@@ -348,7 +348,7 @@ public class MainActivity extends Activity {
         return matches==1&&!title.isEmpty()&&sameTitle==1?title:semantic;
     }
     /** Trigger signals that cannot be read, and the unavailable semantics of the current set (without the triggers already named). */
-    static String smartUnavailableText(JSONObject smart,JSONArray catalog){
+    public static String smartUnavailableText(JSONObject smart,JSONArray catalog){
         JSONArray missing=smart==null?null:smart.optJSONArray("missing"),unavailable=smart==null?null:smart.optJSONArray("unavailable");JSONObject reasons=smart==null?null:smart.optJSONObject("reasons");
         StringBuilder gone=new StringBuilder(),none=new StringBuilder();
         for(int i=0;missing!=null&&i<missing.length();i++){if(gone.length()>0)gone.append(", ");gone.append(semanticLabel(missing.optString(i),catalog));}
@@ -356,7 +356,7 @@ public class MainActivity extends Activity {
         return (gone.length()==0?"":"Nicht lesbare Auslöser: "+gone+"\nDiese Bedingungen gelten als unbekannt, nicht als 0.")+(none.length()==0?"":(gone.length()==0?"":"\n")+"Im aktuellen Satz nicht verfügbar: "+none);
     }
     /** Every trigger with its state and sample age. */
-    static String smartTriggerText(JSONObject smart,JSONArray catalog){
+    public static String smartTriggerText(JSONObject smart,JSONArray catalog){
         JSONArray triggers=smart==null?null:smart.optJSONArray("triggers");StringBuilder t=new StringBuilder();
         for(int i=0;triggers!=null&&i<triggers.length();i++){JSONObject trigger=triggers.optJSONObject(i);if(trigger==null)continue;
             String semantic=trigger.optString("semantic"),detail=trigger.optString("detail");long age=trigger.has("age_ms")&&!trigger.isNull("age_ms")?trigger.optLong("age_ms",-1):-1;
