@@ -844,3 +844,205 @@ requirements:
         text: "While a gap is active the app probes a currently selected signal that previously returned a finite value at most once every 5 seconds, rather than continuing the full polling set; the first finite result ends the gap and restores normal polling. Selection changes, stop, reconnect, failure, jobs, and extended-session keepalive and cleanup remain safe and responsive; no new vehicle operation or background connection is introduced. Missing and stale trigger values remain unknown, never zero or proof that an event did not occur."
       - id: REQ-037.3
         text: "Each recorded gap has a timestamped start and, on recovery or recording stop, an end with only the observed outcome, not an inferred ignition state. An open gap is carried into a rotated file so each part is independently understandable. Offline Android replay and the mobile report show the gap without vehicle traffic, older recordings remain readable, and the raw request and response evidence remains available."
+
+  - id: REQ-038
+    title: Track measurement coverage per vehicle and per Smart run without promising a diagnosis
+    type: functional
+    priority: should
+    status: draft
+    source: "Conversation 2026-11-14: Smart measurement coverage, decisions by @frankherchet"
+    description: |
+      While the user-started Smart analysis
+      runs, the app keeps a local coverage ledger that says, per vehicle signal and
+      per goal context, what was actually measured, for how long, and what could not
+      be measured and why. The ledger counts only future readings. It is a statement
+      about measurement evidence, never about vehicle health or diagnostic
+      completeness. Two ledgers exist: one per Smart run (one Smart start) and one
+      per identified vehicle that accumulates across drives and app restarts.
+
+      Counting rules:
+      - A qualifying dynamic reading is a decoded finite numeric value of a signal,
+        taken in a context whose required context values are all fresh. A reading
+        flagged implausible (REQ-030.8) stays visible with a warning and its raw
+        evidence is kept, but it is not counted as successful or covered; any later
+        clarification of such readings is a separate, versioned definition and never
+        credits earlier readings retroactively.
+      - A static identity observation is a different kind: a typed ECU identity
+        entry of the existing catalog or Knowledge (never an arbitrary value) that
+        yields a nonempty valid decoded text or typed value, which may be a string.
+        It is observed once per vehicle ledger and needs neither 3 samples nor valid
+        measured time. The ledger tracks only the observation and its provenance
+        (key, ECU target, time, run, definition versions, reference to the raw
+        evidence in the recording) and does not duplicate the possibly sensitive
+        value. The exact metadata that classifies an entry as static identity is an
+        implementation detail.
+      - Valid measured time counts only between two consecutive qualifying readings
+        of the same signal in the same context that are at most 10 seconds apart, and
+        only the portions in which both neighboring signal readings and all required
+        context readings are fresh and qualifying. When a context reading becomes
+        stale inside an interval, at most the portion confirmed until its expiry
+        counts and the contiguous segment ends at the expiry. A longer gap ends the
+        segment and adds no time; time is never bridged across Smart runs or a
+        disconnect. Valid segments accumulate across Smart runs and drives in the
+        vehicle ledger.
+      - Every goal and the generic baseline need at least 3 qualifying samples and at
+        least 30 seconds of total valid measured time. Only egr additionally needs
+        at least 30 seconds in one contiguous segment; the other goals use cumulative
+        time.
+      - Progress under an older goal or Knowledge definition stays separate and
+        visible and is never silently credited to a newer version; historical data
+        is not reprocessed, only new results are recorded under the version in force.
+      - Without a confirmed vehicle identity only the run ledger exists. When the
+        identity is confirmed during a run, only later observations are credited to
+        that vehicle; earlier observations of the run stay session-only.
+      - The German user-visible labels are an implementation choice, and no new
+        operation to reset a ledger is required.
+
+    depends_on: [REQ-002, REQ-028, REQ-030, REQ-031, REQ-032, REQ-036, REQ-037]
+    acceptance:
+      - id: REQ-038.1
+        text: "While Smart runs the app maintains two coverage ledgers: a run ledger for the current Smart start and, when the vehicle is identified, a vehicle ledger for that vehicle record that accumulates over all Smart runs and drives. Only readings taken after this requirement is in force and after the start of a Smart run are counted; historical readings, existing recordings and the stored results of earlier availability checks are never imported, re-scored or counted. When the vehicle identity is missing or not confirmed, only the run ledger exists, it is shown as session-only, and nothing is attributed to a vehicle record or to another vehicle. When the identity becomes confirmed during a run, only later observations are credited to that vehicle ledger; earlier observations of the run stay session-only."
+      - id: REQ-038.2
+        text: "Coverage is tracked per signal key (REQ-024.6) and per goal context of REQ-039, so the same signal can be covered in one context and uncovered in another. A qualifying dynamic measurement is a read of the existing closed kinds that yields a decoded finite numeric value that is not flagged implausible, taken while all required context values are fresh. A static identity observation is a typed ECU identity entry of the existing catalog or Knowledge that yields a nonempty valid decoded text or typed value (not necessarily numeric, never an arbitrary value); for it the ledger keeps only the observation and its provenance (key, ECU target, time, run, definition versions, reference to the raw evidence) and does not duplicate the value. Every outcome is kept with the key, context, run, vehicle ledger and session state, and never merged with a different context. A reading flagged implausible (REQ-030.8) is shown with a warning, keeps its raw request and response evidence, and does not count as a successful, qualifying or covered measurement and adds no valid measured time; a later clarification can only be a separate, versioned definition and never credits earlier readings."
+      - id: REQ-038.3
+        text: "For a signal or context without a defined goal (undefined context) the app reports a generic technical baseline: it is reached when at least 3 qualifying dynamic measurements exist and the total valid measured time (REQ-038.4) is at least 30 seconds, cumulatively over runs and drives; continuity is not required. Time in a measurement gap (REQ-037), time without a qualifying reading, and time during which the signal was unsupported, rejected, unanswered, implausible or session-inaccessible never count. A static identity entry (REQ-038.2) is covered by one observation once per vehicle ledger and needs neither 3 samples nor valid measured time. The baseline is labeled as a technical baseline and is never worded or displayed as diagnostic completeness, health, or a finished diagnosis, also not when every signal reached it."
+      - id: REQ-038.4
+        text: "Per signal and context the ledger keeps both the total valid measured time, accumulated over drives and Smart runs of the vehicle ledger, and the longest contiguous valid segment. Valid measured time counts only between two consecutive qualifying readings of the same signal in the same context that are at most 10 seconds apart and only for the portions in which both neighboring signal readings and all required context readings are fresh and qualifying; when a context reading becomes stale inside an interval at most the portion confirmed until its expiry counts and the contiguous segment ends at the expiry. A longer gap, an unsupported, rejected, unanswered, empty, implausible or stale reading in between, a session restriction, the end of the Smart run, a disconnect or a reconnect ends the contiguous segment and adds no time, time is never bridged across Smart runs or a disconnect, and a single qualifying reading adds none. Every goal needs at least 3 qualifying samples and at least 30 seconds of total valid time; only the egr goal (REQ-039) additionally needs at least 30 seconds in one contiguous segment and is evaluated on the longest segment, while the other goals use the cumulative time and need no continuity."
+      - id: REQ-038.5
+        text: "The ledger and display distinguish historical coverage from the latest availability per signal and context. They report not yet observed, observed successfully, unsupported, rejected (with response code), empty, error or no answer (with reason), measurement gap, and session-restricted (with reason) separately. An unavailable or failed reading adds no successful samples or measured time and is never treated as zero; it does not erase earlier valid coverage, which remains visibly distinct from the latest failure."
+      - id: REQ-038.6
+        text: "The vehicle ledger is stored locally in app-private storage with the vehicle record, survives an app restart and later drives, and is not automatically exported, shared, uploaded, or offered to MCP or AI. An explicitly exported recording may contain the run evidence described in REQ-038.9 under the existing privacy rules. Introducing, migrating or resetting the ledger never deletes or rewrites existing recordings, vehicle records, availability results or other private data; only an explicit user action removes anything (REQ-028.6). Coverage values and vehicle-specific evidence never appear in GitHub issues, docs or the operational app log (REQ-029); the log names only goals, contexts and reasons."
+      - id: REQ-038.7
+        text: "Every ledger entry records the version of the goal definition (REQ-039) and the Knowledge revision it was measured under. When either changes, progress recorded under the old definition stays separate, visible and labeled with its definition, is never silently credited to or compared with progress under the new version, and is not reprocessed from historical data; only new results are recorded under the version in force when they are taken."
+      - id: REQ-038.8
+        text: "When the ledger cannot be read, written or migrated, the user sees a message with the reason, coverage is shown as unavailable (not as zero or empty), live measurement and the running recording are not stopped by it, and existing data is left untouched. A ledger that was read incompletely is never overwritten by an empty one."
+      - id: REQ-038.9
+        text: "The facts needed to rebuild the run ledger - signal key, context, outcome with code or reason, raw evidence reference (for static identity entries only the observation and its provenance, not a duplicated value), wallclock time, monotonic offset, session state, goal and Knowledge definition versions, run identifier and gap and segment boundaries - are written into the running analysis recording (REQ-028, REQ-036.5, REQ-037.3) and continue across file rotation. Replay and the desktop mobile report re-derive the run ledger from the recording without adapter traffic and never change a persisted vehicle ledger; replay stops on a Knowledge-pin mismatch instead of silently using different definitions. Older recordings without these facts stay readable and show no coverage."
+      - id: REQ-038.10
+        text: "The Live tab or an equivalent screen shows per goal context the covered, partial and not covered counts, the measured time and the longest contiguous segment, the separate states of REQ-038.5 and the label of REQ-038.3, readable without input while driving; numeric trigger values stay in the private recording and in memory."
+
+  - id: REQ-039
+    title: Plan Smart measurements automatically by diagnostic context over the whole safely readable catalog
+    type: functional
+    priority: should
+    status: draft
+    source: "Conversation 2026-11-14: Smart measurement coverage, decisions by @frankherchet"
+    description: |
+      After one user start, Smart plans which
+      signals to read next so that, over one or several drives, the entire safely
+      readable signal catalog of the connected vehicle is measured, each signal in
+      the contexts where its reading is meaningful, with repeated measurements per
+      context.
+
+      User-approved contextual goal groups:
+      - cooling: warm-up and warm driving
+      - dpf: warm driving and raw regeneration request
+      - turbo: elevated load
+      - rail: warm idle
+      - egr: steady partial-load driving
+      - every safely readable signal: baseline (generic context of REQ-038.3)
+
+      Agreed provisional technical thresholds (user decision 2026-11-14). They are
+      OBDentic-owned technical defaults for choosing when to measure, not validated
+      clinical or vehicle health conclusions, and the app never claims a fault or a
+      healthy vehicle from reaching or missing them:
+      - warm: engine coolant temperature at least 80 degC; warm-up below 80 degC is
+        recorded as a separate context, and "warm not yet reached" is shown while
+        the threshold is not reached.
+      - driving: vehicle speed above 0 (cooling and dpf warm driving = warm and
+        driving).
+      - turbo (elevated load): accelerator pedal position E (vehicle.accelerator_pedal_e)
+        above 80 %.
+      - rail (warm idle): warm, speed 0 and engine rpm 500 to 1100 inclusive.
+      - egr (steady partial-load driving): speed 50 to 80 km/h and engine load 15 to
+        60 %, which must persist continuously for at least 30 seconds.
+      - dpf raw regeneration request: a fresh reading of the raw
+        dpf.field_regeneration_request_status other than 0.
+      - target amount: each target and the generic baseline initially need at least 3
+        qualifying samples and at least 30 seconds of total valid measured time,
+        counted only between consecutive qualifying readings of the same signal and
+        context at most 10 seconds apart while all required context values are fresh
+        (REQ-038.4); EGR additionally needs at least 30 seconds in one contiguous
+        segment. The other contexts use cumulative valid time across runs and drives
+        and do not require continuity.
+
+    depends_on: [REQ-025, REQ-030, REQ-031, REQ-035, REQ-036, REQ-038]
+    acceptance:
+      - id: REQ-039.1
+        text: "Smart is started once by the user in a ready live session and then plans, switches and records automatically without any further prompt, dialog or input while driving. It ends on user stop, disconnect, loss of the recording, error or the start of conflicting work."
+      - id: REQ-039.2
+        text: "The goal contexts cover cooling (warm-up, warm driving), dpf (warm driving, raw regeneration request), turbo (elevated load), rail (warm idle), egr (steady partial-load driving) and a generic baseline for every safely readable signal. Context-specific goals require repeated measurements inside their own condition; measurements outside that condition count only toward the generic baseline of REQ-038.3. The provisional technical conditions are: warm = coolant temperature at least 80 degC (below it is separate warm-up); driving = speed above 0; cooling and dpf warm driving = warm and driving; turbo = accelerator_pedal_e above 80 %; rail = warm, speed 0 and rpm 500 to 1100 inclusive; egr = speed 50 to 80 km/h and engine load 15 to 60 % inclusive, persisting continuously for at least 30 seconds; dpf raw request = a fresh raw dpf.field_regeneration_request_status other than 0. Every goal needs at least 3 qualifying samples and at least 30 seconds of total valid measured time as counted in REQ-038.4; only egr additionally needs 30 seconds in one contiguous segment, the other goals use cumulative time across runs and drives. Once a qualifying EGR interval reaches 30 continuous seconds, its qualifying measurements throughout those 30 seconds count toward the goal; another 30-second interval is not required. Readings flagged implausible are shown with a warning, keep their raw evidence and do not count until clarified. These are technical defaults, not validated health conclusions, and no result is reported as a fault, as healthy or as a diagnosis."
+      - id: REQ-039.3
+        text: "The planner covers the entire safely readable catalog of the connected vehicle, not only the signals of the five component presets: the standard PIDs the vehicle reports as supported, the default-session signals of the effective Knowledge (REQ-035.2) and, only under REQ-040, the session-flagged DIDs of every eligible ECU, meaning an identified ECU with a validated target and explicit typed Knowledge entries for those DIDs. It uses only closed, validated read and session operations; it adds no write, raw command, caller-provided service byte, arbitrary address or DID, elevated capability or automatic DTC clearing (Mode 04 or any other clearing service), and no caller, profile, vehicle preset, MCP call or AI prompt can add a target."
+      - id: REQ-039.4
+        text: "The raw dpf.field_regeneration_request_status reading remains in the continuously monitored trigger set whenever readable. When a fresh reading is nonzero, its goal context has the highest planning priority until the existing REQ-036 DPF window ends; every lower-priority goal it interrupts keeps its progress in the ledger and is resumed when the DPF priority ends. The reading is shown and recorded as a raw request status and is never described as confirmed regeneration."
+      - id: REQ-039.5
+        text: "Within the limit of 32 selected signals per step (REQ-036.1) the planner distributes the catalog over successive steps so every plannable signal is attempted in its context, resumes unfinished work across steps, drives and restarts using the vehicle ledger, and never lets one unavailable signal block other signals or goals."
+      - id: REQ-039.6
+        text: "Every context condition is evaluated as holds, does not hold, or unknown. A condition whose input reading is unsupported, unavailable, rejected, empty, unanswered, in a gap or older than the maximum age (10 seconds as in REQ-036.2, provisional) is unknown; unknown is never treated as zero, as holding, as not holding, as a crossing or as a release, never starts or extends a measurement toward a context goal, and ends or pauses a continuity segment that needs it. The reason is visible and recorded."
+      - id: REQ-039.7
+        text: "A signal that is unsupported, rejected, empty, unanswered or session-restricted is reported with its reason in the plan and the ledger (REQ-038.5), is skipped by the planner without a tight retry loop, and the unsuccessful attempt is never counted as a measurement, as 0 or as success. Previously recorded valid coverage is retained. A goal whose required signals are all unavailable is reported as not reachable with the reason, and the other goals continue."
+      - id: REQ-039.8
+        text: "Plan changes (goal start, interruption, resumption, completion, skip with reason, expiry, stop) are shown with their reason and remaining time and are written into the analysis recording with wallclock time, monotonic offset, goal, reason, the condition readings behind it and the definition versions; replay shows the same without adapter traffic. Condition values stay in the private recording and in memory; the operational app log (REQ-029) names only goals and reasons."
+      - id: REQ-039.9
+        text: "Diagnostic goals and planning thresholds are owned by OBDentic. Knowledge, profiles, stored vehicle presets, MCP calls and AI prompts cannot alter planning policies or elevate vehicle capabilities."
+      - id: REQ-039.10
+        text: "The goal, condition and threshold definitions are versioned (REQ-038.7). Changing them or the Knowledge definitions of a vehicle starts a new definition version, never rewrites stored progress and never silently mixes progress between versions."
+      - id: REQ-039.11
+        text: "Warm-up and driving below the warm threshold of 80 degC are recorded separately from measurements at or above it, in the ledger, recording and display of every warm-dependent goal; until the threshold is reached the goal shows warm not yet reached (cold or warming), not unmet, failed, fault or complete. The 80 degC threshold is a provisional technical default: reaching or missing it, or measuring in either range, is never reported as a fault, as healthy, or as a diagnosis. An unknown coolant reading makes the warm condition unknown (REQ-039.6), not warm and not below."
+
+  - id: REQ-040
+    title: Automatically use extended UDS sessions on several validated ECU targets during Smart, only as long as needed
+    type: functional
+    priority: should
+    status: draft
+    source: "Conversation 2026-11-14: Smart measurement coverage, decisions by @frankherchet"
+    description: |
+      The user starts Smart once and Smart may then automatically
+      hold and use several extended UDS sessions at the same time, one per distinct
+      eligible ECU, without a new prompt. An ECU is eligible when it is identified,
+      has a validated target and has explicit typed Knowledge entries for its
+      session-flagged DIDs. Smart interleaves the Mode 01 reads and the reads of the
+      other ECUs while keeping request, address and response association correct
+      and keeping the session and keepalive state per ECU. The project-imposed
+      absolute 10 minute limit and the limit of one activation or attempt per Smart
+      start are removed: a session is held only as long as unfinished eligible goals
+      need it and is closed when no longer needed, with bounded backoff and retry per
+      ECU. When the return or session state of one target is uncertain, that ECU is
+      isolated and the others continue only if the shared transport, address and
+      response association are known to be safe; otherwise all operations stop and
+      the app reconnects safely. The app never asserts an ECU's real session state
+      and never infers a real ECU timeout.
+
+      A positive response to 10 03 does not prove that the session continues after
+      suppressed-response tester present; S3
+      timing and gateway behaviour are ECU-specific, and serial requests can block
+      beyond deadlines. The app therefore tracks per target the observed state (what
+      a response showed) separately from the app-assumed state, schedules due
+      maintenance between requests per target, promises no hard timely keepalive,
+      and does not treat a session as confirmed when timing or keepalive is
+      uncertain. A tester present maintains only its addressed ECU; traffic to
+      another target is never relied on to keep a session alive.
+
+    depends_on: [REQ-027, REQ-030, REQ-035, REQ-036, REQ-037, REQ-038, REQ-039]
+    acceptance:
+      - id: REQ-040.1
+        text: "Proposed: Only inside a Smart run started by the user, without a new prompt, dialog or input, Smart activates an extended session for each distinct eligible ECU that has at least one unfinished coverage target readable solely as a session-flagged DID: the ECU is identified, its target is validated, and its session-flagged DIDs are explicit typed Knowledge entries. Several ECUs may hold sessions at the same time. No limit of one activation or attempt per Smart start applies. It never happens at app start, connection, reconnect, demo, replay, in the planner outside a Smart run, or on behalf of any profile, layout, stored vehicle preset, MCP call or AI prompt, and never for an arbitrary address."
+      - id: REQ-040.2
+        text: "Proposed: Each activation is the closed operation 10 03 to that ECU's validated target; its positive response shows only that the ECU accepted the request at that time. Tester present 3E 80 is addressed to, and maintains only, its own target and is never replaced by traffic to another target. The app schedules due maintenance between requests per target, no more often than every 2 seconds per target (REQ-027.2), and promises no hard timely keepalive because serial requests can block beyond deadlines and S3 timing and gateway behaviour are ECU-specific. Per target it tracks the observed state and the app-assumed state separately; when maintenance is overdue, could not be sent or its timing is uncertain, the session is not treated as confirmed. A persistent indicator names the ECUs whose session the app assumes active. No timer of the app ends a session (the 10 minute limit is removed), and a real ECU timeout is never inferred or asserted."
+      - id: REQ-040.3
+        text: "Proposed: The app sends to the vehicle only 10 03, 10 01, 3E 80, 0x22 reads of Knowledge-listed DIDs of the ECU that owns them, and 01 xx reads of standard PIDs through the validated engine target, each only to a validated target. No generic write, raw or caller-provided command, service, address or DID, no arbitrary address, no SecurityAccess, RoutineControl, InputOutputControl, WriteDataByIdentifier, ECUReset, communication or DTC control, no elevated capability and no automatic DTC clearing. A session on a non-engine ECU requires explicit typed Knowledge entries and a validated target."
+      - id: REQ-040.4
+        text: "Proposed: Mode 01 reads and the reads of the several ECUs may be interleaved. Every request is bound to its ECU's validated target; every change of the adapter's addressing (header switching) is tracked, and a response is attributed to a signal only when the current addressing state, the response's source address and its request association establish it. A response or a header switch whose association or outcome cannot be established is attributed to no signal and no ECU, counts toward no coverage, and makes the shared address state uncertain under REQ-040.6. Session and keepalive state is kept per ECU and a read of one ECU never changes or assumes the state of another."
+      - id: REQ-040.5
+        text: "A session is held only while unfinished eligible goals of that ECU need it. When they are finished or no longer reachable, or Smart ends, the app sends 10 01 to that ECU when possible and removes its session-only signals; OBD2 and default-session reads continue when safe. Unmet preconditions or a definitive negative response to 10 03 prevent activation and mark session-only targets session-restricted with the reason or response code. An unanswered or ambiguous activation never establishes either the default or an extended session: the app attempts bounded cleanup and treats an unconfirmed return under REQ-040.6. Transient failures use bounded retry and backoff per ECU. An ordinary negative response, unsupported signal, invalid payload or NO DATA is not by itself proof that a session ended or that another ECU is affected: the affected signal or target retains its outcome."
+      - id: REQ-040.6
+        text: "A suppressed-response tester-present is not a confirmed ECU response; the absence of such a response alone is normal and does not isolate the ECU. The app distinguishes an observed session transition from its continuing assumption. If a return to default is unanswered or malformed, a maintenance request cannot be sent or becomes overdue so the session may have expired, or another error makes that target's session status uncertain, the app isolates that ECU: no further reads are sent to it except bounded recovery or close attempts, it is shown as state unconfirmed, and neither default nor extended state is asserted as observed. Reads of other validated targets continue only when the shared adapter, transport, address and response association are known safe. If that shared state is uncertain, the app stops all vehicle operations, ends Smart, shows the reason and reconnects safely."
+      - id: REQ-040.7
+        text: "Proposed: Smart ends on user stop or disconnect; with it the app sends 10 01 to every target it assumes in a session when possible, tester present stops on a lost link and no vehicle traffic is sent afterwards. Other functional operations, jobs, named recordings and test sequences remain refused while Smart runs (REQ-036.1)."
+      - id: REQ-040.8
+        text: "Proposed: The recording marks per ECU that a session was requested by Smart, the observed and the app-assumed session state and the target of every read, each activation, retry with its backoff, maintenance, close, isolation and stop with its reason, and the ledger states of REQ-038.5; replay re-decodes them offline without adapter traffic. The indicator and recorded state are the app's view, not ECU-confirmed (REQ-027.6)."
+      - id: REQ-040.9
+        text: "Proposed: The activation is not described to the user as diagnostic completion, repair or confirmed regeneration. Session-only measurements count toward coverage only as qualifying decoded reads from the ECU that owns them (REQ-038.2), recorded with the observed and the assumed session state; the DPF raw request status remains a raw request value."
+      - id: REQ-040.10
+        text: "While Smart uses extended sessions, the user can see each target's app-assumed session state, observed state and any uncertainty, refusal or isolation without interacting while driving. These indicators never claim an ECU state that has not been observed."
