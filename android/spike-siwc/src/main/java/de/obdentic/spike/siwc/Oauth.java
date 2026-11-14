@@ -468,12 +468,19 @@ final class Oauth {
             f.put("code_verifier", a.verifier);
             f.put("redirect_uri", a.redirectUri);
             f.put("resource", RESOURCE);
-            Http h = postForm(TOKEN, f);
-            if (!h.ok()) {
-                Report.line("S4", "FAIL", h.summary());
+            JSONObject t;
+            Http h;
+            try {
+                h = postForm(TOKEN, f);
+                if (!h.ok()) {
+                    Report.line("S4", "FAIL", h.summary());
+                    return null;
+                }
+                t = new JSONObject(h.body);
+            } catch (IOException | JSONException e) {
+                Report.line("S4", "FAIL", "exception=" + safe(e.getClass().getSimpleName()));
                 return null;
             }
-            JSONObject t = new JSONObject(h.body);
             boolean planScope = Arrays.asList(t.optString("scope", "").split(" ")).contains(PLAN_SCOPE);
             String detail = "http=" + h.status + " refresh_token=" + hasStr(t, "refresh_token")
                     + " id_token=" + hasStr(t, "id_token") + " earliest_refresh_at=" + t.has("earliest_refresh_at")
@@ -482,13 +489,16 @@ final class Oauth {
                 Report.line("S4", "FAIL", "plan_scope_missing " + detail);
                 return null;
             }
+            if (!hasStr(t, "access_token") || !hasStr(t, "refresh_token") || !hasStr(t, "id_token")) {
+                Report.line("S4", "FAIL", "token_missing access_token=" + hasStr(t, "access_token") + " " + detail);
+                return null;
+            }
             Report.line("S4", "PASS", detail);
 
-            // S5: ID-token validation
-            String idToken = t.optString("id_token", "");
+            // S5: ID-token validation; nothing is stored or used when it fails, for first and returning sign-in
+            String idToken = t.getString("id_token");
             String requiredSub = returning ? stored.optString("subject", "") : null;
-            boolean valid = validateIdToken(idToken, clientId, a.nonce, requiredSub);
-            if (returning && !valid) return null;
+            if (!validateIdToken(idToken, clientId, a.nonce, requiredSub)) return null;
 
             JSONObject claims = unverifiedClaims(idToken);
             JSONObject rec = new JSONObject();
@@ -654,7 +664,8 @@ final class Oauth {
         n.put("refresh_token", resp.optString("refresh_token", rec.optString("refresh_token", "")));
         n.put("scopes", resp.optString("scope", rec.optString("scopes", "")));
         n.put("expires_in", resp.optLong("expires_in", 0));
-        if (!resp.optString("id_token", "").isEmpty()) n.put("id_token", resp.getString("id_token"));
+        // An ID token in a refresh response is not stored: it is not validated here (no nonce), and only the
+        // validated sign-in ID token is kept as id_token_hint.
         n.put("saved_at", System.currentTimeMillis());
         return n;
     }

@@ -85,6 +85,9 @@ public final class SpikeActivity extends Activity {
 
     private void run(String action) {
         final Context ctx = this;
+        final Context app = getApplicationContext();
+        final boolean network = !action.equals("status");
+        if (network) KeepAliveService.acquire(app); // activity is in front here; the service survives the browser
         EXEC.execute(() -> {
             try {
                 switch (action) {
@@ -108,6 +111,8 @@ public final class SpikeActivity extends Activity {
                 }
             } catch (Throwable t) {
                 Report.line("action", "ERR", action + " " + t.getClass().getSimpleName());
+            } finally {
+                if (network) KeepAliveService.release(app);
             }
         });
     }
