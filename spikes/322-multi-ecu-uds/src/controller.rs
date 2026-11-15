@@ -167,13 +167,18 @@ pub enum Ev {
 pub enum ActEffect {
     /// Refused for this Smart run, no retry.
     Definitive,
-    /// Back off and retry.
+    /// Final negative answer that says "not now": back off and retry.
     Transient,
+    /// Not a final answer (busyRepeatRequest 0x21, like responsePending 0x78): the ECU may
+    /// still have entered the session. Assumed unconfirmed, bounded `10 01` cleanup; back off
+    /// only after a positive default return, otherwise isolate the target.
+    Unconfirmed,
 }
 
 pub fn activation_effect(nrc: u8) -> ActEffect {
     match nrc {
-        0x21 | 0x22 | 0x37 | 0x92 | 0x93 => ActEffect::Transient,
+        0x21 => ActEffect::Unconfirmed,
+        0x22 | 0x37 | 0x92 | 0x93 => ActEffect::Transient,
         _ => ActEffect::Definitive,
     }
 }
@@ -680,6 +685,16 @@ impl Controller {
         false
     }
 
+    /// The ECU may or may not have switched: never conclude default or extended. Bounded
+    /// return to default; the backoff starts only after a positive `50 01`, otherwise `close`
+    /// has isolated the target.
+    fn unconfirmed_activation(&mut self, ti: usize) {
+        self.sessions[ti].assumed = Assumed::Unconfirmed;
+        if self.close(ti) {
+            self.backoff(ti);
+        }
+    }
+
     fn try_activate(&mut self, ti: usize) {
         match self.request(ti, Op::Enter) {
             Err(()) => {}
@@ -696,25 +711,23 @@ impl Controller {
                 s.unanswered_reads = 0;
                 self.events.push(Ev::Activated(ti));
             }
-            Ok(Reply::Nrc(n)) => {
-                let now = self.now();
-                self.sessions[ti].observed = Observed::Refused(n, now);
-                self.sessions[ti].assumed = Assumed::Default;
-                match activation_effect(n) {
-                    ActEffect::Definitive => {
+            Ok(Reply::Nrc(n)) => match activation_effect(n) {
+                // Not a final answer: nothing is observed, nothing is assumed.
+                ActEffect::Unconfirmed => self.unconfirmed_activation(ti),
+                effect => {
+                    // A final negative answer: the ECU stayed in the default session.
+                    let now = self.now();
+                    self.sessions[ti].observed = Observed::Refused(n, now);
+                    self.sessions[ti].assumed = Assumed::Default;
+                    if effect == ActEffect::Definitive {
                         self.sessions[ti].status = Status::Refused(n);
                         self.events.push(Ev::Refused(ti, n));
+                    } else {
+                        self.backoff(ti);
                     }
-                    ActEffect::Transient => self.backoff(ti),
                 }
-            }
-            Ok(Reply::Silent) => {
-                // The ECU may or may not have switched: never conclude default or extended.
-                self.sessions[ti].assumed = Assumed::Unconfirmed;
-                if self.close(ti) {
-                    self.backoff(ti);
-                }
-            }
+            },
+            Ok(Reply::Silent) => self.unconfirmed_activation(ti),
         }
     }
 

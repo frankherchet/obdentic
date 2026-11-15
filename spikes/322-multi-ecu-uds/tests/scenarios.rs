@@ -369,9 +369,11 @@ fn nrc_table() {
     for nrc in [0x11, 0x12, 0x13, 0x7E, 0x7F, 0x33, 0x10, 0x99] {
         assert_eq!(activation_effect(nrc), Definitive, "{nrc:02X}");
     }
-    for nrc in [0x21, 0x22, 0x37, 0x92, 0x93] {
+    for nrc in [0x22, 0x37, 0x92, 0x93] {
         assert_eq!(activation_effect(nrc), Transient, "{nrc:02X}");
     }
+    // busyRepeatRequest is not a final refusal: the ECU may have entered the session
+    assert_eq!(activation_effect(0x21), Unconfirmed);
     assert_eq!(read_effect(0x31, true), Unsupported);
     assert_eq!(read_effect(0x33, true), Restricted);
     for nrc in [0x21, 0x22, 0x78, 0x92, 0x93] {
@@ -501,6 +503,101 @@ fn transient_refusal_backs_off_2_4_s_then_cools_down_60_s_and_never_gives_up() {
         t[1] - t[0] < 3000 && t[2] - t[1] < 5000,
         "backoff is bounded: {t:?}"
     );
+    assert_eq!(
+        sent(&c, "1001").len(),
+        0,
+        "a final negative answer needs no return to default"
+    );
+}
+
+/// Commands that reached one target, in order (session and read vocabulary only).
+fn commands_to(c: &Controller, req: &str) -> Vec<String> {
+    let mut sh = String::new();
+    let mut v = Vec::new();
+    for (_, cmd) in &c.sim.log {
+        if let Some(h) = cmd.strip_prefix("ATSH ") {
+            sh = h.to_string();
+        } else if sh == req
+            && (cmd == "1003" || cmd == "1001" || cmd == "3E80" || cmd.starts_with("22"))
+        {
+            v.push(cmd.clone());
+        }
+    }
+    v
+}
+
+#[test]
+fn busy_repeat_request_on_activation_is_unconfirmed_cleaned_up_and_only_then_backed_off() {
+    // NRC 21 is not a final refusal (ADR 0003 fail-closed rule, `has_expected_negative_session_
+    // response`): the ECU may still have entered the session. Return to default first (bounded
+    // `10 01`); back off only after a positive default return.
+    let mut c = fleet(&[A, B]);
+    c.sim
+        .rules
+        .push(Rule::always("7E2", "1003", Action::Nrc(0x21)));
+    c.wants = vec![
+        want(IB, Item::Did(0xB001), 1, true, 400, 100),
+        want(IA, Item::Did(0xA002), 1, true, 400, 100_000),
+    ];
+    c.run_until(9_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+    let to_b = commands_to(&c, "7E2");
+    assert_eq!(
+        to_b,
+        vec!["1003", "1001", "1003", "1001", "1003", "1001"],
+        "each NRC 21 is followed by the cleanup; no read of a session DID is sent"
+    );
+    // backoff only after the positive return: 2 s, then 4 s, measured from the activation
+    let t: Vec<Ms> = sent(&c, "1003")
+        .into_iter()
+        .filter(|(_, h)| h == "7E2")
+        .map(|(t, _)| t)
+        .collect();
+    assert!(
+        t[1] - t[0] >= 2000 && t[1] - t[0] < 3000,
+        "first backoff 2 s: {t:?}"
+    );
+    assert!(
+        t[2] - t[1] >= 4000 && t[2] - t[1] < 5000,
+        "second backoff 4 s: {t:?}"
+    );
+    // never recorded as a refusal, never a session; the closed return is observed
+    assert_eq!(c.count_events(|e| matches!(e, Ev::Refused(_, _))), 0);
+    assert!(matches!(c.sessions[IB].observed, Observed::Default(_)));
+    assert_eq!(c.sessions[IB].assumed, Assumed::Default);
+    assert!(matches!(c.sessions[IB].status, Status::CoolDown { .. }));
+    assert!(count_samples(&c, IA, Item::Did(0xA002)) > 15);
+    // the episode keeps its bound: three attempts, then the 60 s cool-down, then a new episode
+    c.run_until(100_000);
+    assert!(c.stopped.is_none());
+    let to_b = commands_to(&c, "7E2");
+    let count = |wire: &str| to_b.iter().filter(|x| *x == wire).count();
+    assert_eq!(count("1003"), 6, "two episodes of three attempts");
+    assert_eq!(count("1001"), 6, "one cleanup per attempt");
+}
+
+#[test]
+fn busy_repeat_request_on_activation_without_a_positive_return_isolates_only_that_target() {
+    let mut c = fleet(&[A, B]);
+    c.sim
+        .rules
+        .push(Rule::always("7E2", "1003", Action::Nrc(0x21)));
+    c.sim.rules.push(Rule::always("7E2", "1001", Action::Lost));
+    c.wants = vec![
+        want(IB, Item::Did(0xB001), 1, true, 400, 100),
+        want(IA, Item::Did(0xA002), 1, true, 400, 100_000),
+    ];
+    c.run_until(60_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+    assert!(matches!(c.sessions[IB].status, Status::Isolated(_)));
+    assert_eq!(c.sessions[IB].assumed, Assumed::Unconfirmed);
+    assert_eq!(
+        commands_to(&c, "7E2"),
+        vec!["1003", "1001", "1001"],
+        "at most two 10 01, no retry of 10 03, no reads"
+    );
+    assert_eq!(c.count_events(|e| matches!(e, Ev::Refused(_, _))), 0);
+    assert!(count_samples(&c, IA, Item::Did(0xA002)) > 100);
 }
 
 #[test]
@@ -678,6 +775,141 @@ fn finished_goals_close_only_their_ecu_and_end_of_run_closes_the_rest() {
     assert_eq!(
         sent(&c, "1003").iter().filter(|(_, h)| h == "7E0").count(),
         2
+    );
+}
+
+// ---- tester present only for due targets, earliest deadline first ---------------------
+
+struct Audit {
+    /// (send time, time since the target's previous maintenance send)
+    gaps: Vec<(Ms, Ms)>,
+    /// another maintained target had an earlier deadline than the one served
+    order_violations: usize,
+    /// `3E 80` sent while another target was due as well (the order mattered)
+    contended: usize,
+}
+
+/// Replays the adapter log: for every `3E 80`, the time since the target's previous
+/// maintenance send (`10 03` or `3E 80`), and whether another maintained target had an
+/// earlier deadline at that moment.
+fn tester_present_audit(c: &Controller, horizon: Ms) -> Audit {
+    let mut sh = String::new();
+    let mut last: BTreeMap<String, Ms> = BTreeMap::new();
+    let mut gaps = Vec::new();
+    let mut order_violations = 0;
+    let mut contended = 0;
+    for (t, cmd) in &c.sim.log {
+        if let Some(h) = cmd.strip_prefix("ATSH ") {
+            sh = h.to_string();
+        } else if cmd == "1003" {
+            last.insert(sh.clone(), *t);
+        } else if cmd == "1001" {
+            last.remove(&sh);
+        } else if cmd == "3E80" {
+            let prev = last.get(&sh).copied().expect("3E 80 without an activation");
+            gaps.push((*t, *t - prev));
+            // only targets still inside the assumption horizon are maintained at all
+            let earlier = last
+                .iter()
+                .filter(|(h, p)| **h != sh && **p < prev && *t - **p <= horizon)
+                .count();
+            order_violations += earlier;
+            contended += last
+                .iter()
+                .filter(|(h, p)| **h != sh && *t >= **p + 2000 && *t - **p <= horizon)
+                .count();
+            last.insert(sh.clone(), *t);
+        }
+    }
+    Audit {
+        gaps,
+        order_violations,
+        contended,
+    }
+}
+
+#[test]
+fn tester_present_is_sent_only_when_a_target_is_due_never_continuously() {
+    let mut c = fleet(&[A, B, C]);
+    c.wants = vec![
+        want(IA, Item::Did(0xA001), 0, false, 100, 100_000),
+        want(IA, Item::Pid(0x0C), 2, false, 100, 100_000),
+        want(IA, Item::Did(0xA002), 1, true, 100, 100_000),
+        want(IB, Item::Did(0xB001), 1, true, 100, 100_000),
+        want(IC, Item::Did(0xC001), 1, true, 100, 100_000),
+    ];
+    c.run_until(60_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+    let gaps = tester_present_audit(&c, 4000).gaps;
+    assert!(gaps.len() >= 60, "{} keepalives", gaps.len());
+    // REQ-027.2: no more often than every 2 s per target, however busy the reads are
+    assert!(
+        gaps.iter().all(|(_, g)| *g >= 2000),
+        "early tester present: {:?}",
+        gaps.iter().filter(|(_, g)| *g < 2000).collect::<Vec<_>>()
+    );
+    // and not more than one per period and target overall (3 targets, 60 s)
+    assert!(
+        sent(&c, "3E80").len() <= 3 * 30,
+        "{}",
+        sent(&c, "3E80").len()
+    );
+}
+
+#[test]
+fn tester_present_goes_to_the_earliest_deadline_first_when_several_are_due() {
+    let mut c = fleet(&[A, B, C]);
+    // a blocked Mode 01 read makes several targets due at once
+    c.sim
+        .rules
+        .push(Rule::nth("7E0", "010C", 20, Action::Block(2500)));
+    c.sim
+        .rules
+        .push(Rule::nth("7E0", "010C", 40, Action::Block(2500)));
+    c.wants = vec![
+        want(IA, Item::Pid(0x0C), 0, false, 100, 100_000),
+        want(IA, Item::Did(0xA002), 1, true, 100, 100_000),
+        want(IB, Item::Did(0xB001), 1, true, 100, 100_000),
+        want(IC, Item::Did(0xC001), 1, true, 100, 100_000),
+    ];
+    c.run_until(60_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+    let audit = tester_present_audit(&c, 4000);
+    assert!(audit.gaps.len() >= 60, "{} keepalives", audit.gaps.len());
+    assert!(
+        audit.contended >= 2,
+        "the scenario must make several targets due at once ({})",
+        audit.contended
+    );
+    assert_eq!(
+        audit.order_violations, 0,
+        "a target with an earlier deadline was served later"
+    );
+    assert!(audit.gaps.iter().all(|(_, g)| *g >= 2000));
+}
+
+#[test]
+fn idle_scheduler_waits_for_the_next_deadline_instead_of_polling_the_keepalive() {
+    let mut c = fleet(&[A, B]);
+    // one slow read per target: between the reads nothing is due except maintenance
+    c.wants = vec![
+        want(IA, Item::Did(0xA002), 1, true, 10_000, 100_000),
+        want(IB, Item::Did(0xB001), 1, true, 10_000, 100_000),
+    ];
+    c.run_until(40_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+    let audit = tester_present_audit(&c, 4000);
+    let gaps = audit.gaps;
+    assert_eq!(audit.order_violations, 0);
+    assert!(
+        gaps.iter().all(|(_, g)| *g >= 2000 && *g <= 2200),
+        "{gaps:?}"
+    );
+    // 2 targets, 40 s, one `3E 80` per 2 s each
+    assert!(
+        (30..=40).contains(&sent(&c, "3E80").len()),
+        "{}",
+        sent(&c, "3E80").len()
     );
 }
 
