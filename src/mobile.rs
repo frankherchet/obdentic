@@ -1,6 +1,7 @@
 //! Closed mobile facade. Platform code supplies transport, never diagnostic commands.
 mod assistant;
 pub use assistant::execute_nonblocking;
+pub mod coverage;
 pub(crate) mod knowledge;
 pub mod report;
 pub(crate) mod uds;
