@@ -475,6 +475,7 @@ fn definitive_refusal_is_not_retried_and_other_targets_continue() {
     c.run_until(120_000);
     assert!(c.stopped.is_none());
     assert_eq!(c.sessions[IB].status, Status::Refused(0x12));
+    assert_eq!(c.count_events(|e| matches!(e, Ev::Isolated(_, _))), 0);
     assert_eq!(
         sent(&c, "1003").iter().filter(|(_, h)| h == "7E2").count(),
         1
@@ -663,6 +664,7 @@ fn keepalive_refusal_releases_the_ecu_and_marks_it_refused() {
     c.wants = vec![want(IB, Item::Did(0xB001), 1, true, 400, 100_000)];
     c.run_until(20_000);
     assert_eq!(c.sessions[IB].status, Status::Refused(0x12));
+    assert_eq!(c.count_events(|e| matches!(e, Ev::Isolated(_, _))), 0);
     assert_eq!(sent(&c, "1001").len(), 1);
 }
 
