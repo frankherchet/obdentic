@@ -844,3 +844,41 @@ requirements:
         text: "While a gap is active the app probes a currently selected signal that previously returned a finite value at most once every 5 seconds, rather than continuing the full polling set; the first finite result ends the gap and restores normal polling. Selection changes, stop, reconnect, failure, jobs, and extended-session keepalive and cleanup remain safe and responsive; no new vehicle operation or background connection is introduced. Missing and stale trigger values remain unknown, never zero or proof that an event did not occur."
       - id: REQ-037.3
         text: "Each recorded gap has a timestamped start and, on recovery or recording stop, an end with only the observed outcome, not an inferred ignition state. An open gap is carried into a rotated file so each part is independently understandable. Offline Android replay and the mobile report show the gap without vehicle traffic, older recordings remain readable, and the raw request and response evidence remains available."
+
+  - id: REQ-041
+    title: Provide a bounded semantic assistant tool bridge
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-11-15: refinement of semantic assistant tools"
+    description: >
+      An assistant can inspect already-known session information, available
+      semantic signals and a user-selected recording, and request bounded
+      read-only signal and DTC observations through the existing session owner.
+      The tool contract and validation are shared by mobile and future semantic
+      consumers; they do not create a vehicle capability or a model client.
+    acceptance:
+      - id: REQ-041.1
+        text: "The versioned tool interface exposes only vehicle information from the current known session, a list of available semantic signals, a single signal read, a stored and pending DTC scan, and inspection of a recording selected by the user. Vehicle information and signal listing do not initiate inventory or other vehicle traffic."
+      - id: REQ-041.2
+        text: "Signal listing gives each currently available standard or Knowledge-backed signal an opaque identifier bound to the current session; a signal read accepts only an identifier issued for that session and never a diagnostic address, DID, raw request, payload, polling rate or session command."
+      - id: REQ-041.3
+        text: "An unknown tool, malformed argument, unexpected argument, unknown or ambiguous signal, expired session identifier, unsupported operation or unsafe request receives a typed refusal before any adapter traffic. Changing or reconnecting the session invalidates its previously issued signal identifiers."
+      - id: REQ-041.4
+        text: "Each live tool uses the existing single session owner and serialized command path, checks current Knowledge, availability and safety policy before execution, and cannot initiate a second adapter connection, mutation, DTC clearing or restricted-session activation."
+      - id: REQ-041.5
+        text: "A tool that would change a restricted diagnostic session is refused before it sends vehicle traffic; existing safety cleanup after an error remains permitted."
+      - id: REQ-041.6
+        text: "One diagnosis starts at most 20 live signal reads and one DTC scan; after 60 seconds from its start or after cancellation it starts no further live work and returns a typed budget or cancellation outcome. An exchange already in progress may finish under its existing transport timeout."
+      - id: REQ-041.7
+        text: "When the vehicle is disconnected or the session owner is busy, or a requested signal or job is unavailable or unsupported, the tool returns the corresponding typed outcome without starting that work."
+      - id: REQ-041.8
+        text: "Tool results distinguish observed, deterministically decoded, inferred and unknown information, and preserve the available timestamp, responder, freshness and capture provenance. Missing or unknown facts and provenance remain explicit rather than being invented or replaced with zero; known stale data and read failures are identified."
+      - id: REQ-041.9
+        text: "By default tool results exclude VINs, ECU serials, adapter identifiers and raw recordings while returning the requested semantic evidence and its available provenance."
+      - id: REQ-041.10
+        text: "Recording inspection operates only on the recording selected by the user, uses offline replay without Bluetooth activity, and stops with an explicit error when the recording's Knowledge pin does not match."
+      - id: REQ-041.11
+        text: "Tool names and arguments cannot expose or execute arbitrary CAN, UDS or ELM commands, SecurityAccess, RoutineControl, coding, adaptation, actuator tests or any write, regardless of process capability or model output."
+      - id: REQ-041.12
+        text: "The tool bridge is usable without a model, account or network, and its semantic snapshot tool is not part of this initial interface."
