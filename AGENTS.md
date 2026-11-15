@@ -130,6 +130,8 @@ rtk env PATH=/Users/frankherchet/.cargo/bin:/opt/local/bin:/usr/bin:/bin cargo +
 rtk env PATH=/Users/frankherchet/.cargo/bin:/opt/local/bin:/usr/bin:/bin cargo +1.98.0 clippy --all-targets --locked -- -D warnings
 ```
 
+Before Android implementation work, run the full `AcceptanceRunner` once on the unmodified default branch and record any failing checks on the issue. Compare the implementation against that baseline; pre-existing failures do not waive the required checks or count as a passing acceptance run.
+
 For Android changes, also run the APK build and lint locally using the SDK/JDK setup in `docs/android.md`:
 
 ```sh
