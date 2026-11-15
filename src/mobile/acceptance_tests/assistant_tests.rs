@@ -264,8 +264,9 @@ fn req_041_3_refusals_come_before_traffic_and_a_new_session_expires_ids() {
             json!({"tool":"vehicle_info","arguments":{"verbose":true}}),
             "unexpected_argument",
         ),
+        // Epoch 0 is never issued: the process-wide counter starts at 1, so this is expired in any test order.
         (
-            json!({"tool":"signal_read","arguments":{"signal":"s9.9"}}),
+            json!({"tool":"signal_read","arguments":{"signal":"s0.0"}}),
             "expired_signal",
         ),
         (
