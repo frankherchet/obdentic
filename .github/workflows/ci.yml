@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   # Cheap gate: docs, memos and requirements-only changes skip the macOS Rust job.
-  # A skipped `check` still reports as a passed check on the PR.
+  # The classifier and the gate verdict live in tools/ci-gate.sh and are tested first.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -26,6 +26,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Test CI gate script
+        run: tools/test-ci-gate.sh
       - id: diff
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
@@ -33,17 +35,11 @@ jobs:
           if [[ -z "$BASE" || "$BASE" =~ ^0+$ ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          code=false
-          while IFS= read -r path; do
-            case "$path" in
-              *.md|docs/*|.memento/*) ;;
-              *) code=true ;;
-            esac
-          done < <(git diff --name-only "$BASE" "$GITHUB_SHA")
+          code="$(git diff --name-only "$BASE" "$GITHUB_SHA" | tools/ci-gate.sh classify)"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "code changes: $code"
 
-  check:
+  rust:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
@@ -66,3 +62,18 @@ jobs:
       - run: cargo +1.98.0 test --locked
       - run: cargo +1.98.0 clippy --all-targets --locked -- -D warnings
       - run: cargo +1.98.0 build --locked
+
+  # Stable required check. Always runs; green only if change detection succeeded and the
+  # Rust job either succeeded (code changes) or was skipped (documentation-only changes).
+  # Failed, cancelled, skipped-by-mistake or unknown results are never green.
+  check:
+    needs: [changes, rust]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          RUST: ${{ needs.rust.result }}
+        run: tools/ci-gate.sh verdict "$CHANGES" "$CODE" "$RUST"
