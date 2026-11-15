@@ -40,6 +40,9 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
     let mut last_smart_offset = 0u64;
     let mut component_changes = Vec::new();
     let mut gaps = Gaps::default();
+    let mut value_provenance = BTreeMap::new();
+    let mut last_offset: Option<u64> = None;
+    let mut pin_mismatch = false;
     for (index, line) in reader.lines().enumerate() {
         if complete {
             complete = false;
@@ -78,6 +81,9 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
             continue;
         }
         events += 1;
+        if let Some(offset) = event["offset_us"].as_u64() {
+            last_offset = last_offset.max(Some(offset));
+        }
         match event["type"].as_str() {
             Some("session_end") => {
                 complete = true;
@@ -138,6 +144,9 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
                 )
                 .map_err(|error| error.to_string())?;
                 if decoded["ok"] != true {
+                    pin_mismatch |= decoded["error"]
+                        .as_str()
+                        .is_some_and(|error| error.ends_with(super::knowledge::PIN_MISMATCH));
                     issues.push(format!("{action}: {}", decoded["error"]));
                 } else if action == "read" {
                     // REQ-024.6: replay always sets the signal key, so two signals that share a
@@ -146,6 +155,10 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
                         .as_str()
                         .ok_or("read without key")?
                         .to_string();
+                    value_provenance.insert(
+                        key.clone(),
+                        json!({"at":event["at"],"offset_us":event["offset_us"]}),
+                    );
                     values.insert(key, decoded["data"].clone());
                 } else if action == "adapter.throughput" {
                     jobs.push(
@@ -177,6 +190,8 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
         "smart_changes":smart_changes,"component_snapshot":session["component"],
         "component_changes":component_changes,"measurement_gap_events":gaps.events,
         "measurement_gaps":measurement_gaps,"issues":issues,
+        "knowledge_pin_mismatch":pin_mismatch,"value_provenance":value_provenance,
+        "recording_end_offset_us":last_offset,
         "note":"Values and diagnostic facts are recomputed from recorded responses. Original evidence remains in the source file."}))
 }
 

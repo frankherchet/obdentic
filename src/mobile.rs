@@ -1,4 +1,6 @@
 //! Closed mobile facade. Platform code supplies transport, never diagnostic commands.
+mod assistant;
+pub use assistant::execute_nonblocking;
 pub(crate) mod knowledge;
 pub mod report;
 pub(crate) mod uds;
@@ -14,6 +16,7 @@ use crate::{
     },
     runtime_state::Activity,
     safety::{OperationRequest, SafetyPolicy},
+    semantic_tools,
     signal_read::{self, decode, Decoder, Evidence, OutcomeState, SignalOutcome, SignalRoute},
     throughput,
     topology::{
@@ -59,6 +62,8 @@ pub struct MobileCore<E> {
     uds_error: Option<String>,
     /// Raw evidence of the read that just failed, emitted next to the error of the closing envelope.
     failure_evidence: Map<String, Value>,
+    /// REQ-041: session-bound signal ids, the budget of the running diagnosis and the selected recording.
+    assistant: assistant::AssistantState,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -76,6 +81,7 @@ impl<E: Exchange> MobileCore<E> {
             uds: uds::UdsSessionState::default(),
             uds_error: None,
             failure_evidence: Map::new(),
+            assistant: assistant::AssistantState::default(),
         })
     }
 
@@ -87,6 +93,7 @@ impl<E: Exchange> MobileCore<E> {
         self.engine = None;
         self.vehicle_manufacturer = None;
         self.knowledge = None;
+        self.assistant.session_changed();
     }
 
     /// Clear an indeterminate session only after the platform confirms a new
@@ -98,6 +105,7 @@ impl<E: Exchange> MobileCore<E> {
         self.engine = None;
         self.vehicle_manufacturer = None;
         self.knowledge = None;
+        self.assistant.session_changed();
     }
 
     /// Full Carly initialization. Functional operations re-initialize on
@@ -117,9 +125,11 @@ impl<E: Exchange> MobileCore<E> {
     /// No caller-supplied wire bytes, addresses or write capabilities are accepted.
     pub fn execute(&mut self, action: &str, argument: &str) -> String {
         self.failure_evidence.clear();
+        let uds_active_before = self.uds.is_active();
         let mut result = self.dispatch(action, argument);
-        let offline_action =
-            action.starts_with("replay.") || matches!(action, "vin.describe" | "catalog");
+        let offline_action = action.starts_with("replay.")
+            || action.starts_with("assistant.")
+            || matches!(action, "vin.describe" | "catalog");
         if result.is_err() && self.uds.is_active() && !offline_action {
             let cleanup = self.disable_uds_outcome();
             self.stage_session_observations(&cleanup["observations"]);
@@ -129,6 +139,8 @@ impl<E: Exchange> MobileCore<E> {
                 result = Err(format!("{original}; {cleanup_error}"));
             }
         }
+        self.assistant
+            .after_action(action, uds_active_before != self.uds.is_active());
         let mut envelope = match result {
             Ok(data) => json!({"ok":true,"data":data}),
             Err(error) => {
@@ -144,6 +156,9 @@ impl<E: Exchange> MobileCore<E> {
     }
 
     fn dispatch(&mut self, action: &str, argument: &str) -> Result<Value, String> {
+        if let Some(tool_action) = action.strip_prefix("assistant.") {
+            return self.assistant_action(tool_action, argument);
+        }
         if action == "catalog" {
             return Ok(self.catalog());
         }
@@ -249,21 +264,31 @@ impl<E: Exchange> MobileCore<E> {
             "uds.enable" => self.enable_uds(),
             "uds.disable" => Ok(self.disable_uds_outcome()),
             "uds.tick" => Ok(self.tick_uds()),
-            "dtc.scan" => {
-                self.disable_uds()?;
-                let session = self.session.as_mut().unwrap();
-                let responses = self.runtime.block_on(session.read_stored_dtcs())?;
-                // Pending codes (Mode 07) never fail the scan; the failure is part of the result.
-                let pending = match self.runtime.block_on(session.read_pending_dtcs()) {
-                    Ok(pending) => dtc_section(&pending, crate::dtc::decode_mode07_payload),
-                    Err(error) => json!({"error":error}),
-                };
-                let mut scan = dtc_section(&responses, crate::dtc::decode_mode03_payload);
-                scan["pending"] = pending;
-                Ok(scan)
-            }
+            "dtc.scan" => self.scan_dtcs(|| None),
             _ => unreachable!(),
         }
+    }
+
+    /// One DTC scan: stored codes (Mode 03), then pending codes (Mode 07). `proceed` is asked before the
+    /// pending request: a diagnosis that was cancelled or ran out of time sends no further request.
+    fn scan_dtcs(
+        &mut self,
+        proceed: impl Fn() -> Option<semantic_tools::Stop>,
+    ) -> Result<Value, String> {
+        self.disable_uds()?;
+        let session = self.session.as_mut().ok_or("session unavailable")?;
+        let responses = self.runtime.block_on(session.read_stored_dtcs())?;
+        // Pending codes (Mode 07) never fail the scan; the failure is part of the result.
+        let pending = match proceed() {
+            Some(stop) => json!({"skipped":stop.code()}),
+            None => match self.runtime.block_on(session.read_pending_dtcs()) {
+                Ok(pending) => dtc_section(&pending, crate::dtc::decode_mode07_payload),
+                Err(error) => json!({"error":error}),
+            },
+        };
+        let mut scan = dtc_section(&responses, crate::dtc::decode_mode03_payload);
+        scan["pending"] = pending;
+        Ok(scan)
     }
 
     fn read_signal(&mut self, key: &str) -> Result<Value, String> {
@@ -807,6 +832,7 @@ impl<E: Exchange> MobileCore<E> {
                 break;
             }
         }
+        self.assistant.record_availability(&entries);
         let restore_error = self.restore_functional_addressing().err();
         Ok(json!({
             "knowledge_repository":repository,

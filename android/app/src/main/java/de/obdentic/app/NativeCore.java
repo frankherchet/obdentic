@@ -6,5 +6,7 @@ public final class NativeCore {
     public interface Exchange { String exchange(String command, long timeoutMs) throws Exception; }
     public static native long create(Exchange exchange);
     public static native String execute(long handle, String action, String argument);
+    /** Cancels the running assistant diagnosis without waiting for the session owner (REQ-041.6). */
+    public static native void cancel(long handle);
     public static native void destroy(long handle);
 }
