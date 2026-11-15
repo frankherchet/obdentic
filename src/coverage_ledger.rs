@@ -17,8 +17,11 @@
 //!   previous one still counts as a sample but adds no time and does not move the segment.
 //! - A context signal is fresh from its latest finite, plausible reading for [`FRESHNESS_LIMIT`],
 //!   whatever goal context that reading was taken in, and only for results under the same
-//!   definition versions. A failed, implausible or non-finite reading of the signal ends that
-//!   freshness (and the contiguous segments that depend on it) at its offset.
+//!   definition versions. A reading counts toward the freshness it is judged by when its own
+//!   signal is one of its context's required signals. A failed, implausible or non-finite reading
+//!   of the signal, and a boundary, end the freshness of readings up to its offset (and the
+//!   contiguous segments that depend on it); a later reading renewed the signal after it and
+//!   keeps it fresh.
 //! - A static identity observation is kept once per vehicle ledger, signal key, ECU target and
 //!   definition versions; the ledger stores provenance only, never the value. Its entry is covered
 //!   by that one observation and stays covered when a later read fails.
@@ -382,6 +385,39 @@ impl fmt::Display for ForeignRun {
 
 impl Error for ForeignRun {}
 
+/// Continuous freshness of one context signal: the usable readings that renewed it and the instant
+/// it holds until.
+#[derive(Debug, Clone)]
+struct Span {
+    /// Offsets of the usable readings, ascending; the first one starts the span.
+    renewals: Vec<Duration>,
+    until: Duration,
+}
+
+impl Span {
+    fn start(&self) -> Duration {
+        self.renewals[0]
+    }
+
+    /// An event at `at` (failed reading or boundary) ends the freshness of the readings up to
+    /// `at`. Readings after it renewed the signal again and stay in a span of their own.
+    fn cut(self, at: Duration) -> (Self, Option<Self>) {
+        let split = self.renewals.partition_point(|&renewal| renewal <= at);
+        let mut kept = self.renewals;
+        let later = kept.split_off(split);
+        let until = self.until;
+        let later = (!later.is_empty()).then_some(Self {
+            renewals: later,
+            until,
+        });
+        let kept = Self {
+            renewals: kept,
+            until: until.min(at),
+        };
+        (kept, later)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OpenSegment {
     last: Duration,
@@ -406,9 +442,9 @@ pub struct SmartRun {
     ledger: Ledger,
     confirmed_since: Option<Duration>,
     open: BTreeMap<EntryKey, OpenSegment>,
-    /// Per definition versions and context signal the spans `(first reading, fresh until)` of
-    /// continuous freshness. A reading under other versions never renews or extends them.
-    freshness: BTreeMap<(DefinitionVersions, String), Vec<(Duration, Duration)>>,
+    /// Per definition versions and context signal the spans of continuous freshness, ordered by
+    /// start. A reading under other versions never renews or extends them.
+    freshness: BTreeMap<(DefinitionVersions, String), Vec<Span>>,
 }
 
 impl SmartRun {
@@ -486,9 +522,7 @@ impl SmartRun {
     fn end_segments(&mut self, at: Duration) {
         self.open.clear();
         for spans in self.freshness.values_mut() {
-            for span in spans {
-                span.1 = span.1.min(at);
-            }
+            Self::cut(spans, at);
         }
     }
 
@@ -506,6 +540,11 @@ impl SmartRun {
                 Outcome::Decoded(Decoded::Text { nonempty }) => reading.static_identity && nonempty,
                 _ => false,
             };
+        // A usable reading renews its own signal first: when a context requires the signal it
+        // belongs to, the reading counts toward the freshness it is judged by.
+        if usable && !reading.static_identity {
+            self.touch(&fact.versions, &reading.signal_key, offset);
+        }
         let fresh = self
             .extent(&fact.versions, &reading.context, offset)
             .is_some();
@@ -565,9 +604,7 @@ impl SmartRun {
         if let Some(vehicle) = vehicle {
             vehicle.record(&key, &vehicle_update);
         }
-        if usable {
-            self.touch(&fact.versions, &reading.signal_key, offset);
-        } else {
+        if !usable {
             self.invalidate(&fact.versions, &reading.signal_key, offset);
         }
     }
@@ -680,9 +717,9 @@ impl SmartRun {
                 .get(&(versions.clone(), signal.clone()))?
                 .iter()
                 .rev()
-                .find(|span| span.0 <= at)
-                .filter(|span| at <= span.1)?;
-            until = until.min(span.1);
+                .find(|span| span.start() <= at)
+                .filter(|span| at <= span.until)?;
+            until = until.min(span.until);
         }
         Some(until)
     }
@@ -694,22 +731,42 @@ impl SmartRun {
             .entry((versions.clone(), signal.to_owned()))
             .or_default();
         match spans.last_mut() {
-            Some(last) if at < last.0 => {}
-            Some(last) if at <= last.1 => last.1 = last.1.max(at + FRESHNESS_LIMIT),
-            _ => spans.push((at, at + FRESHNESS_LIMIT)),
+            Some(last) if at < last.start() => {}
+            Some(last) if at <= last.until => {
+                let position = last.renewals.partition_point(|&renewal| renewal <= at);
+                last.renewals.insert(position, at);
+                last.until = last.until.max(at + FRESHNESS_LIMIT);
+            }
+            _ => spans.push(Span {
+                renewals: vec![at],
+                until: at + FRESHNESS_LIMIT,
+            }),
         }
     }
 
     /// A failed, unusable or implausible reading of a context signal ends the freshness of its
-    /// earlier readings at that moment, whatever goal context the reading was taken in. Spans that
-    /// start after the reading are untouched.
+    /// earlier readings at that moment, whatever goal context the reading was taken in. Readings
+    /// taken after it were not affected and keep the signal fresh.
     fn invalidate(&mut self, versions: &DefinitionVersions, signal: &str, at: Duration) {
         let key = (versions.clone(), signal.to_owned());
-        for span in self.freshness.get_mut(&key).into_iter().flatten() {
-            if span.0 <= at {
-                span.1 = span.1.min(at);
-            }
+        if let Some(spans) = self.freshness.get_mut(&key) {
+            Self::cut(spans, at);
         }
+    }
+
+    /// Applies an event at `at` to `spans`: spans that started after it stay as they are.
+    fn cut(spans: &mut Vec<Span>, at: Duration) {
+        let mut cut = Vec::with_capacity(spans.len());
+        for span in spans.drain(..) {
+            if span.start() > at {
+                cut.push(span);
+                continue;
+            }
+            let (kept, later) = span.cut(at);
+            cut.push(kept);
+            cut.extend(later);
+        }
+        *spans = cut;
     }
 }
 
@@ -1554,6 +1611,92 @@ mod tests {
         let run = run_with(cooling_rules(), SessionKind::Live, &facts);
         let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
         assert_eq!(entry.qualifying_samples, 1);
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_later_renewal_survives_an_older_failed_reading_in_an_overlapping_span() {
+        // Speed is measured at 0 s and 9 s; the failed reading stamped 3 s arrives afterwards. It
+        // ends the freshness of the 0 s reading only: the 9 s renewal keeps speed fresh at 10 s.
+        let facts = [
+            sample("vehicle.speed", "baseline", 0),
+            sample("vehicle.speed", "baseline", 9),
+            outcome_fact("vehicle.speed", "baseline", 3, Outcome::Unsupported),
+            sample("engine.coolant_temperature", "cooling", 10),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let renewed = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(renewed.qualifying_samples, 1);
+        assert_eq!(
+            renewed.latest.as_ref().unwrap().state,
+            LatestState::Observed
+        );
+
+        // The failure still ends the older reading: speed was not fresh between 3 s and 9 s.
+        let facts = [
+            sample("vehicle.speed", "baseline", 0),
+            sample("vehicle.speed", "baseline", 9),
+            outcome_fact("vehicle.speed", "baseline", 3, Outcome::Unsupported),
+            sample("engine.coolant_temperature", "cooling", 5),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(entry.qualifying_samples, 0);
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_later_renewal_survives_an_older_boundary() {
+        let facts = [
+            sample("vehicle.speed", "baseline", 0),
+            sample("vehicle.speed", "baseline", 9),
+            boundary(3, Boundary::Gap),
+            sample("engine.coolant_temperature", "cooling", 10),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(entry.qualifying_samples, 1);
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_signal_required_by_its_own_context_counts_its_current_reading() {
+        let rules = Rules::generic_baseline().with_context(
+            GoalContext::new("cooling"),
+            ContextRule {
+                required_signals: vec!["engine.coolant_temperature".into()],
+                min_contiguous: Some(secs(30)),
+                ..ContextRule::baseline()
+            },
+        );
+        let run = run_with(
+            rules.clone(),
+            SessionKind::Live,
+            &samples("engine.coolant_temperature", "cooling", &[0, 10, 20, 30]),
+        );
+        let own = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(own.qualifying_samples, 4);
+        assert_eq!(own.valid_time, secs(30));
+        assert_eq!(own.longest_segment, secs(30));
+        assert_eq!(
+            run.ledger()
+                .status(&rules, &key("engine.coolant_temperature", "cooling")),
+            Status::Covered
+        );
+
+        // An unusable own reading is never counted toward its own freshness.
+        let run = run_with(
+            rules,
+            SessionKind::Live,
+            &[outcome_fact(
+                "engine.coolant_temperature",
+                "cooling",
+                0,
+                Outcome::Decoded(Decoded::Numeric { finite: false }),
+            )],
+        );
+        let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(entry.qualifying_samples, 0);
     }
 
     #[test]
