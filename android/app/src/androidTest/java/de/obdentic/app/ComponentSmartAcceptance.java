@@ -95,6 +95,7 @@ final class ComponentSmartAcceptance {
             reconnect(service, link, false);
             continuingAndEnding(service, link, dir, vin, user);
             replay(service, link, dir, before, chain);
+            coverage(service, link, dir, chain); // REQ-038.9 (#339): the same three files, as facts and as the rebuilt whole run
         } finally {
             service.rotateAfterSmart = ""; service.rotateMs = 30L * 60 * 1000;
             service.disconnect(); service.connector = savedConnector; service.vehicles = savedStore; service.permissionOverride = savedPermission; service.bluetoothOverride = savedBluetooth;
@@ -349,8 +350,10 @@ final class ComponentSmartAcceptance {
         waitFor(() -> { List<JSONObject> e = read(file); return "session_end".equals(e.get(e.size() - 1).optString("type")); }, "recording closed " + file.getName());
         List<JSONObject> events = read(file); JSONObject end = events.get(events.size() - 1);
         require(reason.equals(end.optString("reason")), "the recording ends with " + reason + ": " + end);
-        JSONObject before = events.get(events.size() - 2), data = smartData(before);
-        require(data != null && "stop".equals(data.optString("change")) && !data.optString("reason").isEmpty() && before.optLong("offset_us") <= end.optLong("offset_us"), "REQ-036.5 the stop event comes right before the end marker: " + before);
+        int at = events.size() - 2; // REQ-038.9: the run's own end record (coverage.boundary run_end) may follow the stop event; nothing else may
+        if ("coverage.boundary".equals(events.get(at).optString("action")) && "run_end".equals(events.get(at).getJSONObject("result").getJSONObject("data").optString("class"))) at--;
+        JSONObject before = events.get(at), data = smartData(before);
+        require(data != null && "stop".equals(data.optString("change")) && !data.optString("reason").isEmpty() && before.optLong("offset_us") <= end.optLong("offset_us"), "REQ-036.5 the stop event comes right before the end marker (or the run's end record): " + before);
     }
 
     // ---- replay ----------------------------------------------------------------------------------------------------------------------
@@ -383,6 +386,55 @@ final class ComponentSmartAcceptance {
         require(link[0].commands.size() == traffic, "replay sent nothing to an adapter: " + link[0].commands.subList(traffic, link[0].commands.size()));
     }
 
+    /**
+     * REQ-038.9 (#339): the run of the smart analysis that rotated twice wrote its coverage facts into all three files, as one run in three parts with
+     * verified joins and no value; replay opened on any part rebuilds the whole run from the set of parts, and with the middle part deleted it says partial
+     * with the missing part number. Replay writes nothing and sends nothing.
+     */
+    private static void coverage(ObdService service, Link[] link, File dir, List<String> chain) throws Exception {
+        int traffic = link[0].commands.size();
+        List<List<JSONObject>> files = new ArrayList<>(); for (String n : chain) files.add(read(new File(dir, n)));
+        String run = null; int[] counts = new int[files.size()]; int facts = 0;
+        for (int f = 0; f < files.size(); f++) {
+            Set<Long> reads = new HashSet<>(); for (JSONObject e : files.get(f)) if ("read".equals(e.optString("action"))) reads.add(e.optLong("offset_us"));
+            List<JSONObject> own = new ArrayList<>(); for (JSONObject e : files.get(f)) if (e.optString("action").startsWith("coverage.")) own.add(e);
+            counts[f] = own.size(); require(own.size() >= 2, "REQ-038.9 file " + f + " holds coverage records: " + own.size());
+            JSONObject first = own.get(0), firstData = first.getJSONObject("result").getJSONObject("data");
+            require("coverage.run".equals(first.optString("action")) && firstData.optInt("part") == f + 1 && (f == 0 ? "start" : "resume").equals(firstData.optString("action")), "REQ-038.9 file " + f + " begins with its part marker: " + first);
+            if (f > 0) require(firstData.optInt("previous_part_records", -1) == counts[f - 1], "REQ-038.9 the resume states the records of the previous part (" + counts[f - 1] + "): " + firstData);
+            long lastOffset = -1; boolean ended = false;
+            for (JSONObject e : own) {
+                JSONObject result = e.getJSONObject("result"), data = result.getJSONObject("data");
+                require(result.optBoolean("ok") && e.has("at") && data.has("run_offset_us") && data.optLong("run_offset_us") >= lastOffset, "REQ-038.9 wall time, ok and an ascending run clock on every record: " + e); lastOffset = data.optLong("run_offset_us");
+                if (run == null) run = data.getString("run"); require(run.equals(data.getString("run")), "REQ-038.9 one run id in all parts");
+                require(!data.has("value") && !data.has("response") && !data.has("vin"), "REQ-038.9 facts carry classes and references, never a value: " + e);
+                if ("coverage.fact".equals(e.optString("action"))) {
+                    facts++; JSONObject evidence = data.getJSONObject("evidence");
+                    require("baseline".equals(data.optString("context")) && data.optInt("goal_definition") == 1 && !data.optString("knowledge_revision").isEmpty() && !data.optString("outcome").isEmpty()
+                        && data.has("session") && data.has("identity_confirmed") && data.has("implausible") && data.has("static_identity"), "REQ-038.9 the fact has every field of the ledger: " + e);
+                    if (!evidence.optBoolean("in_previous_file")) require(reads.contains(evidence.getLong("offset_us")), "REQ-038.9 the evidence reference names the raw read record in the same file: " + e);
+                }
+                if ("coverage.boundary".equals(e.optString("action")) && "run_end".equals(data.optString("class"))) { require(f == files.size() - 1 && !ended, "REQ-038.9 run_end only once, in the last part"); ended = true; }
+            }
+            require(ended == (f == files.size() - 1), "REQ-038.9 only the last part ends the run: file " + f);
+        }
+        require(facts > 0, "REQ-038.9 the reads of the run left facts");
+        for (int f : new int[] {1, 0, 2}) {
+            open(service, chain.get(f)); JSONObject set = service.snapshot().optJSONObject("coverage");
+            require(set != null && set.getJSONArray("runs").length() == 1, "REQ-038.9 replay of part " + (f + 1) + " derives the run: " + set);
+            JSONObject derived = set.getJSONArray("runs").getJSONObject(0);
+            require(derived.optBoolean("run_complete") && !derived.optBoolean("partial") && "exact".equals(derived.optString("figures")) && derived.getJSONArray("parts").length() == 3
+                && derived.getJSONArray("entries").length() > 0 && derived.getJSONArray("joins").getJSONObject(0).optBoolean("verified") && derived.getJSONArray("joins").getJSONObject(1).optBoolean("verified"),
+                "REQ-038.9 replay of any part rebuilds the whole run, complete with exact figures: " + derived);
+        }
+        require(new File(dir, chain.get(1)).delete(), "the middle part can be deleted (REQ-028.7)");
+        for (int f : new int[] {0, 2}) {
+            open(service, chain.get(f)); JSONObject derived = service.snapshot().getJSONObject("coverage").getJSONArray("runs").getJSONObject(0);
+            require(derived.optBoolean("partial") && !derived.optBoolean("run_complete") && "supplied_parts_only".equals(derived.optString("figures")) && derived.getJSONArray("missing_parts").length() == 1
+                && derived.getJSONArray("missing_parts").optInt(0) == 2 && derived.getJSONArray("parts").length() == 2, "REQ-038.9 without the middle part the run is partial and names part 2: " + derived);
+        }
+        require(link[0].commands.size() == traffic, "REQ-038.9 replay sent nothing to an adapter: " + link[0].commands.subList(traffic, link[0].commands.size()));
+    }
     private static void open(ObdService service, String name) throws Exception {
         service.openRecording(name);
         waitFor(() -> "replay".equals(service.snapshot().optString("mode")) && name.equals(service.snapshot().optString("replayFile")) && !service.snapshot().optBoolean("busy"), "replay " + name);
