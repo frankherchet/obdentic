@@ -1,0 +1,10 @@
+[package]
+name = "spike-322-multi-ecu-uds"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Throwaway spike for #322. Never merged. Standalone crate: no dependency on obdentic.
+[workspace]
+
+[dependencies]
