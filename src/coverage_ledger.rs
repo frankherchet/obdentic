@@ -34,8 +34,19 @@
 //! - A static identity observation is kept once per vehicle ledger, signal key, ECU target and
 //!   definition versions; the ledger stores provenance only, never the value. Its entry is covered
 //!   by that one observation and stays covered when a later read fails.
+//! - A failed reading of a signal also ends that signal's contiguous segments in every other
+//!   goal context, without touching their availability states, and no interval between two
+//!   readings of a signal counts when a failure of it (any context) or a boundary was folded at
+//!   an offset after the earlier reading, up to and including the later one, in whatever order
+//!   the facts arrived: such a reading in between ends the segment and adds no time.
 
-use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    ops::Bound,
+    time::Duration,
+};
 
 /// REQ-038.2/.4: a context reading is fresh up to this age; two readings of one signal are
 /// adjacent up to this distance.
@@ -467,10 +478,11 @@ pub struct SmartRun {
     /// Per definition versions and context signal the spans of continuous freshness, ordered by
     /// start. A reading under other versions never renews or extends them.
     freshness: BTreeMap<(DefinitionVersions, String), Vec<Span>>,
-    /// Latest failed reading per definition versions and context signal that was folded.
-    failures: BTreeMap<(DefinitionVersions, String), Duration>,
-    /// Latest boundary that was folded; it ends the freshness of every signal.
-    last_boundary: Option<Duration>,
+    /// Offsets of the failed readings that were folded, per definition versions and signal, in
+    /// any goal context.
+    failures: BTreeMap<(DefinitionVersions, String), BTreeSet<Duration>>,
+    /// Offsets of the boundaries that were folded; each ends the freshness of every signal.
+    boundaries: BTreeSet<Duration>,
 }
 
 impl SmartRun {
@@ -484,7 +496,7 @@ impl SmartRun {
             open: BTreeMap::new(),
             freshness: BTreeMap::new(),
             failures: BTreeMap::new(),
-            last_boundary: None,
+            boundaries: BTreeSet::new(),
         }
     }
 
@@ -548,7 +560,7 @@ impl SmartRun {
     }
 
     fn end_segments(&mut self, at: Duration) {
-        self.last_boundary = self.last_boundary.max(Some(at));
+        self.boundaries.insert(at);
         self.open.clear();
         for spans in self.freshness.values_mut() {
             Self::cut(spans, at);
@@ -663,7 +675,9 @@ impl SmartRun {
                     vehicle_length: previous.vehicle_length.or(start.vehicle_length),
                     ..previous
                 };
-            } else if offset - previous.last <= FRESHNESS_LIMIT {
+            } else if offset - previous.last <= FRESHNESS_LIMIT
+                && !self.broken_between(&key.versions, &key.signal_key, previous.last, offset)
+            {
                 let interval = offset - previous.last;
                 let confirmed = self
                     .extent(&key.versions, &key.context, previous.last)
@@ -778,13 +792,33 @@ impl SmartRun {
             })
     }
 
+    /// Whether a failed reading of `signal` in any context, or a boundary, was folded at an
+    /// offset in `(from, to]`. Whatever order the facts came in, no interval of the signal's
+    /// readings spans it: the reading at `from` belongs to what the break ended, and one at the
+    /// break's own offset was folded after it and starts anew. No time of such an interval is
+    /// counted: a reading in between ends the contiguous segment and adds none (REQ-038.4).
+    fn broken_between(
+        &self,
+        versions: &DefinitionVersions,
+        signal: &str,
+        from: Duration,
+        to: Duration,
+    ) -> bool {
+        let range = (Bound::Excluded(from), Bound::Included(to));
+        self.boundaries.range(range).next().is_some()
+            || self
+                .failures
+                .get(&(versions.clone(), signal.to_owned()))
+                .is_some_and(|offsets| offsets.range(range).next().is_some())
+    }
+
     /// Latest failed reading of the signal or boundary that was folded.
     fn latest_break(&self, versions: &DefinitionVersions, signal: &str) -> Option<Duration> {
         let failure = self
             .failures
             .get(&(versions.clone(), signal.to_owned()))
-            .copied();
-        failure.max(self.last_boundary)
+            .and_then(|offsets| offsets.last().copied());
+        failure.max(self.boundaries.last().copied())
     }
 
     /// Records a finite, plausible reading of a context signal. A reading older than a failure or
@@ -825,22 +859,22 @@ impl SmartRun {
     /// the failure that the ended span confirms.
     fn invalidate(&mut self, versions: &DefinitionVersions, signal: &str, at: Duration) {
         let key = (versions.clone(), signal.to_owned());
-        self.failures
-            .entry(key.clone())
-            .and_modify(|latest| *latest = (*latest).max(at))
-            .or_insert(at);
+        self.failures.entry(key.clone()).or_default().insert(at);
         if let Some(spans) = self.freshness.get_mut(&key) {
             Self::cut(spans, at);
         }
         let rules = &self.rules;
         self.open.retain(|entry, segment| {
+            // The failure ends the signal's own segments in every goal context: a reading in
+            // between is an unavailable one, whatever context it was taken in.
+            let same_signal = entry.versions == *versions && entry.signal_key == signal;
             let depends = entry.versions == *versions
                 && rules
                     .rule_for(&entry.context)
                     .required_signals
                     .iter()
                     .any(|required| required == signal);
-            !(depends && segment.last == at)
+            !(same_signal || depends && segment.last == at)
         });
     }
 
@@ -1595,6 +1629,223 @@ mod tests {
             let entry = entry(run.ledger(), "engine.rpm", "baseline");
             assert_eq!(entry.valid_time, secs(10), "{kind:?}");
             assert_eq!(entry.longest_segment, secs(5), "{kind:?}");
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_baseline_interval_never_crosses_a_boundary_that_was_already_folded() {
+        for kind in [
+            Boundary::Gap,
+            Boundary::Disconnect,
+            Boundary::Reconnect,
+            Boundary::RunEnd,
+        ] {
+            // Readings stamped 5 s and 12 s, folded after a boundary stamped `cut`.
+            let after = |cut: u64| {
+                let mut facts = vec![boundary(cut, kind)];
+                facts.extend(samples("engine.rpm", "baseline", &[5, 12]));
+                entry(baseline_run(&facts).ledger(), "engine.rpm", "baseline").clone()
+            };
+            // Disconnect at 8 s: the 7 s would span it.
+            let spanned = after(8);
+            assert_eq!(spanned.qualifying_samples, 2, "{kind:?}");
+            assert_eq!(spanned.valid_time, Duration::ZERO, "{kind:?}");
+            assert_eq!(spanned.longest_segment, Duration::ZERO, "{kind:?}");
+
+            // A boundary at the later reading's own offset separates the two as well.
+            assert_eq!(after(12).valid_time, Duration::ZERO, "{kind:?}");
+
+            // The boundary at the earlier reading's own offset was folded before that reading.
+            let separate = after(5);
+            assert_eq!(separate.valid_time, secs(7), "{kind:?}");
+            assert_eq!(separate.longest_segment, secs(7), "{kind:?}");
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_vehicle_interval_never_crosses_a_boundary_that_was_already_folded() {
+        let mut vehicle = Ledger::default();
+        let mut run = SmartRun::new(
+            Rules::generic_baseline(),
+            RunId(RUN.into()),
+            SessionKind::Live,
+        );
+        let mut facts = vec![boundary(8, Boundary::Disconnect)];
+        facts.extend(
+            [5, 12]
+                .into_iter()
+                .map(|at| confirmed_sample("engine.rpm", "baseline", at)),
+        );
+        for fact in &facts {
+            run.apply(Some(&mut vehicle), fact).unwrap();
+        }
+        for ledger in [run.ledger(), &vehicle] {
+            let entry = entry(ledger, "engine.rpm", "baseline");
+            assert_eq!(entry.qualifying_samples, 2);
+            assert_eq!(entry.valid_time, Duration::ZERO);
+            assert_eq!(entry.longest_segment, Duration::ZERO);
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_failure_folded_before_its_interval_is_never_credited_across() {
+        // Not only boundaries: any failure of the signal at 8 s folded before readings stamped
+        // 5 s and 12 s breaks the interval between them.
+        let mut facts = vec![outcome_fact(
+            "engine.rpm",
+            "cooling",
+            8,
+            Outcome::NoAnswer {
+                reason: "timeout".into(),
+            },
+        )];
+        facts.extend(samples("engine.rpm", "baseline", &[5, 12]));
+        let run = baseline_run(&facts);
+        let entry = entry(run.ledger(), "engine.rpm", "baseline");
+        assert_eq!(entry.valid_time, Duration::ZERO);
+        assert_eq!(entry.longest_segment, Duration::ZERO);
+    }
+
+    /// Facts of one signal in two contexts: `engine.rpm` readings at 0, 10, 20 and 30 s in the
+    /// baseline and, between the second and third, a failure in the `cooling` context.
+    fn baseline_with_failure_elsewhere(failure: Outcome) -> Vec<Fact> {
+        let mut facts = samples("engine.rpm", "baseline", &[0, 10]);
+        facts.push(outcome_fact("engine.rpm", "cooling", 15, failure));
+        facts.extend(samples("engine.rpm", "baseline", &[20, 30]));
+        facts
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_failure_in_another_context_breaks_the_same_signals_segment() {
+        for failure in [
+            Outcome::Gap,
+            Outcome::Unsupported,
+            Outcome::Rejected {
+                response_code: 0x31,
+            },
+            Outcome::Empty,
+            Outcome::Error {
+                reason: "decode".into(),
+            },
+            Outcome::NoAnswer {
+                reason: "timeout".into(),
+            },
+            Outcome::SessionRestricted {
+                reason: "session".into(),
+            },
+            Outcome::Decoded(Decoded::Numeric { finite: false }),
+        ] {
+            let run = baseline_run(&baseline_with_failure_elsewhere(failure.clone()));
+            let entry = entry(run.ledger(), "engine.rpm", "baseline");
+            let context = format!("{failure:?}");
+            assert_eq!(entry.qualifying_samples, 4, "{context}");
+            // 0 -> 10 and 20 -> 30; 10 -> 20 holds the failure and adds no time.
+            assert_eq!(entry.valid_time, secs(20), "{context}");
+            assert_eq!(entry.longest_segment, secs(10), "{context}");
+            assert_eq!(
+                run.ledger()
+                    .status(&Rules::generic_baseline(), &key("engine.rpm", "baseline")),
+                Status::Partial,
+                "{context}"
+            );
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_an_implausible_reading_in_another_context_breaks_the_same_signals_segment() {
+        let implausible = Reading {
+            implausible: true,
+            ..reading("engine.rpm", "cooling", numeric())
+        };
+        let mut facts = samples("engine.rpm", "baseline", &[0, 10]);
+        facts.push(fact(RUN, 15, false, FactBody::Reading(implausible)));
+        facts.extend(samples("engine.rpm", "baseline", &[20, 30]));
+        let run = baseline_run(&facts);
+        let entry = entry(run.ledger(), "engine.rpm", "baseline");
+        assert_eq!(entry.valid_time, secs(20));
+        assert_eq!(entry.longest_segment, secs(10));
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_failure_in_another_context_ends_an_egr_segment_of_the_same_signal() {
+        let mut facts = samples("engine.egr_rate", "egr", &[0, 10]);
+        facts.push(outcome_fact(
+            "engine.egr_rate",
+            "baseline",
+            15,
+            Outcome::Unsupported,
+        ));
+        facts.extend(samples("engine.egr_rate", "egr", &[20, 30, 40]));
+        let run = run_with(egr_rules(), SessionKind::Live, &facts);
+        let broken = entry(run.ledger(), "engine.egr_rate", "egr");
+        assert_eq!(broken.valid_time, secs(30));
+        assert_eq!(broken.longest_segment, secs(20));
+        assert_eq!(
+            run.ledger()
+                .status(&egr_rules(), &key("engine.egr_rate", "egr")),
+            Status::Partial
+        );
+
+        // The same readings without the failure are one 40 s segment.
+        let run = run_with(
+            egr_rules(),
+            SessionKind::Live,
+            &samples("engine.egr_rate", "egr", &[0, 10, 20, 30, 40]),
+        );
+        let entry = entry(run.ledger(), "engine.egr_rate", "egr");
+        assert_eq!(entry.longest_segment, secs(40));
+        assert_eq!(
+            run.ledger()
+                .status(&egr_rules(), &key("engine.egr_rate", "egr")),
+            Status::Covered
+        );
+    }
+
+    #[test]
+    // REQ-038.5
+    fn req_038_5_the_availability_of_each_context_stays_separate_when_a_failure_breaks_segments() {
+        let run = baseline_run(&baseline_with_failure_elsewhere(Outcome::Rejected {
+            response_code: 0x31,
+        }));
+        let ledger = run.ledger();
+        assert_eq!(
+            ledger.latest_state(&key("engine.rpm", "baseline")),
+            LatestState::Observed
+        );
+        assert_eq!(
+            ledger.latest_state(&key("engine.rpm", "cooling")),
+            LatestState::Rejected {
+                response_code: 0x31
+            }
+        );
+        // The failing context gained no coverage and kept no segment of its own.
+        let failed = entry(ledger, "engine.rpm", "cooling");
+        assert_eq!(failed.qualifying_samples, 0);
+        assert_eq!(failed.valid_time, Duration::ZERO);
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_failure_of_another_signal_or_version_does_not_break_a_segment() {
+        let mut other_version = outcome_fact("engine.rpm", "cooling", 15, Outcome::Unsupported);
+        other_version.versions = versions(2);
+        for failure in [
+            outcome_fact("engine.load", "cooling", 15, Outcome::Unsupported),
+            other_version,
+        ] {
+            let mut facts = samples("engine.rpm", "baseline", &[0, 10]);
+            facts.push(failure);
+            facts.extend(samples("engine.rpm", "baseline", &[20, 30]));
+            let run = baseline_run(&facts);
+            let entry = entry(run.ledger(), "engine.rpm", "baseline");
+            assert_eq!(entry.valid_time, secs(30));
+            assert_eq!(entry.longest_segment, secs(30));
         }
     }
 
@@ -2435,14 +2686,16 @@ mod tests {
         )
     }
 
-    /// Calls `visit` with every sequence of at most `max_len` steps over `offsets`; sorted ones
-    /// only when `sorted` (non-decreasing offsets, the recording order of a live session).
-    fn enumerate(
+    /// Calls `visit` with every sequence of at most `max_len` of the given `steps` over `offsets`;
+    /// sorted ones only when `sorted` (non-decreasing offsets, the recording order of a live
+    /// session).
+    fn enumerate<T: Copy>(
+        steps: &[T],
         offsets: &[u64],
         sorted: bool,
         max_len: usize,
-        current: &mut Sequence,
-        visit: &mut impl FnMut(&Sequence),
+        current: &mut Vec<(T, u64)>,
+        visit: &mut impl FnMut(&Vec<(T, u64)>),
     ) {
         visit(current);
         if current.len() == max_len {
@@ -2452,9 +2705,9 @@ mod tests {
             if sorted && current.last().is_some_and(|&(_, last)| at < last) {
                 continue;
             }
-            for step in Step::ALL {
+            for &step in steps {
                 current.push((step, at));
-                enumerate(offsets, sorted, max_len, current, visit);
+                enumerate(steps, offsets, sorted, max_len, current, visit);
                 current.pop();
             }
         }
@@ -2513,6 +2766,7 @@ mod tests {
     fn req_038_4_invariant_segments_never_bridge_a_failure_or_boundary() {
         let mut checked = 0_u32;
         enumerate(
+            &Step::ALL,
             &[0, 5, 10, 15, 20],
             true,
             6,
@@ -2556,6 +2810,7 @@ mod tests {
     fn req_038_4_invariant_a_failed_context_never_becomes_fresh_whatever_the_fold_order() {
         let mut checked = 0_u32;
         enumerate(
+            &Step::ALL,
             &[0, 5, 10, 15],
             false,
             5,
@@ -2583,30 +2838,211 @@ mod tests {
     // REQ-038.4
     fn req_038_4_invariant_an_extra_failure_or_boundary_never_raises_coverage() {
         let mut checked = 0_u32;
-        enumerate(&[0, 5, 10, 15], true, 4, &mut Vec::new(), &mut |sequence| {
-            let base = egr_entry(&fold_sequence(sequence));
-            for position in 0..=sequence.len() {
-                let low = position
-                    .checked_sub(1)
-                    .map_or(0, |before| sequence[before].1);
-                let high = sequence.get(position).map_or(15, |&(_, at)| at);
-                for at in (low..=high).filter(|at| at % 5 == 0) {
-                    for step in [Step::SpeedFails, Step::Boundary] {
-                        let mut changed = sequence.clone();
-                        changed.insert(position, (step, at));
-                        let entry = egr_entry(&fold_sequence(&changed));
-                        let context = format!("{changed:?} vs {sequence:?}");
-                        assert!(entry.valid_time <= base.valid_time, "{context}");
-                        assert!(entry.longest_segment <= base.longest_segment, "{context}");
-                        assert!(
-                            entry.qualifying_samples <= base.qualifying_samples,
-                            "{context}"
-                        );
-                        checked += 1;
+        enumerate(
+            &Step::ALL,
+            &[0, 5, 10, 15],
+            true,
+            4,
+            &mut Vec::new(),
+            &mut |sequence| {
+                let base = egr_entry(&fold_sequence(sequence));
+                for position in 0..=sequence.len() {
+                    let low = position
+                        .checked_sub(1)
+                        .map_or(0, |before| sequence[before].1);
+                    let high = sequence.get(position).map_or(15, |&(_, at)| at);
+                    for at in (low..=high).filter(|at| at % 5 == 0) {
+                        for step in [Step::SpeedFails, Step::Boundary] {
+                            let mut changed = sequence.clone();
+                            changed.insert(position, (step, at));
+                            let entry = egr_entry(&fold_sequence(&changed));
+                            let context = format!("{changed:?} vs {sequence:?}");
+                            assert!(entry.valid_time <= base.valid_time, "{context}");
+                            assert!(entry.longest_segment <= base.longest_segment, "{context}");
+                            assert!(
+                                entry.qualifying_samples <= base.qualifying_samples,
+                                "{context}"
+                            );
+                            checked += 1;
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
         assert!(checked > 10_000);
+    }
+
+    /// One step of the same-signal invariants below: `engine.rpm` read in the baseline or in the
+    /// `cooling` context, its failure in either context, a boundary, or the failure of another
+    /// signal (which must change nothing).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Probe {
+        ReadBaseline,
+        ReadCooling,
+        FailBaseline,
+        FailCooling,
+        Cut,
+        FailOther,
+    }
+
+    impl Probe {
+        const ALL: [Probe; 6] = [
+            Probe::ReadBaseline,
+            Probe::ReadCooling,
+            Probe::FailBaseline,
+            Probe::FailCooling,
+            Probe::Cut,
+            Probe::FailOther,
+        ];
+
+        /// Steps that break every segment of `engine.rpm`, whatever context they happened in.
+        fn breaks(self) -> bool {
+            matches!(self, Probe::FailBaseline | Probe::FailCooling | Probe::Cut)
+        }
+
+        fn reads(self) -> Option<&'static str> {
+            match self {
+                Probe::ReadBaseline => Some("baseline"),
+                Probe::ReadCooling => Some("cooling"),
+                _ => None,
+            }
+        }
+
+        fn fact(self, at: u64) -> Fact {
+            let timeout = || Outcome::NoAnswer {
+                reason: "timeout".into(),
+            };
+            match self {
+                Probe::ReadBaseline => sample("engine.rpm", "baseline", at),
+                Probe::ReadCooling => sample("engine.rpm", "cooling", at),
+                Probe::FailBaseline => outcome_fact("engine.rpm", "baseline", at, timeout()),
+                Probe::FailCooling => outcome_fact("engine.rpm", "cooling", at, timeout()),
+                Probe::Cut => boundary(at, Boundary::Gap),
+                Probe::FailOther => outcome_fact("engine.load", "baseline", at, timeout()),
+            }
+        }
+    }
+
+    fn probe_entry(sequence: &[(Probe, u64)], context: &str) -> Entry {
+        let facts: Vec<Fact> = sequence.iter().map(|&(step, at)| step.fact(at)).collect();
+        let run = run_with(Rules::generic_baseline(), SessionKind::Live, &facts);
+        run.ledger()
+            .entry(&key("engine.rpm", context))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_invariant_a_segment_ends_at_a_failure_of_its_signal_in_any_context() {
+        let limit = FRESHNESS_LIMIT.as_secs();
+        let mut checked = 0_u32;
+        // Recording order: offsets never decrease. Without required context signals the counting
+        // is exact: consecutive readings of one context add their distance when it is positive and
+        // at most the limit and nothing was folded that breaks the signal between them.
+        enumerate(
+            &Probe::ALL,
+            &[0, 4, 10, 15],
+            true,
+            5,
+            &mut Vec::new(),
+            &mut |sequence| {
+                for context in ["baseline", "cooling"] {
+                    let (mut samples, mut valid, mut longest, mut current) = (0_u32, 0, 0, 0);
+                    let mut previous: Option<u64> = None;
+                    for &(step, at) in sequence {
+                        if step.breaks() {
+                            previous = None;
+                            current = 0;
+                        } else if step.reads() == Some(context) {
+                            samples += 1;
+                            match previous {
+                                Some(before) if at > before && at - before <= limit => {
+                                    valid += at - before;
+                                    current += at - before;
+                                    longest = u64::max(longest, current);
+                                }
+                                // Not later than the previous reading: nothing added, no move.
+                                Some(before) if at == before => {}
+                                _ => current = 0,
+                            }
+                            previous = Some(at);
+                        }
+                    }
+                    let entry = probe_entry(sequence, context);
+                    let found = (
+                        entry.qualifying_samples,
+                        entry.valid_time,
+                        entry.longest_segment,
+                    );
+                    assert_eq!(
+                        found,
+                        (samples, secs(valid), secs(longest)),
+                        "{context}: {sequence:?}"
+                    );
+                    checked += 1;
+                }
+            },
+        );
+        assert!(checked > 100_000);
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_invariant_no_interval_crosses_a_break_folded_before_it_whatever_the_order() {
+        let limit = FRESHNESS_LIMIT.as_secs();
+        let steps = [
+            Probe::ReadBaseline,
+            Probe::ReadCooling,
+            Probe::FailBaseline,
+            Probe::FailCooling,
+            Probe::Cut,
+        ];
+        let mut checked = 0_u32;
+        // Breaks first, readings after them in any order and with any stamps, also older than a
+        // break: such a reading belongs to what the break ended and never bridges it. The bound is
+        // the sum of the distances between neighbouring distinct stamps that no break lies in.
+        enumerate(
+            &steps,
+            &[0, 4, 8, 12],
+            false,
+            5,
+            &mut Vec::new(),
+            &mut |sequence| {
+                let breaks = sequence
+                    .iter()
+                    .take_while(|(step, _)| step.breaks())
+                    .count();
+                if sequence[breaks..].iter().any(|(step, _)| step.breaks()) {
+                    return;
+                }
+                let cuts: Vec<u64> = sequence[..breaks].iter().map(|&(_, at)| at).collect();
+                for context in ["baseline", "cooling"] {
+                    let mut stamps: Vec<u64> = sequence[breaks..]
+                        .iter()
+                        .filter(|(step, _)| step.reads() == Some(context))
+                        .map(|&(_, at)| at)
+                        .collect();
+                    let reads = u32::try_from(stamps.len()).unwrap();
+                    stamps.sort_unstable();
+                    stamps.dedup();
+                    let bound: u64 = stamps
+                        .windows(2)
+                        .filter(|pair| {
+                            pair[1] - pair[0] <= limit
+                                && !cuts.iter().any(|&cut| pair[0] < cut && cut <= pair[1])
+                        })
+                        .map(|pair| pair[1] - pair[0])
+                        .sum();
+                    let entry = probe_entry(sequence, context);
+                    let found = (entry.qualifying_samples, entry.valid_time);
+                    assert!(found.0 == reads, "{context}: {sequence:?}");
+                    assert!(found.1 <= secs(bound), "{context}: {sequence:?}: {entry:?}");
+                    assert!(entry.longest_segment <= entry.valid_time, "{sequence:?}");
+                    checked += 1;
+                }
+            },
+        );
+        assert!(checked > 100_000);
     }
 }
