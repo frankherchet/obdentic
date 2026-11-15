@@ -96,8 +96,13 @@ signal ids, a 20-read/1-scan/60 s budget per diagnosis) runs through the same `M
 
 `coverage_ledger.rs` is the pure measurement-coverage model of REQ-038: facts folded into a run ledger and a
 vehicle ledger count qualifying samples, valid measured time and contiguous segments per signal and goal
-context, keep the latest availability state apart, and make no health claim. It has no I/O, clock or adapter;
-recording the facts (#339) and persisting the vehicle ledger (#340) follow.
+context, keep the latest availability state apart, and make no health claim. It has no I/O, clock or adapter.
+A Smart run writes its facts (`coverage.run`, `coverage.fact`, `coverage.boundary`) into the running recording, and
+`mobile/coverage.rs` re-derives the whole run from the set of rotated recording parts without an adapter, marking a
+single part or an incomplete set as partial: `obdentic-mobile-report part1.jsonl part2.jsonl …` (one or more files, any
+order) prints it in the `coverage` section, and Android replay publishes the same result (details in the
+[Android workbench](docs/android.md#coverage-facts-in-the-recording-req-0389)). Persisting the vehicle ledger (#340)
+follows.
 
 In a ready live session the Android app marks a measurement gap ("Keine aktuellen Messwerte")
 once a selected signal has produced a value and none arrives for 10 seconds while reads are
