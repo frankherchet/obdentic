@@ -16,64 +16,46 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Cheap gate: docs, memos and requirements-only changes skip the macOS Rust job.
-  # The classifier and the gate verdict live in tools/ci-gate.sh and are tested first.
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      code: ${{ steps.diff.outputs.code }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Test CI gate script
-        run: tools/test-ci-gate.sh
-      - id: diff
-        env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [[ -z "$BASE" || "$BASE" =~ ^0+$ ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          code="$(git diff --name-only "$BASE" "$GITHUB_SHA" | tools/ci-gate.sh classify)"
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "code changes: $code"
-
-  rust:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
+  # One stable required check that always runs: a documentation-only PR must not carry a skipped
+  # job or check (xp-ship never merges with one). Docs, memos and requirements-only changes skip
+  # only the expensive Rust *steps*; the gate script and the classifier are tested first. Change
+  # detection that fails fails the job, and any output other than exactly 'false' runs the Rust steps.
+  check:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          fetch-depth: 0
+      - name: Test CI gate script
+        run: tools/test-ci-gate.sh
+      - name: Detect code changes
+        id: diff
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          code="$(tools/ci-gate.sh detect "$BASE" "$GITHUB_SHA")"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code changes: $code"
       - name: Verify pinned Knowledge DB revision
+        if: steps.diff.outputs.code != 'false'
         run: |
           expected="$(sed -n 's/^revision = //p' knowledge.lock)"
           actual="$(git -C knowledge rev-parse HEAD)"
           test -n "$expected"
           test "$actual" = "$expected"
-      - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: steps.diff.outputs.code != 'false'
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - if: steps.diff.outputs.code != 'false'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Cache only main's state; PRs restore it read-only to avoid cache churn.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo +1.98.0 fmt --check
-      - run: cargo +1.98.0 test --locked
-      - run: cargo +1.98.0 clippy --all-targets --locked -- -D warnings
-      - run: cargo +1.98.0 build --locked
-
-  # Stable required check. Always runs; green only if change detection succeeded and the
-  # Rust job either succeeded (code changes) or was skipped (documentation-only changes).
-  # Failed, cancelled, skipped-by-mistake or unknown results are never green.
-  check:
-    needs: [changes, rust]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - env:
-          CHANGES: ${{ needs.changes.result }}
-          CODE: ${{ needs.changes.outputs.code }}
-          RUST: ${{ needs.rust.result }}
-        run: tools/ci-gate.sh verdict "$CHANGES" "$CODE" "$RUST"
+      - if: steps.diff.outputs.code != 'false'
+        run: cargo +1.98.0 fmt --check
+      - if: steps.diff.outputs.code != 'false'
+        run: cargo +1.98.0 test --locked
+      - if: steps.diff.outputs.code != 'false'
+        run: cargo +1.98.0 clippy --all-targets --locked -- -D warnings
+      - if: steps.diff.outputs.code != 'false'
+        run: cargo +1.98.0 build --locked

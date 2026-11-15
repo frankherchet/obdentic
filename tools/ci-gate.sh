@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # CI gate helpers (#341), used by .github/workflows/ci.yml.
 #
-#   ci-gate.sh classify                      changed paths on stdin -> "true" if Rust checks are needed, else "false"
-#   ci-gate.sh verdict <changes> <code> <rust>
-#                                            exit 0 only if the `check` gate may be green
+#   ci-gate.sh classify               changed paths on stdin -> "true" if Rust checks are needed, else "false"
+#   ci-gate.sh detect <base> <head>   same answer for the git range <base>..<head>; fails if git cannot diff it
 #
-# <changes> and <rust> are job results (success|failure|cancelled|skipped), <code> is the classify output.
 set -euo pipefail
 
 classify() {
@@ -22,35 +20,31 @@ classify() {
   echo false
 }
 
-verdict() {
-  [ "$#" -eq 3 ] || { echo "usage: ci-gate.sh verdict <changes> <code> <rust>" >&2; return 2; }
-  local changes="$1" code="$2" rust="$3"
-  if [ "$changes" != success ]; then
-    echo "change detection: $changes" >&2
-    return 1
+# detect <base> <head>: "true" if the changes since <base> need the Rust checks, "false" if they are documentation only.
+# An empty, all-zero or unknown base means nothing to compare against: "true". A failing git diff fails the command.
+detect() {
+  [ "$#" -eq 2 ] || { echo "usage: ci-gate.sh detect <base> <head>" >&2; return 2; }
+  local base="$1" head="$2" paths
+  if [ -z "$base" ] || [[ "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+    echo true
+    return 0
   fi
-  case "$code:$rust" in
-    true:success)
-      echo "Rust checks passed"
-      ;;
-    false:skipped)
-      echo "documentation-only change: Rust checks not required"
-      ;;
-    *)
-      echo "check rejected: code=$code rust=$rust" >&2
-      return 1
-      ;;
-  esac
+  paths="$(git diff --name-only "$base" "$head")" || return 1
+  if [ -z "$paths" ]; then
+    echo false
+  else
+    printf '%s\n' "$paths" | classify
+  fi
 }
 
 case "${1:-}" in
   classify) classify ;;
-  verdict)
+  detect)
     shift
-    verdict "$@"
+    detect "$@"
     ;;
   *)
-    echo "usage: ci-gate.sh classify|verdict ..." >&2
+    echo "usage: ci-gate.sh classify|detect ..." >&2
     exit 2
     ;;
 esac
