@@ -9,6 +9,7 @@ pub mod capture_format;
 pub mod capture_replay;
 pub mod capture_report;
 pub mod capture_tui;
+pub mod coverage_ledger;
 pub mod diagnostic_job;
 pub mod dtc;
 pub mod ecu_identification;
