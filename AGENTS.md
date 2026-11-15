@@ -117,7 +117,7 @@ Every xp-* skill ends with a hand-over in this form:
 - Remote: `frankherchet/obdentic`
 - Default branch: `main`
 - GitHub access: `gh` CLI; if unavailable, use the host's GitHub MCP tools.
-- CI: `.github/workflows/ci.yml` on every push and PR; verifies the Knowledge pin, formatting, tests, Clippy and build on macOS.
+- CI: `.github/workflows/ci.yml` on every push and PR: one job `check` on macOS that always runs, so no PR carries a skipped check. It verifies the Knowledge pin, formatting, tests, Clippy and build. Documentation-only changes (`*.md`, `docs/`, `.memento/`) skip only those Rust steps; failing change detection fails the job and any unknown result runs the Rust steps. The logic is in `tools/ci-gate.sh`, tested by `tools/test-ci-gate.sh`.
 - Build and test feedback target: under 10 minutes. On 2026-10-23, the full 466-test suite passed in 2.57 seconds with a warm build cache in an isolated checkout using the locked Knowledge revision. This is not a cold-build timing.
 - **Fix the default branch first:** while it is red, repairing it is the only next issue. A local dirty Knowledge submodule is not itself evidence that `main` is red: compare against `knowledge.lock`, preserve local changes, and verify the locked revision in isolation when needed.
 
