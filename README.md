@@ -203,6 +203,12 @@ VIN is used as a local vehicle-identity anchor where necessary, but it is not in
 
 Adapter-specific findings for the current Carly CUA-V200, including its hardware architecture, BLE/GATT interface, ELM-compatible dialect and source references, are documented in [`docs/carly-cua-v200.md`](docs/carly-cua-v200.md). Research notes live under [`docs/research/`](docs/research/).
 
+## License
+
+The main repository, including its source code, documentation and profiles, is licensed under the [Apache License, Version 2.0](LICENSE) (`Apache-2.0`), except for the Knowledge submodule and third-party material.
+
+The separate Knowledge repository (the `knowledge` submodule) is not covered by this license and keeps its own terms. Third-party materials, such as dependencies and referenced documents, are likewise not covered; they retain their own applicable terms.
+
 ## Roadmap
 
 The roadmap is intentionally broader than the first EA189 use cases. GitHub issues and milestones track the executable work; the stages below describe the architectural direction.
