@@ -89,6 +89,11 @@ presentation, including the ECU/group selector; it cannot supply diagnostic byte
 See [Android workbench](docs/android.md), [Knowledge loading](docs/knowledge-db.md)
 and [ADR 0003](docs/adr/0003-uds-extended-session-reads.md).
 
+The closed, versioned semantic tool interface of `semantic_tools.rs` (five read-only tools, session-bound
+signal ids, a 20-read/1-scan/60 s budget per diagnosis) runs through the same `MobileCore` and session owner
+(`mobile/assistant.rs`) and reuses `mobile/report.rs` for offline recording inspection; see
+[Android workbench](docs/android.md#semantic-assistant-tool-bridge-req-041).
+
 In a ready live session the Android app marks a measurement gap ("Keine aktuellen Messwerte")
 once a selected signal has produced a value and none arrives for 10 seconds while reads are
 attempted. It asserts no ignition or connection state, probes one known-working selected
