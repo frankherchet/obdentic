@@ -22,8 +22,9 @@ use serde_json::{json, Value};
 use crate::coverage_ledger::{
     Boundary, Decoded, DefinitionVersions, EvidenceRef, Fact, FactBody, GoalContext, Latest,
     LatestState, Outcome, Reading, Rules, RunId, SessionKind, SessionState, SmartRun, Status,
-    BASELINE_LABEL,
+    BASELINE_CONTEXT, BASELINE_LABEL,
 };
+use crate::knowledge_db::KnowledgeCatalog;
 
 /// The most parts one run may have; more invalidates it.
 pub const MAX_PARTS: usize = 64;
@@ -629,17 +630,202 @@ fn latest_json(latest: Option<&Latest>) -> Value {
         "evidence":latest.evidence.0})
 }
 
+/// The Knowledge revision this build embeds, loaded once.
+fn pin_revision() -> &'static str {
+    static PIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PIN.get_or_init(|| {
+        KnowledgeCatalog::embedded_pinned()
+            .map(|catalog| catalog.pin().revision().to_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// How much of an error text a fact keeps as its reason.
+const REASON_LIMIT: usize = 120;
+
+fn reason_of(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|char| if char.is_control() { ' ' } else { char })
+        .take(REASON_LIMIT)
+        .collect();
+    let flat = flat.trim();
+    if flat.is_empty() {
+        "no reason given"
+    } else {
+        flat
+    }
+    .to_owned()
+}
+
+/// The pure classification of one live `read` result (REQ-038.5) into the outcome fields of a
+/// fact. The value of the read is never copied: only its class survives.
+fn classify(read: &Value, catalog: Option<&KnowledgeCatalog>) -> serde_json::Map<String, Value> {
+    let data = &read["data"];
+    let mut fields = serde_json::Map::new();
+    let mut set = |name: &str, value: Value| {
+        fields.insert(name.to_owned(), value);
+    };
+    let mut implausible = false;
+    let mut static_identity = false;
+    let revision = data["knowledge_revision"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| pin_revision().to_owned());
+    let definition = data["definition_id"]
+        .as_str()
+        .and_then(|id| catalog.and_then(|catalog| catalog.definition(id)));
+    if let (Some(definition), Some(catalog)) = (definition, catalog) {
+        static_identity = catalog
+            .set(crate::knowledge_db::STANDARD_UDS_ECU_IDENTIFICATION_SET)
+            .is_some_and(|set| {
+                set.members()
+                    .iter()
+                    .any(|member| member == definition.semantic())
+            });
+        implausible = match (data["value"].as_f64(), definition.plausible_range()) {
+            (Some(number), Some(range)) => number < range.minimum() || number > range.maximum(),
+            _ => false,
+        };
+    }
+    let decoded_or = |value: &Value| -> Option<(&'static str, bool)> {
+        match value {
+            Value::Number(number) => Some(("numeric", number.as_f64().is_some_and(f64::is_finite))),
+            Value::String(text) => Some(("text", !text.is_empty())),
+            _ => None,
+        }
+    };
+    if read["ok"] == true {
+        let status = data["status"].as_str();
+        if matches!(status, None | Some("available")) {
+            match &data["value"] {
+                Value::Null => set("outcome", json!("empty")),
+                Value::String(text) if text.is_empty() => set("outcome", json!("empty")),
+                value => match decoded_or(value) {
+                    Some((kind, usable)) => {
+                        set("outcome", json!("decoded"));
+                        set("value_kind", json!(kind));
+                        set(
+                            if kind == "numeric" {
+                                "finite"
+                            } else {
+                                "nonempty"
+                            },
+                            json!(usable),
+                        );
+                    }
+                    None => {
+                        set("outcome", json!("error"));
+                        set("reason", json!("value is not a number or text"));
+                    }
+                },
+            }
+        } else if let Some(nrc) = data["nrc"].as_u64() {
+            set("outcome", json!("rejected"));
+            set("response_code", json!(nrc));
+        } else {
+            set("outcome", json!("no_answer"));
+            set(
+                "reason",
+                json!(reason_of(data["error"].as_str().unwrap_or(""))),
+            );
+        }
+    } else {
+        let error = read["error"].as_str().unwrap_or("");
+        let lower = error.to_lowercase();
+        if lower.contains("does not advertise support") || lower.contains("rejected unsupported") {
+            set("outcome", json!("unsupported"));
+        } else if lower.contains("session") || lower.contains("not sent") {
+            set("outcome", json!("session_restricted"));
+            set("reason", json!(reason_of(error)));
+        } else if [
+            "timeout",
+            "timed out",
+            "no data",
+            "no response",
+            "no answer",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        {
+            set("outcome", json!("no_answer"));
+            set("reason", json!(reason_of(error)));
+        } else {
+            set("outcome", json!("error"));
+            set("reason", json!(reason_of(error)));
+        }
+    }
+    fields.insert("implausible".into(), json!(implausible));
+    fields.insert("static_identity".into(), json!(static_identity));
+    fields.insert("knowledge_revision".into(), json!(revision));
+    fields.insert("ecu_target".into(), data["target_id"].clone());
+    fields
+}
+
+/// The core action `coverage.fact`: the `data` of one `coverage.fact` record for one live read.
+/// Android supplies what only it owns (run, run clock, session state, identity flag, the evidence
+/// reference of the raw read record) next to the read result. Pure: no transport, no clock.
+pub(super) fn fact_data(
+    argument: &str,
+    catalog: Option<&KnowledgeCatalog>,
+) -> Result<Value, String> {
+    let argument: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
+    let run = token(argument.get("run")).ok_or("run is missing or not a token")?;
+    let key = argument["key"]
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .ok_or("key is missing")?;
+    let offset = argument["run_offset_us"]
+        .as_u64()
+        .ok_or("run_offset_us is missing")?;
+    let session = match argument["session"].as_str() {
+        Some(session @ ("default" | "extended")) => session,
+        _ => return Err("unknown session state".into()),
+    };
+    let confirmed = argument["identity_confirmed"]
+        .as_bool()
+        .ok_or("identity_confirmed is missing")?;
+    let evidence = &argument["evidence"];
+    if !(evidence["at"].is_number() && evidence["offset_us"].is_u64()) {
+        return Err("evidence reference is missing".into());
+    }
+    let read = argument
+        .get("read")
+        .filter(|read| read.is_object())
+        .ok_or("read result is missing")?;
+    let embedded;
+    let catalog = match catalog {
+        Some(catalog) => Some(catalog),
+        None if read["data"]["definition_id"].is_string() => {
+            embedded = KnowledgeCatalog::embedded_pinned().map_err(|error| error.to_string())?;
+            Some(&embedded)
+        }
+        None => None,
+    };
+    let mut data = classify(read, catalog);
+    let mut put = |name: &str, value: Value| {
+        data.insert(name.to_owned(), value);
+    };
+    put("run", json!(run));
+    put("signal_key", json!(key));
+    put("context", json!(BASELINE_CONTEXT));
+    put("session", json!(session));
+    put("identity_confirmed", json!(confirmed));
+    put("goal_definition", json!(GOAL_DEFINITION));
+    put("run_offset_us", json!(offset));
+    let mut reference = json!({"at":evidence["at"],"offset_us":evidence["offset_us"]});
+    if evidence["in_previous_file"] == true {
+        reference["in_previous_file"] = json!(true);
+    }
+    put("evidence", reference);
+    Ok(Value::Object(data))
+}
+
 /// Derives the run ledgers of every Smart run named by the supplied parts, with the Knowledge
 /// pin of this build. `Value::Null` when no part has a `coverage.*` record (REQ-038.9: older
 /// recordings contribute nothing).
 pub fn derive(parts: &[Part]) -> Value {
-    derive_with_pin(parts, &pin_revision())
-}
-
-fn pin_revision() -> String {
-    crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
-        .map(|catalog| catalog.pin().revision().to_owned())
-        .unwrap_or_default()
+    derive_with_pin(parts, pin_revision())
 }
 
 pub fn derive_with_pin(parts: &[Part], pin: &str) -> Value {
@@ -1343,5 +1529,188 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(super::super::knowledge::PIN_MISMATCH));
+    }
+
+    // Classification of one live read (REQ-038.5, REQ-038.9).
+
+    struct Offline;
+    impl crate::mobile::Exchange for Offline {
+        fn exchange(&mut self, _: &str, _: Duration) -> Result<String, String> {
+            Err("no adapter in a classification test".into())
+        }
+    }
+
+    fn classify_read(read: Value, catalog: Option<&KnowledgeCatalog>) -> Value {
+        fact_data(
+            &json!({"run":RUN,"key":"engine.rpm","run_offset_us":secs(3),"session":"default",
+                "identity_confirmed":true,"evidence":{"at":at(secs(3)),"offset_us":777},
+                "read":read})
+            .to_string(),
+            catalog,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn req_038_9_classification_maps_every_read_outcome_without_copying_the_value() {
+        let table = [
+            (
+                json!({"ok":true,"data":{"key":"engine.rpm","value":812.5}}),
+                json!({"outcome":"decoded","value_kind":"numeric","finite":true}),
+            ),
+            (
+                json!({"ok":true,"data":{"key":"x","value":"WVWZZZ1JZXW000001"}}),
+                json!({"outcome":"decoded","value_kind":"text","nonempty":true}),
+            ),
+            (
+                json!({"ok":true,"data":{"key":"x","value":""}}),
+                json!({"outcome":"empty"}),
+            ),
+            (
+                json!({"ok":true,"data":{"key":"x","status":"unavailable","nrc":49,
+                    "error":"negative response"}}),
+                json!({"outcome":"rejected","response_code":49}),
+            ),
+            (
+                json!({"ok":true,"data":{"key":"x","status":"unavailable","nrc":null,
+                    "error":"Knowledge DID unavailable"}}),
+                json!({"outcome":"no_answer","reason":"Knowledge DID unavailable"}),
+            ),
+            (
+                json!({"ok":false,"error":"vehicle does not advertise support for engine.rpm"}),
+                json!({"outcome":"unsupported"}),
+            ),
+            (
+                json!({"ok":false,"error":"Knowledge DID is not enabled for this ECU session"}),
+                json!({"outcome":"session_restricted",
+                    "reason":"Knowledge DID is not enabled for this ECU session"}),
+            ),
+            (
+                json!({"ok":false,"error":"adapter timeout after 2s"}),
+                json!({"outcome":"no_answer","reason":"adapter timeout after 2s"}),
+            ),
+            (
+                json!({"ok":false,"error":"link failure"}),
+                json!({"outcome":"error","reason":"link failure"}),
+            ),
+            (
+                json!({"ok":true,"data":{"key":"x","value":{"nested":1}}}),
+                json!({"outcome":"error","reason":"value is not a number or text"}),
+            ),
+        ];
+        for (read, expected) in table {
+            let fact = classify_read(read.clone(), None);
+            for (name, value) in expected.as_object().unwrap() {
+                assert_eq!(&fact[name], value, "{read}");
+            }
+            assert!(!fact.to_string().contains("812"), "no value in {fact}");
+            assert!(!fact.to_string().contains("WVW"), "no value in {fact}");
+        }
+    }
+
+    #[test]
+    fn req_038_9_classification_adds_the_owned_fields_and_a_valid_record() {
+        let fact = classify_read(
+            json!({"ok":true,"data":{"key":"engine.rpm","value":900}}),
+            None,
+        );
+        assert_eq!(fact["run"], RUN);
+        assert_eq!(fact["signal_key"], "engine.rpm");
+        assert_eq!(fact["context"], "baseline");
+        assert_eq!(fact["session"], "default");
+        assert_eq!(fact["identity_confirmed"], true);
+        assert_eq!(fact["goal_definition"], 1);
+        assert_eq!(fact["run_offset_us"], secs(3));
+        assert_eq!(fact["knowledge_revision"], pin_revision());
+        assert_eq!(fact["evidence"], json!({"at":at(secs(3)),"offset_us":777}));
+        // The produced data is a record the derivation accepts as it is.
+        let mut opening = start(RUN, 0);
+        opening["result"]["data"]["knowledge_revision"] = json!(pin_revision());
+        let records = vec![
+            opening,
+            record("coverage.fact", secs(3), fact),
+            boundary(RUN, "run_end", secs(4)),
+        ];
+        let set = derive(&[part(records, None)]);
+        assert_eq!(set["runs"][0]["coverage_invalid"], false, "{set}");
+        assert_eq!(set["runs"][0]["entries"][0]["signal_key"], "engine.rpm");
+    }
+
+    #[test]
+    fn req_038_9_classification_takes_plausibility_and_identity_from_knowledge() {
+        let catalog = KnowledgeCatalog::embedded_pinned().unwrap();
+        let ranged = catalog
+            .definitions()
+            .find(|definition| definition.plausible_range().is_some())
+            .unwrap();
+        let range = ranged.plausible_range().unwrap();
+        let read = |value: f64| {
+            json!({"ok":true,"data":{"key":"k","definition_id":ranged.id(),
+                "target_id":"engine","status":"available","value":value}})
+        };
+        let inside = classify_read(
+            read((range.minimum() + range.maximum()) / 2.0),
+            Some(&catalog),
+        );
+        assert_eq!(inside["implausible"], false);
+        assert_eq!(inside["ecu_target"], "engine");
+        let outside = classify_read(read(range.maximum() + 1000.0), Some(&catalog));
+        assert_eq!(outside["implausible"], true);
+        assert_eq!(outside["outcome"], "decoded");
+
+        let identity = catalog
+            .set(crate::knowledge_db::STANDARD_UDS_ECU_IDENTIFICATION_SET)
+            .unwrap()
+            .members()
+            .iter()
+            .find_map(|member| catalog.semantic(member))
+            .unwrap();
+        let identity_read = json!({"ok":true,"data":{"key":"k","definition_id":identity.id(),
+            "target_id":"engine","status":"available","value":"SERIAL-1"}});
+        let fact = classify_read(identity_read.clone(), Some(&catalog));
+        assert_eq!(fact["static_identity"], true);
+        assert!(!fact.to_string().contains("SERIAL-1"));
+        // Without a handed-over catalog the embedded pin answers the same.
+        assert_eq!(classify_read(identity_read, None)["static_identity"], true);
+        assert_eq!(fact["knowledge_revision"], catalog.pin().revision());
+        assert_eq!(inside["static_identity"], false);
+    }
+
+    #[test]
+    fn req_038_9_classification_rejects_arguments_it_cannot_trust() {
+        let good = json!({"run":RUN,"key":"engine.rpm","run_offset_us":1,"session":"default",
+            "identity_confirmed":false,"evidence":{"at":1,"offset_us":2},
+            "read":{"ok":true,"data":{"value":1}}});
+        assert!(fact_data(&good.to_string(), None).is_ok());
+        for (field, value) in [
+            ("run", json!("not a token!")),
+            ("key", json!("")),
+            ("run_offset_us", json!(-1)),
+            ("session", json!("programming")),
+            ("identity_confirmed", json!("yes")),
+            ("evidence", json!({"at":1})),
+            ("read", json!("ok")),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            assert!(fact_data(&bad.to_string(), None).is_err(), "{field}");
+        }
+        assert!(fact_data("not json", None).is_err());
+    }
+
+    #[test]
+    fn req_038_9_core_action_classifies_without_any_adapter_traffic() {
+        let mut core = crate::mobile::MobileCore::new(Offline).unwrap();
+        let argument = json!({"run":RUN,"key":"engine.rpm","run_offset_us":5,"session":"extended",
+            "identity_confirmed":false,"evidence":{"at":1,"offset_us":2,"in_previous_file":true},
+            "read":{"ok":false,"error":"link failure"}});
+        let result: Value =
+            serde_json::from_str(&core.execute("coverage.fact", &argument.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["outcome"], "error");
+        assert_eq!(result["data"]["session"], "extended");
+        assert_eq!(result["data"]["evidence"]["in_previous_file"], true);
+        let rejected: Value = serde_json::from_str(&core.execute("coverage.fact", "{}")).unwrap();
+        assert_eq!(rejected["ok"], false);
     }
 }

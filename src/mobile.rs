@@ -130,6 +130,7 @@ impl<E: Exchange> MobileCore<E> {
         let mut result = self.dispatch(action, argument);
         let offline_action = action.starts_with("replay.")
             || action.starts_with("assistant.")
+            || action == "coverage.fact"
             || matches!(action, "vin.describe" | "catalog");
         if result.is_err() && self.uds.is_active() && !offline_action {
             let cleanup = self.disable_uds_outcome();
@@ -159,6 +160,14 @@ impl<E: Exchange> MobileCore<E> {
     fn dispatch(&mut self, action: &str, argument: &str) -> Result<Value, String> {
         if let Some(tool_action) = action.strip_prefix("assistant.") {
             return self.assistant_action(tool_action, argument);
+        }
+        if action == "coverage.fact" {
+            // REQ-038.9: classifies one finished read into the fields of a coverage fact; pure, no
+            // transport access.
+            return coverage::fact_data(
+                argument,
+                self.knowledge.as_ref().map(|knowledge| &knowledge.catalog),
+            );
         }
         if action == "catalog" {
             return Ok(self.catalog());
