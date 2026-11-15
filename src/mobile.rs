@@ -65,6 +65,9 @@ pub struct MobileCore<E> {
     failure_evidence: Map<String, Value>,
     /// REQ-041: session-bound signal ids, the budget of the running diagnosis and the selected recording.
     assistant: assistant::AssistantState,
+    /// REQ-038.9: the parts of a recorded run handed over by `replay.coverage.part` until
+    /// `replay.coverage` derives them; parts go in file by file so no argument holds a whole run.
+    coverage_parts: Vec<coverage::Part>,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -83,6 +86,7 @@ impl<E: Exchange> MobileCore<E> {
             uds_error: None,
             failure_evidence: Map::new(),
             assistant: assistant::AssistantState::default(),
+            coverage_parts: Vec::new(),
         })
     }
 
@@ -130,7 +134,7 @@ impl<E: Exchange> MobileCore<E> {
         let mut result = self.dispatch(action, argument);
         let offline_action = action.starts_with("replay.")
             || action.starts_with("assistant.")
-            || action == "coverage.fact"
+            || action.starts_with("coverage.")
             || matches!(action, "vin.describe" | "catalog");
         if result.is_err() && self.uds.is_active() && !offline_action {
             let cleanup = self.disable_uds_outcome();
@@ -160,6 +164,15 @@ impl<E: Exchange> MobileCore<E> {
     fn dispatch(&mut self, action: &str, argument: &str) -> Result<Value, String> {
         if let Some(tool_action) = action.strip_prefix("assistant.") {
             return self.assistant_action(tool_action, argument);
+        }
+        if action == "replay.coverage.part" {
+            return coverage::accept_part(&mut self.coverage_parts, argument);
+        }
+        if action == "replay.coverage" {
+            return coverage::derive_parts(std::mem::take(&mut self.coverage_parts));
+        }
+        if action == "coverage.run" {
+            return coverage::run_data(argument);
         }
         if action == "coverage.fact" {
             // REQ-038.9: classifies one finished read into the fields of a coverage fact; pure, no

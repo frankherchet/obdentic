@@ -821,6 +821,72 @@ pub(super) fn fact_data(
     Ok(Value::Object(data))
 }
 
+/// The core action `coverage.run`: the `data` of one `coverage.run` record. Android supplies the run,
+/// the part counter and the run clock; the definition versions are the core's own.
+pub(super) fn run_data(argument: &str) -> Result<Value, String> {
+    let argument: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
+    let run = token(argument.get("run")).ok_or("run is missing or not a token")?;
+    let offset = argument["run_offset_us"]
+        .as_u64()
+        .ok_or("run_offset_us is missing")?;
+    let part = argument["part"]
+        .as_u64()
+        .filter(|part| *part >= 1)
+        .ok_or("part is missing or not a positive integer")?;
+    let mut data = json!({"run":run,"part":part,"goal_definition":GOAL_DEFINITION,
+        "knowledge_revision":pin_revision(),"run_offset_us":offset});
+    match (argument["action"].as_str(), part) {
+        (Some("start"), 1) => data["action"] = json!("start"),
+        (Some("resume"), 2..) => {
+            data["action"] = json!("resume");
+            data["previous_part_records"] = json!(argument["previous_part_records"]
+                .as_u64()
+                .ok_or("previous_part_records is missing")?);
+        }
+        _ => return Err("unknown run action for this part".into()),
+    }
+    Ok(data)
+}
+
+/// The core action `replay.coverage.part`: hands one file over as a part (its raw `coverage.*`
+/// records in file order and how it ended). One more than [`MAX_PARTS`] is kept so that the
+/// derivation can reject a run of too many parts; nothing beyond that is accepted.
+pub(super) fn accept_part(parts: &mut Vec<Part>, argument: &str) -> Result<Value, String> {
+    let argument: Value = serde_json::from_str(argument).map_err(|error| error.to_string())?;
+    let records = argument["records"]
+        .as_array()
+        .ok_or("records is not a list")?;
+    if records.len() > 200_000 {
+        return Err("coverage part exceeds the record limit".into());
+    }
+    let ended = match &argument["ended"] {
+        Value::Null => None,
+        Value::String(reason) => Some(reason.clone()),
+        _ => return Err("ended is neither null nor text".into()),
+    };
+    if parts.len() > MAX_PARTS {
+        return Err("too many coverage parts handed over".into());
+    }
+    parts.push(Part {
+        records: records.clone(),
+        ended,
+    });
+    Ok(json!({"parts":parts.len()}))
+}
+
+/// The core action `replay.coverage`: derives the parts handed over so far and forgets them. A
+/// Knowledge-pin mismatch stops the replay with the error `replay.read` gives.
+pub(super) fn derive_parts(parts: Vec<Part>) -> Result<Value, String> {
+    let derived = derive(&parts);
+    if derived["knowledge_pin_mismatch"] == true {
+        return Err(format!(
+            "recording Knowledge revision {}",
+            super::knowledge::PIN_MISMATCH
+        ));
+    }
+    Ok(derived)
+}
+
 /// Derives the run ledgers of every Smart run named by the supplied parts, with the Knowledge
 /// pin of this build. `Value::Null` when no part has a `coverage.*` record (REQ-038.9: older
 /// recordings contribute nothing).
@@ -1718,5 +1784,120 @@ mod tests {
         assert_eq!(result["data"]["evidence"]["in_previous_file"], true);
         let rejected: Value = serde_json::from_str(&core.execute("coverage.fact", "{}")).unwrap();
         assert_eq!(rejected["ok"], false);
+    }
+
+    #[test]
+    fn req_038_9_core_action_builds_run_records_the_derivation_accepts() {
+        let mut core = crate::mobile::MobileCore::new(Offline).unwrap();
+        let mut ask = |argument: Value| -> Value {
+            serde_json::from_str(&core.execute("coverage.run", &argument.to_string())).unwrap()
+        };
+        let first = ask(json!({"run":RUN,"action":"start","part":1,"run_offset_us":0}));
+        let second = ask(
+            json!({"run":RUN,"action":"resume","part":2,"previous_part_records":2,"run_offset_us":5}),
+        );
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["data"]["goal_definition"], 1);
+        assert_eq!(first["data"]["knowledge_revision"], pin_revision());
+        assert_eq!(second["data"]["previous_part_records"], 2);
+        for bad in [
+            json!({"run":RUN,"action":"start","part":2,"run_offset_us":0}),
+            json!({"run":RUN,"action":"resume","part":1,"previous_part_records":0,"run_offset_us":0}),
+            json!({"run":RUN,"action":"resume","part":2,"run_offset_us":0}),
+            json!({"run":"bad token","action":"start","part":1,"run_offset_us":0}),
+            json!({"run":RUN,"action":"pause","part":1,"run_offset_us":0}),
+        ] {
+            assert_eq!(ask(bad.clone())["ok"], false, "{bad}");
+        }
+        let records = vec![
+            record("coverage.run", 0, first["data"].clone()),
+            record("coverage.fact", 1, {
+                let mut data = classify_read(
+                    json!({"ok":true,"data":{"key":"engine.rpm","value":900}}),
+                    None,
+                );
+                data["run_offset_us"] = json!(1);
+                data
+            }),
+            record(
+                "coverage.boundary",
+                2,
+                json!({"run":RUN,"class":"run_end","run_offset_us":2}),
+            ),
+        ];
+        let set = derive(&[part(records, None)]);
+        assert_eq!(set["runs"][0]["coverage_invalid"], false, "{set}");
+    }
+
+    #[test]
+    fn req_038_9_core_actions_derive_the_parts_handed_over_one_by_one_and_then_forget_them() {
+        let mut core = crate::mobile::MobileCore::new(Offline).unwrap();
+        let mut ask = |action: &str, argument: Value| -> Value {
+            serde_json::from_str(&core.execute(action, &argument.to_string())).unwrap()
+        };
+        let pin = pin_revision();
+        let files: Vec<Part> = three_parts()
+            .into_iter()
+            .map(|mut file| {
+                for record in &mut file.records {
+                    if record["result"]["data"]["knowledge_revision"].is_string() {
+                        record["result"]["data"]["knowledge_revision"] = json!(pin);
+                    }
+                }
+                file
+            })
+            .collect();
+        for index in [2, 0, 1] {
+            let handed = ask(
+                "replay.coverage.part",
+                json!({"records":files[index].records,"ended":files[index].ended}),
+            );
+            assert_eq!(handed["ok"], true, "{handed}");
+        }
+        let derived = ask("replay.coverage", json!({}));
+        assert_eq!(derived["ok"], true, "{derived}");
+        let run = &derived["data"]["runs"][0];
+        assert_eq!(run["run_complete"], true);
+        assert_eq!(run["entries"][0]["valid_time_ms"], 60_000);
+        // The accumulator is empty again: nothing is derived twice or mixed into the next file.
+        assert_eq!(ask("replay.coverage", json!({}))["data"], Value::Null);
+        for bad in [
+            json!({"records":"x","ended":null}),
+            json!({"records":[],"ended":5}),
+        ] {
+            assert_eq!(ask("replay.coverage.part", bad)["ok"], false);
+        }
+    }
+
+    #[test]
+    fn req_038_9_core_replay_stops_on_a_knowledge_pin_mismatch() {
+        let mut core = crate::mobile::MobileCore::new(Offline).unwrap();
+        let file = whole_run_in_one_file();
+        let handed: Value = serde_json::from_str(&core.execute(
+            "replay.coverage.part",
+            &json!({"records":file.records,"ended":file.ended}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(handed["ok"], true);
+        let derived: Value = serde_json::from_str(&core.execute("replay.coverage", "{}")).unwrap();
+        assert_eq!(derived["ok"], false);
+        assert!(derived["error"]
+            .as_str()
+            .unwrap()
+            .ends_with(super::super::knowledge::PIN_MISMATCH));
+    }
+
+    #[test]
+    fn req_038_9_core_accepts_at_most_one_part_more_than_the_run_limit() {
+        let mut core = crate::mobile::MobileCore::new(Offline).unwrap();
+        let empty = json!({"records":[],"ended":null}).to_string();
+        for _ in 0..=MAX_PARTS {
+            let handed: Value =
+                serde_json::from_str(&core.execute("replay.coverage.part", &empty)).unwrap();
+            assert_eq!(handed["ok"], true);
+        }
+        let refused: Value =
+            serde_json::from_str(&core.execute("replay.coverage.part", &empty)).unwrap();
+        assert_eq!(refused["ok"], false);
     }
 }
