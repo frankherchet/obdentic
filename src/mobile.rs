@@ -1,5 +1,6 @@
 //! Closed mobile facade. Platform code supplies transport, never diagnostic commands.
 pub(crate) mod knowledge;
+pub mod report;
 pub(crate) mod uds;
 
 use std::time::{Duration, Instant};
