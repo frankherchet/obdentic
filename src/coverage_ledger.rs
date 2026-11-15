@@ -22,6 +22,12 @@
 //!   of the signal, and a boundary, end the freshness of readings up to its offset (and the
 //!   contiguous segments that depend on it); a later reading renewed the signal after it and
 //!   keeps it fresh.
+//! - Such an event is an explicit break: a reading with the event's own offset that is folded
+//!   after it renewed the signal after the break and never merges with the freshness the event
+//!   ended, and that ended freshness no longer holds at the event's offset for a reading folded
+//!   after the event. A reading stamped before an event that was already folded cannot renew
+//!   freshness at all (its horizon would need the facts reordered); it is rejected, which can
+//!   only lower coverage.
 //! - A static identity observation is kept once per vehicle ledger, signal key, ECU target and
 //!   definition versions; the ledger stores provenance only, never the value. Its entry is covered
 //!   by that one observation and stays covered when a later read fails.
@@ -392,11 +398,21 @@ struct Span {
     /// Offsets of the usable readings, ascending; the first one starts the span.
     renewals: Vec<Duration>,
     until: Duration,
+    /// A failed reading or boundary cut the span: `until` is that event, not a renewal horizon.
+    /// A reading with the same offset folded afterwards renewed the signal after the event and
+    /// starts a span of its own, so the event stays a segment break.
+    ended: bool,
 }
 
 impl Span {
     fn start(&self) -> Duration {
         self.renewals[0]
+    }
+
+    /// Whether `at` lies inside the freshness this span grants. An ended span grants nothing at
+    /// the instant of its ending event: a reading folded after the event is after it.
+    fn holds(&self, at: Duration) -> bool {
+        self.start() <= at && (at < self.until || (!self.ended && at == self.until))
     }
 
     /// An event at `at` (failed reading or boundary) ends the freshness of the readings up to
@@ -409,10 +425,12 @@ impl Span {
         let later = (!later.is_empty()).then_some(Self {
             renewals: later,
             until,
+            ended: false,
         });
         let kept = Self {
             renewals: kept,
             until: until.min(at),
+            ended: true,
         };
         (kept, later)
     }
@@ -445,6 +463,10 @@ pub struct SmartRun {
     /// Per definition versions and context signal the spans of continuous freshness, ordered by
     /// start. A reading under other versions never renews or extends them.
     freshness: BTreeMap<(DefinitionVersions, String), Vec<Span>>,
+    /// Latest failed reading per definition versions and context signal that was folded.
+    failures: BTreeMap<(DefinitionVersions, String), Duration>,
+    /// Latest boundary that was folded; it ends the freshness of every signal.
+    last_boundary: Option<Duration>,
 }
 
 impl SmartRun {
@@ -457,6 +479,8 @@ impl SmartRun {
             confirmed_since: None,
             open: BTreeMap::new(),
             freshness: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            last_boundary: None,
         }
     }
 
@@ -520,6 +544,7 @@ impl SmartRun {
     }
 
     fn end_segments(&mut self, at: Duration) {
+        self.last_boundary = self.last_boundary.max(Some(at));
         self.open.clear();
         for spans in self.freshness.values_mut() {
             Self::cut(spans, at);
@@ -717,22 +742,39 @@ impl SmartRun {
                 .get(&(versions.clone(), signal.clone()))?
                 .iter()
                 .rev()
-                .find(|span| span.start() <= at)
-                .filter(|span| at <= span.until)?;
+                .find(|span| span.holds(at))?;
             until = until.min(span.until);
         }
         Some(until)
     }
 
-    /// Records a finite, plausible reading of a context signal.
+    /// Latest failed reading of the signal or boundary that was folded.
+    fn latest_break(&self, versions: &DefinitionVersions, signal: &str) -> Option<Duration> {
+        let failure = self
+            .failures
+            .get(&(versions.clone(), signal.to_owned()))
+            .copied();
+        failure.max(self.last_boundary)
+    }
+
+    /// Records a finite, plausible reading of a context signal. A reading older than a failure or
+    /// boundary that was already folded cannot renew anything: it belongs to freshness that the
+    /// event ended, and its horizon is not known without reordering the facts. One at the
+    /// event's own offset was folded after it and starts a span of its own.
     fn touch(&mut self, versions: &DefinitionVersions, signal: &str, at: Duration) {
+        if self
+            .latest_break(versions, signal)
+            .is_some_and(|event| at < event)
+        {
+            return;
+        }
         let spans = self
             .freshness
             .entry((versions.clone(), signal.to_owned()))
             .or_default();
         match spans.last_mut() {
             Some(last) if at < last.start() => {}
-            Some(last) if at <= last.until => {
+            Some(last) if !last.ended && at <= last.until => {
                 let position = last.renewals.partition_point(|&renewal| renewal <= at);
                 last.renewals.insert(position, at);
                 last.until = last.until.max(at + FRESHNESS_LIMIT);
@@ -740,18 +782,36 @@ impl SmartRun {
             _ => spans.push(Span {
                 renewals: vec![at],
                 until: at + FRESHNESS_LIMIT,
+                ended: false,
             }),
         }
     }
 
     /// A failed, unusable or implausible reading of a context signal ends the freshness of its
     /// earlier readings at that moment, whatever goal context the reading was taken in. Readings
-    /// taken after it were not affected and keep the signal fresh.
+    /// taken after it were not affected and keep the signal fresh. A dependent segment whose last
+    /// reading has the failure's own offset has no confirmed time left to count and ends there,
+    /// so a recovery with the same offset cannot bridge it; earlier ones keep the portion up to
+    /// the failure that the ended span confirms.
     fn invalidate(&mut self, versions: &DefinitionVersions, signal: &str, at: Duration) {
         let key = (versions.clone(), signal.to_owned());
+        self.failures
+            .entry(key.clone())
+            .and_modify(|latest| *latest = (*latest).max(at))
+            .or_insert(at);
         if let Some(spans) = self.freshness.get_mut(&key) {
             Self::cut(spans, at);
         }
+        let rules = &self.rules;
+        self.open.retain(|entry, segment| {
+            let depends = entry.versions == *versions
+                && rules
+                    .rule_for(&entry.context)
+                    .required_signals
+                    .iter()
+                    .any(|required| required == signal);
+            !(depends && segment.last == at)
+        });
     }
 
     /// Applies an event at `at` to `spans`: spans that started after it stay as they are.
@@ -1522,8 +1582,8 @@ mod tests {
         assert_eq!(entry.qualifying_samples, 0);
     }
 
-    /// A failed, implausible or non-finite reading of a context signal at 3 s.
-    fn invalid_speed_readings() -> Vec<Fact> {
+    /// A failed, implausible or non-finite reading of a context signal at `at` seconds.
+    fn invalid_speed_readings(at: u64) -> Vec<Fact> {
         let implausible = Reading {
             implausible: true,
             ..reading("vehicle.speed", "baseline", numeric())
@@ -1532,25 +1592,25 @@ mod tests {
             outcome_fact(
                 "vehicle.speed",
                 "baseline",
-                3,
+                at,
                 Outcome::NoAnswer {
                     reason: "timeout".into(),
                 },
             ),
-            outcome_fact("vehicle.speed", "baseline", 3, Outcome::Unsupported),
-            outcome_fact("vehicle.speed", "baseline", 3, Outcome::Gap),
+            outcome_fact("vehicle.speed", "baseline", at, Outcome::Unsupported),
+            outcome_fact("vehicle.speed", "baseline", at, Outcome::Gap),
             outcome_fact(
                 "vehicle.speed",
                 "baseline",
-                3,
+                at,
                 Outcome::Decoded(Decoded::Numeric { finite: false }),
             ),
-            fact(RUN, 3, false, FactBody::Reading(implausible)),
+            fact(RUN, at, false, FactBody::Reading(implausible)),
             // Any goal context of the signal ends its freshness.
             outcome_fact(
                 "vehicle.speed",
                 "cooling",
-                3,
+                at,
                 Outcome::Rejected {
                     response_code: 0x31,
                 },
@@ -1561,7 +1621,7 @@ mod tests {
     #[test]
     // REQ-038.4
     fn req_038_4_an_invalid_context_reading_ends_its_freshness_and_the_segment() {
-        for invalid in invalid_speed_readings() {
+        for invalid in invalid_speed_readings(3) {
             let facts = [
                 sample("vehicle.speed", "baseline", 0),
                 sample("engine.coolant_temperature", "cooling", 1),
@@ -1582,7 +1642,7 @@ mod tests {
     #[test]
     // REQ-038.2
     fn req_038_2_a_reading_after_an_invalid_context_reading_is_not_fresh() {
-        for invalid in invalid_speed_readings() {
+        for invalid in invalid_speed_readings(3) {
             let facts = [
                 sample("vehicle.speed", "baseline", 0),
                 invalid.clone(),
@@ -1654,6 +1714,219 @@ mod tests {
             sample("engine.coolant_temperature", "cooling", 10),
         ];
         let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(entry.qualifying_samples, 1);
+    }
+
+    /// Cooling needs 30 s of valid time in one segment while speed stays fresh.
+    fn continuous_cooling_rules() -> Rules {
+        Rules::generic_baseline().with_context(
+            GoalContext::new("cooling"),
+            ContextRule {
+                required_signals: vec!["vehicle.speed".into()],
+                min_contiguous: Some(secs(30)),
+                ..ContextRule::baseline()
+            },
+        )
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_context_failure_and_recovery_at_one_timestamp_keep_separate_segments() {
+        let cooling = key("engine.coolant_temperature", "cooling");
+        for invalid in invalid_speed_readings(20) {
+            let facts = [
+                sample("vehicle.speed", "baseline", 0),
+                sample("engine.coolant_temperature", "cooling", 1),
+                sample("vehicle.speed", "baseline", 9),
+                sample("engine.coolant_temperature", "cooling", 9),
+                sample("vehicle.speed", "baseline", 18),
+                sample("engine.coolant_temperature", "cooling", 19),
+                // Speed fails and is measured again within the same second: two freshness spans.
+                invalid.clone(),
+                sample("vehicle.speed", "baseline", 20),
+                // 19 s..26 s crosses the failure: only 19 s..20 s is confirmed.
+                sample("engine.coolant_temperature", "cooling", 26),
+                sample("vehicle.speed", "baseline", 28),
+                sample("engine.coolant_temperature", "cooling", 32),
+            ];
+            let rules = continuous_cooling_rules();
+            let run = run_with(rules.clone(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 5, "{invalid:?}");
+            assert_eq!(entry.valid_time, secs(8 + 10 + 1 + 6), "{invalid:?}");
+            assert_eq!(entry.longest_segment, secs(19), "{invalid:?}");
+            assert_eq!(
+                run.ledger().status(&rules, &cooling),
+                Status::Partial,
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_failure_and_recovery_at_the_timestamp_of_the_last_reading_end_its_segment() {
+        for invalid in invalid_speed_readings(20) {
+            let facts = [
+                sample("vehicle.speed", "baseline", 10),
+                sample("engine.coolant_temperature", "cooling", 12),
+                sample("engine.coolant_temperature", "cooling", 20),
+                invalid.clone(),
+                sample("vehicle.speed", "baseline", 20),
+                // 20 s..26 s lies behind the failure: a new segment starts at 26 s.
+                sample("engine.coolant_temperature", "cooling", 26),
+                sample("engine.coolant_temperature", "cooling", 30),
+            ];
+            let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 4, "{invalid:?}");
+            assert_eq!(entry.valid_time, secs(8 + 4), "{invalid:?}");
+            assert_eq!(entry.longest_segment, secs(8), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_boundary_and_a_renewal_at_one_timestamp_keep_separate_segments() {
+        let facts = [
+            sample("vehicle.speed", "baseline", 0),
+            sample("engine.coolant_temperature", "cooling", 1),
+            sample("engine.coolant_temperature", "cooling", 4),
+            boundary(5, Boundary::Reconnect),
+            sample("vehicle.speed", "baseline", 5),
+            sample("engine.coolant_temperature", "cooling", 8),
+            sample("engine.coolant_temperature", "cooling", 12),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(entry.valid_time, secs(3 + 4));
+        assert_eq!(entry.longest_segment, secs(4));
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_a_reading_at_the_timestamp_of_a_context_failure_folded_before_it_is_not_fresh() {
+        for invalid in invalid_speed_readings(20) {
+            let facts = [
+                sample("vehicle.speed", "baseline", 15),
+                invalid.clone(),
+                sample("engine.coolant_temperature", "cooling", 20),
+            ];
+            let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 0, "{invalid:?}");
+            assert_eq!(
+                entry.latest.as_ref().unwrap().state,
+                LatestState::ContextNotFresh,
+                "{invalid:?}"
+            );
+        }
+
+        // The recovery stamped with the failure's second keeps speed fresh, and a failure folded
+        // after the recovery ends it again.
+        let renewed = [
+            sample("vehicle.speed", "baseline", 15),
+            outcome_fact("vehicle.speed", "baseline", 20, Outcome::Unsupported),
+            sample("vehicle.speed", "baseline", 20),
+            sample("engine.coolant_temperature", "cooling", 22),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &renewed);
+        let after_recovery = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(after_recovery.qualifying_samples, 1);
+
+        let failed_again = [
+            sample("vehicle.speed", "baseline", 20),
+            outcome_fact("vehicle.speed", "baseline", 20, Outcome::Unsupported),
+            sample("engine.coolant_temperature", "cooling", 22),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &failed_again);
+        let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(entry.qualifying_samples, 0);
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_an_older_success_folded_after_a_failure_cannot_extend_freshness_past_it() {
+        let cooling = |at| sample("engine.coolant_temperature", "cooling", at);
+        let speed = |at| sample("vehicle.speed", "baseline", at);
+        for invalid in invalid_speed_readings(8) {
+            let orders = [
+                (
+                    "success folded first",
+                    vec![speed(5), invalid.clone(), cooling(12)],
+                ),
+                (
+                    "failure folded first",
+                    vec![invalid.clone(), speed(5), cooling(12)],
+                ),
+                (
+                    "failure folded before an older success of an open span",
+                    vec![speed(0), invalid.clone(), speed(5), cooling(12)],
+                ),
+                (
+                    "success folded first in an open span",
+                    vec![speed(0), speed(5), invalid.clone(), cooling(12)],
+                ),
+            ];
+            for (order, facts) in orders {
+                let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+                let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+                assert_eq!(entry.qualifying_samples, 0, "{order}: {invalid:?}");
+                assert_eq!(
+                    entry.latest.as_ref().unwrap().state,
+                    LatestState::ContextNotFresh,
+                    "{order}: {invalid:?}"
+                );
+            }
+
+            // A reading taken after the failure renews speed in either order.
+            let orders = [
+                (
+                    "success folded first",
+                    vec![speed(5), invalid.clone(), speed(9)],
+                ),
+                (
+                    "failure folded first",
+                    vec![invalid.clone(), speed(5), speed(9)],
+                ),
+            ];
+            for (order, mut facts) in orders {
+                facts.push(cooling(12));
+                let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+                let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+                assert_eq!(entry.qualifying_samples, 1, "{order}: {invalid:?}");
+                assert_eq!(
+                    entry.latest.as_ref().unwrap().state,
+                    LatestState::Observed,
+                    "{order}: {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_an_older_success_folded_after_a_boundary_cannot_extend_freshness_past_it() {
+        let cooling = |at| sample("engine.coolant_temperature", "cooling", at);
+        let speed = |at| sample("vehicle.speed", "baseline", at);
+        let gap = || boundary(8, Boundary::Gap);
+        let orders = [
+            ("success folded first", vec![speed(5), gap(), cooling(12)]),
+            ("boundary folded first", vec![gap(), speed(5), cooling(12)]),
+            (
+                "boundary folded before an older success of an open span",
+                vec![speed(0), gap(), speed(5), cooling(12)],
+            ),
+        ];
+        for (order, facts) in orders {
+            let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 0, "{order}");
+        }
+
+        let renewed = [gap(), speed(5), speed(9), cooling(12)];
+        let run = run_with(cooling_rules(), SessionKind::Live, &renewed);
         let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
         assert_eq!(entry.qualifying_samples, 1);
     }
