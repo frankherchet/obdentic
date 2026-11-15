@@ -314,6 +314,46 @@ deterministic replay tests. Gap behaviour on a real vehicle (how long values are
 whether the first probe recovers) is not validated and belongs to the separate #178 hardware
 acceptance; until then the thresholds above are the specified behaviour, not measured results.
 
+## Semantic assistant tool bridge (REQ-041)
+
+`MobileCore` offers an in-process, versioned tool interface for a future assistant runtime. It is the contract
+and safety validator of `src/semantic_tools.rs` plus the executor in `src/mobile/assistant.rs`; there is no
+model client, account, network, UI or MCP server in it, and it needs none to work. Everything goes through
+`NativeCore.execute` and so through the one session owner:
+
+- `assistant.tools` lists the five tools (version 1): `vehicle_info`, `signal_list`, `signal_read`, `dtc_scan`,
+  `recording_inspect`. Arguments are closed: `signal_read` takes exactly `signal`, an opaque id from `signal_list`;
+  everything else takes none. A semantic snapshot tool is not part of version 1 (#332).
+- `assistant.tool` runs one call, `{"tool":…,"arguments":{…}}`. The answer is always `ok:true` with an `outcome`:
+  `ok`, `refused` (with `reason` `unknown_tool`, `malformed_arguments`, `unexpected_argument`, `unknown_signal`,
+  `ambiguous_signal`, `expired_signal`, `unsupported`, `unsafe`, `session_change`, `no_diagnosis`), `unavailable`,
+  `busy`, `disconnected`, `cancelled`, `budget_exhausted` or `failed`. Every refusal and typed outcome is decided
+  before the first adapter byte. A request that names a raw, write, session, addressing or rate operation is
+  `unsafe`; nothing a model writes can reach the transport.
+- Ids are issued per listing and bound to the session; initializing, inventory, ECU discovery, an availability
+  measurement, a UDS session change or a reconnect expires them. Only standard PIDs the vehicle advertises and
+  Knowledge signals of identified ECUs are listed, minus signals the last availability job measured as rejected or
+  silent. ECU identification (serial, part and software numbers) and the VIN are never listed or returned.
+- `assistant.begin` starts a diagnosis: at most 20 live signal reads and one DTC scan, and no new live work after
+  60 s. `NativeCore.cancel(handle)` cancels without waiting for the session owner; a read or scan already in
+  flight finishes under its normal timeout and nothing further starts (a scan skips its pending-code request).
+  Live tools without `assistant.begin` are refused. `assistant.*` actions never queue behind a running job: a busy
+  session owner answers a tool call with the typed `busy` outcome, and `assistant.begin` and
+  `assistant.recording.select` with `ok:false` (they did not run, so a selection stays as it was).
+- Live tools reuse the code of the user's own reads and scans. A tool that would end an active extended session
+  (a scan, or a read outside the session's own engine target) is refused with `session_change`; the existing safety
+  cleanup after a failed read still applies.
+- Each value carries `provenance`: evidence class (`observed`, `decoded`, `inferred`, `unknown`), source (`live` or
+  `recording`), responder, timestamp, age, `freshness` (`fresh`, `stale` from 10 s, `unknown`) and, for a recording,
+  the capture position. Unknown parts are `null`, never zero.
+- `assistant.recording.select` (platform only, never a tool argument) names the user's recording; `recording_inspect`
+  summarizes it through the same offline report as `obdentic-mobile-report` (`mobile::report`), without Bluetooth, and
+  stops with `knowledge_pin_mismatch` when a recorded Knowledge repository or revision differs from the embedded pin.
+
+Software verification uses the scripted adapter and synthetic recordings (`src/mobile/acceptance_tests/assistant_tests.rs`).
+The JNI route is covered by the build only; nothing here is real-phone, adapter or vehicle evidence, which stays
+with #330.
+
 ## Adapter throughput (Diagnose)
 
 "Adapter-Leistung messen" in the Diagnose tab runs a closed, read-only job (`adapter.throughput`, REQ-022). It

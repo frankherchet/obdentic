@@ -961,20 +961,23 @@ fn recorded_evidence_payload(
     Ok(evidence)
 }
 
+/// Ends the error of a recording whose Knowledge pin differs from the embedded one (REQ-041.10).
+pub(super) const PIN_MISMATCH: &str = "does not match the embedded pin";
+
 fn require_revision(recorded: &Value, catalog: &KnowledgeCatalog) -> Result<(), String> {
     let revision = recorded
         .get("knowledge_revision")
         .and_then(Value::as_str)
         .ok_or("recording knowledge_revision missing")?;
     if revision != catalog.pin().revision() {
-        return Err("recording Knowledge revision does not match the embedded pin".into());
+        return Err(format!("recording Knowledge revision {PIN_MISMATCH}"));
     }
     let repository = recorded
         .get("knowledge_repository")
         .and_then(Value::as_str)
         .ok_or("recording knowledge_repository missing")?;
     if repository != catalog.pin().repository() {
-        return Err("recording Knowledge repository does not match the embedded pin".into());
+        return Err(format!("recording Knowledge repository {PIN_MISMATCH}"));
     }
     Ok(())
 }

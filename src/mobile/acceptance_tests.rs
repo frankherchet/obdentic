@@ -51,6 +51,8 @@ struct LinkState {
     /// Queued answers to `010C` and `3E80`; the defaults apply when the queue is empty.
     mode01_replies: VecDeque<Reply>,
     tester_replies: VecDeque<Reply>,
+    /// Runs when the adapter receives exactly this command, for example to cancel a diagnosis mid-scan.
+    on_command: Option<(String, Box<dyn Fn() + Send>)>,
 }
 
 struct FakeExchange(Arc<Mutex<LinkState>>);
@@ -63,6 +65,11 @@ impl Exchange for FakeExchange {
             wire: command.to_owned(),
             target,
         });
+        if let Some((wire, hook)) = &state.on_command {
+            if wire == command {
+                hook();
+            }
+        }
         if let Some(target) = command
             .strip_prefix("ATSH ")
             .and_then(|value| value.strip_suffix('\r'))
@@ -234,6 +241,7 @@ fn setup(
         leave_reply: Reply::Payload(vec![0x50, 0x01]),
         mode01_replies: VecDeque::new(),
         tester_replies: VecDeque::new(),
+        on_command: None,
     }));
     let mut core = MobileCore::new(FakeExchange(state.clone())).unwrap();
     assert_eq!(run(&mut core, "initialize", "")["ok"], true);
@@ -1165,6 +1173,7 @@ fn req_035_2_without_knowledge_or_engine_there_are_no_session_candidates() {
         leave_reply: Reply::NoData,
         mode01_replies: VecDeque::new(),
         tester_replies: VecDeque::new(),
+        on_command: None,
     }))))
     .unwrap();
     let data = catalog_data(&mut core);
@@ -1587,3 +1596,5 @@ fn req_023_7_8_live_knowledge_read_and_replay_use_the_decisive_response() {
     assert_eq!(replayed["ok"], true, "{replayed}");
     assert_eq!(answered(&replayed), 1, "replay {replayed}");
 }
+
+mod assistant_tests;

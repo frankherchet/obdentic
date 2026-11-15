@@ -4,7 +4,10 @@ use jni::{
     sys::{jlong, jstring},
     JNIEnv, JavaVM,
 };
-use obdentic::mobile::{Exchange, MobileCore};
+use obdentic::{
+    mobile::{execute_nonblocking, Exchange, MobileCore},
+    semantic_tools::CancelHandle,
+};
 use std::{
     collections::HashMap,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -49,10 +52,14 @@ impl Exchange for JavaExchange {
             .map_err(|e| e.to_string())
     }
 }
-type Core = Arc<Mutex<MobileCore<JavaExchange>>>;
-static CORES: OnceLock<Mutex<HashMap<i64, Core>>> = OnceLock::new();
+#[derive(Clone)]
+struct Session {
+    core: Arc<Mutex<MobileCore<JavaExchange>>>,
+    cancel: CancelHandle,
+}
+static CORES: OnceLock<Mutex<HashMap<i64, Session>>> = OnceLock::new();
 static NEXT: AtomicI64 = AtomicI64::new(1);
-fn cores() -> &'static Mutex<HashMap<i64, Core>> {
+fn cores() -> &'static Mutex<HashMap<i64, Session>> {
     CORES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -68,10 +75,17 @@ pub extern "system" fn Java_de_obdentic_app_NativeCore_create(
             object: env.new_global_ref(exchange).map_err(|e| e.to_string())?,
         })?;
         let handle = NEXT.fetch_add(1, Ordering::Relaxed);
+        let cancel = core.cancel_handle();
         cores()
             .lock()
             .map_err(|_| "native registry poisoned")?
-            .insert(handle, Arc::new(Mutex::new(core)));
+            .insert(
+                handle,
+                Session {
+                    core: Arc::new(Mutex::new(core)),
+                    cancel,
+                },
+            );
         Ok(handle)
     }))
     .ok()
@@ -96,16 +110,22 @@ pub extern "system" fn Java_de_obdentic_app_NativeCore_execute(
     let response = catch_unwind(AssertUnwindSafe(|| -> Result<String, String> {
         let action: String = env.get_string(&action).map_err(|e| e.to_string())?.into();
         let argument: String = env.get_string(&argument).map_err(|e| e.to_string())?.into();
-        let core = cores()
+        let session = cores()
             .lock()
             .map_err(|_| "native registry poisoned")?
             .get(&handle)
             .cloned()
             .ok_or("native session closed")?;
-        let response = core
-            .lock()
-            .map_err(|_| "native session poisoned")?
-            .execute(&action, &argument);
+        // The assistant never queues behind a running job: a busy session owner answers `busy`.
+        let response = if action.starts_with("assistant.") {
+            execute_nonblocking(&session.core, &action, &argument)
+        } else {
+            session
+                .core
+                .lock()
+                .map_err(|_| "native session poisoned")?
+                .execute(&action, &argument)
+        };
         Ok(response)
     }))
     .unwrap_or_else(|_| Err("native diagnostic panic contained; reconnect adapter".into()));
@@ -130,6 +150,25 @@ pub extern "system" fn Java_de_obdentic_app_NativeCore_destroy(
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if let Ok(mut cores) = cores().lock() {
             cores.remove(&handle);
+        }
+    }));
+}
+
+/// Cancels the running diagnosis of the assistant. It never waits for the session owner: the exchange
+/// in progress finishes, no further live work starts (REQ-041.6).
+#[no_mangle]
+pub extern "system" fn Java_de_obdentic_app_NativeCore_cancel(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(session) = cores()
+            .lock()
+            .ok()
+            .and_then(|cores| cores.get(&handle).cloned())
+        {
+            session.cancel.cancel();
         }
     }));
 }
