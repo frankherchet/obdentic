@@ -338,7 +338,8 @@ model client, account, network, UI or MCP server in it, and it needs none to wor
   60 s. `NativeCore.cancel(handle)` cancels without waiting for the session owner; a read or scan already in
   flight finishes under its normal timeout and nothing further starts (a scan skips its pending-code request).
   Live tools without `assistant.begin` are refused. `assistant.*` actions never queue behind a running job: a busy
-  session owner answers `busy`.
+  session owner answers a tool call with the typed `busy` outcome, and `assistant.begin` and
+  `assistant.recording.select` with `ok:false` (they did not run, so a selection stays as it was).
 - Live tools reuse the code of the user's own reads and scans. A tool that would end an active extended session
   (a scan, or a read outside the session's own engine target) is refused with `session_change`; the existing safety
   cleanup after a failed read still applies.

@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::{report, uds, Exchange, MobileCore};
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
         self as tools, Call, CancelHandle, Diagnosis, Evidence, Outcome, Provenance, Reason,
         Refusal, SessionIds, Tool,
     },
-    signal_read::{OutcomeState, SignalRoute},
+    signal_read::{OutcomeState, SignalOutcome, SignalRoute},
 };
 
 /// A request longer than this cannot be a tool call.
@@ -70,14 +70,15 @@ impl AssistantState {
 }
 
 /// One signal the session can read right now, before it gets an id.
-struct Listed {
-    key: String,
-    semantic: String,
-    info: Value,
+pub(super) struct Listed {
+    pub(super) key: String,
+    pub(super) semantic: String,
+    pub(super) info: Value,
 }
 
-/// Run an assistant action on a core another thread may be driving. A busy session owner answers with the
-/// typed `busy` outcome at once instead of queueing behind its job, and sends nothing (REQ-041.7).
+/// Run an assistant action on a core another thread may be driving. A busy session owner answers a tool call
+/// with the typed `busy` outcome at once, and any other action with an error, instead of queueing behind its
+/// job; nothing is sent and no state changes (REQ-041.7).
 pub fn execute_nonblocking<E: Exchange>(
     core: &Mutex<MobileCore<E>>,
     action: &str,
@@ -85,7 +86,7 @@ pub fn execute_nonblocking<E: Exchange>(
 ) -> String {
     match core.try_lock() {
         Ok(mut core) => core.execute(action, argument),
-        Err(TryLockError::WouldBlock) => {
+        Err(TryLockError::WouldBlock) if action == "assistant.tool" => {
             let tool = serde_json::from_str::<Value>(argument)
                 .ok()
                 .and_then(|request| tools::named_tool(&request));
@@ -93,6 +94,10 @@ pub fn execute_nonblocking<E: Exchange>(
                 "the session owner is running another operation")})
             .to_string()
         }
+        // Starting a diagnosis or selecting a recording did not run: report an error, never success.
+        Err(TryLockError::WouldBlock) => json!({"ok":false,
+            "error":"session busy: the session owner is running another operation"})
+        .to_string(),
         Err(TryLockError::Poisoned(_)) => {
             json!({"ok":false,"error":"native session poisoned"}).to_string()
         }
@@ -406,12 +411,28 @@ impl<E: Exchange> MobileCore<E> {
         if let Some(stop) = self.admit(|diagnosis, now, cancel| diagnosis.admit_read(now, cancel)) {
             return stop_outcome(tool, stop);
         }
-        match self.read_outcome(&listed.key) {
+        let read = self.read_outcome(&listed.key);
+        self.answer_read(signal, listed, read)
+    }
+
+    /// Turn one live read into the tool result. A read that ends without a usable value ends the
+    /// extended session as the user's own read does (REQ-041.5): a standard read (no ECU target) that is
+    /// rejected or not answered is an error there, and every error runs the safety cleanup.
+    pub(super) fn answer_read(
+        &mut self,
+        signal: &str,
+        listed: &Listed,
+        read: Result<(SignalOutcome, Map<String, Value>), String>,
+    ) -> Value {
+        let tool = Tool::SignalRead;
+        let cleanup = |core: &mut Self| {
+            if core.uds.is_active() {
+                let _ = core.disable_uds_outcome();
+            }
+        };
+        match read {
             Err(error) => {
-                // Safety cleanup after an error stays what it is for the user's own reads (REQ-041.5).
-                if self.uds.is_active() {
-                    let _ = self.disable_uds_outcome();
-                }
+                cleanup(self);
                 let reason = if crate::scheduler::is_fatal_runtime_error(&error) {
                     "transport"
                 } else {
@@ -448,18 +469,28 @@ impl<E: Exchange> MobileCore<E> {
                                 "provenance":live_provenance(Evidence::Decoded, responder, Some(timestamp)).to_json()}),
                         )
                     }
-                    OutcomeState::Rejected { nrc } => tools::failure(
-                        Some(tool),
-                        Outcome::Failed,
-                        "rejected",
-                        &format!("the ECU rejected the read with NRC 0x{nrc:02X}"),
-                    ),
-                    OutcomeState::NotAnswered { reason } => tools::failure(
-                        Some(tool),
-                        Outcome::Failed,
-                        "not_answered",
-                        &detail(reason.as_deref().unwrap_or("no usable answer")),
-                    ),
+                    OutcomeState::Rejected { nrc } => {
+                        if outcome.target_id.is_none() {
+                            cleanup(self);
+                        }
+                        tools::failure(
+                            Some(tool),
+                            Outcome::Failed,
+                            "rejected",
+                            &format!("the ECU rejected the read with NRC 0x{nrc:02X}"),
+                        )
+                    }
+                    OutcomeState::NotAnswered { reason } => {
+                        if outcome.target_id.is_none() {
+                            cleanup(self);
+                        }
+                        tools::failure(
+                            Some(tool),
+                            Outcome::Failed,
+                            "not_answered",
+                            &detail(reason.as_deref().unwrap_or("no usable answer")),
+                        )
+                    }
                 }
             }
         }
@@ -560,7 +591,21 @@ impl<E: Exchange> MobileCore<E> {
                 ),
             );
         }
-        tools::ok(Tool::RecordingInspect, recording_view(&report))
+        let identification = match identification_semantics() {
+            Ok(identification) => identification,
+            Err(error) => {
+                return tools::failure(
+                    Some(tool),
+                    Outcome::Failed,
+                    "recording_unreadable",
+                    &detail(&error),
+                )
+            }
+        };
+        tools::ok(
+            Tool::RecordingInspect,
+            recording_view(&report, &identification),
+        )
     }
 }
 
@@ -610,12 +655,15 @@ fn stop_outcome(tool: Tool, stop: tools::Stop) -> Value {
 
 /// What a consumer may see of a recording report: decoded values, the last DTC scan and availability
 /// statuses with their recorded provenance. Raw responses, identifiers and discovery data stay in the file.
-fn recording_view(report: &Value) -> Value {
+fn recording_view(report: &Value, identification: &BTreeSet<String>) -> Value {
     let end = report["recording_end_offset_us"].as_u64();
     let signals: Vec<Value> = report["last_values"]
         .as_object()
         .into_iter()
         .flatten()
+        .filter(|(key, data)| {
+            !is_identification(identification, Some(key.as_str()), data["semantic"].as_str())
+        })
         .map(|(key, data)| {
             let recorded = &report["value_provenance"][key];
             let offset = recorded["offset_us"].as_u64();
@@ -652,8 +700,22 @@ fn recording_view(report: &Value) -> Value {
         json!({"recorded_at":job["at"],"stored":data["observations"],
             "pending":data["pending"].get("observations").unwrap_or(&Value::Null)})
     });
-    let availability = last_job("knowledge.availability")
-        .map(|job| json!({"recorded_at":job["at"],"entries":job["table"],"counts":job["counts"]}));
+    // The availability table lists every measured signal; identification rows carry the ECU values.
+    let availability = last_job("knowledge.availability").map(|job| {
+        let entries: Vec<&Value> = job["table"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| !is_identification(identification, entry["key"].as_str(), None))
+            .collect();
+        let mut counts = BTreeMap::<&str, u32>::new();
+        for entry in &entries {
+            *counts
+                .entry(entry["status"].as_str().unwrap_or("unknown"))
+                .or_insert(0) += 1;
+        }
+        json!({"recorded_at":job["at"],"entries":entries,"counts":counts})
+    });
     json!({
         "recording":{"mode":report["mode"],"profile":report["profile"],"complete":report["complete"],
             "event_count":report["event_count"],"outcome":report["outcome"]},
@@ -662,6 +724,33 @@ fn recording_view(report: &Value) -> Value {
         "availability":availability,
         "measurement_gaps":report["measurement_gaps"],
         "issues":report["issues"],
-        "withheld":["raw_responses","vin","ecu_serials","adapter_identifier"]
+        "withheld":["raw_responses","vin","ecu_serials","ecu_identification","adapter_identifier"]
     })
+}
+
+/// The semantics of ECU identification (serials, part and software numbers): the typed plan the
+/// pinned Knowledge defines. A recording that passed the pin check is read against that same plan.
+fn identification_semantics() -> Result<BTreeSet<String>, String> {
+    let catalog = crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+        .map_err(|error| error.to_string())?;
+    let plan = crate::ecu_identification::EcuIdentificationPlan::from_catalog(&catalog)?;
+    Ok(plan
+        .candidates()
+        .iter()
+        .map(|candidate| candidate.semantic().to_owned())
+        .collect())
+}
+
+/// Whether a recorded signal is ECU identification, by its semantic or by the semantic inside its
+/// `semantic@target` key (REQ-041.9).
+fn is_identification(
+    identification: &BTreeSet<String>,
+    key: Option<&str>,
+    semantic: Option<&str>,
+) -> bool {
+    let from_key = key.map(|key| key.rsplit_once('@').map_or(key, |(semantic, _)| semantic));
+    from_key
+        .into_iter()
+        .chain(semantic)
+        .any(|semantic| identification.contains(semantic))
 }

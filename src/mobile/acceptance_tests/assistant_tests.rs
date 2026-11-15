@@ -391,6 +391,47 @@ fn req_041_5_a_tool_that_would_end_the_restricted_session_is_refused_before_traf
 
 #[test]
 // REQ-041.5
+fn req_041_5_a_standard_read_without_a_usable_answer_ends_the_extended_session_like_a_user_read() {
+    // The transport rejects malformed Mode 01 answers before decoding, so a decoded standard read that
+    // is not answered is driven through the result seam with the same inputs the decoder produces.
+    for response in [vec![0x41, 0x0C, 0x1A], vec![0x41, 0x0C, 0x1A, 0xF8, 0x00]] {
+        let (mut core, state) = active_session(3);
+        let listed = crate::mobile::assistant::Listed {
+            key: "engine.rpm".into(),
+            semantic: "engine.rpm".into(),
+            info: json!({"source":"standard","ecu_role":null,"validation":null}),
+        };
+        let outcome = crate::signal_read::decode(
+            "engine.rpm",
+            crate::signal_read::Decoder::Standard {
+                request: crate::read::prepare_read("engine.rpm").unwrap(),
+                source: "user",
+            },
+            crate::signal_read::Evidence {
+                response: Some(response),
+                error: None,
+            },
+        );
+        assert!(
+            matches!(
+                outcome.state,
+                crate::signal_read::OutcomeState::NotAnswered { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert!(core.uds.is_active());
+        clear_commands(&state);
+
+        let failed = core.answer_read("sig-1", &listed, Ok((outcome, serde_json::Map::new())));
+        assert_eq!(failed["outcome"], "failed", "{failed}");
+        assert_eq!(failed["reason"], "not_answered", "{failed}");
+        assert!(!core.uds.is_active(), "the extended session stayed active");
+        assert!(wires(&state).iter().any(|wire| wire == "1001\r"));
+    }
+}
+
+#[test]
+// REQ-041.5
 fn req_041_5_a_read_outside_the_active_session_target_is_refused_without_ending_the_session() {
     let (mut core, state) = ready();
     begin(&mut core);
@@ -536,6 +577,45 @@ fn req_041_7_disconnected_busy_and_unavailable_start_no_work() {
 
 #[test]
 // REQ-041.7
+fn req_041_7_busy_begin_and_recording_selection_are_errors_that_change_nothing() {
+    let (mut core, state) = ready();
+    let old = rpm_recording("busy-old");
+    let new = TempRecording::new("busy-new", &[header(), end(1_000)]);
+    select(&mut core, &old);
+    clear_commands(&state);
+
+    let shared = Mutex::new(core);
+    {
+        let owner = shared.lock().unwrap();
+        for (action, argument) in [
+            ("assistant.begin", ""),
+            ("assistant.recording.select", new.path()),
+            ("assistant.recording.select", ""),
+        ] {
+            let busy: Value =
+                serde_json::from_str(&execute_nonblocking(&shared, action, argument)).unwrap();
+            assert_eq!(busy["ok"], false, "{action}: {busy}");
+            assert!(
+                busy["error"].as_str().unwrap().contains("busy"),
+                "{action}: {busy}"
+            );
+        }
+        drop(owner);
+    }
+    assert!(commands(&state).is_empty());
+    let mut core = shared.into_inner().unwrap();
+
+    // No diagnosis began and the earlier selection still stands: the tool reads the old recording.
+    let dtc = call(&mut core, json!({"tool":"dtc_scan"}));
+    assert_eq!(dtc["reason"], "no_diagnosis", "{dtc}");
+    let inspected = call(&mut core, json!({"tool":"recording_inspect"}));
+    assert_eq!(inspected["signals"][0]["key"], "engine.rpm", "{inspected}");
+    let free = run(&mut core, "assistant.recording.select", new.path());
+    assert_eq!(free["ok"], true, "{free}");
+}
+
+#[test]
+// REQ-041.7
 fn req_041_7_the_availability_measurement_decides_which_signals_are_listed() {
     let (mut core, state) = ready();
     answer_knowledge_signal(&state, 1);
@@ -653,6 +733,84 @@ fn req_041_9_results_exclude_vins_serials_adapter_ids_and_raw_recordings() {
         let text = result.to_string();
         assert!(!text.contains("43 01 0C"), "raw DTC frame in {text}");
     }
+}
+
+#[test]
+// REQ-041.9
+fn req_041_9_recording_inspection_withholds_recorded_ecu_identification() {
+    let (mut core, _) = ready();
+    let catalog = KnowledgeCatalog::embedded_pinned().unwrap();
+    let identification = "ecu.manufacturer_spare_part_number";
+    let key = format!("{identification}@vag.ecu_target.7e0");
+    let mut payload = vec![0x62, 0xF1, 0x87];
+    payload.extend_from_slice(b"1K0907115XY");
+    assert_eq!(payload[3..7], *b"1K09");
+    let recording = TempRecording::new(
+        "identification",
+        &[
+            header(),
+            action(
+                "read",
+                1_000,
+                json!({"knowledge_repository":catalog.pin().repository(),
+                    "knowledge_revision":catalog.pin().revision(),
+                    "semantic":identification,
+                    "definition_id":"uds.f187.manufacturer_spare_part_number",
+                    "target_id":"vag.ecu_target.7e0","request":[0x22,0xF1,0x87],
+                    "response":payload,
+                    "observations":[{"selected_responder":"7E8","responses":[
+                        {"responder":"7E8","payload":payload}]}]}),
+            ),
+            action(
+                "read",
+                2_000,
+                json!({"semantic":"engine.rpm","response":[65,12,26,248],
+                    "observations":[{"selected_responder":"7E8","responses":[]}]}),
+            ),
+            action(
+                "knowledge.availability",
+                3_000,
+                json!({"knowledge_repository":catalog.pin().repository(),
+                    "knowledge_revision":catalog.pin().revision(),
+                    "entries":[
+                        {"key":key,"target":"vag.ecu_target.7e0",
+                         "definition_id":"uds.f187.manufacturer_spare_part_number","response":payload},
+                        {"key":"engine.rpm","target":null,"response":[65,12,26,248]}]}),
+            ),
+            end(40_000_000),
+        ],
+    );
+    select(&mut core, &recording);
+    let inspected = call(&mut core, json!({"tool":"recording_inspect"}));
+    assert_eq!(inspected["outcome"], "ok", "{inspected}");
+    // The recording does hold the identification, so the filter is what keeps it out.
+    let report = crate::mobile::report::report(&PathBuf::from(recording.path())).unwrap();
+    assert!(report["last_values"].get(&key).is_some(), "{report}");
+    assert_eq!(
+        report["diagnostic_jobs"][0]["table"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    assert_eq!(
+        inspected["signals"].as_array().unwrap().len(),
+        1,
+        "{inspected}"
+    );
+    assert_eq!(inspected["signals"][0]["key"], "engine.rpm");
+    let entries = inspected["availability"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{inspected}");
+    assert_eq!(entries[0]["key"], "engine.rpm");
+    assert_eq!(
+        inspected["availability"]["counts"]["answered"], 1,
+        "{inspected}"
+    );
+    let text = inspected.to_string();
+    // The identification value is bytes of text: "1K09" in decimal.
+    assert!(!text.contains("49,75,48,57"), "{text}");
+    assert!(!text.contains(identification), "{text}");
 }
 
 #[test]
