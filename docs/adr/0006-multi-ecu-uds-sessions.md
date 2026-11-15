@@ -1,6 +1,6 @@
 # 0006. Concurrent per-ECU UDS sessions over one serial adapter
 Date: 2026-11-15
-Status: proposed (amends ADR 0003 for Smart once accepted; ADR 0003 stays accepted until then)
+Status: accepted 2026-11-15 (amends ADR 0003 for Smart only; ADR 0003 stays in force for the manual path and, in code, until the implementing change #321 lands)
 
 ## Context
 Epic #318 lets Smart hold extended UDS sessions on several eligible ECUs at the same time, interleaved with Mode 01 and other ECU reads (REQ-040, draft in PR #323; feature #321). The product goal is decided by the maintainer and is not reopened here: no project-imposed ten-minute limit, no one-attempt-per-start limit, sessions held only while goals need them, a target-local isolation of uncertainty, and stop-all with a safe reconnect when the shared transport is not known safe. Spike #322 answers only the implementation and safety unknowns. It changes no behaviour.
@@ -96,7 +96,7 @@ Eligible: identified ECU, validated physical target (`Protocol::Obd2`, physical 
 | `configured_target` single shadow | kept as K2; cleared on any anomaly; setup reply must be exactly `OK` |
 | `functional_dirty` after targeted work | unchanged; functional operations stay refused while Smart runs (REQ-036.1) |
 | `uds.tick` once per Java poll | scheduling moves into the core; Java wakes it |
-| Manual Diagnose-tab session and preset apply (REQ-027, REQ-035.3) | proposed: unchanged behaviour as another owner of the same ledger entry (own limit); Smart and the manual session never run together |
+| Manual Diagnose-tab session and preset apply (REQ-027, REQ-035.3) | decided by the maintainer: unchanged behaviour as another owner of the same ledger entry (own limit); Smart and the manual session never run together |
 
 ## Consequences
 - **REQ-040 open decisions answered:** retry/backoff (section 5); maintenance scheduling and concurrency limit (4, 5); known-safe criteria and observed versus assumed (1, 3); one rejected read ends only the signal (6); when to activate (5); Knowledge marker needed (7); #321 does not fit one PR (below); acceptance of this ADR is a human gate. Left to #178: real S3/gateway behaviour, adapter buffering of late frames, the horizon, the 50 % budget and the ceiling of 3.
@@ -106,8 +106,8 @@ Eligible: identified ECU, validated physical target (`Protocol::Obd2`, physical 
 - **Costs:** one extra header setup after every silent request; a 2 s wait before an identical request is repeated; slow start delays the second session by one maintenance period; a spurious stop-all is possible when an adapter prints unexplained text (safe, costs availability).
 - **Vehicle acceptance is separate (#178)** and needs user-confirmed availability for a bounded session; nothing here is claimed from simulation.
 
-### Questions for the maintainer
-1. Accept this ADR (and #321 stays blocked until then)?
-2. Does the supersession also cover the manual Diagnose-tab session and preset apply, or only Smart? Proposal: Smart only; the manual path keeps its ten-minute limit and rules and shares the ledger.
-3. May a typed `requires_extended_session` field be proposed in the Knowledge repository?
-4. Start values for #178: at most 3 sessions, 50 % maintenance budget, 4 s assumption horizon, backoff 2/4 s, 60 s cool-down. Change any?
+### Maintainer decisions (2026-11-15)
+1. **Accepted.** This ADR is accepted; #321 is unblocked by this ADR.
+2. **Supersession covers Smart only.** The manual Diagnose-tab session and preset apply keep their ten-minute limit and rules (REQ-027, REQ-035.3) and share the ledger entry; the any-error and ten-minute rules are removed for Smart only.
+3. **Knowledge field approved to propose.** A typed `requires_extended_session` field may be proposed in the Knowledge repository (schema change plus pin bump, as in section 7). Until it is merged and pinned, the file-name/id-prefix rule and the engine-only check stay in force.
+4. **Initial hardware test values accepted, subject to hardware verification (#178):** at most 3 sessions, 50 % maintenance budget, 4 s assumption horizon, backoff 2 s / 4 s, 60 s cool-down. They are starting values for the hardware test, not verified properties of any adapter or vehicle.
