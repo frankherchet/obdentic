@@ -849,7 +849,7 @@ requirements:
     title: Track measurement coverage per vehicle and per Smart run without promising a diagnosis
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "Conversation 2026-11-14: Smart measurement coverage, decisions by @frankherchet"
     description: |
       While the user-started Smart analysis
@@ -914,7 +914,7 @@ requirements:
       - id: REQ-038.5
         text: "The ledger and display distinguish historical coverage from the latest availability per signal and context. They report not yet observed, observed successfully, unsupported, rejected (with response code), empty, error or no answer (with reason), measurement gap, and session-restricted (with reason) separately. An unavailable or failed reading adds no successful samples or measured time and is never treated as zero; it does not erase earlier valid coverage, which remains visibly distinct from the latest failure."
       - id: REQ-038.6
-        text: "The vehicle ledger is stored locally in app-private storage with the vehicle record, survives an app restart and later drives, and is not automatically exported, shared, uploaded, or offered to MCP or AI. An explicitly exported recording may contain the run evidence described in REQ-038.9 under the existing privacy rules. Introducing, migrating or resetting the ledger never deletes or rewrites existing recordings, vehicle records, availability results or other private data; only an explicit user action removes anything (REQ-028.6). Coverage values and vehicle-specific evidence never appear in GitHub issues, docs or the operational app log (REQ-029); the log names only goals, contexts and reasons."
+        text: "The vehicle ledger is stored locally in app-private storage with the vehicle record, survives an app restart and later drives, and is not automatically exported, shared, uploaded, or offered to MCP or AI. An explicitly exported recording may contain the run evidence described in REQ-038.9 under the existing privacy rules. Introducing, migrating or resetting the ledger never deletes or rewrites existing recordings, vehicle records, availability results or other private data; only an explicit user action removes anything (REQ-028.6). Deleting a vehicle record under REQ-013.9 also deletes its vehicle ledger without a separate confirmation; recordings remain unchanged. Coverage values and vehicle-specific evidence never appear in GitHub issues, docs or the operational app log (REQ-029); the log names only goals, contexts and reasons."
       - id: REQ-038.7
         text: "Every ledger entry records the version of the goal definition (REQ-039) and the Knowledge revision it was measured under. When either changes, progress recorded under the old definition stays separate, visible and labeled with its definition, is never silently credited to or compared with progress under the new version, and is not reprocessed from historical data; only new results are recorded under the version in force when they are taken."
       - id: REQ-038.8
