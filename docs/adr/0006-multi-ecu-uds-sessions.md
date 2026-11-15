@@ -1,0 +1,113 @@
+# 0006. Concurrent per-ECU UDS sessions over one serial adapter
+Date: 2026-11-15
+Status: proposed (amends ADR 0003 for Smart once accepted; ADR 0003 stays accepted until then)
+
+## Context
+Epic #318 lets Smart hold extended UDS sessions on several eligible ECUs at the same time, interleaved with Mode 01 and other ECU reads (REQ-040, draft in PR #323; feature #321). The product goal is decided by the maintainer and is not reopened here: no project-imposed ten-minute limit, no one-attempt-per-start limit, sessions held only while goals need them, a target-local isolation of uncertainty, and stop-all with a safe reconnect when the shared transport is not known safe. Spike #322 answers only the implementation and safety unknowns. It changes no behaviour.
+
+**What the code does today** (read for this spike):
+- One session slot. `UdsSessionState` (`src/mobile/uds.rs`) holds one target, one responder and one authorization; `enable` refuses a second ECU ("an extended session is already active for another ECU") and refuses every candidate whose `ecu_role` is not `engine`. `MobileCore` owns exactly one such state.
+- Fixed lifecycle: ten minutes (`EXTENDED_SESSION_LIMIT`), and every rejected, unanswered or malformed read calls `cleanup_after_error` (`10 01`), so a single NRC on one DID ends the session.
+- One adapter, one command at a time. `ElmSession` (`src/elm.rs`) keeps one `configured_target` (the ATSH/ATCRA shadow); a request to another target sends `ATSH` and `ATCRA` first (3 s each, `require_response` accepts a response when any line equals `OK`). Normal commands wait up to `COMMAND_TIMEOUT` = 5 s for the prompt. `uds_session_command` marks `functional_dirty`, so a later functional (7DF) operation re-initialises the adapter.
+- Keepalive is polled: `tick` sends `3E 80` when 2 s have passed; the Android worker (`ObdService.poll`) calls `uds.tick` once per poll, before the next read. The reply is suppressed, so the only accepted evidence is an explicit adapter `NO DATA`.
+- Eligibility is not a typed Knowledge property: `requires_extended_session` is true for the file name `ea189-engine-session-candidates.yaml` or an id starting `vag.ea189_session.` (`src/knowledge_db.rs`).
+- The test seam: `ScriptedExchange` (`src/test_support.rs`) replays a FIFO of responses and records commands. It does not model adapter header state, ECU session state, clocks or faults. Multi-ECU behaviour cannot be tested through it.
+
+**Method.** A throwaway prototype on the unmerged branch `spike/322-multi-ecu-uds-sim` (standalone crate `spikes/322-multi-ecu-uds/`, std only, no dependency on this crate, no PR): a stateful ELM327-style adapter on a virtual clock (ATSH/ATCRA state, per-ECU S3 timers, multi-frame replies, scripted NRCs, lost/late/foreign/truncated frames, blocking reads, missing prompt) and the controller proposed below. 27 scenarios pass. All data is synthetic, there is no live traffic, and the latencies are modelled, not measured: the numbers below show behaviour of the rules, not vehicle timing. Hardware behaviour stays with #178.
+
+**Not tested here:** real adapter timing and buffering, real ECU S3 values, gateway behaviour, what an ECU does after an unanswered `10 03`, whether a real adapter prints frames that arrive while no command is outstanding, BLE latency, behaviour while driving.
+
+## Options considered
+1. **Keep the single slot, loosen the limits.** Cannot hold two ECUs; the any-error rule would end a session on one rejected DID. Rejected.
+2. **One serialized owner with a per-target session ledger, an explicit shared-transport classification and a maintenance-first scheduler.** One adapter has one command in flight, so the owner already exists (AGENTS: one actor owns the adapter). Chosen.
+3. **Several independent session actors, or a second adapter connection.** Two writers on one serial link cannot attribute responses and would break the single-owner rule. Rejected.
+4. **Functional (7DF) `3E 80` as a shared keepalive.** Outside the closed vocabulary, not addressed to one validated target (REQ-040.2 maintains only the addressed ECU), and it forces header and adapter resets. Rejected.
+5. **Pipelined requests.** ELM-style adapters answer one command at a time; association of a response to a request would be impossible. Rejected.
+
+## Decision
+Option 2. The scheduler and the ledger live in the Rust core (testable through the transport seam); the Android side only supplies the planner's goals and wake-ups. No new service, address or capability: the vocabulary stays `ATSH`/`ATCRA` for validated targets, `10 03`, `10 01`, `3E 80`, `22 <Knowledge DID>` and `01 <PID>` through the validated engine target.
+
+### 1. Per-target ledger: observed versus app-assumed state
+One entry per validated target (`TargetKey` = request header, expected responder).
+- **Observed** is what an attributed response from that target showed, with its time: `Never`, `Default` (positive `50 01`), `Extended` (positive `50 03`, or a positive `62` of a session-only DID), `NotExtended` (NRC `7F`/`7E` for a session-only DID, or for `3E`), `Refused(nrc)`. Only an attributed response changes it. A suppressed `3E 80` and a timeout never change it.
+- **Assumed** is the app's decision: `Default`, `Extended{since, maintained}` or `Unconfirmed`. `maintained` is the send time of the latest activation or `3E 80`. Reads, even of the same target, do not renew it, and no other target's traffic does.
+- **Status** (scheduling): `Idle`, `Active`, `Retry{next_at}`, `CoolDown{until}`, `Refused(nrc)`, `Isolated(reason)`.
+- Assumption decays: when `now − maintained` exceeds the **assumption horizon of 4 s (twice the 2 s period)** the target becomes `Unconfirmed` and is re-verified by a new `10 03`. This is an app policy, not an inference of any ECU's S3; hardware acceptance may tune it. Unanswered or ambiguous activation never sets `Default` or `Extended`.
+- Every sample is recorded with the observed and assumed state of its target at that time (REQ-040.8/.9).
+
+### 2. Request path, header ownership, attribution
+One request in flight; one owner. Per request: if the adapter's configured target differs, send `ATSH <req>` and `ATCRA <resp>`, each answered by a clean `OK`, before the request; the shadow is cleared on any setup error. After any silent request the setup pair is sent immediately again for the same target (resynchronisation). Consecutive requests to one target send no setup. A response belongs to a request only if all hold: it comes with the expected responder header, its service echo matches (`62 <DID>`, `50 03`, `41 <PID>`, or `7F <SID> <NRC>`), multi-frame replies are complete and in sequence from one responder, and there is exactly one final answer (`7F .. 78` is intermediate). Flow control stays with the adapter; no `ATFC*` command is in the vocabulary.
+
+### 3. Known safe versus uncertain, isolate versus stop-all
+Shared transport is **known safe** only while all hold: (K1) the last exchange returned a prompt; (K2) the shadow equals the target of the request, set only after two clean `OK`s; (K3) the response met every attribution rule above; (K4) the adapter printed nothing else; (K5) after any silent request the immediate resynchronisation came back clean. `OK` must be the only content of a setup reply (today's `require_response` accepts extra lines; the implementing change tightens that).
+
+| Event | Class | Outcome |
+|---|---|---|
+| NRC or well-formed negative answer from the target, K1–K5 hold | answered | target-local: signal or session rule of section 6 |
+| `NO DATA` with prompt, then clean resync | silent | target-local: signal `Unanswered`; same request not repeated for 2 s |
+| a frame outside any request that matches exactly one unanswered request of the last 2 s (same responder, same service echo) | benign late | discarded, never counted; association stays known |
+| no prompt, link error, adapter `?`/`ERROR`/`BUFFER FULL`/`STOPPED`, disconnect | transport | **stop-all** |
+| foreign responder, wrong echo, conflicting or truncated multi-frame, any other stray frame, empty reply without `NO DATA`, unclean setup | association | **stop-all** |
+
+**Stop-all** sends no further vehicle traffic, not even `10 01`: without attribution no answer to it could be read. Every assumed session becomes `Unconfirmed`, Smart ends, the link is closed and re-established with full initialisation; ECUs fall back by their own timeout (hardware-unverified, as in ADR 0003). **Isolate** applies to one target only when the shared transport is known safe: an unconfirmed return (two `10 01`, no positive answer), a refused keepalive, or a refusal. An isolated target gets no reads, only bounded close attempts, and is shown as state unconfirmed.
+
+### 4. Maintenance and scheduling
+Each step picks, in this order: (1) the active target whose `maintained + 2 s` is earliest (earliest deadline first); (2) a close for a target without open goals; (3) an activation of a needed target that is ready and admitted; (4) the due read with the lowest priority number (0 = DPF raw request status), ties by earliest due; (5) idle until the next due time. A visit to one target is a **burst**: due `3E 80`, the chosen read, then up to 3 reads in total of the same target while no better-priority read exists elsewhere and no other target's maintenance falls due within a read's cost. Grouping avoids header switches. Maintenance is never skipped for reads, and reads of one ECU are never counted as maintenance of another. No hard timeliness is promised; a blocked read can only delay maintenance, and the horizon above turns the delay into an explicit `Unconfirmed`. A read cannot be aborted once sent (no raw interrupt exists in the vocabulary), so blocking is bounded by the adapter's own timeout and by the transport timeout, which is a stop-all.
+
+### 5. Activation, retry, close, concurrency
+- **When:** a session is activated only for an eligible target with at least one open session-only goal that the planner currently wants, with admission (below), a known-safe transport and a status of `Idle`, `Retry` due or `CoolDown` over. A session is closed (`10 01`) as soon as no open goal needs it; a later need activates it again (no activation limit).
+- **Retry:** a transient refusal or an unconfirmed-then-cleaned activation backs off 2 s then 4 s; after 3 attempts the episode ends with a 60 s cool-down, then a new episode starts if goals still need it. The bound is a rate, not a count. A definitive refusal ends activation for the rest of the Smart run. Session loss evidence (section 6) re-activates at once without counting as a failed attempt.
+- **Unanswered activation:** assumed `Unconfirmed`; the controller sends at most two `10 01`. A positive answer starts the backoff; no positive answer isolates the target.
+- **Close:** at most two `10 01` for any close; user stop and disconnect follow REQ-040.7.
+- **Concurrency limit:** at most 3 sessions, and only while the measured cost of maintenance (average of the last 8 header-switch and `3E 80` costs per session) stays at or below 50 % of the 2 s period. Slow start: the next session is admitted only after one maintenance cost was measured. Refused targets are reported as capacity-limited and retried when a session closes. Both numbers are starting values for #178 to tune.
+- **Order inside a Smart run:** demand-driven, not at Smart start; the ECU's default-session targets get their first pass first.
+
+### 6. NRC table
+| Request | NRC | Effect |
+|---|---|---|
+| `10 03` | `21`, `22`, `37`, `92`, `93` | transient: back off and retry (section 5) |
+| `10 03` | `11`, `12`, `13`, `7E`, `7F`, `33`, `10`, any unlisted code | definitive: refused for this Smart run, no retry; session-only goals marked session-restricted with the code |
+| any | `7F <SID> 78` (response pending) without a final answer | not final: treated as unanswered (silent), then resynchronised |
+| `22 <session DID>` | `31` | signal unsupported or session-gated; if the target answered another session DID earlier in this activation, a canary read of that DID decides: positive → signal only, otherwise session lost; if the failing DID is the canary itself, session lost; no earlier answer → signal only |
+| `22` | `33` | signal restricted; never SecurityAccess; no session effect |
+| `22` | `21`, `22`, `92`, `93` | signal busy or conditions; planner decides when to read again; no session effect |
+| `22 <session DID>` | `7F`, `7E` | session lost evidence: observed `NotExtended`, assumed `Unconfirmed`, re-activate |
+| `22 <default DID>`, `01 <PID>` | any | signal only; never session evidence |
+| `22` | any other (`10`, `13`, `14`, `24`–`26`, unknown) | signal rejected, no session effect |
+| `3E 80` | none (adapter `NO DATA`) | normal; not an observation |
+| `3E 80` | `11`, `12`, `13` | keepalive refused: close with `10 01`, target refused |
+| `3E 80` | `7E`, `7F`, anything else | session lost evidence, re-activate |
+| `10 01` | positive `50 01` | observed `Default` |
+| `10 01` | NRC or no answer | second attempt, then isolate |
+| any | no answer twice in a row for session reads | session `Unconfirmed`, re-verified by `10 03` |
+
+**One rejected or unanswered read ends only that signal** unless it is session-loss evidence as listed. This replaces ADR 0003's any-error return. An ordinary negative response is never proof that the session ended.
+
+### 7. Eligibility and Knowledge
+Eligible: identified ECU, validated physical target (`Protocol::Obd2`, physical addressing, concrete header and responder), and an explicit typed Knowledge definition per session DID. The engine-only check and the file-name/id-prefix rule must go: **a typed `requires_extended_session` property in the Knowledge definition schema is needed** for non-engine ECUs. That is a Knowledge repository change plus a pin bump; it is outside this repository and needs the maintainer's approval (question below). The `ExtendedSessionReadRequest` authorization (`src/safety.rs`) stays per definition.
+
+### 8. What carries over, what changes
+| Existing | In the implementing change |
+|---|---|
+| `UdsSessionCommand` closed set, `SafetyPolicy` `ExtendedSessionRead` authorization, validated-target rule | unchanged |
+| `has_expected_negative_session_response` (final NRC, not `21`/`78`, from the expected responder) | unchanged; basis of the definitive/transient split |
+| `NO DATA` as the only accepted evidence for `3E 80` | unchanged |
+| Single `UdsSessionState`, engine-only, ten-minute limit, any-error return | replaced by the ledger; ten-minute limit and any-error rule removed for Smart |
+| `configured_target` single shadow | kept as K2; cleared on any anomaly; setup reply must be exactly `OK` |
+| `functional_dirty` after targeted work | unchanged; functional operations stay refused while Smart runs (REQ-036.1) |
+| `uds.tick` once per Java poll | scheduling moves into the core; Java wakes it |
+| Manual Diagnose-tab session and preset apply (REQ-027, REQ-035.3) | proposed: unchanged behaviour as another owner of the same ledger entry (own limit); Smart and the manual session never run together |
+
+## Consequences
+- **REQ-040 open decisions answered:** retry/backoff (section 5); maintenance scheduling and concurrency limit (4, 5); known-safe criteria and observed versus assumed (1, 3); one rejected read ends only the signal (6); when to activate (5); Knowledge marker needed (7); #321 does not fit one PR (below); acceptance of this ADR is a human gate. Left to #178: real S3/gateway behaviour, adapter buffering of late frames, the horizon, the 50 % budget and the ceiling of 3.
+- **Text to amend in the implementing change #321, with this ADR accepted:** REQ-027.1/.3/.6/.7 (ten minutes and any-error return become the manual-owner rules; the Smart owner follows ADR 0006), REQ-035.3/.4, REQ-036.1 (Smart may hold sessions; other functional operations stay refused), REQ-040.2 (define overdue by the horizon), .4 (benign late frame), .5 (retry numbers, NRC sets), .6 (stop-all sends no traffic), ADR 0003 (Status line and the Mixed-selections return rules) and `docs/project-goals.md` section 7 (the extended-session paragraph). Nothing of this is edited now.
+- **Split of #321** (proposal): (a) ledger, header and attribution, transport classification, tightened setup reply, stateful simulation adapter in `test_support`; (b) lifecycle: activation, maintenance, retry, NRC table, capacity; (c) recording, replay, UI of REQ-040.8/.10, and the Knowledge marker.
+- **Tests to carry into the implementation** are the 27 prototype scenarios, rewritten through `ElmSession` and a new stateful simulated adapter (a FIFO `ScriptedExchange` is not enough). They cover: S3 survival of two and three sessions under reads that do not renew S3 (a), one header switch per target change and none otherwise (b), multi-frame assembly (c), foreign, stray and truncated frames stopping everything with no later traffic (d), a late frame matching exactly one unanswered request (e), the same request not repeated inside the late window (f), missing prompt and disconnect (g), a blocked read making maintenance overdue and the ECU really losing its session, followed by re-verification and no sample under `Unconfirmed` (h), the NRC table and its three effects on a live session (i), definitive refusal without retry (j), transient backoff 2 s, 4 s, 60 s cool-down (k), unanswered activation with two `10 01` and target-only isolation, or stop-all over a failing transport (l), keepalive refusal (m), two silent reads re-verified (n), DPF priority with maintenance and no starvation (o), the capacity limit at a slow adapter and admission at a fast one (p), close of only the finished ECU and end of run (q), and the closed vocabulary over a mixed run (r). In the model, two sessions plus Mode 01 and a DPF request kept every maintenance gap at or below 2.08 s and the DPF gap at or below 1.36 s over 120 s of virtual time; three sessions 2.2 s and 1.7 s. These are properties of the model.
+- **Costs:** one extra header setup after every silent request; a 2 s wait before an identical request is repeated; slow start delays the second session by one maintenance period; a spurious stop-all is possible when an adapter prints unexplained text (safe, costs availability).
+- **Vehicle acceptance is separate (#178)** and needs user-confirmed availability for a bounded session; nothing here is claimed from simulation.
+
+### Questions for the maintainer
+1. Accept this ADR (and #321 stays blocked until then)?
+2. Does the supersession also cover the manual Diagnose-tab session and preset apply, or only Smart? Proposal: Smart only; the manual path keeps its ten-minute limit and rules and shares the ledger.
+3. May a typed `requires_extended_session` field be proposed in the Knowledge repository?
+4. Start values for #178: at most 3 sessions, 50 % maintenance budget, 4 s assumption horizon, backoff 2/4 s, 60 s cool-down. Change any?
