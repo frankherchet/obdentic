@@ -25,7 +25,10 @@
 //! - Such an event is an explicit break: a reading with the event's own offset that is folded
 //!   after it renewed the signal after the break and never merges with the freshness the event
 //!   ended, and that ended freshness no longer holds at the event's offset for a reading folded
-//!   after the event. A reading stamped before an event that was already folded cannot renew
+//!   after the event. A contiguous segment never continues from a reading whose freshness the
+//!   event ended into a reading at the event's offset: the time up to the event counts and the
+//!   later reading starts a new segment. An event that splits an already ended freshness span
+//!   leaves both parts ended. A reading stamped before an event that was already folded cannot renew
 //!   freshness at all (its horizon would need the facts reordered); it is rejected, which can
 //!   only lower coverage.
 //! - A static identity observation is kept once per vehicle ledger, signal key, ECU target and
@@ -425,7 +428,8 @@ impl Span {
         let later = (!later.is_empty()).then_some(Self {
             renewals: later,
             until,
-            ended: false,
+            // Splitting an ended span leaves the part after `at` ended by the same event.
+            ended: self.ended,
         });
         let kept = Self {
             renewals: kept,
@@ -673,13 +677,17 @@ impl SmartRun {
                 if let Some(length) = vehicle_length {
                     vehicle = (counted, Some(length));
                 }
-                if counted == interval {
+                if counted == interval
+                    && self.holds_through(&key.versions, &key.context, previous.last, offset)
+                {
                     next.run_length = run_length;
                     next.vehicle_length = vehicle_length.or(start.vehicle_length);
                 }
-                // Otherwise a required context reading expired inside the interval: only the
-                // confirmed portion counted and the segment ended there; this reading starts a new
-                // one.
+                // Otherwise the segment ended inside or at the end of the interval: a required
+                // context reading expired inside it (only the confirmed portion counted), or a
+                // failure or boundary ended the freshness of the previous reading exactly at this
+                // reading's offset, so a recovery at that offset is a new freshness. This reading
+                // starts a new segment.
             }
         }
         self.open.insert(key.clone(), next);
@@ -746,6 +754,28 @@ impl SmartRun {
             until = until.min(span.until);
         }
         Some(until)
+    }
+
+    /// Whether every required context signal of `context` is fresh at `to` through the very span
+    /// that makes it fresh at `from`. A span that a failure or boundary ended at `to` does not
+    /// reach `to`: what is fresh there afterwards is a new span, and a segment never joins two.
+    fn holds_through(
+        &self,
+        versions: &DefinitionVersions,
+        context: &GoalContext,
+        from: Duration,
+        to: Duration,
+    ) -> bool {
+        self.rules
+            .rule_for(context)
+            .required_signals
+            .iter()
+            .all(|signal| {
+                self.freshness
+                    .get(&(versions.clone(), signal.clone()))
+                    .and_then(|spans| spans.iter().rev().find(|span| span.holds(from)))
+                    .is_some_and(|span| span.holds(to))
+            })
     }
 
     /// Latest failed reading of the signal or boundary that was folded.
@@ -1788,6 +1818,72 @@ mod tests {
 
     #[test]
     // REQ-038.4
+    fn req_038_4_a_context_failure_at_an_interval_endpoint_does_not_bridge_the_segment() {
+        let cooling = key("engine.coolant_temperature", "cooling");
+        for invalid in invalid_speed_readings(6) {
+            let facts = [
+                sample("vehicle.speed", "baseline", 0),
+                sample("engine.coolant_temperature", "cooling", 1),
+                sample("engine.coolant_temperature", "cooling", 4),
+                // Speed fails and is measured again at the second the next reading closes the
+                // interval 4 s..6 s: that interval is confirmed up to the failure, the segment
+                // ends there, and what follows is a segment of its own.
+                invalid.clone(),
+                sample("vehicle.speed", "baseline", 6),
+                sample("engine.coolant_temperature", "cooling", 6),
+                sample("engine.coolant_temperature", "cooling", 9),
+                sample("engine.coolant_temperature", "cooling", 12),
+            ];
+            let rules = continuous_cooling_rules();
+            let run = run_with(rules.clone(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 5, "{invalid:?}");
+            assert_eq!(entry.valid_time, secs(3 + 2 + 3 + 3), "{invalid:?}");
+            assert_eq!(entry.longest_segment, secs(6), "{invalid:?}");
+            assert_eq!(
+                run.ledger().status(&rules, &cooling),
+                Status::Partial,
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_splitting_an_ended_span_keeps_its_end_marker() {
+        let mut breaks = invalid_speed_readings(3);
+        breaks.push(boundary(3, Boundary::Disconnect));
+        for earlier in breaks {
+            let facts = [
+                sample("vehicle.speed", "baseline", 0),
+                sample("vehicle.speed", "baseline", 5),
+                // The failure at 8 s ends the span of both readings ...
+                outcome_fact(
+                    "vehicle.speed",
+                    "baseline",
+                    8,
+                    Outcome::NoAnswer {
+                        reason: "timeout".into(),
+                    },
+                ),
+                // ... and an older event folded afterwards splits it: the part after 3 s is
+                // still ended at 8 s.
+                earlier.clone(),
+                sample("engine.coolant_temperature", "cooling", 8),
+            ];
+            let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 0, "{earlier:?}");
+            assert_eq!(
+                entry.latest.as_ref().unwrap().state,
+                LatestState::ContextNotFresh,
+                "{earlier:?}"
+            );
+        }
+    }
+
+    #[test]
+    // REQ-038.4
     fn req_038_4_a_boundary_and_a_renewal_at_one_timestamp_keep_separate_segments() {
         let facts = [
             sample("vehicle.speed", "baseline", 0),
@@ -2290,5 +2386,227 @@ mod tests {
             assert_eq!(new_entry.valid_time, secs(3));
             assert_eq!(new_entry.longest_segment, secs(3));
         }
+    }
+
+    /// One step of the exhaustive interval and segment invariants below: an `egr` reading that
+    /// needs fresh speed, a speed reading, a failed speed reading or a boundary.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Step {
+        Egr,
+        Speed,
+        SpeedFails,
+        Boundary,
+    }
+
+    impl Step {
+        const ALL: [Step; 4] = [Step::Egr, Step::Speed, Step::SpeedFails, Step::Boundary];
+
+        fn breaks(self) -> bool {
+            matches!(self, Step::SpeedFails | Step::Boundary)
+        }
+
+        fn fact(self, at: u64) -> Fact {
+            match self {
+                Step::Egr => sample("engine.egr_rate", "egr", at),
+                Step::Speed => sample("vehicle.speed", "baseline", at),
+                Step::SpeedFails => outcome_fact(
+                    "vehicle.speed",
+                    "baseline",
+                    at,
+                    Outcome::NoAnswer {
+                        reason: "timeout".into(),
+                    },
+                ),
+                Step::Boundary => boundary(at, Boundary::Gap),
+            }
+        }
+    }
+
+    type Sequence = Vec<(Step, u64)>;
+
+    fn invariant_rules() -> Rules {
+        Rules::generic_baseline().with_context(
+            GoalContext::new("egr"),
+            ContextRule {
+                required_signals: vec!["vehicle.speed".into()],
+                min_contiguous: Some(secs(30)),
+                ..ContextRule::baseline()
+            },
+        )
+    }
+
+    /// Calls `visit` with every sequence of at most `max_len` steps over `offsets`; sorted ones
+    /// only when `sorted` (non-decreasing offsets, the recording order of a live session).
+    fn enumerate(
+        offsets: &[u64],
+        sorted: bool,
+        max_len: usize,
+        current: &mut Sequence,
+        visit: &mut impl FnMut(&Sequence),
+    ) {
+        visit(current);
+        if current.len() == max_len {
+            return;
+        }
+        for &at in offsets {
+            if sorted && current.last().is_some_and(|&(_, last)| at < last) {
+                continue;
+            }
+            for step in Step::ALL {
+                current.push((step, at));
+                enumerate(offsets, sorted, max_len, current, visit);
+                current.pop();
+            }
+        }
+    }
+
+    fn fold_sequence(sequence: &Sequence) -> SmartRun {
+        let facts: Vec<Fact> = sequence.iter().map(|&(step, at)| step.fact(at)).collect();
+        run_with(invariant_rules(), SessionKind::Live, &facts)
+    }
+
+    fn egr_entry(run: &SmartRun) -> Entry {
+        run.ledger()
+            .entry(&key("engine.egr_rate", "egr"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Upper bounds the counting rules must respect for recording-ordered facts: consecutive
+    /// `egr` readings at most [`FRESHNESS_LIMIT`] apart add at most their distance; a segment
+    /// continues across such a pair only when no failure or boundary was folded between them (a
+    /// pair with one ends its segment there); a larger distance starts a new segment.
+    fn segment_bounds(sequence: &Sequence) -> (Duration, Duration) {
+        let limit = FRESHNESS_LIMIT.as_secs();
+        let (mut valid, mut longest, mut current) = (0, 0, 0);
+        let mut previous: Option<u64> = None;
+        let mut broken = false;
+        for &(step, at) in sequence {
+            match step {
+                Step::Egr => {
+                    if let Some(before) = previous {
+                        let gap = at - before;
+                        if gap > limit {
+                            current = 0;
+                        } else if broken {
+                            valid += gap;
+                            longest = longest.max(current + gap);
+                            current = 0;
+                        } else {
+                            valid += gap;
+                            current += gap;
+                            longest = longest.max(current);
+                        }
+                    }
+                    previous = Some(at);
+                    broken = false;
+                }
+                step if step.breaks() => broken = true,
+                _ => {}
+            }
+        }
+        (secs(valid), secs(longest))
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_invariant_segments_never_bridge_a_failure_or_boundary() {
+        let mut checked = 0_u32;
+        enumerate(
+            &[0, 5, 10, 15, 20],
+            true,
+            6,
+            &mut Vec::new(),
+            &mut |sequence| {
+                let entry = egr_entry(&fold_sequence(sequence));
+                let (valid, longest) = segment_bounds(sequence);
+                assert!(entry.longest_segment <= entry.valid_time, "{sequence:?}");
+                assert!(entry.valid_time <= valid, "{sequence:?}: {entry:?}");
+                assert!(entry.longest_segment <= longest, "{sequence:?}: {entry:?}");
+                checked += 1;
+            },
+        );
+        assert!(checked > 100_000);
+    }
+
+    /// Whether an `egr` reading at `at`, folded at position `reading`, may be fresh: a speed
+    /// reading folded after every earlier break above its own offset renews the signal for
+    /// [`FRESHNESS_LIMIT`], inclusive, unless a break at an offset in `[speed, at]` was folded
+    /// after it. This is deliberately an upper bound.
+    fn may_be_fresh(sequence: &Sequence, reading: usize, at: u64) -> bool {
+        let limit = FRESHNESS_LIMIT.as_secs();
+        sequence[..reading]
+            .iter()
+            .enumerate()
+            .any(|(index, &(step, speed))| {
+                step == Step::Speed
+                    && speed <= at
+                    && at <= speed + limit
+                    && !sequence[..index]
+                        .iter()
+                        .any(|&(earlier, event)| earlier.breaks() && event > speed)
+                    && !sequence[index + 1..reading]
+                        .iter()
+                        .any(|&(later, event)| later.breaks() && speed <= event && event <= at)
+            })
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_invariant_a_failed_context_never_becomes_fresh_whatever_the_fold_order() {
+        let mut checked = 0_u32;
+        enumerate(
+            &[0, 5, 10, 15],
+            false,
+            5,
+            &mut Vec::new(),
+            &mut |sequence| {
+                let mut run =
+                    SmartRun::new(invariant_rules(), RunId(RUN.into()), SessionKind::Live);
+                for (position, &(step, at)) in sequence.iter().enumerate() {
+                    run.apply(None, &step.fact(at)).unwrap();
+                    if step == Step::Egr {
+                        let state = egr_entry(&run).latest.unwrap().state;
+                        assert!(
+                            state != LatestState::Observed || may_be_fresh(sequence, position, at),
+                            "{sequence:?} counted as fresh at step {position}"
+                        );
+                    }
+                }
+                checked += 1;
+            },
+        );
+        assert!(checked > 100_000);
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_invariant_an_extra_failure_or_boundary_never_raises_coverage() {
+        let mut checked = 0_u32;
+        enumerate(&[0, 5, 10, 15], true, 4, &mut Vec::new(), &mut |sequence| {
+            let base = egr_entry(&fold_sequence(sequence));
+            for position in 0..=sequence.len() {
+                let low = position
+                    .checked_sub(1)
+                    .map_or(0, |before| sequence[before].1);
+                let high = sequence.get(position).map_or(15, |&(_, at)| at);
+                for at in (low..=high).filter(|at| at % 5 == 0) {
+                    for step in [Step::SpeedFails, Step::Boundary] {
+                        let mut changed = sequence.clone();
+                        changed.insert(position, (step, at));
+                        let entry = egr_entry(&fold_sequence(&changed));
+                        let context = format!("{changed:?} vs {sequence:?}");
+                        assert!(entry.valid_time <= base.valid_time, "{context}");
+                        assert!(entry.longest_segment <= base.longest_segment, "{context}");
+                        assert!(
+                            entry.qualifying_samples <= base.qualifying_samples,
+                            "{context}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        });
+        assert!(checked > 10_000);
     }
 }
