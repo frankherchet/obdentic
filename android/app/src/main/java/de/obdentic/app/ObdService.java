@@ -37,6 +37,8 @@ public final class ObdService extends Service {
     public volatile long rotateBytes = 10L * 1024 * 1024, rotateMs = 30L * 60 * 1000;
     /** Test seam (REQ-036.5): the next smart.set record whose data.change equals this value makes the recording rotate inside that very write; reset after use. */
     public volatile String rotateAfterSmart = "";
+    /** Test seam (REQ-038.9): the next raw read record is preceded by a rotation of the automatic file, as a write of another thread (a wire line) may cause; reset after use. */
+    public volatile boolean rotateBeforeRead;
     private long recordingBytes, recordingStartedAt;
     private ReconnectPolicy policy = new ReconnectPolicy(true);
     private volatile String sessionAddress = "", pendingProfile = "", retryNote = "";
@@ -456,8 +458,8 @@ public final class ObdService extends Service {
             }
         }
         JSONObject event=new JSONObject(); put(event,"type","action"); put(event,"action",action); put(event,"argument",argument); put(event,"result",result);
-        int serial; synchronized(recordLock) { serial=fileSerial; }
-        record(event);
+        if(rotateBeforeRead && action.equals("read")) { rotateBeforeRead=false; synchronized(recordLock) { if(writer!=null && recordingProfile.equals(AUTO_PROFILE)) try { rotate(); } catch(IOException e) { AppLog.e("rec","rotate failed",e); } } } // acceptance seam: another thread's write rotated the file right before this raw record
+        int serial=record(event); // captured under the same lock as the raw write
         if(action.equals("read")) coverageFact(argument,result,event,serial); // REQ-038.9: the fact follows the raw read it classifies
         Link active = transport; if(mode.equals("live") && active != null && !active.isOpen()) throw new IOException("BLE-Verbindung beendet; bitte neu verbinden");
         return result;
@@ -793,12 +795,12 @@ public final class ObdService extends Service {
         if(result.unavailable) exportUnavailable(); else message(result.message());
     }
     private void exportUnavailable() { if(exportTarget==null) RecordingExporter.setFolder(this,""); message(RecordingExporter.UNAVAILABLE); }
-    private void record(JSONObject event) {
-        put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
-            try { String line=event.toString(); writer.write(line); writer.newLine(); writer.flush(); recordingBytes+=line.length()+1; if(event.optString("action").startsWith("coverage.")) coverageRecords++; rotateIfDue(); } // counted before a rotation inside this very write
+    private int record(JSONObject event) {
+        put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return -1; int serial=fileSerial; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
+            try { String line=event.toString(); writer.write(line); writer.newLine(); writer.flush(); recordingBytes+=line.length()+1; if(event.optString("action").startsWith("coverage.")) coverageRecords++; rotateIfDue(); return serial; }
             catch(IOException e) { AppLog.e("rec","write failed",e); try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=activeRecording(); } set("recording",""); set("autoRecording",""); message("Aufnahmefehler: "+e.getMessage());
                 // REQ-018.4: a recording ended by a write error is auto-exported too (after the lock is released).
-                if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) ) exportLater(failed); }
+                if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) ) exportLater(failed); return -1; }
         }
     }
     /** REQ-028.3: caller holds recordLock. Closes the automatic file as "rotated" and continues in a new one that starts with a fresh header. */
@@ -893,8 +895,9 @@ public final class ObdService extends Service {
                         headerFound=true;
                         headerAccepted=true;
                     }
+                    if(event.optString("action").startsWith("coverage.")) { coverage.put(event); continue; } // validate even when the envelope type is corrupt
                     if(event.optString("type").equals("session_end")) { endFound=true; outcome=event.optString("reason"); outcomeDetail=event.optString("detail"); coverageEnded=outcome; }
-                    if(event.optString("type").equals("action")) { String action=event.optString("action"); if(action.startsWith("coverage.")) { coverage.put(event); continue; } /* REQ-038.9: never filtered or skipped here; the core validates the set */ JSONObject result=event.optJSONObject("result"); if(result==null) continue;
+                    if(event.optString("type").equals("action")) { String action=event.optString("action"); JSONObject result=event.optJSONObject("result"); if(result==null) continue;
                         if(action.equals("read")) { JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay.read",recorded.toString()));
                             updateValue(event.optString("argument"),decoded); result=decoded;
@@ -948,22 +951,24 @@ public final class ObdService extends Service {
                 message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
         finally { if(token==generation) { busy=false; changed(); } } });
     }
-    /** REQ-038.9: derives the run ledger of the opened file together with every other automatic recording that holds a part of the same run, found by the run id in its first lines and never by name, date or order. Nothing is sent. A file without coverage records contributes none. */
+    /** REQ-038.9: derive runs from the opened file and related automatic recordings, identified by run ids anywhere within recording limits. */
     private void replayCoverage(File opened,JSONArray records,String ended) throws Exception {
         if(records.length()==0) return;
-        Set<String> runs=new HashSet<>();
-        for(int i=0;i<records.length();i++) { JSONObject result=records.optJSONObject(i).optJSONObject("result"); JSONObject data=result==null ? null : result.optJSONObject("data"); if(data!=null && data.opt("run") instanceof String) runs.add(data.optString("run")); }
+        Set<String> runs=coverageRuns(records);
         handCoveragePart(records,ended);
         File[] files=opened.getParentFile().listFiles(); int parts=1;
-        if(files!=null) { Arrays.sort(files); // a stable walk only: the order decides nothing
-            for(File file:files) {
-                if(parts>64+1) break; // one more than the limit is enough for the core to invalidate the run
-                if(!file.isFile() || file.equals(opened) || !file.getName().endsWith("-auto.jsonl") || !namesRun(file,runs)) continue;
-                JSONArray more=new JSONArray(); String[] end={null};
-                try { readCoveragePart(file,more,end); } catch(IOException unreadable) { continue; } // a part that cannot be read is simply not supplied: the run is partial
-                if(more.length()==0) continue;
-                handCoveragePart(more,end[0]); parts++;
-            }
+        if(files!=null) { Arrays.sort(files);
+            Set<File> supplied=new HashSet<>(); boolean changed;
+            do { changed=false;
+                for(File file:files) {
+                    if(parts>=65) break;
+                    if(!file.isFile() || file.equals(opened) || supplied.contains(file) || !file.getName().endsWith("-auto.jsonl") || !namesRun(file,runs)) continue;
+                    JSONArray more=new JSONArray(); String[] end={null};
+                    try { readCoveragePart(file,more,end); } catch(IOException unreadable) { continue; }
+                    if(more.length()==0) continue;
+                    handCoveragePart(more,end[0]); parts++; supplied.add(file); runs.addAll(coverageRuns(more)); changed=true;
+                }
+            } while(changed && parts<65);
         }
         JSONObject derived=new JSONObject(NativeCore.execute(core,"replay.coverage",""));
         if(!derived.optBoolean("ok")) throw new IOException(derived.optString("error","Abdeckung nicht ableitbar"));
@@ -974,17 +979,16 @@ public final class ObdService extends Service {
         JSONObject handed=new JSONObject(NativeCore.execute(core,"replay.coverage.part",argument.toString()));
         if(!handed.optBoolean("ok")) throw new IOException(handed.optString("error","Abdeckung nicht lesbar"));
     }
-    /** True when one of the first 50 lines, up to the file's first coverage.run record, names one of {@code runs}. */
+    private static Set<String> coverageRuns(JSONArray records) {
+        Set<String> runs=new HashSet<>();
+        for(int i=0;i<records.length();i++) { JSONObject event=records.optJSONObject(i), result=event==null ? null : event.optJSONObject("result"); JSONObject data=result==null ? null : result.optJSONObject("data"); if(data!=null && data.opt("run") instanceof String) runs.add(data.optString("run")); }
+        return runs;
+    }
+    /** Read every marker, including later runs, under the same limits as the replay reader. */
     private static boolean namesRun(File file,Set<String> runs) {
-        try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(file),StandardCharsets.UTF_8))) {
-            String line; for(int i=0;i<50 && (line=input.readLine())!=null;i++) {
-                if(line.length()>1048576 || !line.contains("coverage.run")) continue;
-                JSONObject event=new JSONObject(line);
-                if(!"coverage.run".equals(event.optString("action"))) continue;
-                JSONObject result=event.optJSONObject("result"), data=result==null ? null : result.optJSONObject("data");
-                return data!=null && runs.contains(data.optString("run"));
-            }
-        } catch(IOException | JSONException e) { /* not a recording of ours */ }
+        JSONArray records=new JSONArray(); String[] end={null};
+        try { readCoveragePart(file,records,end); } catch(IOException unreadable) { return false; }
+        for(String run:coverageRuns(records)) if(runs.contains(run)) return true;
         return false;
     }
     /** All raw coverage records of a file in file order and how it ended; reading stops at an unreadable line (the part then ended interrupted), like the main replay. */
@@ -997,8 +1001,8 @@ public final class ObdService extends Service {
                 if(endFound) { ended[0]=null; return; } // data after the end marker: invalid recording, the part counts as interrupted
                 JSONObject event; try { event=new JSONObject(line); } catch(JSONException unreadable) { ended[0]=null; return; }
                 if(first) { first=false; if(!event.optString("type").equals("session") || !event.optString("schema").equals("OBDENTIC-MOBILE") || event.optInt("version")!=1) throw new IOException("Unbekanntes Aufnahmeformat"); continue; }
-                if(event.optString("type").equals("session_end")) { endFound=true; ended[0]=event.optString("reason"); }
-                else if(event.optString("type").equals("action") && event.optString("action").startsWith("coverage.")) records.put(event);
+                if(event.optString("action").startsWith("coverage.")) records.put(event);
+                else if(event.optString("type").equals("session_end")) { endFound=true; ended[0]=event.optString("reason"); }
             }
         }
     }
@@ -1599,6 +1603,17 @@ public final class ObdService extends Service {
                 case "0144":data="80 00";break;
                 case "0159":data="0B B8";break;
                 case "015C":data="82";break;
+                case "015D":data="69 00";break;
+                case "015E":data="00 64";break;
+                case "0161":case "0162":data="96";break;
+                case "0163":data="01 90";break;
+                default:return null;
+            }
+            return String.format(Locale.ROOT,"7E8 %02X 41 %s %s\r>",2+data.split(" ").length,command.substring(2),data);
+        }
+    }
+}
+               case "015C":data="82";break;
                 case "015D":data="69 00";break;
                 case "015E":data="00 64";break;
                 case "0161":case "0162":data="96";break;

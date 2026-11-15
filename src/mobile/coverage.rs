@@ -424,6 +424,15 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
         return Err(vec!["coverage.run: too_many_parts".into()]);
     }
     pieces.sort_by_key(|piece| piece.part);
+    // A run has at most MAX_PARTS parts, so no part number can exceed it. Checked before any join
+    // is built: a gap between two supplied parts is never expanded into a list of missing parts
+    // unless both numbers are in range (a part 1 next to a part u64::MAX must not allocate).
+    if let Some(piece) = pieces.iter().find(|piece| piece.part > MAX_PARTS as u64) {
+        return Err(vec![format!(
+            "coverage.run: part number {} exceeds the limit of {MAX_PARTS} parts",
+            piece.part
+        )]);
+    }
     for pair in pieces.windows(2) {
         if pair[0].part == pair[1].part {
             issues.push(format!(
@@ -1588,6 +1597,36 @@ mod tests {
         let set = derive_with_pin(&many, PIN);
         assert_eq!(run_of(&set)["coverage_invalid"], false);
         assert_eq!(run_of(&set)["partial_reasons"], json!(["no_run_end"]));
+    }
+
+    // The review of #344: a part number far beyond the 64-part limit must invalidate the run before
+    // any list of "missing parts" is built (a gap of u64::MAX would exhaust memory).
+    #[test]
+    fn req_038_9_a_huge_part_number_gap_invalidates_the_run_without_building_the_missing_parts() {
+        for number in [65, 1 << 40, u64::MAX - 1, u64::MAX] {
+            let parts = vec![
+                part(vec![start(RUN, 0), read("engine.rpm", 1)], Some("rotated")),
+                part(
+                    vec![resume(RUN, number, 2, secs(2)), read("engine.rpm", 3)],
+                    Some("rotated"),
+                ),
+            ];
+            let set = derive_with_pin(&parts, PIN);
+            assert_invalid(&set, RUN, "exceeds the limit of 64 parts");
+            let reversed = vec![parts[1].clone(), parts[0].clone()];
+            assert_invalid(&derive_with_pin(&reversed, PIN), RUN, "exceeds the limit");
+        }
+        // The limit itself is still a valid number: part 1 and part 64 leave 62 parts missing.
+        let parts = vec![
+            part(vec![start(RUN, 0), read("engine.rpm", 1)], Some("rotated")),
+            part(
+                vec![resume(RUN, 64, 2, secs(2)), read("engine.rpm", 3)],
+                Some("rotated"),
+            ),
+        ];
+        let set = derive_with_pin(&parts, PIN);
+        assert_eq!(run_of(&set)["coverage_invalid"], false);
+        assert_eq!(run_of(&set)["missing_parts"].as_array().unwrap().len(), 62);
     }
 
     #[test]

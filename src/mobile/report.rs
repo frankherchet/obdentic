@@ -136,6 +136,16 @@ fn inspect_part(reader: impl BufRead) -> Result<(Value, coverage::Part), String>
         if let Some(offset) = event["offset_us"].as_u64() {
             last_offset = last_offset.max(Some(offset));
         }
+        if event["action"]
+            .as_str()
+            .is_some_and(coverage::is_coverage_action)
+        {
+            // REQ-038.9: a record that names itself a coverage record goes raw to the derivation,
+            // which validates it as a set, whatever its envelope `type` says: a missing or corrupt
+            // type must invalidate the run it may affect, never hide a boundary or a failed read.
+            coverage_part.records.push(event);
+            continue;
+        }
         match event["type"].as_str() {
             Some("session_end") => {
                 complete = true;
@@ -149,12 +159,6 @@ fn inspect_part(reader: impl BufRead) -> Result<(Value, coverage::Part), String>
             Some("action") => {
                 let action = event["action"].as_str().unwrap_or("");
                 let recorded = &event["result"];
-                if coverage::is_coverage_action(action) {
-                    // REQ-038.9: coverage facts go raw to the derivation, which validates them as
-                    // a set; a record is never skipped or filtered here.
-                    coverage_part.records.push(event);
-                    continue;
-                }
                 if recorded["ok"] != true {
                     issues.push(format!("{action}: {}", recorded["error"]));
                     continue;
@@ -1170,6 +1174,60 @@ mod tests {
         assert!(run.get("entries").is_none());
         // The other action records of the file are reported as before.
         assert_eq!(value["event_count"], 6);
+    }
+
+    // The review of #344: a record whose action names it a coverage record is handed over whatever
+    // its envelope type says; a missing or corrupt type must invalidate, never hide a boundary.
+    #[test]
+    fn req_038_9_report_hands_over_a_coverage_record_with_a_missing_or_corrupt_envelope_type() {
+        let corruptions: [Option<Value>; 6] = [
+            None,
+            Some(json!(null)),
+            Some(json!(7)),
+            Some(json!("wire")),
+            Some(json!("session_end")),
+            Some(json!("Action")),
+        ];
+        for corruption in corruptions {
+            let mut broken = boundary(RUN, "gap", secs(12));
+            match &corruption {
+                Some(value) => broken["type"] = value.clone(),
+                None => {
+                    broken.as_object_mut().unwrap().remove("type");
+                }
+            }
+            let records = vec![
+                start(RUN, 0),
+                read("engine.rpm", 10),
+                broken.clone(),
+                read("engine.rpm", 15),
+                boundary(RUN, "run_end", secs(15)),
+            ];
+            let value = inspect(recording(records, Some("disconnect")).as_bytes()).unwrap();
+            let run = &value["coverage"]["runs"][0];
+            assert_eq!(run["coverage_invalid"], true, "type {corruption:?}");
+            assert!(run.get("entries").is_none(), "type {corruption:?}");
+            assert!(
+                run["issues"].to_string().contains("not an action"),
+                "type {corruption:?}: {}",
+                run["issues"]
+            );
+            // The same record without a readable run invalidates every run of the set.
+            broken["result"]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("run");
+            let records = vec![
+                start(RUN, 0),
+                broken,
+                read("engine.rpm", 15),
+                boundary(RUN, "run_end", secs(15)),
+            ];
+            let value = inspect(recording(records, Some("disconnect")).as_bytes()).unwrap();
+            let run = &value["coverage"]["runs"][0];
+            assert_eq!(run["coverage_invalid"], true, "type {corruption:?} no run");
+            assert!(run.get("entries").is_none());
+        }
     }
 
     #[test]

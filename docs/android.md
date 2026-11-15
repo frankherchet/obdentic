@@ -357,10 +357,11 @@ written to a file). A single rotated part is partial; a rotated file's `complete
 
 A coverage record that cannot be trusted is never skipped, because a skipped boundary or failed read could overstate
 the valid time. It invalidates the run it may affect (`coverage_invalid: true` with the reason in `issues`, no counts,
-time or status), or every run of the set when its run cannot be read: `ok` not true, `data` not an object, unknown
-action, outcome, boundary, session or run action, missing or backwards `run_offset_us`, an orphan or duplicate
-record, a malformed `part`, two parts with the same number (also the same file twice), a `previous_part_records` that
-differs from the real count, offsets running backwards across a join, a record after `run_end`, more than 64 parts. A
+time or status), or every run of the set when its run cannot be read: missing or corrupt envelope type, `ok` not true,
+`data` not an object, unknown action, outcome, boundary, session or run action, missing or backwards `run_offset_us`,
+an orphan or duplicate record, a malformed `part`, part number above 64, two parts with the same number (also the same
+file twice), a `previous_part_records` that differs from the real count, offsets running backwards across a join,
+a record after `run_end`, more than 64 parts. A
 Knowledge revision that differs from the embedded pin in any part stops the derivation (`knowledge_pin_mismatch`);
 the raw evidence stays available. Recordings without `coverage.*` records (every file written before this change) open
 as before and contribute no coverage (`coverage: null`).
@@ -368,10 +369,10 @@ as before and contribute no coverage (`coverage: null`).
 The report takes several files: `obdentic-mobile-report part1.jsonl part2.jsonl part3.jsonl` prints
 `{"schema":"OBDENTIC-MOBILE-REPORT-SET","version":1,"files":[…],"coverage":{…}}`, and the `coverage` section is the
 same whatever the argument order. One file prints its report with the `coverage` of that file as a one-part set.
-Replay derives the run from the opened file and every other automatic recording in the app's folder whose first lines
-(at most 50, up to its first `coverage.run` record) name one of its run ids (`replay.coverage.part`, `replay.coverage`;
-at most 64 parts); a part that was deleted or never exported is simply not supplied, so the run is partial. The result
-is kept in the service state as `coverage`; this slice adds no screen (#340 shows it).
+Replay scans every automatic recording in the app's folder under the recording's size and line limits for run ids,
+including markers after earlier runs. It includes related files transitively (`replay.coverage.part`, `replay.coverage`;
+at most 65 supplied files, so an excessive run is invalidated). A deleted or unavailable part is not supplied, so the
+run is partial. The result is kept in the service state as `coverage`; this slice adds no screen (#340 shows it).
 
 ## Semantic assistant tool bridge (REQ-041)
 
