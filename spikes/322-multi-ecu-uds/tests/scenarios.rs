@@ -511,6 +511,202 @@ fn transient_refusal_backs_off_2_4_s_then_cools_down_60_s_and_never_gives_up() {
     );
 }
 
+// ---- bounded retry after activation success followed by immediate session loss ---------
+// Approved criterion (maintainer, #322, 2026-11-15): activation succeeds but the session is
+// lost again before any qualifying session read succeeded -> a failed attempt: 2 s, 4 s, then
+// 60 s cool-down, repeating per episode. A qualifying session read resets the sequence.
+
+/// Send times of `10 03` to one target.
+fn activation_times(c: &Controller, req: &str) -> Vec<Ms> {
+    sent(c, "1003")
+        .into_iter()
+        .filter(|(_, h)| h == req)
+        .map(|(t, _)| t)
+        .collect()
+}
+
+/// Instants at which the controller scheduled the next activation of a target, in order:
+/// `Retry.next_at` after a failed attempt, `CoolDown.until` after the third.
+fn scheduled_instants(c: &Controller, target: usize) -> Vec<Ms> {
+    c.events
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Retry { ti, next_at, .. } if *ti == target => Some(*next_at),
+            Ev::CoolDown { ti, until } if *ti == target => Some(*until),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Gap i between consecutive activations must be at least 2 s, 4 s, 60 s, 2 s, 4 s, 60 s ...
+/// (three failed attempts per episode) and not wastefully longer.
+fn assert_backoff_rhythm(t: &[Ms]) {
+    println!("10 03 send times (virtual ms): {t:?}");
+    const MIN: [Ms; 3] = [2000, 4000, 60_000];
+    for (i, w) in t.windows(2).enumerate() {
+        let (gap, min) = (w[1] - w[0], MIN[i % 3]);
+        assert!(
+            gap >= min,
+            "premature activation {} after {i}: gap {gap} ms < {min} ms: {t:?}",
+            i + 1
+        );
+        assert!(
+            gap < min + 1000,
+            "gap {gap} ms is much longer than {min} ms: {t:?}"
+        );
+    }
+}
+
+#[test]
+fn repeated_activation_then_immediate_session_loss_is_bounded_by_backoff_and_cooldown() {
+    let mut c = fleet(&[A, B]);
+    // B accepts every `10 03` but answers every session read with 7F (session lost) before
+    // a single session read ever succeeds. A is a healthy bystander.
+    c.sim
+        .rules
+        .push(Rule::always("7E2", "22B001", Action::Nrc(0x7F)));
+    c.wants = vec![
+        want(IB, Item::Did(0xB001), 1, true, 400, 100_000),
+        want(IA, Item::Did(0xA002), 1, true, 400, 100_000),
+    ];
+    c.run_until(140_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+
+    let t = activation_times(&c, "7E2");
+    assert!(t.len() >= 7, "two full episodes and more expected: {t:?}");
+    assert_eq!(c.count_events(|e| *e == Ev::Activated(IB)), t.len());
+    assert_backoff_rhythm(&t);
+
+    // every activation was scheduled by the controller at its backoff or cool-down instant
+    let due = scheduled_instants(&c, IB);
+    println!("scheduled instants (virtual ms): {due:?}");
+    for (i, next) in t.iter().skip(1).enumerate() {
+        assert!(
+            *next >= due[i],
+            "activation {} before its scheduled instant: {next} < {}",
+            i + 1,
+            due[i]
+        );
+        assert!(
+            *next - due[i] < 500,
+            "activation {} late against the schedule: {t:?} vs {due:?}",
+            i + 1
+        );
+    }
+    let attempts: Vec<u32> = c
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Retry { ti, attempt, .. } if *ti == IB => Some(*attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(&attempts[..4], &[1, 2, 1, 2], "{attempts:?}");
+    assert_eq!(
+        c.events
+            .iter()
+            .filter(|e| matches!(e, Ev::CoolDown { ti, .. } if *ti == IB))
+            .count(),
+        2
+    );
+
+    // nothing of this was a qualifying read; no vehicle traffic outside the closed vocabulary
+    assert_eq!(count_samples(&c, IB, Item::Did(0xB001)), 0);
+    assert!(!c.sessions[IB].qualified);
+    assert_eq!(
+        sent(&c, "1001").len(),
+        0,
+        "a lost session needs no return to default"
+    );
+
+    // target isolation: the bystander is neither re-activated nor delayed
+    assert_eq!(c.count_events(|e| *e == Ev::Activated(IA)), 1);
+    assert_eq!(c.count_events(|e| *e == Ev::SessionLost(IA)), 0);
+    assert_eq!(c.count_events(|e| matches!(e, Ev::Isolated(_, _))), 0);
+    assert!(count_samples(&c, IA, Item::Did(0xA002)) > 100);
+    assert!(maintenance_gaps(&c)["7E0"] <= 3000);
+    assert!(c.sim.ecus[IA].expiries.is_empty());
+}
+
+#[test]
+fn successful_default_session_reads_do_not_qualify_and_do_not_reset_the_sequence() {
+    let mut c = fleet(&[A, B]);
+    c.sim.ecus[IB].dids.push(Did {
+        id: 0xB0D0,
+        data: vec![7],
+        session_only: false,
+    });
+    c.sim
+        .rules
+        .push(Rule::always("7E2", "22B001", Action::Nrc(0x7F)));
+    c.wants = vec![
+        want(IB, Item::Did(0xB0D0), 0, false, 400, 100_000),
+        want(IB, Item::Did(0xB001), 1, true, 400, 100_000),
+    ];
+    c.run_until(80_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+    let t = activation_times(&c, "7E2");
+    assert!(t.len() >= 4, "{t:?}");
+    assert_backoff_rhythm(&t);
+    // the default-session DID answers all along, yet it is not a qualifying session read
+    assert!(count_samples(&c, IB, Item::Did(0xB0D0)) > 100);
+    assert_eq!(count_samples(&c, IB, Item::Did(0xB001)), 0);
+}
+
+#[test]
+fn a_qualifying_session_read_resets_the_failure_sequence() {
+    let mut c = fleet(&[A, B]);
+    // Reads of 22 B001 to B, overall request numbers: 1-2 fail, 3-4 succeed (qualifying),
+    // 5 fails after a qualifying read (free, immediate re-activation), 6 fails again before
+    // any qualifying read (first failed attempt of a new sequence), 7 onwards succeed.
+    // The second rule counts only requests the first one did not consume, hence n = 3.
+    c.sim
+        .rules
+        .push(Rule::nth_times("7E2", "22B001", 1, 2, Action::Nrc(0x7F)));
+    c.sim
+        .rules
+        .push(Rule::nth_times("7E2", "22B001", 3, 2, Action::Nrc(0x7F)));
+    c.wants = vec![want(IB, Item::Did(0xB001), 1, true, 400, 100_000)];
+    c.run_until(40_000);
+    assert!(c.stopped.is_none(), "{:?}", c.stopped);
+
+    let t = activation_times(&c, "7E2");
+    assert_eq!(t.len(), 5, "{t:?}");
+    println!("10 03 send times (virtual ms): {t:?}");
+    assert_eq!(c.count_events(|e| *e == Ev::SessionLost(IB)), 4);
+    let attempts: Vec<u32> = c
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Retry { ti, attempt, .. } if *ti == IB => Some(*attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        vec![1, 2, 1],
+        "sequence restarted after the qualifying reads"
+    );
+    assert_eq!(c.count_events(|e| matches!(e, Ev::CoolDown { .. })), 0);
+
+    assert!(t[1] - t[0] >= 2000 && t[2] - t[1] >= 4000, "{t:?}");
+    assert!(
+        t[3] - t[2] < 2000,
+        "loss after a qualifying read re-activates at once: {t:?}"
+    );
+    assert!(
+        t[4] - t[3] >= 2000 && t[4] - t[3] < 3000,
+        "first failure of the new sequence backs off 2 s, not 4 s or a cool-down: {t:?}"
+    );
+    let due = scheduled_instants(&c, IB);
+    println!("scheduled instants (virtual ms): {due:?}");
+    assert!(t[4] >= due[2] && t[4] - due[2] < 500, "{t:?} vs {due:?}");
+
+    assert_eq!(c.sessions[IB].status, Status::Active);
+    assert!(c.sessions[IB].qualified);
+    assert!(count_samples(&c, IB, Item::Did(0xB001)) > 20);
+}
+
 /// Commands that reached one target, in order (session and read vocabulary only).
 fn commands_to(c: &Controller, req: &str) -> Vec<String> {
     let mut sh = String::new();

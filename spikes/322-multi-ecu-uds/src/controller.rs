@@ -77,7 +77,11 @@ pub struct Session {
     pub observed: Observed,
     pub assumed: Assumed,
     pub status: Status,
+    /// Failed attempts of the current episode. Only a qualifying session read resets it.
     pub attempts: u32,
+    /// A session-only read was answered positively since the latest successful activation.
+    /// Activation alone proves nothing: until this is true, a session loss is a failed attempt.
+    pub qualified: bool,
     pub unanswered_reads: u32,
     pub canary: Option<u16>,
 }
@@ -141,7 +145,10 @@ pub enum Ev {
         attempt: u32,
         next_at: Ms,
     },
-    CoolDown(usize),
+    CoolDown {
+        ti: usize,
+        until: Ms,
+    },
     Refused(usize, u8),
     SessionLost(usize),
     Overdue(usize),
@@ -393,6 +400,7 @@ impl Controller {
                 assumed: Assumed::Default,
                 status: Status::Idle,
                 attempts: 0,
+                qualified: false,
                 unanswered_reads: 0,
                 canary: None,
             })
@@ -630,8 +638,9 @@ impl Controller {
         s.attempts += 1;
         if s.attempts >= max {
             s.attempts = 0;
-            s.status = Status::CoolDown { until: now + cool };
-            self.events.push(Ev::CoolDown(ti));
+            let until = now + cool;
+            s.status = Status::CoolDown { until };
+            self.events.push(Ev::CoolDown { ti, until });
         } else {
             let next_at = now + base * (1 << (s.attempts - 1));
             s.status = Status::Retry { next_at };
@@ -643,6 +652,11 @@ impl Controller {
         }
     }
 
+    /// Session loss evidence (or two unanswered session reads). A loss before any qualifying
+    /// session read since the activation is a failed attempt: it takes the 2 s / 4 s backoff
+    /// and the 60 s cool-down, so repeated "activated, then immediately lost" cycles cannot
+    /// reactivate without bound. A loss after a qualifying read re-activates at once and is
+    /// not counted.
     fn lost(&mut self, ti: usize, evidence: bool) {
         let now = self.now();
         let s = &mut self.sessions[ti];
@@ -650,10 +664,16 @@ impl Controller {
             s.observed = Observed::NotExtended(now);
         }
         s.assumed = Assumed::Unconfirmed;
-        s.status = Status::Retry { next_at: now };
         s.canary = None;
         s.unanswered_reads = 0;
+        let failed_attempt = !s.qualified;
+        s.qualified = false;
         self.events.push(Ev::SessionLost(ti));
+        if failed_attempt {
+            self.backoff(ti);
+        } else {
+            self.sessions[ti].status = Status::Retry { next_at: now };
+        }
     }
 
     fn isolate(&mut self, ti: usize, why: &str) {
@@ -707,7 +727,7 @@ impl Controller {
                     maintained: self.last_tx,
                 };
                 s.status = Status::Active;
-                s.attempts = 0;
+                s.qualified = false;
                 s.unanswered_reads = 0;
                 self.events.push(Ev::Activated(ti));
             }
@@ -768,6 +788,8 @@ impl Controller {
                     let s = &mut self.sessions[w.ti];
                     s.observed = Observed::Extended(now);
                     s.unanswered_reads = 0;
+                    s.qualified = true;
+                    s.attempts = 0;
                     if let Item::Did(d) = w.item {
                         s.canary = Some(d);
                     }
