@@ -899,26 +899,26 @@ pub fn derive_with_pin(parts: &[Part], pin: &str) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
 
-    const PIN: &str = "rev-a";
-    const RUN: &str = "run-aaaa";
+    pub(crate) const PIN: &str = "rev-a";
+    pub(crate) const RUN: &str = "run-aaaa";
 
-    fn at(offset_us: u64) -> i64 {
+    pub(crate) fn at(offset_us: u64) -> i64 {
         1_700_000_000_000 + (offset_us / 1000) as i64
     }
 
-    fn secs(seconds: u64) -> u64 {
+    pub(crate) fn secs(seconds: u64) -> u64 {
         seconds * 1_000_000
     }
 
-    fn record(action: &str, offset_us: u64, data: Value) -> Value {
+    pub(crate) fn record(action: &str, offset_us: u64, data: Value) -> Value {
         json!({"type":"action","action":action,"argument":"","at":at(offset_us),
             "offset_us":offset_us,"result":{"ok":true,"data":data}})
     }
 
-    fn start(run: &str, offset_us: u64) -> Value {
+    pub(crate) fn start(run: &str, offset_us: u64) -> Value {
         record(
             "coverage.run",
             offset_us,
@@ -927,7 +927,7 @@ mod tests {
         )
     }
 
-    fn resume(run: &str, part: u64, previous: u64, offset_us: u64) -> Value {
+    pub(crate) fn resume(run: &str, part: u64, previous: u64, offset_us: u64) -> Value {
         record(
             "coverage.run",
             offset_us,
@@ -936,7 +936,7 @@ mod tests {
         )
     }
 
-    fn fact_with(run: &str, signal: &str, offset_us: u64, outcome: Value) -> Value {
+    pub(crate) fn fact_with(run: &str, signal: &str, offset_us: u64, outcome: Value) -> Value {
         let mut data = json!({"run":run,"signal_key":signal,"context":"baseline",
             "ecu_target":null,"session":"default","implausible":false,"static_identity":false,
             "identity_confirmed":false,"goal_definition":1,"knowledge_revision":PIN,
@@ -948,7 +948,7 @@ mod tests {
         record("coverage.fact", offset_us, data)
     }
 
-    fn read(signal: &str, seconds: u64) -> Value {
+    pub(crate) fn read(signal: &str, seconds: u64) -> Value {
         fact_with(
             RUN,
             signal,
@@ -957,7 +957,7 @@ mod tests {
         )
     }
 
-    fn failed_read(signal: &str, seconds: u64) -> Value {
+    pub(crate) fn failed_read(signal: &str, seconds: u64) -> Value {
         fact_with(
             RUN,
             signal,
@@ -966,7 +966,7 @@ mod tests {
         )
     }
 
-    fn boundary(run: &str, class: &str, offset_us: u64) -> Value {
+    pub(crate) fn boundary(run: &str, class: &str, offset_us: u64) -> Value {
         record(
             "coverage.boundary",
             offset_us,
@@ -974,16 +974,22 @@ mod tests {
         )
     }
 
-    fn part(records: Vec<Value>, ended: Option<&str>) -> Part {
+    pub(crate) fn part(records: Vec<Value>, ended: Option<&str>) -> Part {
         Part {
             records,
             ended: ended.map(str::to_owned),
         }
     }
 
-    fn reads(signal: &str, from: u64, to: u64) -> Vec<Value> {
+    pub(crate) fn reads(signal: &str, from: u64, to: u64) -> Vec<Value> {
         (from..=to).step_by(2).map(|s| read(signal, s)).collect()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
 
     /// The same facts: one file, or three rotated parts of a 60 s run.
     fn whole_run_in_one_file() -> Part {
