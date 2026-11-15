@@ -94,6 +94,11 @@ signal ids, a 20-read/1-scan/60 s budget per diagnosis) runs through the same `M
 (`mobile/assistant.rs`) and reuses `mobile/report.rs` for offline recording inspection; see
 [Android workbench](docs/android.md#semantic-assistant-tool-bridge-req-041).
 
+`coverage_ledger.rs` is the pure measurement-coverage model of REQ-038: facts folded into a run ledger and a
+vehicle ledger count qualifying samples, valid measured time and contiguous segments per signal and goal
+context, keep the latest availability state apart, and make no health claim. It has no I/O, clock or adapter;
+recording the facts (#339) and persisting the vehicle ledger (#340) follow.
+
 In a ready live session the Android app marks a measurement gap ("Keine aktuellen Messwerte")
 once a selected signal has produced a value and none arrives for 10 seconds while reads are
 attempted. It asserts no ignition or connection state, probes one known-working selected
