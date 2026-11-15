@@ -16,9 +16,12 @@
 //!   extend freshness; a reading of the same signal and context whose offset is not later than the
 //!   previous one still counts as a sample but adds no time and does not move the segment.
 //! - A context signal is fresh from its latest finite, plausible reading for [`FRESHNESS_LIMIT`],
-//!   whatever goal context that reading was taken in.
+//!   whatever goal context that reading was taken in, and only for results under the same
+//!   definition versions. A failed, implausible or non-finite reading of the signal ends that
+//!   freshness (and the contiguous segments that depend on it) at its offset.
 //! - A static identity observation is kept once per vehicle ledger, signal key, ECU target and
-//!   definition versions; the ledger stores provenance only, never the value.
+//!   definition versions; the ledger stores provenance only, never the value. Its entry is covered
+//!   by that one observation and stays covered when a later read fails.
 
 use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 
@@ -317,10 +320,30 @@ impl Ledger {
             .map_or(LatestState::NotYetObserved, |latest| latest.state.clone())
     }
 
+    /// Coverage of an entry. A static identity entry is covered by one observation of its signal
+    /// under its definition versions, at any ECU target, and stays covered when a later read
+    /// fails; the dynamic thresholds apply to every other entry.
     pub fn status(&self, rules: &Rules, key: &EntryKey) -> Status {
+        if self.identity_observed(key) {
+            return Status::Covered;
+        }
         self.entry(key).map_or(Status::NotCovered, |entry| {
             rules.rule_for(&key.context).status(entry)
         })
+    }
+
+    fn identity_observed(&self, key: &EntryKey) -> bool {
+        let first = IdentityKey {
+            versions: key.versions.clone(),
+            signal_key: key.signal_key.clone(),
+            ecu_target: None,
+        };
+        self.identity
+            .range(first..)
+            .next()
+            .is_some_and(|(found, _)| {
+                found.versions == key.versions && found.signal_key == key.signal_key
+            })
     }
 
     fn record(&mut self, key: &EntryKey, update: &Update) {
@@ -383,8 +406,9 @@ pub struct SmartRun {
     ledger: Ledger,
     confirmed_since: Option<Duration>,
     open: BTreeMap<EntryKey, OpenSegment>,
-    /// Per context signal the spans `(first reading, fresh until)` of continuous freshness.
-    freshness: BTreeMap<String, Vec<(Duration, Duration)>>,
+    /// Per definition versions and context signal the spans `(first reading, fresh until)` of
+    /// continuous freshness. A reading under other versions never renews or extends them.
+    freshness: BTreeMap<(DefinitionVersions, String), Vec<(Duration, Duration)>>,
 }
 
 impl SmartRun {
@@ -482,7 +506,9 @@ impl SmartRun {
                 Outcome::Decoded(Decoded::Text { nonempty }) => reading.static_identity && nonempty,
                 _ => false,
             };
-        let fresh = self.extent(&reading.context, offset).is_some();
+        let fresh = self
+            .extent(&fact.versions, &reading.context, offset)
+            .is_some();
         let qualifying = usable && !reading.static_identity && fresh;
         let latest = Latest {
             state: Self::state_of(reading, fresh),
@@ -540,7 +566,9 @@ impl SmartRun {
             vehicle.record(&key, &vehicle_update);
         }
         if usable {
-            self.touch(&reading.signal_key, offset);
+            self.touch(&fact.versions, &reading.signal_key, offset);
+        } else {
+            self.invalidate(&fact.versions, &reading.signal_key, offset);
         }
     }
 
@@ -572,7 +600,7 @@ impl SmartRun {
             } else if offset - previous.last <= FRESHNESS_LIMIT {
                 let interval = offset - previous.last;
                 let confirmed = self
-                    .extent(&key.context, previous.last)
+                    .extent(&key.versions, &key.context, previous.last)
                     .map_or(Duration::ZERO, |until| until.saturating_sub(previous.last));
                 let counted = interval.min(confirmed);
                 let run_length = previous.run_length + counted;
@@ -637,14 +665,19 @@ impl SmartRun {
         }
     }
 
-    /// Instant until which every required context signal of `context` stays continuously fresh,
-    /// counted from `at`; `None` when one is not fresh at `at`.
-    fn extent(&self, context: &GoalContext, at: Duration) -> Option<Duration> {
+    /// Instant until which every required context signal of `context` stays continuously fresh
+    /// under `versions`, counted from `at`; `None` when one is not fresh at `at`.
+    fn extent(
+        &self,
+        versions: &DefinitionVersions,
+        context: &GoalContext,
+        at: Duration,
+    ) -> Option<Duration> {
         let mut until = Duration::MAX;
         for signal in &self.rules.rule_for(context).required_signals {
             let span = self
                 .freshness
-                .get(signal)?
+                .get(&(versions.clone(), signal.clone()))?
                 .iter()
                 .rev()
                 .find(|span| span.0 <= at)
@@ -655,12 +688,27 @@ impl SmartRun {
     }
 
     /// Records a finite, plausible reading of a context signal.
-    fn touch(&mut self, signal: &str, at: Duration) {
-        let spans = self.freshness.entry(signal.to_owned()).or_default();
+    fn touch(&mut self, versions: &DefinitionVersions, signal: &str, at: Duration) {
+        let spans = self
+            .freshness
+            .entry((versions.clone(), signal.to_owned()))
+            .or_default();
         match spans.last_mut() {
             Some(last) if at < last.0 => {}
             Some(last) if at <= last.1 => last.1 = last.1.max(at + FRESHNESS_LIMIT),
             _ => spans.push((at, at + FRESHNESS_LIMIT)),
+        }
+    }
+
+    /// A failed, unusable or implausible reading of a context signal ends the freshness of its
+    /// earlier readings at that moment, whatever goal context the reading was taken in. Spans that
+    /// start after the reading are untouched.
+    fn invalidate(&mut self, versions: &DefinitionVersions, signal: &str, at: Duration) {
+        let key = (versions.clone(), signal.to_owned());
+        for span in self.freshness.get_mut(&key).into_iter().flatten() {
+            if span.0 <= at {
+                span.1 = span.1.min(at);
+            }
         }
     }
 }
@@ -1112,6 +1160,67 @@ mod tests {
     }
 
     #[test]
+    // REQ-038.3
+    fn req_038_3_a_static_identity_entry_is_covered_by_one_observation() {
+        let text = || Outcome::Decoded(Decoded::Text { nonempty: true });
+        let signal = "uds.ecu.hardware_number";
+        let rules = Rules::generic_baseline();
+        let identity_key = key(signal, "baseline");
+
+        let run = baseline_run(&[identity_fact(signal, "engine", RUN, 0, text())]);
+        assert_eq!(run.ledger().status(&rules, &identity_key), Status::Covered);
+
+        // A later failed read keeps the earlier observation and its coverage.
+        let failed = Outcome::NoAnswer {
+            reason: "timeout".into(),
+        };
+        let run = baseline_run(&[
+            identity_fact(signal, "engine", RUN, 0, text()),
+            identity_fact(signal, "engine", RUN, 5, failed.clone()),
+        ]);
+        assert_eq!(run.ledger().status(&rules, &identity_key), Status::Covered);
+        assert_eq!(
+            run.ledger().latest_state(&identity_key),
+            LatestState::NoAnswer {
+                reason: "timeout".into()
+            }
+        );
+
+        // Observed in a vehicle ledger over two runs, the second run only failing.
+        let mut vehicle = Ledger::default();
+        for (name, outcome) in [("run-1", text()), ("run-2", failed)] {
+            let mut run = SmartRun::new(rules.clone(), RunId(name.into()), SessionKind::Live);
+            run.apply(
+                Some(&mut vehicle),
+                &identity_fact(signal, "engine", name, 1, outcome),
+            )
+            .unwrap();
+        }
+        assert_eq!(vehicle.status(&rules, &identity_key), Status::Covered);
+
+        // Without an observation nothing is covered, and another version is separate.
+        let run = baseline_run(&[
+            identity_fact(
+                signal,
+                "engine",
+                RUN,
+                0,
+                Outcome::Decoded(Decoded::Text { nonempty: false }),
+            ),
+            versioned(2, identity_fact(signal, "engine", RUN, 1, text())),
+        ]);
+        assert_eq!(
+            run.ledger().status(&rules, &identity_key),
+            Status::NotCovered
+        );
+        assert_eq!(
+            run.ledger()
+                .status(&rules, &keyed(versions(2), signal, "baseline")),
+            Status::Covered
+        );
+    }
+
+    #[test]
     // REQ-038.2
     fn req_038_2_every_outcome_keeps_key_context_run_and_session() {
         let restricted = Reading {
@@ -1356,6 +1465,97 @@ mod tests {
         assert_eq!(entry.qualifying_samples, 0);
     }
 
+    /// A failed, implausible or non-finite reading of a context signal at 3 s.
+    fn invalid_speed_readings() -> Vec<Fact> {
+        let implausible = Reading {
+            implausible: true,
+            ..reading("vehicle.speed", "baseline", numeric())
+        };
+        vec![
+            outcome_fact(
+                "vehicle.speed",
+                "baseline",
+                3,
+                Outcome::NoAnswer {
+                    reason: "timeout".into(),
+                },
+            ),
+            outcome_fact("vehicle.speed", "baseline", 3, Outcome::Unsupported),
+            outcome_fact("vehicle.speed", "baseline", 3, Outcome::Gap),
+            outcome_fact(
+                "vehicle.speed",
+                "baseline",
+                3,
+                Outcome::Decoded(Decoded::Numeric { finite: false }),
+            ),
+            fact(RUN, 3, false, FactBody::Reading(implausible)),
+            // Any goal context of the signal ends its freshness.
+            outcome_fact(
+                "vehicle.speed",
+                "cooling",
+                3,
+                Outcome::Rejected {
+                    response_code: 0x31,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_an_invalid_context_reading_ends_its_freshness_and_the_segment() {
+        for invalid in invalid_speed_readings() {
+            let facts = [
+                sample("vehicle.speed", "baseline", 0),
+                sample("engine.coolant_temperature", "cooling", 1),
+                invalid.clone(),
+                // Speed is measured again only at 7 s: 3 s..7 s was never confirmed.
+                sample("vehicle.speed", "baseline", 7),
+                sample("engine.coolant_temperature", "cooling", 8),
+            ];
+            let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 2, "{invalid:?}");
+            // Only 1 s..3 s counts; the segment ended at the invalid reading.
+            assert_eq!(entry.valid_time, secs(2), "{invalid:?}");
+            assert_eq!(entry.longest_segment, secs(2), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    // REQ-038.2
+    fn req_038_2_a_reading_after_an_invalid_context_reading_is_not_fresh() {
+        for invalid in invalid_speed_readings() {
+            let facts = [
+                sample("vehicle.speed", "baseline", 0),
+                invalid.clone(),
+                sample("engine.coolant_temperature", "cooling", 4),
+            ];
+            let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+            let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+            assert_eq!(entry.qualifying_samples, 0, "{invalid:?}");
+            assert_eq!(
+                entry.latest.as_ref().unwrap().state,
+                LatestState::ContextNotFresh,
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    // REQ-038.4
+    fn req_038_4_an_older_invalid_reading_cannot_end_later_freshness() {
+        let facts = [
+            sample("vehicle.speed", "baseline", 0),
+            sample("vehicle.speed", "baseline", 20),
+            outcome_fact("vehicle.speed", "baseline", 3, Outcome::Unsupported),
+            sample("engine.coolant_temperature", "cooling", 21),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let entry = entry(run.ledger(), "engine.coolant_temperature", "cooling");
+        assert_eq!(entry.qualifying_samples, 1);
+    }
+
     #[test]
     // REQ-038.4
     fn req_038_4_egr_needs_thirty_seconds_in_one_segment() {
@@ -1563,5 +1763,116 @@ mod tests {
         );
         let run = baseline_run(&[first, second]);
         assert_eq!(run.ledger().identity.len(), 2);
+    }
+
+    fn knowledge(revision: &str, mut fact: Fact) -> Fact {
+        fact.versions.knowledge_revision = revision.into();
+        fact
+    }
+
+    fn keyed(versions: DefinitionVersions, signal: &str, context: &str) -> EntryKey {
+        EntryKey {
+            versions,
+            signal_key: signal.into(),
+            context: GoalContext::new(context),
+        }
+    }
+
+    #[test]
+    // REQ-038.7
+    fn req_038_7_a_context_reading_of_an_older_goal_definition_is_not_fresh_for_a_new_one() {
+        let facts = [
+            sample("vehicle.speed", "baseline", 0),
+            versioned(2, sample("engine.coolant_temperature", "cooling", 4)),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let new = keyed(versions(2), "engine.coolant_temperature", "cooling");
+        let entry = run.ledger().entry(&new).unwrap();
+        assert_eq!(entry.qualifying_samples, 0);
+        assert_eq!(
+            entry.latest.as_ref().unwrap().state,
+            LatestState::ContextNotFresh
+        );
+    }
+
+    #[test]
+    // REQ-038.7
+    fn req_038_7_a_context_reading_of_an_older_knowledge_revision_is_not_fresh_for_a_new_one() {
+        let facts = [
+            sample("vehicle.speed", "baseline", 0),
+            knowledge("k2", sample("engine.coolant_temperature", "cooling", 4)),
+        ];
+        let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+        let new = keyed(
+            DefinitionVersions {
+                goal_definition: 1,
+                knowledge_revision: "k2".into(),
+            },
+            "engine.coolant_temperature",
+            "cooling",
+        );
+        let entry = run.ledger().entry(&new).unwrap();
+        assert_eq!(entry.qualifying_samples, 0);
+        assert_eq!(
+            entry.latest.as_ref().unwrap().state,
+            LatestState::ContextNotFresh
+        );
+    }
+
+    #[test]
+    // REQ-038.7
+    fn req_038_7_time_after_a_definition_change_counts_only_under_its_own_context_readings() {
+        type Wrap = Box<dyn Fn(Fact) -> Fact>;
+        let transitions: [(Wrap, DefinitionVersions); 2] = [
+            (
+                Box::new(|fact| versioned(2, fact)),
+                DefinitionVersions {
+                    goal_definition: 2,
+                    knowledge_revision: "k1".into(),
+                },
+            ),
+            (
+                Box::new(|fact| knowledge("k2", fact)),
+                DefinitionVersions {
+                    goal_definition: 1,
+                    knowledge_revision: "k2".into(),
+                },
+            ),
+        ];
+        for (wrap, new_versions) in transitions {
+            let mut facts = vec![
+                sample("vehicle.speed", "baseline", 0),
+                sample("engine.coolant_temperature", "cooling", 1),
+                sample("engine.coolant_temperature", "cooling", 5),
+            ];
+            // The new version has no context reading yet: these two do not qualify, however
+            // fresh the old version's speed still is.
+            facts.extend(
+                [
+                    sample("engine.coolant_temperature", "cooling", 6),
+                    sample("engine.coolant_temperature", "cooling", 7),
+                ]
+                .map(&wrap),
+            );
+            // Its own speed reading renews freshness for the new version only.
+            facts.extend(
+                [
+                    sample("vehicle.speed", "baseline", 8),
+                    sample("engine.coolant_temperature", "cooling", 9),
+                    sample("engine.coolant_temperature", "cooling", 12),
+                ]
+                .map(&wrap),
+            );
+            let run = run_with(cooling_rules(), SessionKind::Live, &facts);
+            let old = key("engine.coolant_temperature", "cooling");
+            let new = keyed(new_versions, "engine.coolant_temperature", "cooling");
+            let old_entry = run.ledger().entry(&old).unwrap();
+            assert_eq!(old_entry.valid_time, secs(4));
+            assert_eq!(old_entry.qualifying_samples, 2);
+            let new_entry = run.ledger().entry(&new).unwrap();
+            assert_eq!(new_entry.qualifying_samples, 2);
+            assert_eq!(new_entry.valid_time, secs(3));
+            assert_eq!(new_entry.longest_segment, secs(3));
+        }
     }
 }
