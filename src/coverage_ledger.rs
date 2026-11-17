@@ -6,10 +6,11 @@
 //! ([`SmartRun`]) and the vehicle ledger ([`Ledger`]) that accumulates over runs and drives.
 //!
 //! The module is plain data and a fold over recorded [`Fact`]s: no I/O, no clock (time comes only
-//! from the facts' monotonic offsets), no adapter and no Knowledge access. Writing facts into a
-//! recording, reading them back and persisting the vehicle ledger belong to later slices, so the
-//! types carry no serialization format yet. The desktop report and Android replay call the same
-//! [`SmartRun::fold`].
+//! from the facts' monotonic offsets), no adapter and no Knowledge access. The recorded form of the
+//! facts and their re-derivation from the parts of a rotated recording live in
+//! `mobile::coverage` (REQ-038.9); persisting the vehicle ledger belongs to a later slice, so these
+//! types carry no serialization format themselves. The desktop report and Android replay call the
+//! same [`SmartRun::fold`].
 //!
 //! Counting conventions the criteria leave open:
 //! - Facts are folded in recording order. A context reading older than one already folded cannot

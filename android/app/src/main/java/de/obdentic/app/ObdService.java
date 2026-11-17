@@ -37,6 +37,8 @@ public final class ObdService extends Service {
     public volatile long rotateBytes = 10L * 1024 * 1024, rotateMs = 30L * 60 * 1000;
     /** Test seam (REQ-036.5): the next smart.set record whose data.change equals this value makes the recording rotate inside that very write; reset after use. */
     public volatile String rotateAfterSmart = "";
+    /** Test seam (REQ-038.9): the next raw read record is preceded by a rotation of the automatic file, as a write of another thread (a wire line) may cause; reset after use. */
+    public volatile boolean rotateBeforeRead;
     private long recordingBytes, recordingStartedAt;
     private ReconnectPolicy policy = new ReconnectPolicy(true);
     private volatile String sessionAddress = "", pendingProfile = "", retryNote = "";
@@ -71,6 +73,10 @@ public final class ObdService extends Service {
     private final MeasurementGap gap=new MeasurementGap();
     private volatile boolean gapOpen;
     private boolean fileGap; // guarded by recordLock: the open recording file holds a gap that has no end yet (separate from the live gap, which outlives files)
+    /** REQ-038.9: coverage facts of a running Smart run (all guarded by recordLock). Part 1 is the file the run started in; each rotation continues it as the next part. */
+    private String coverageRun, coverageRevision=""; // run id (null: no run is on) and the Knowledge revision its start record carried
+    private int coveragePart, coverageRecords, fileSerial; // part number of the open file; coverage.* records written into it; files begun so far
+    private long coverageOriginNanos, coverageLastOffset; // the run clock: monotonic since the Smart start, never reset by a rotation
     private volatile long gapSince;
     private volatile int gapProbes;
     private volatile String gapOutcome="";
@@ -289,6 +295,7 @@ public final class ObdService extends Service {
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
             put(state,"uds",new JSONObject()); put(state,"udsCandidates",0);
             put(state,"replayFile","");
+            put(state,"coverage",JSONObject.NULL);
             put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"availability",new JSONObject()); put(state,"replayPartial",false);
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
@@ -452,7 +459,10 @@ public final class ObdService extends Service {
                 componentSessionEnded(uds); // REQ-035.4: entries that needed the session are unavailable with the reason
             }
         }
-        JSONObject event=new JSONObject(); put(event,"type","action"); put(event,"action",action); put(event,"argument",argument); put(event,"result",result); record(event);
+        JSONObject event=new JSONObject(); put(event,"type","action"); put(event,"action",action); put(event,"argument",argument); put(event,"result",result);
+        if(rotateBeforeRead && action.equals("read")) { rotateBeforeRead=false; synchronized(recordLock) { if(writer!=null && recordingProfile.equals(AUTO_PROFILE)) try { rotate(); } catch(IOException e) { AppLog.e("rec","rotate failed",e); } } } // acceptance seam: another thread's write rotated the file right before this raw record
+        int serial=record(event); // captured under the same lock as the raw write
+        if(action.equals("read")) coverageFact(argument,result,event,serial); // REQ-038.9: the fact follows the raw read it classifies
         Link active = transport; if(mode.equals("live") && active != null && !active.isOpen()) throw new IOException("BLE-Verbindung beendet; bitte neu verbinden");
         return result;
     }
@@ -717,6 +727,7 @@ public final class ObdService extends Service {
                 fileGap=false; // a new file holds no gap until gapResume or a start says so
                 writer=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory,name)),StandardCharsets.UTF_8));
                 recordingBytes=0; recordingStartedAt=SystemClock.elapsedRealtime();
+                int carried=coverageRecords; coverageRecords=0; fileSerial++; // REQ-038.9: the count of the file that ends here is what the next part's resume states
                 set(auto?"autoRecording":"recording",name);
                 JSONObject header=new JSONObject(); put(header,"type","session"); put(header,"schema","OBDENTIC-MOBILE"); put(header,"version",1); put(header,"mode",mode); put(header,"profile",profileId); put(header,"selected",signals);
                 synchronized(stateLock) { put(header,"vehicle",state.opt("vehicle")); put(header,"diagnostics",state.opt("diagnostics")); put(header,"catalog",state.opt("signals")); put(header,"profiles",state.opt("profiles")); put(header,"component",state.opt("component")); } // REQ-035.4: preset provenance even when it was applied before this file existed
@@ -725,6 +736,7 @@ public final class ObdService extends Service {
                 if(writer==null) return false;
                 if(smartOn) smartResume(); // REQ-036.5: every file of a running analysis starts with the set it continues
                 gapResume(); // REQ-037.3: every file of an open gap starts with it
+                coverageResume(carried); // REQ-038.9: every file of a running Smart run starts with the part it continues
             }
             recordingProfile=profileId;
             AppLog.i("rec","start "+name+" profile "+profileId);
@@ -739,6 +751,7 @@ public final class ObdService extends Service {
     private void stopRecordingNow() { closeRecording("stopped",""); }
     private void closeRecording(String reason,String detail) { closeRecording(reason,detail,true); }
     private void closeRecording(String reason,String detail,boolean resumeAuto) {
+        if(reason.equals("disconnected") || reason.equals("error")) coverageBoundary("disconnect"); // REQ-038.9: before the stop event and the end marker
         if(smart!=null) smartEnd("Aufzeichnung beendet: "+reason+(detail.isEmpty()?"":" ("+detail+")"),false); // the stop event precedes session_end
         synchronized(recordLock) { for(int i=0;i<2 && fileGap && writer!=null;i++) recordGap("end","stopped"); } // REQ-037.3: this file ends inside the gap; no recovery is claimed (a rotation inside the write continues it, so once more)
         boolean wasAuto=recordingProfile.equals(AUTO_PROFILE);
@@ -784,12 +797,12 @@ public final class ObdService extends Service {
         if(result.unavailable) exportUnavailable(); else message(result.message());
     }
     private void exportUnavailable() { if(exportTarget==null) RecordingExporter.setFolder(this,""); message(RecordingExporter.UNAVAILABLE); }
-    private void record(JSONObject event) {
-        put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
-            try { String line=event.toString(); writer.write(line); writer.newLine(); writer.flush(); recordingBytes+=line.length()+1; rotateIfDue(); }
+    private int record(JSONObject event) {
+        put(event,"at",System.currentTimeMillis()); synchronized(recordLock) { if(writer==null) return -1; int serial=fileSerial; put(event,"offset_us",Math.max(0,(SystemClock.elapsedRealtimeNanos()-recordingOriginNanos)/1000));
+            try { String line=event.toString(); writer.write(line); writer.newLine(); writer.flush(); recordingBytes+=line.length()+1; if(event.optString("action").startsWith("coverage.")) coverageRecords++; rotateIfDue(); return serial; }
             catch(IOException e) { AppLog.e("rec","write failed",e); try { writer.close(); } catch(IOException ignored) {} writer=null; recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); } String failed; synchronized(stateLock) { failed=activeRecording(); } set("recording",""); set("autoRecording",""); message("Aufnahmefehler: "+e.getMessage());
                 // REQ-018.4: a recording ended by a write error is auto-exported too (after the lock is released).
-                if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) ) exportLater(failed); }
+                if(!failed.isEmpty() && RecordingExporter.auto(this) && (exportTarget!=null || !RecordingExporter.folder(this).isEmpty()) ) exportLater(failed); return -1; }
         }
     }
     /** REQ-028.3: caller holds recordLock. Closes the automatic file as "rotated" and continues in a new one that starts with a fresh header. */
@@ -867,7 +880,7 @@ public final class ObdService extends Service {
     public void openRecording(String filename) {
         if(filename==null || !filename.matches("[A-Za-z0-9_.-]+\\.jsonl")) { message("Ungültiger Aufnahmepfad"); return; }
         disconnect(); replayFilename=filename; set("replayFile",filename); int token=++generation; busy=true; mode="replay"; set("mode",mode); set("phase","replay");
-        worker.execute(() -> { boolean headerAccepted=false; try {
+        worker.execute(() -> { boolean headerAccepted=false, coverageDone=false; JSONArray coverage=new JSONArray(); String coverageEnded=null; try { // REQ-038.9: the raw coverage records of the opened file, handed to the core as one part
             if(token!=generation)return;
             synchronized(stateLock) { values.clear(); } resetSessionData(); replayFilename=filename; set("replayFile",filename);
             destroyCore(); core=NativeCore.create((command,timeout) -> { throw new IOException("Offline replay cannot access an adapter"); });
@@ -883,7 +896,8 @@ public final class ObdService extends Service {
                         headerFound=true;
                         headerAccepted=true;
                     }
-                    if(event.optString("type").equals("session_end")) { endFound=true; outcome=event.optString("reason"); outcomeDetail=event.optString("detail"); }
+                    if(event.optString("action").startsWith("coverage.")) { coverage.put(event); continue; } // validate even when the envelope type is corrupt
+                    if(event.optString("type").equals("session_end")) { endFound=true; outcome=event.optString("reason"); outcomeDetail=event.optString("detail"); coverageEnded=outcome; }
                     if(event.optString("type").equals("action")) { String action=event.optString("action"); JSONObject result=event.optJSONObject("result"); if(result==null) continue;
                         if(action.equals("read")) { JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay.read",recorded.toString()));
@@ -930,10 +944,68 @@ public final class ObdService extends Service {
                     } else if(event.optString("type").equals("wire")) { synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } }
                 }
                 if(!headerFound) throw new IOException("Leere Aufnahme");
+                if(token==generation) { coverageDone=true; replayCoverage(file,coverage,coverageEnded); } // a Knowledge-pin mismatch of any part stops the replay here
                 if(token==generation) { set("replayPartial",!endFound); set("replayOutcome",outcome); message(!endFound?"Teilaufnahme ohne Abschlussmarker: "+filename:outcome.equals("error")?"Aufnahme mit Fehler beendet: "+outcomeDetail:"Offline geöffnet ("+outcome+"): "+filename); }
             }
-        } catch(Exception e) { if(token==generation) { if(!headerAccepted){replayFilename="";set("replayFile","");} set("replayPartial",true); message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
+        } catch(Exception e) { if(token==generation) { if(!headerAccepted){replayFilename="";set("replayFile","");} set("replayPartial",true);
+                if(headerAccepted && !coverageDone) { coverageDone=true; try { replayCoverage(recordingFile(filename),coverage,null); } catch(Exception ignored) { /* the first error is the one shown */ } } // facts before an unreadable line are still derived; the part ended interrupted
+                message("Teilweise oder ungültige Aufnahme: " + e.getMessage()); } }
         finally { if(token==generation) { busy=false; changed(); } } });
+    }
+    /** REQ-038.9: derive runs from the opened file and related automatic recordings, identified by run ids anywhere within recording limits. */
+    private void replayCoverage(File opened,JSONArray records,String ended) throws Exception {
+        if(records.length()==0) return;
+        Set<String> runs=coverageRuns(records);
+        handCoveragePart(records,ended);
+        File[] files=opened.getParentFile().listFiles(); int parts=1;
+        if(files!=null) { Arrays.sort(files);
+            Set<File> supplied=new HashSet<>(); boolean changed;
+            do { changed=false;
+                for(File file:files) {
+                    if(parts>=65) break;
+                    if(!file.isFile() || file.equals(opened) || supplied.contains(file) || !file.getName().endsWith("-auto.jsonl") || !namesRun(file,runs)) continue;
+                    JSONArray more=new JSONArray(); String[] end={null};
+                    try { readCoveragePart(file,more,end); } catch(IOException unreadable) { continue; }
+                    if(more.length()==0) continue;
+                    handCoveragePart(more,end[0]); parts++; supplied.add(file); runs.addAll(coverageRuns(more)); changed=true;
+                }
+            } while(changed && parts<65);
+        }
+        JSONObject derived=new JSONObject(NativeCore.execute(core,"replay.coverage",""));
+        if(!derived.optBoolean("ok")) throw new IOException(derived.optString("error","Abdeckung nicht ableitbar"));
+        set("coverage",derived.opt("data"));
+    }
+    private void handCoveragePart(JSONArray records,String ended) throws Exception {
+        JSONObject argument=new JSONObject(); put(argument,"records",records); put(argument,"ended",ended==null ? JSONObject.NULL : ended);
+        JSONObject handed=new JSONObject(NativeCore.execute(core,"replay.coverage.part",argument.toString()));
+        if(!handed.optBoolean("ok")) throw new IOException(handed.optString("error","Abdeckung nicht lesbar"));
+    }
+    private static Set<String> coverageRuns(JSONArray records) {
+        Set<String> runs=new HashSet<>();
+        for(int i=0;i<records.length();i++) { JSONObject event=records.optJSONObject(i), result=event==null ? null : event.optJSONObject("result"); JSONObject data=result==null ? null : result.optJSONObject("data"); if(data!=null && data.opt("run") instanceof String) runs.add(data.optString("run")); }
+        return runs;
+    }
+    /** Read every marker, including later runs, under the same limits as the replay reader. */
+    private static boolean namesRun(File file,Set<String> runs) {
+        JSONArray records=new JSONArray(); String[] end={null};
+        try { readCoveragePart(file,records,end); } catch(IOException unreadable) { return false; }
+        for(String run:coverageRuns(records)) if(runs.contains(run)) return true;
+        return false;
+    }
+    /** All raw coverage records of a file in file order and how it ended; reading stops at an unreadable line (the part then ended interrupted), like the main replay. */
+    private static void readCoveragePart(File file,JSONArray records,String[] ended) throws IOException {
+        if(file.length()>64L*1024*1024) throw new IOException("Aufnahme größer als 64 MiB");
+        try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(file),StandardCharsets.UTF_8))) {
+            String line; int count=0; boolean first=true, endFound=false;
+            while((line=input.readLine())!=null) {
+                if(line.length()>1048576 || ++count>200000) throw new IOException("Aufnahme überschreitet Leselimit");
+                if(endFound) { ended[0]=null; return; } // data after the end marker: invalid recording, the part counts as interrupted
+                JSONObject event; try { event=new JSONObject(line); } catch(JSONException unreadable) { ended[0]=null; return; }
+                if(first) { first=false; if(!event.optString("type").equals("session") || !event.optString("schema").equals("OBDENTIC-MOBILE") || event.optInt("version")!=1) throw new IOException("Unbekanntes Aufnahmeformat"); continue; }
+                if(event.optString("action").startsWith("coverage.")) records.put(event);
+                else if(event.optString("type").equals("session_end")) { endFound=true; ended[0]=event.optString("reason"); }
+            }
+        }
     }
     private void restoreVehicle(JSONObject vehicle) throws Exception {
         if(vehicle==null)return;
@@ -1157,6 +1229,7 @@ public final class ObdService extends Service {
         if(!open && !beginRecording(AUTO_PROFILE,userSelection)) { message("Smart-Analyse nicht gestartet: Aufzeichnung konnte nicht begonnen werden"); return; }
         smart=new SmartAnalysis(SystemClock.elapsedRealtime()); smartSaved=userSelection; smartComponent=null; smartSelection=""; smartMissing=""; smartLastTriggered=false;
         smartStartedWall=System.currentTimeMillis(); smartLastAvailability=0; smartLatencyMs=-1; smartChanges.clear(); smartLast=null; smartCatalogSeen=-1; smartOn=true;
+        coverageStart(); // REQ-038.9: the facts of this run go into the recording from here
         clearComponent(); // the analysis chooses the selection from now on
         AppLog.i("smart","start"+(open ? "" : " in own recording"));
         smartStep();
@@ -1282,6 +1355,7 @@ public final class ObdService extends Service {
         smartOn=false; // before the stop event: a rotation inside record() must not resume this analysis in the new file
         selectSignals(saved); // the user's own selection, restored before the stop event: a rotation inside that write must start its header with it; nothing the analysis chose was ever stored
         recordSmart(data);
+        coverageEnd(); // REQ-038.9: the run's last record; a rotation inside the stop event above already continued the run in the new file
         smart=null; smartComponent=null; smartSaved=null; smartLast=null;
         JSONObject idle=idleSmart(); put(idle,"reason",reason); put(idle,"changes",new JSONArray(smartChanges)); put(idle,"latency_ms",smartLatencyMs);
         synchronized(stateLock) { put(state,"smart",idle); }
@@ -1309,6 +1383,81 @@ public final class ObdService extends Service {
         JSONArray selected=data.optJSONArray("selected"); if(selected!=null) selectSignals(selected);
         changed();
     }
+    // ---- #339 (REQ-038.9): coverage facts in the recording ----------------------------------------------------------------------
+    /** Worker thread. The run record of a new Smart run (part 1): the run id is a random token that names no vehicle or adapter. A run that cannot be recorded writes no facts at all. */
+    private void coverageStart() {
+        String run=UUID.randomUUID().toString(); long origin=SystemClock.elapsedRealtimeNanos();
+        JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"action","start"); put(argument,"part",1); put(argument,"run_offset_us",0);
+        JSONObject data=coverageCore("coverage.run",argument);
+        synchronized(recordLock) {
+            if(data==null || writer==null) { AppLog.w("coverage","run not recorded"); return; }
+            coverageRun=run; coveragePart=1; coverageOriginNanos=origin; coverageLastOffset=0; coverageRevision=data.optString("knowledge_revision");
+            coverageWrite("coverage.run",data);
+        }
+    }
+    /** Caller holds recordLock (a wire callback may rotate while the core is busy, so no core call here): the first record of a file that continues the run. A run whose file cannot say so ends here. */
+    private void coverageResume(int previousRecords) {
+        if(coverageRun==null || writer==null) return;
+        JSONObject data=new JSONObject(); put(data,"run",coverageRun); put(data,"action","resume"); put(data,"part",++coveragePart); put(data,"previous_part_records",previousRecords);
+        put(data,"goal_definition",1); put(data,"knowledge_revision",coverageRevision); put(data,"run_offset_us",coverageOffset());
+        coverageWrite("coverage.run",data);
+    }
+    /** The run's own monotonic clock in microseconds, never backwards (caller holds recordLock). */
+    private long coverageOffset() {
+        coverageLastOffset=Math.max(coverageLastOffset,Math.max(0,(SystemClock.elapsedRealtimeNanos()-coverageOriginNanos)/1000));
+        return coverageLastOffset;
+    }
+    /** Caller holds recordLock. One coverage record in the same envelope as every other event; record() adds at and offset_us and counts it. */
+    private void coverageWrite(String action,JSONObject data) {
+        JSONObject envelope=new JSONObject(), result=new JSONObject(); put(envelope,"type","action"); put(envelope,"action",action); put(envelope,"argument","");
+        put(result,"ok",true); put(result,"data",data); put(envelope,"result",result); record(envelope);
+    }
+    private JSONObject coverageCore(String action,JSONObject argument) {
+        try { JSONObject result=new JSONObject(NativeCore.execute(core,action,argument.toString())); return result.optBoolean("ok") ? result.optJSONObject("data") : null; }
+        catch(Exception e) { return null; }
+    }
+    /** A boundary of the running run (gap, disconnect); nothing when no run is on or the recording is gone. */
+    private void coverageBoundary(String boundary) {
+        synchronized(recordLock) { if(coverageRun!=null && writer!=null) coverageBoundaryWrite(coverageRun,boundary); }
+    }
+    private void coverageBoundaryWrite(String run,String boundary) {
+        JSONObject data=new JSONObject(); put(data,"run",run); put(data,"class",boundary); put(data,"run_offset_us",coverageOffset());
+        coverageWrite("coverage.boundary",data);
+    }
+    /** The run ends with the Smart stop: the run is off before its last record, so a rotation inside that write adds no part after it. */
+    private void coverageEnd() {
+        synchronized(recordLock) { String run=coverageRun; if(run==null) return; coverageRun=null; if(writer!=null) coverageBoundaryWrite(run,"run_end"); }
+    }
+    /** Worker thread, right after the raw read record: one fact per read attempt, carrying classes and references but never the value. A fact that cannot be produced is written as a failed read, never skipped. */
+    private void coverageFact(String key,JSONObject result,JSONObject read,int serialBefore) {
+        String run; long origin;
+        synchronized(recordLock) { run=coverageRun; if(run==null || writer==null) return; origin=coverageOffset(); }
+        if(!read.has("offset_us")) return; // the raw read was not written (no recording): nothing to refer to
+        JSONObject data=result.optJSONObject("data"), at=result.optJSONObject("uds_at_request");
+        if(at==null && data!=null) at=data.optJSONObject("uds");
+        if(at==null) at=result.optJSONObject("uds");
+        String session=at!=null && at.optBoolean("active") ? "extended" : "default";
+        String vin; synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); vin=vehicle==null ? "" : vehicle.optString("vin"); }
+        boolean confirmed=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin());
+        JSONObject evidence=new JSONObject(); put(evidence,"at",read.optLong("at")); put(evidence,"offset_us",read.optLong("offset_us"));
+        JSONObject outcome=new JSONObject(); put(outcome,"ok",result.optBoolean("ok")); if(result.has("error")) put(outcome,"error",result.optString("error")); if(data!=null) put(outcome,"data",data);
+        JSONObject negative=result.optJSONObject("negative_response"); if(negative!=null) put(outcome,"negative_response",negative); // a standard negative response: the core's structured rejection with its NRC, the one thing the classifier reads besides the error's wording
+        JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"key",key); put(argument,"run_offset_us",origin); put(argument,"session",session);
+        put(argument,"identity_confirmed",confirmed); put(argument,"evidence",evidence); put(argument,"read",outcome);
+        JSONObject fact=coverageCore("coverage.fact",argument);
+        synchronized(recordLock) {
+            if(!run.equals(coverageRun) || writer==null) return;
+            if(fact==null) { // fail closed: an unclassified read still ends the segments of its signal
+                AppLog.w("coverage","classification failed");
+                fact=new JSONObject(); put(fact,"run",run); put(fact,"signal_key",key); put(fact,"context","baseline"); put(fact,"ecu_target",JSONObject.NULL); put(fact,"session",session);
+                put(fact,"outcome","error"); put(fact,"reason","classification_failed"); put(fact,"implausible",false); put(fact,"static_identity",false); put(fact,"identity_confirmed",confirmed);
+                put(fact,"goal_definition",1); put(fact,"knowledge_revision",coverageRevision); put(fact,"evidence",evidence);
+            }
+            JSONObject reference=fact.optJSONObject("evidence"); if(reference!=null && fileSerial!=serialBefore) put(reference,"in_previous_file",true); // a rotation fell between the raw read and this fact (decided now, in the file that receives it)
+            put(fact,"run_offset_us",coverageOffset());
+            coverageWrite("coverage.fact",fact);
+        }
+    }
     // ---- #314 (REQ-037): gap in live measurement ----------------------------------------------------------------------------
     private static JSONObject idleGap() {
         JSONObject idle=new JSONObject(); put(idle,"active",false); put(idle,"replay",false); put(idle,"text",""); put(idle,"probes",0); put(idle,"outcome",""); put(idle,"changes",new JSONArray());
@@ -1330,7 +1479,7 @@ public final class ObdService extends Service {
     private void gapApply(MeasurementGap.Change change) {
         synchronized(recordLock) {
             switch(change) {
-                case START: gapSince=System.currentTimeMillis(); gapProbes=0; gapOutcome=""; gapOpen=true; AppLog.i("gap","start"); gapNote("start","no_values"); break;
+                case START: gapSince=System.currentTimeMillis(); gapProbes=0; gapOutcome=""; gapOpen=true; AppLog.i("gap","start"); gapNote("start","no_values"); coverageBoundary("gap"); break; // REQ-038.9: a gap start ends every open segment
                 case RECOVERED: gapOpen=false; gapOutcome="recovered"; AppLog.i("gap","end: recovered"); gapNote("end","recovered"); break;
                 case STOPPED: gapOpen=false; gapOutcome="stopped"; AppLog.i("gap","end: stopped"); gapNote("end","stopped"); break;
                 default: break;

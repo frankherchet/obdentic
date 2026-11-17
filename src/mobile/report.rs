@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use super::{Exchange, MobileCore};
+use super::{coverage, Exchange, MobileCore};
 use serde_json::{json, Value};
 
 struct Offline;
@@ -17,15 +17,67 @@ impl Exchange for Offline {
     }
 }
 
-pub fn report(path: &Path) -> Result<Value, String> {
+fn open(path: &Path) -> Result<BufReader<File>, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     if file.metadata().map_err(|error| error.to_string())?.len() > 64 * 1024 * 1024 {
         return Err("mobile recording exceeds the 64 MiB inspection limit".into());
     }
-    inspect(BufReader::new(file))
+    Ok(BufReader::new(file))
+}
+
+/// The report of one recording, with the run ledger derived from its coverage records as a
+/// one-part set (REQ-038.9): `coverage` is null for a recording without coverage facts.
+pub fn report(path: &Path) -> Result<Value, String> {
+    inspect(open(path)?)
+}
+
+/// The report of one or more recordings. One file gives the report of that file; several give a
+/// set whose `coverage` is derived from the parts of every file together, so the whole run of a
+/// rotated recording is rebuilt (REQ-038.9). The argument order never changes `coverage`.
+pub fn report_set(paths: &[impl AsRef<Path>]) -> Result<Value, String> {
+    if let [path] = paths {
+        return report(path.as_ref());
+    }
+    let mut files = Vec::new();
+    let mut parts = Vec::new();
+    for path in paths {
+        let (report, part) = inspect_part(open(path.as_ref())?)?;
+        files.push(report);
+        parts.push(part);
+    }
+    let coverage = coverage::derive(&parts);
+    let mismatch = coverage["knowledge_pin_mismatch"] == true;
+    let issues = if mismatch {
+        coverage["issues"].clone()
+    } else {
+        json!([])
+    };
+    Ok(
+        json!({"schema":"OBDENTIC-MOBILE-REPORT-SET","version":1,"files":files,
+        "coverage":coverage,"knowledge_pin_mismatch":mismatch,"issues":issues}),
+    )
 }
 
 pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
+    let (mut report, part) = inspect_part(reader)?;
+    let coverage = coverage::derive(std::slice::from_ref(&part));
+    if coverage["knowledge_pin_mismatch"] == true {
+        report["knowledge_pin_mismatch"] = json!(true);
+        if let (Some(issues), Some(found)) = (
+            report["issues"].as_array_mut(),
+            coverage["issues"].as_array(),
+        ) {
+            issues.extend(found.iter().cloned());
+        }
+    }
+    report["coverage"] = coverage;
+    Ok(report)
+}
+
+/// The report of one file without coverage, and the file as a part of a run (REQ-038.9): its raw
+/// `coverage.*` records in file order and how it ended.
+fn inspect_part(reader: impl BufRead) -> Result<(Value, coverage::Part), String> {
+    let mut coverage_part = coverage::Part::default();
     let mut core = MobileCore::new(Offline)?;
     let mut session = None;
     let mut complete = false;
@@ -83,6 +135,16 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
         events += 1;
         if let Some(offset) = event["offset_us"].as_u64() {
             last_offset = last_offset.max(Some(offset));
+        }
+        if event["action"]
+            .as_str()
+            .is_some_and(coverage::is_coverage_action)
+        {
+            // REQ-038.9: a record that names itself a coverage record goes raw to the derivation,
+            // which validates it as a set, whatever its envelope `type` says: a missing or corrupt
+            // type must invalidate the run it may affect, never hide a boundary or a failed read.
+            coverage_part.records.push(event);
+            continue;
         }
         match event["type"].as_str() {
             Some("session_end") => {
@@ -183,7 +245,12 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
         issues.push("interrupted recording: no session_end marker".into());
     }
     let measurement_gaps = gaps.periods();
-    Ok(json!({"schema":"OBDENTIC-MOBILE-REPORT","version":1,
+    coverage_part.ended = if complete {
+        outcome["reason"].as_str().map(str::to_owned)
+    } else {
+        None
+    };
+    let report = json!({"schema":"OBDENTIC-MOBILE-REPORT","version":1,
         "mode":session["mode"],"profile":session["profile"],
         "complete":complete,"outcome":outcome,"event_count":events,"tx_count":tx,"rx_count":rx,
         "last_values":values,"diagnostic_jobs":jobs,"smart_snapshot":session["smart"],
@@ -192,7 +259,8 @@ pub fn inspect(reader: impl BufRead) -> Result<Value, String> {
         "measurement_gaps":measurement_gaps,"issues":issues,
         "knowledge_pin_mismatch":pin_mismatch,"value_provenance":value_provenance,
         "recording_end_offset_us":last_offset,
-        "note":"Values and diagnostic facts are recomputed from recorded responses. Original evidence remains in the source file."}))
+        "note":"Values and diagnostic facts are recomputed from recorded responses. Original evidence remains in the source file."});
+    Ok((report, coverage_part))
 }
 
 /// REQ-036.5: one recorded smart-analysis set change. Every recorded data field (set, reason, the
@@ -946,5 +1014,261 @@ mod tests {
         assert_eq!(gaps[0]["outcome"], "recovered");
         assert_eq!(gaps[0]["duration_us"], 32_500_000);
         assert_eq!(gaps[0]["duration_ms"], 32_500);
+    }
+
+    // REQ-038.9: coverage facts in the recording, the report of one file and of a set of parts.
+
+    use super::coverage::fixtures::{boundary, read, reads, resume, secs, start, RUN};
+
+    /// The fixture records carry a test pin; recordings of this build carry the embedded one.
+    fn pinned(mut records: Vec<Value>) -> Vec<Value> {
+        let pin = crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+            .unwrap()
+            .pin()
+            .revision()
+            .to_owned();
+        for record in &mut records {
+            if record["result"]["data"]["knowledge_revision"].is_string() {
+                record["result"]["data"]["knowledge_revision"] = json!(pin);
+            }
+        }
+        records
+    }
+
+    fn recording(records: Vec<Value>, end: Option<&str>) -> String {
+        let mut text = String::from(
+            "{\"type\":\"session\",\"schema\":\"OBDENTIC-MOBILE\",\"version\":1,\"mode\":\"live\"}\n",
+        );
+        for record in pinned(records) {
+            text.push_str(&format!("{record}\n"));
+        }
+        if let Some(reason) = end {
+            text.push_str(&format!(
+                "{{\"type\":\"session_end\",\"reason\":\"{reason}\"}}\n"
+            ));
+        }
+        text
+    }
+
+    fn three_files() -> Vec<String> {
+        let mut first = vec![start(RUN, 0)];
+        first.extend(reads("engine.rpm", 0, 20));
+        let first_count = first.len() as u64;
+        let mut second = vec![resume(RUN, 2, first_count, secs(21))];
+        second.extend(reads("engine.rpm", 22, 40));
+        let second_count = second.len() as u64;
+        let mut third = vec![resume(RUN, 3, second_count, secs(41))];
+        third.extend(reads("engine.rpm", 42, 60));
+        third.push(boundary(RUN, "run_end", secs(60)));
+        vec![
+            recording(first, Some("rotated")),
+            recording(second, Some("rotated")),
+            recording(third, Some("disconnect")),
+        ]
+    }
+
+    fn write_files(name: &str, files: &[String]) -> Vec<std::path::PathBuf> {
+        let directory =
+            std::env::temp_dir().join(format!("obdentic-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        files
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let path = directory.join(format!("part-{index}.jsonl"));
+                std::fs::write(&path, text).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req_038_9_report_of_one_file_derives_its_run_as_a_one_part_set() {
+        let mut records = vec![start(RUN, 0)];
+        records.extend(reads("engine.rpm", 0, 60));
+        records.push(boundary(RUN, "run_end", secs(60)));
+        let value = inspect(recording(records, Some("disconnect")).as_bytes()).unwrap();
+        let run = &value["coverage"]["runs"][0];
+        assert_eq!(run["run_complete"], true);
+        assert_eq!(run["figures"], "exact");
+        assert_eq!(run["entries"][0]["valid_time_ms"], 60_000);
+        assert_eq!(value["knowledge_pin_mismatch"], false);
+    }
+
+    #[test]
+    fn req_038_9_report_of_an_older_recording_has_no_coverage() {
+        let value = inspect(
+            concat!(
+                "{\"type\":\"session\",\"schema\":\"OBDENTIC-MOBILE\",\"version\":1,\"mode\":\"demo\"}\n",
+                "{\"type\":\"action\",\"action\":\"read\",\"result\":{\"ok\":true,\"data\":{\"semantic\":\"engine.rpm\",\"response\":[65,12,12,128]}}}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(value["coverage"], Value::Null);
+        assert_eq!(value["issues"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn req_038_9_report_of_a_set_rebuilds_the_whole_run_in_any_argument_order() {
+        let files = three_files();
+        let paths = write_files("report-set", &files);
+        let ordered = report_set(&paths).unwrap();
+        assert_eq!(ordered["schema"], "OBDENTIC-MOBILE-REPORT-SET");
+        assert_eq!(ordered["version"], 1);
+        assert_eq!(ordered["files"].as_array().unwrap().len(), 3);
+        for file in ordered["files"].as_array().unwrap() {
+            assert!(file.get("coverage").is_none());
+            // A rotated file is a complete recording; that never implies a complete run.
+            assert_eq!(file["complete"], true);
+        }
+        let run = &ordered["coverage"]["runs"][0];
+        assert_eq!(run["run_complete"], true);
+        assert_eq!(run["partial"], false);
+        assert_eq!(run["figures"], "exact");
+        assert_eq!(run["entries"][0]["valid_time_ms"], 60_000);
+        assert_eq!(run["entries"][0]["longest_segment_ms"], 60_000);
+        let shuffled = report_set(&[paths[2].clone(), paths[0].clone(), paths[1].clone()]).unwrap();
+        assert_eq!(shuffled["coverage"], ordered["coverage"]);
+    }
+
+    #[test]
+    fn req_038_9_report_of_one_rotated_file_or_an_incomplete_set_is_partial() {
+        let paths = write_files("report-partial", &three_files());
+        let single = report_set(&paths[..1]).unwrap();
+        assert_eq!(single["coverage"]["runs"][0]["partial"], true);
+        assert_eq!(
+            single["coverage"]["runs"][0]["figures"],
+            "supplied_parts_only"
+        );
+        assert_eq!(single["complete"], true);
+        let missing_middle = report_set(&[paths[0].clone(), paths[2].clone()]).unwrap();
+        let run = &missing_middle["coverage"]["runs"][0];
+        assert_eq!(run["partial"], true);
+        assert_eq!(run["missing_parts"], json!([2]));
+        assert_eq!(run["entries"][0]["valid_time_ms"], 38_000);
+    }
+
+    #[test]
+    fn req_038_9_report_of_the_same_file_twice_is_an_invalid_duplicate_part() {
+        let paths = write_files("report-duplicate", &three_files());
+        let set = report_set(&[paths[0].clone(), paths[0].clone()]).unwrap();
+        assert_eq!(set["coverage"]["runs"][0]["coverage_invalid"], true);
+        assert!(set["coverage"]["runs"][0].get("entries").is_none());
+    }
+
+    #[test]
+    fn req_038_9_report_hands_over_a_malformed_coverage_record_instead_of_skipping_it() {
+        let mut broken = boundary(RUN, "gap", secs(12));
+        broken["result"]["ok"] = json!(false);
+        let records = vec![
+            start(RUN, 0),
+            read("engine.rpm", 10),
+            broken,
+            read("engine.rpm", 15),
+            boundary(RUN, "run_end", secs(15)),
+        ];
+        let value = inspect(recording(records, Some("disconnect")).as_bytes()).unwrap();
+        let run = &value["coverage"]["runs"][0];
+        assert_eq!(run["coverage_invalid"], true);
+        assert!(run.get("entries").is_none());
+        // The other action records of the file are reported as before.
+        assert_eq!(value["event_count"], 6);
+    }
+
+    // The review of #344: a record whose action names it a coverage record is handed over whatever
+    // its envelope type says; a missing or corrupt type must invalidate, never hide a boundary.
+    #[test]
+    fn req_038_9_report_hands_over_a_coverage_record_with_a_missing_or_corrupt_envelope_type() {
+        let corruptions: [Option<Value>; 6] = [
+            None,
+            Some(json!(null)),
+            Some(json!(7)),
+            Some(json!("wire")),
+            Some(json!("session_end")),
+            Some(json!("Action")),
+        ];
+        for corruption in corruptions {
+            let mut broken = boundary(RUN, "gap", secs(12));
+            match &corruption {
+                Some(value) => broken["type"] = value.clone(),
+                None => {
+                    broken.as_object_mut().unwrap().remove("type");
+                }
+            }
+            let records = vec![
+                start(RUN, 0),
+                read("engine.rpm", 10),
+                broken.clone(),
+                read("engine.rpm", 15),
+                boundary(RUN, "run_end", secs(15)),
+            ];
+            let value = inspect(recording(records, Some("disconnect")).as_bytes()).unwrap();
+            let run = &value["coverage"]["runs"][0];
+            assert_eq!(run["coverage_invalid"], true, "type {corruption:?}");
+            assert!(run.get("entries").is_none(), "type {corruption:?}");
+            assert!(
+                run["issues"].to_string().contains("not an action"),
+                "type {corruption:?}: {}",
+                run["issues"]
+            );
+            // The same record without a readable run invalidates every run of the set.
+            broken["result"]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("run");
+            let records = vec![
+                start(RUN, 0),
+                broken,
+                read("engine.rpm", 15),
+                boundary(RUN, "run_end", secs(15)),
+            ];
+            let value = inspect(recording(records, Some("disconnect")).as_bytes()).unwrap();
+            let run = &value["coverage"]["runs"][0];
+            assert_eq!(run["coverage_invalid"], true, "type {corruption:?} no run");
+            assert!(run.get("entries").is_none());
+        }
+    }
+
+    #[test]
+    fn req_038_9_report_derives_the_facts_before_an_unreadable_line_and_ends_the_part_interrupted()
+    {
+        let mut text = recording(
+            vec![start(RUN, 0), read("engine.rpm", 0), read("engine.rpm", 5)],
+            None,
+        );
+        text.push_str("{truncated\n");
+        let value = inspect(text.as_bytes()).unwrap();
+        assert_eq!(value["complete"], false);
+        let run = &value["coverage"]["runs"][0];
+        assert_eq!(run["parts"][0]["ended"], Value::Null);
+        assert_eq!(run["partial_reasons"], json!(["no_run_end"]));
+        assert_eq!(run["entries"][0]["valid_time_ms"], 5_000);
+    }
+
+    #[test]
+    fn req_038_9_report_stops_on_a_knowledge_pin_mismatch_of_any_part() {
+        let mut files = three_files();
+        files[2] = files[2].replacen(
+            crate::knowledge_db::KnowledgeCatalog::embedded_pinned()
+                .unwrap()
+                .pin()
+                .revision(),
+            "0000000000000000000000000000000000000000",
+            1,
+        );
+        let paths = write_files("report-pin", &files);
+        let set = report_set(&paths).unwrap();
+        assert_eq!(set["knowledge_pin_mismatch"], true);
+        assert_eq!(set["coverage"]["runs"], json!([]));
+        assert!(set["issues"][0]
+            .as_str()
+            .unwrap()
+            .ends_with(super::super::knowledge::PIN_MISMATCH));
+        let single = inspect(files[2].as_bytes()).unwrap();
+        assert_eq!(single["knowledge_pin_mismatch"], true);
+        assert!(single["issues"]
+            .to_string()
+            .contains(super::super::knowledge::PIN_MISMATCH));
     }
 }

@@ -32,7 +32,7 @@ final class ComponentSmartAcceptance {
     /** Answers like the demo adapter, except for the steered trigger inputs and the engine's DIDs; every command is logged with its target. */
     private static final class Link implements ObdService.Link {
         final ObdService.Link delegate; final List<String> commands = Collections.synchronizedList(new ArrayList<>());
-        volatile String target = ""; volatile boolean open = true, pedalMissing, failActivation; volatile int regen; volatile String pedal = "20";
+        volatile String target = ""; volatile boolean open = true, pedalMissing, pedalRejected, failActivation; volatile int regen; volatile String pedal = "20";
         Link(ObdService.Link delegate) { this.delegate = delegate; }
         public boolean isOpen() { return open && delegate.isOpen(); }
         public void close() { open = false; delegate.close(); }
@@ -42,7 +42,7 @@ final class ComponentSmartAcceptance {
             if (!open) throw new IOException("simulated link lost");
             if (compact.startsWith("ATSH")) target = compact.substring(4);
             commands.add(target + ":" + compact);
-            if (compact.equals("014A")) return pedalMissing ? "NO DATA\r>" : "7E8 03 41 4A " + pedal + "\r>";
+            if (compact.equals("014A")) return pedalMissing ? "NO DATA\r>" : pedalRejected ? "7E8 03 7F 01 12\r>" : "7E8 03 41 4A " + pedal + "\r>";
             if (compact.equals("1003")) return !target.equals("7E0") ? "NO DATA\r>" : failActivation ? "7E8 03 7F 10 22\r>" : "7E8 06 50 03 00 32 01 F4\r>";
             if (compact.equals("1001")) return target.equals("7E0") ? "7E8 02 50 01\r>" : "NO DATA\r>";
             if (compact.equals("3E80")) return "NO DATA\r>";
@@ -94,7 +94,19 @@ final class ComponentSmartAcceptance {
             List<String> chain = smartWithOwnRecording(service, link[0], dir, vin, user);
             reconnect(service, link, false);
             continuingAndEnding(service, link, dir, vin, user);
+            coverageRace(service, link, dir); // REQ-038.9 (#344 review): a rotation right before a raw read never misplaces its fact's evidence
+            coverageNegativeResponse(service, link, dir); // REQ-038.9 (#344 review): a standard negative response is a rejection with its NRC; facts never copy error text
             replay(service, link, dir, before, chain);
+            coverage(service, link, dir, chain); // REQ-038.9 (#339): the same three files, as facts and as the rebuilt whole run
+            coverageDiscovery(service, link, dir, chain); // REQ-038.9 (#344 review): parts are found anywhere in the folder; untrusted records invalidate
+            require(service.snapshot().optJSONObject("coverage") != null, "REQ-038.9 replay coverage exists before leaving replay");
+            connect(service);
+            require(service.snapshot().isNull("coverage"), "REQ-038.9 a live connection cannot inherit replay coverage");
+            open(service, chain.get(0));
+            require(service.snapshot().optJSONObject("coverage") != null, "REQ-038.9 reopening derives coverage again");
+            service.setDemo();
+            waitFor(() -> "demo".equals(service.snapshot().optString("mode")) && "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"), "demo after replay");
+            require(service.snapshot().isNull("coverage"), "REQ-038.9 demo cannot inherit replay coverage");
         } finally {
             service.rotateAfterSmart = ""; service.rotateMs = 30L * 60 * 1000;
             service.disconnect(); service.connector = savedConnector; service.vehicles = savedStore; service.permissionOverride = savedPermission; service.bluetoothOverride = savedBluetooth;
@@ -349,8 +361,10 @@ final class ComponentSmartAcceptance {
         waitFor(() -> { List<JSONObject> e = read(file); return "session_end".equals(e.get(e.size() - 1).optString("type")); }, "recording closed " + file.getName());
         List<JSONObject> events = read(file); JSONObject end = events.get(events.size() - 1);
         require(reason.equals(end.optString("reason")), "the recording ends with " + reason + ": " + end);
-        JSONObject before = events.get(events.size() - 2), data = smartData(before);
-        require(data != null && "stop".equals(data.optString("change")) && !data.optString("reason").isEmpty() && before.optLong("offset_us") <= end.optLong("offset_us"), "REQ-036.5 the stop event comes right before the end marker: " + before);
+        int at = events.size() - 2; // REQ-038.9: the run's own end record (coverage.boundary run_end) may follow the stop event; nothing else may
+        if ("coverage.boundary".equals(events.get(at).optString("action")) && "run_end".equals(events.get(at).getJSONObject("result").getJSONObject("data").optString("class"))) at--;
+        JSONObject before = events.get(at), data = smartData(before);
+        require(data != null && "stop".equals(data.optString("change")) && !data.optString("reason").isEmpty() && before.optLong("offset_us") <= end.optLong("offset_us"), "REQ-036.5 the stop event comes right before the end marker (or the run's end record): " + before);
     }
 
     // ---- replay ----------------------------------------------------------------------------------------------------------------------
@@ -383,6 +397,232 @@ final class ComponentSmartAcceptance {
         require(link[0].commands.size() == traffic, "replay sent nothing to an adapter: " + link[0].commands.subList(traffic, link[0].commands.size()));
     }
 
+    /**
+     * REQ-038.9 (#339): the run of the smart analysis that rotated twice wrote its coverage facts into all three files, as one run in three parts with
+     * verified joins and no value; replay opened on any part rebuilds the whole run from the set of parts, and with the middle part deleted it says partial
+     * with the missing part number. Replay writes nothing and sends nothing.
+     */
+    private static void coverage(ObdService service, Link[] link, File dir, List<String> chain) throws Exception {
+        int traffic = link[0].commands.size();
+        List<List<JSONObject>> files = new ArrayList<>(); for (String n : chain) files.add(read(new File(dir, n)));
+        String run = null; int[] counts = new int[files.size()]; int facts = 0;
+        for (int f = 0; f < files.size(); f++) {
+            Set<Long> reads = new HashSet<>(); for (JSONObject e : files.get(f)) if ("read".equals(e.optString("action"))) reads.add(e.optLong("offset_us"));
+            List<JSONObject> own = new ArrayList<>(); for (JSONObject e : files.get(f)) if (e.optString("action").startsWith("coverage.")) own.add(e);
+            counts[f] = own.size(); require(own.size() >= 2, "REQ-038.9 file " + f + " holds coverage records: " + own.size());
+            JSONObject first = own.get(0), firstData = first.getJSONObject("result").getJSONObject("data");
+            require("coverage.run".equals(first.optString("action")) && firstData.optInt("part") == f + 1 && (f == 0 ? "start" : "resume").equals(firstData.optString("action")), "REQ-038.9 file " + f + " begins with its part marker: " + first);
+            if (f > 0) require(firstData.optInt("previous_part_records", -1) == counts[f - 1], "REQ-038.9 the resume states the records of the previous part (" + counts[f - 1] + "): " + firstData);
+            long lastOffset = -1; boolean ended = false;
+            for (JSONObject e : own) {
+                JSONObject result = e.getJSONObject("result"), data = result.getJSONObject("data");
+                require(result.optBoolean("ok") && e.has("at") && data.has("run_offset_us") && data.optLong("run_offset_us") >= lastOffset, "REQ-038.9 wall time, ok and an ascending run clock on every record: " + e); lastOffset = data.optLong("run_offset_us");
+                if (run == null) run = data.getString("run"); require(run.equals(data.getString("run")), "REQ-038.9 one run id in all parts");
+                require(!data.has("value") && !data.has("response") && !data.has("vin"), "REQ-038.9 facts carry classes and references, never a value: " + e);
+                if ("coverage.fact".equals(e.optString("action"))) {
+                    facts++; JSONObject evidence = data.getJSONObject("evidence");
+                    require("baseline".equals(data.optString("context")) && data.optInt("goal_definition") == 1 && !data.optString("knowledge_revision").isEmpty() && !data.optString("outcome").isEmpty()
+                        && data.has("session") && data.has("identity_confirmed") && data.has("implausible") && data.has("static_identity"), "REQ-038.9 the fact has every field of the ledger: " + e);
+                    if (!evidence.optBoolean("in_previous_file")) require(reads.contains(evidence.getLong("offset_us")), "REQ-038.9 the evidence reference names the raw read record in the same file: " + e);
+                }
+                if ("coverage.boundary".equals(e.optString("action")) && "run_end".equals(data.optString("class"))) { require(f == files.size() - 1 && !ended, "REQ-038.9 run_end only once, in the last part"); ended = true; }
+            }
+            require(ended == (f == files.size() - 1), "REQ-038.9 only the last part ends the run: file " + f);
+        }
+        require(facts > 0, "REQ-038.9 the reads of the run left facts");
+        for (int f : new int[] {1, 0, 2}) {
+            open(service, chain.get(f)); JSONObject set = service.snapshot().optJSONObject("coverage");
+            require(set != null && set.getJSONArray("runs").length() == 1, "REQ-038.9 replay of part " + (f + 1) + " derives the run: " + set);
+            JSONObject derived = set.getJSONArray("runs").getJSONObject(0);
+            require(derived.optBoolean("run_complete") && !derived.optBoolean("partial") && "exact".equals(derived.optString("figures")) && derived.getJSONArray("parts").length() == 3
+                && derived.getJSONArray("entries").length() > 0 && derived.getJSONArray("joins").getJSONObject(0).optBoolean("verified") && derived.getJSONArray("joins").getJSONObject(1).optBoolean("verified"),
+                "REQ-038.9 replay of any part rebuilds the whole run, complete with exact figures: " + derived);
+        }
+        require(new File(dir, chain.get(1)).delete(), "the middle part can be deleted (REQ-028.7)");
+        for (int f : new int[] {0, 2}) {
+            open(service, chain.get(f)); JSONObject derived = service.snapshot().getJSONObject("coverage").getJSONArray("runs").getJSONObject(0);
+            require(derived.optBoolean("partial") && !derived.optBoolean("run_complete") && "supplied_parts_only".equals(derived.optString("figures")) && derived.getJSONArray("missing_parts").length() == 1
+                && derived.getJSONArray("missing_parts").optInt(0) == 2 && derived.getJSONArray("parts").length() == 2, "REQ-038.9 without the middle part the run is partial and names part 2: " + derived);
+        }
+        require(link[0].commands.size() == traffic, "REQ-038.9 replay sent nothing to an adapter: " + link[0].commands.subList(traffic, link[0].commands.size()));
+    }
+
+    // ---- REQ-038.9, review of #344 ---------------------------------------------------------------------------------------------------
+
+    /**
+     * A rotation by another thread right before a raw read is written: the raw record and the file serial are taken under one lock, so the fact of
+     * that read is not flagged as living in the previous file, and every flag of every fact names the file that really holds the raw read. Live,
+     * simulated adapter, no session; the seam only rotates the open automatic file.
+     */
+    private static void coverageRace(ObdService service, Link[] link, File dir) throws Exception {
+        Set<String> known = names(dir);
+        reconnect(service, link, false);
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started for the rotation race");
+        waitFor(() -> smart(service).optJSONArray("triggers").length() == 6, "trigger rows before the race");
+        String owned = service.snapshot().optString("autoRecording"); require(!owned.isEmpty(), "the run records into an automatic file");
+        service.rotateBeforeRead = true;
+        waitFor(() -> !service.rotateBeforeRead && !owned.equals(service.snapshot().optString("autoRecording")), "the file rotated right before a raw read record");
+        Thread.sleep(1500); // a few more reads land in the new file
+        service.disconnect(); waitFor(() -> "disconnected".equals(service.snapshot().optString("phase")) && service.snapshot().optString("autoRecording").isEmpty(), "disconnected after the race");
+        List<String> made = new ArrayList<>(names(dir)); made.removeAll(known); made.removeIf(n -> !n.endsWith("-auto.jsonl")); Collections.sort(made);
+        require(made.size() == 2 && made.get(0).equals(owned), "the seam rotated exactly once: " + made);
+        List<List<JSONObject>> files = new ArrayList<>(); for (String n : made) files.add(read(new File(dir, n)));
+        JSONObject raced = null; for (JSONObject e : files.get(1)) if ("read".equals(e.optString("action"))) { raced = e; break; }
+        require(raced != null, "the raw read that followed the rotation is the first read of the new file");
+        boolean found = false;
+        for (int f = 0; f < files.size(); f++) for (JSONObject e : files.get(f)) {
+            if (!"coverage.fact".equals(e.optString("action"))) continue;
+            JSONObject evidence = e.getJSONObject("result").getJSONObject("data").getJSONObject("evidence"); boolean previous = evidence.optBoolean("in_previous_file");
+            require(holdsRead(files.get(f), evidence) == !previous && (!previous || (f > 0 && holdsRead(files.get(f - 1), evidence))),
+                "REQ-038.9 the evidence flag names the file that holds the raw read (file " + f + ", previous " + previous + "): " + e);
+            if (f == 1 && evidence.optLong("at") == raced.optLong("at") && evidence.optLong("offset_us") == raced.optLong("offset_us")) { found = true; require(!previous, "REQ-038.9 the fact of the raced read is in the same file as its raw read: " + e); }
+        }
+        require(found, "REQ-038.9 the raced raw read has its fact in the new file");
+    }
+    private static boolean holdsRead(List<JSONObject> events, JSONObject evidence) {
+        for (JSONObject e : events) if ("read".equals(e.optString("action")) && e.optLong("at") == evidence.optLong("at") && e.optLong("offset_us") == evidence.optLong("offset_us")) return true;
+        return false;
+    }
+
+    private static final Set<String> CLOSED_REASONS = new HashSet<>(Arrays.asList("timeout", "no_data", "session_state", "malformed_response", "read_failed", "no_usable_answer", "undecodable_value", "classification_failed"));
+
+    /** All records of the automatic files made since {@code known}, in file order. */
+    private static List<JSONObject> autoEvents(File dir, Set<String> known) throws Exception {
+        List<String> made = new ArrayList<>(names(dir)); made.removeAll(known); made.removeIf(n -> !n.endsWith("-auto.jsonl")); Collections.sort(made);
+        List<JSONObject> events = new ArrayList<>(); for (String n : made) events.addAll(read(new File(dir, n)));
+        return events;
+    }
+
+    /**
+     * REQ-038.9 (#339, review of #344): a standard negative response to a Mode 01 read (7F 01 12) is a rejection with its code in the fact, not a failed
+     * read, because the core passes it on as structure; and no fact of the run copies the wording of an error or of a wire line - a reason, when there is
+     * one, comes from the closed set. Live, simulated adapter, no session; the pedal input answers 7F 01 12 for a while.
+     */
+    private static void coverageNegativeResponse(ObdService service, Link[] link, File dir) throws Exception {
+        Set<String> known = names(dir);
+        reconnect(service, link, false);
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started for the negative response");
+        waitFor(() -> smart(service).optJSONArray("triggers").length() == 6, "trigger rows before the negative response");
+        link[0].pedalRejected = true;
+        waitFor(() -> { for (JSONObject e : autoEvents(dir, known)) if (rejectedPedal(e)) return true; return false; }, "the rejected pedal read left its fact");
+        link[0].pedalRejected = false;
+        waitFor(() -> { for (JSONObject e : autoEvents(dir, known)) if ("read".equals(e.optString("action")) && e.getJSONObject("result").optBoolean("ok") && PEDAL.equals(e.optString("argument"))) return true; return false; }, "the pedal answers again");
+        service.disconnect(); waitFor(() -> "disconnected".equals(service.snapshot().optString("phase")) && service.snapshot().optString("autoRecording").isEmpty(), "disconnected after the negative response");
+        List<JSONObject> events = autoEvents(dir, known); int rejected = 0;
+        for (JSONObject e : events) {
+            if (!"coverage.fact".equals(e.optString("action"))) continue;
+            JSONObject data = e.getJSONObject("result").getJSONObject("data"); String text = e.toString();
+            require(!text.contains("OBD-II") && !text.contains("NO DATA") && !text.contains("ELM327") && !data.has("error") && !data.has("negative_response"), "REQ-038.9 a fact never copies the text of an error or a wire line: " + e);
+            if (data.has("reason")) require(CLOSED_REASONS.contains(data.optString("reason")), "REQ-038.9 a reason comes from the closed set: " + e);
+            if (!rejectedPedal(e)) continue;
+            rejected++;
+            require(data.optInt("response_code", -1) == 0x12 && !data.has("reason"), "REQ-038.9 the negative response is a rejection with its code, not an error: " + e);
+            JSONObject evidence = data.getJSONObject("evidence"); boolean raw = false;
+            for (JSONObject r : events) if ("read".equals(r.optString("action")) && r.optLong("at") == evidence.optLong("at") && r.optLong("offset_us") == evidence.optLong("offset_us")) {
+                JSONObject negative = r.getJSONObject("result").optJSONObject("negative_response"); raw = negative != null && negative.optInt("service") == 1 && negative.optInt("nrc") == 0x12;
+            }
+            require(raw, "REQ-038.9 the evidence reference names the raw read that carries the structured negative response: " + e);
+        }
+        require(rejected > 0, "REQ-038.9 the rejected reads left facts");
+    }
+    private static boolean rejectedPedal(JSONObject e) throws Exception {
+        if (!"coverage.fact".equals(e.optString("action"))) return false;
+        JSONObject data = e.getJSONObject("result").getJSONObject("data");
+        return PEDAL.equals(data.optString("signal_key")) && "rejected".equals(data.optString("outcome"));
+    }
+
+    /** Synthetic recordings of the shape the service writes: header, filler wire lines and coverage records, one file per part. Never any vehicle data. */
+    private static final class Synth {
+        private static final long AT = 1_700_000_000_000L; private static long clock = 5_000_000;
+        final List<String> lines = new ArrayList<>(); final String revision; int coverage;
+        Synth(String revision) throws Exception { this.revision = revision; lines.add(new JSONObject().put("type", "session").put("schema", "OBDENTIC-MOBILE").put("version", 1).put("mode", "live").toString()); }
+        Synth filler(int n) throws Exception { for (int i = 0; i < n; i++) { clock += 1000; lines.add(new JSONObject().put("type", "wire").put("direction", "TX").put("text", "010C").put("at", AT + clock / 1000).put("offset_us", clock).toString()); } return this; }
+        JSONObject envelope(String action, JSONObject data) throws Exception {
+            clock += 1_000_000; data.put("run_offset_us", clock);
+            return new JSONObject().put("type", "action").put("action", action).put("argument", "").put("at", AT + clock / 1000).put("offset_us", clock).put("result", new JSONObject().put("ok", true).put("data", data));
+        }
+        Synth add(JSONObject envelope) { lines.add(envelope.toString()); coverage++; return this; }
+        Synth start(String run) throws Exception { return add(envelope("coverage.run", new JSONObject().put("run", run).put("action", "start").put("part", 1).put("goal_definition", 1).put("knowledge_revision", revision))); }
+        Synth resume(String run, long part, int previous) throws Exception { return add(envelope("coverage.run", new JSONObject().put("run", run).put("action", "resume").put("part", part).put("previous_part_records", previous).put("goal_definition", 1).put("knowledge_revision", revision))); }
+        JSONObject factEnvelope(String run) throws Exception {
+            JSONObject data = new JSONObject().put("run", run).put("signal_key", "engine.rpm").put("context", "baseline").put("ecu_target", JSONObject.NULL).put("session", "default").put("implausible", false)
+                .put("static_identity", false).put("identity_confirmed", false).put("goal_definition", 1).put("knowledge_revision", revision).put("outcome", "decoded").put("value_kind", "numeric").put("finite", true);
+            data.put("evidence", new JSONObject().put("at", AT + clock / 1000).put("offset_us", clock));
+            return envelope("coverage.fact", data);
+        }
+        Synth fact(String run) throws Exception { return add(factEnvelope(run)); }
+        JSONObject boundaryEnvelope(String run, String kind) throws Exception { return envelope("coverage.boundary", new JSONObject().put("run", run).put("class", kind)); }
+        Synth end(String run) throws Exception { return add(boundaryEnvelope(run, "run_end")); }
+        File write(File dir, String name, String reason) throws Exception {
+            File file = new File(dir, name);
+            try (java.io.Writer out = new java.io.OutputStreamWriter(new java.io.FileOutputStream(file), StandardCharsets.UTF_8)) {
+                for (String line : lines) out.write(line + "\n");
+                if (reason != null) out.write(new JSONObject().put("type", "session_end").put("reason", reason).put("at", AT + clock / 1000).put("offset_us", clock + 1).toString() + "\n");
+            }
+            return file;
+        }
+    }
+    private static JSONObject runOf(JSONObject set, String run) {
+        JSONArray runs = set == null ? null : set.optJSONArray("runs");
+        for (int i = 0; runs != null && i < runs.length(); i++) if (run.equals(runs.optJSONObject(i).optString("run"))) return runs.optJSONObject(i);
+        return null;
+    }
+    private static void requireWhole(JSONObject set, String run, int parts, String why) throws Exception {
+        JSONObject r = runOf(set, run);
+        require(r != null && !r.optBoolean("coverage_invalid") && r.optBoolean("run_complete") && !r.optBoolean("partial") && "exact".equals(r.optString("figures")) && r.getJSONArray("parts").length() == parts, why + ": " + r + " in " + set);
+    }
+
+    /**
+     * REQ-038.9, review of #344: the parts of a run are found by the run ids named anywhere in the folder's automatic recordings, within the
+     * recording limits: a part whose first coverage record comes after the first 50 lines, a part that begins with another, ended run, and the
+     * parts of that other run (found through the first). A coverage record with a missing or corrupt envelope type or an absurd part number
+     * invalidates its run instead of being skipped. Synthetic files only; replay sends nothing.
+     */
+    private static void coverageDiscovery(ObdService service, Link[] link, File dir, List<String> chain) throws Exception {
+        int traffic = link[0].commands.size();
+        String revision = null; for (JSONObject e : read(new File(dir, chain.get(0)))) if ("coverage.run".equals(e.optString("action"))) { revision = e.getJSONObject("result").getJSONObject("data").getString("knowledge_revision"); break; }
+        require(revision != null, "the recorded run carries the Knowledge revision of this build");
+        // a part whose run starts after line 50 of its file, three parts
+        String delayed = "synthetic-delayed";
+        Synth d1 = new Synth(revision).filler(60).start(delayed).fact(delayed).fact(delayed); d1.write(dir, "20990101-000001-001-live-auto.jsonl", "rotated");
+        Synth d2 = new Synth(revision).filler(60).resume(delayed, 2, d1.coverage).fact(delayed).fact(delayed); d2.write(dir, "20990101-000001-002-live-auto.jsonl", "rotated");
+        Synth d3 = new Synth(revision).filler(60).resume(delayed, 3, d2.coverage).fact(delayed).fact(delayed).end(delayed); d3.write(dir, "20990101-000001-003-live-auto.jsonl", "disconnected");
+        for (int f = 1; f <= 3; f++) {
+            open(service, "20990101-000001-00" + f + "-live-auto.jsonl"); JSONObject set = service.snapshot().optJSONObject("coverage");
+            require(set != null && set.getJSONArray("runs").length() == 1, "REQ-038.9 only the run of the opened file is derived (part " + f + "): " + set);
+            requireWhole(set, delayed, 3, "REQ-038.9 parts whose run record is far behind the header are found (opened part " + f + ")");
+        }
+        // a part that begins with another, ended run; that run's earlier part is found through it
+        String earlier = "synthetic-earlier", later = "synthetic-later";
+        Synth a = new Synth(revision).start(earlier).fact(earlier); a.write(dir, "20990101-000002-001-live-auto.jsonl", "rotated");
+        Synth b = new Synth(revision).resume(earlier, 2, a.coverage).fact(earlier).end(earlier).filler(3).start(later).fact(later); b.write(dir, "20990101-000002-002-live-auto.jsonl", "rotated");
+        Synth c = new Synth(revision).resume(later, 2, b.coverage).fact(later).end(later); c.write(dir, "20990101-000002-003-live-auto.jsonl", "disconnected");
+        for (int f : new int[] {3, 2, 1}) {
+            open(service, "20990101-000002-00" + f + "-live-auto.jsonl"); JSONObject set = service.snapshot().optJSONObject("coverage");
+            require(set != null && set.getJSONArray("runs").length() == 2, "REQ-038.9 the two successive runs are derived (opened file " + f + "): " + set);
+            requireWhole(set, later, 2, "REQ-038.9 a run that starts after another run in the same file is found (opened file " + f + ")");
+            requireWhole(set, earlier, 2, "REQ-038.9 the earlier run, whose first part holds nothing of the opened run, is whole too (opened file " + f + ")");
+        }
+        // a coverage record without envelope type, in the opened file and in a part found by its run id
+        String broken = "synthetic-corrupt";
+        Synth e1 = new Synth(revision).start(broken).fact(broken); e1.write(dir, "20990101-000003-001-live-auto.jsonl", "rotated");
+        Synth e2 = new Synth(revision).resume(broken, 2, e1.coverage).fact(broken);
+        JSONObject untyped = e2.boundaryEnvelope(broken, "gap"); untyped.remove("type");
+        e2.add(untyped).fact(broken).end(broken); e2.write(dir, "20990101-000003-002-live-auto.jsonl", "disconnected");
+        for (int f = 1; f <= 2; f++) {
+            open(service, "20990101-000003-00" + f + "-live-auto.jsonl"); JSONObject r = runOf(service.snapshot().optJSONObject("coverage"), broken);
+            require(r != null && r.optBoolean("coverage_invalid") && !r.has("entries") && r.getJSONArray("issues").toString().contains("not an action"), "REQ-038.9 a coverage record without type invalidates the run (opened file " + f + "): " + r);
+        }
+        // an absurd part number is invalid, never expanded into a list of missing parts
+        String huge = "synthetic-huge";
+        Synth h1 = new Synth(revision).start(huge).fact(huge); h1.write(dir, "20990101-000004-001-live-auto.jsonl", "rotated");
+        new Synth(revision).resume(huge, Long.MAX_VALUE, h1.coverage).fact(huge).end(huge).write(dir, "20990101-000004-002-live-auto.jsonl", "disconnected");
+        for (int f = 1; f <= 2; f++) {
+            open(service, "20990101-000004-00" + f + "-live-auto.jsonl"); JSONObject r = runOf(service.snapshot().optJSONObject("coverage"), huge);
+            require(r != null && r.optBoolean("coverage_invalid") && !r.has("missing_parts") && r.getJSONArray("issues").toString().contains("exceeds the limit"), "REQ-038.9 a part number beyond the limit invalidates the run (opened file " + f + "): " + r);
+        }
+        require(link[0].commands.size() == traffic, "REQ-038.9 discovery and replay sent nothing to an adapter");
+    }
     private static void open(ObdService service, String name) throws Exception {
         service.openRecording(name);
         waitFor(() -> "replay".equals(service.snapshot().optString("mode")) && name.equals(service.snapshot().optString("replayFile")) && !service.snapshot().optBoolean("busy"), "replay " + name);

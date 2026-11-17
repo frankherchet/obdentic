@@ -316,6 +316,74 @@ deterministic replay tests. Gap behaviour on a real vehicle (how long values are
 whether the first probe recovers) is not validated and belongs to the separate #178 hardware
 acceptance; until then the thresholds above are the specified behaviour, not measured results.
 
+## Coverage facts in the recording (REQ-038.9)
+
+A Smart run writes the facts that rebuild its run ledger (`coverage_ledger.rs`, REQ-038) into the running
+automatic recording, as three action events in the existing envelope (empty `argument`, result
+`{"ok":true,"data":{…}}`; the record's own `at` is the wallclock time and `offset_us` the file offset; the header
+format version stays 1):
+
+- `coverage.run`: `action` `start` (`part` 1) or `resume` (`part` = previous + 1, `previous_part_records`), `run`,
+  `goal_definition`, `knowledge_revision`, `run_offset_us`. The run id is a random token created at each Smart start;
+  it names no vehicle or adapter. `run_offset_us` is the monotonic run clock since the Smart start and is never reset
+  by a rotation.
+- `coverage.fact`: one record per read attempt, written right after the raw `read` record and classified by the Rust
+  core (`coverage.fact`, a closed read-only action without transport access): `signal_key`, `context` (`baseline`),
+  `ecu_target`, `session` (`default`/`extended`), `outcome` (`decoded` with `value_kind` and `finite`/`nonempty`,
+  `unsupported`, `rejected` with `response_code`, `empty`, `error`/`no_answer`/`session_restricted` with `reason`),
+  `implausible`, `static_identity`, `identity_confirmed`, versions, `run_offset_us` and `evidence` (the `at` and
+  `offset_us` of the raw read record, plus `in_previous_file` when a rotation fell between the read and the fact).
+  A fact never carries the value; it stays in the raw `read` record. Nor does it carry the text of an error or of a
+  wire line, which can quote a VIN, an ECU serial number or an adapter identifier: a `reason` is one of a closed set
+  (`timeout`, `no_data`, `session_state`, `malformed_response`, `read_failed`, `no_usable_answer`,
+  `undecodable_value`, `classification_failed`) chosen by the classifier. Replay rejects any reason outside this vocabulary
+  too; it never republishes arbitrary recorded error text. A standard Mode 01 negative response (`7F 01 <nrc>`) is a
+  `rejected` fact with its `response_code`, never an `error`: the core adds it to the failed
+  read as `negative_response` (`{"service":1,"nrc":…}`, taken from the same observation that stays in the raw
+  record) and the classifier reads that structure, not the error text. A read whose classification fails is still
+  written, as an `error` fact with the reason `classification_failed`, because a lost failure could let the two
+  readings around it count as one continuous segment.
+- `coverage.boundary`: `class` `gap` (with the start of a `measurement.gap`), `disconnect` (before the end of a
+  session by disconnect or link failure), `run_end` (with the Smart stop; always the run's last record) and
+  `reconnect` (accepted on read, not written yet).
+
+A rotation (REQ-028.3) keeps a Smart run going: the new file starts, after the header and the `smart.set` and
+`measurement.gap` resume records, with `coverage.run` `resume`, so every file is understandable on its own and a long
+run is a chain of parts. `previous_part_records` is the number of `coverage.*` records written into the previous part
+(its own `start`/`resume` included). Parts are identified by run id and `part`, never by file name, file time or
+order.
+
+Replay and `obdentic-mobile-report` never re-classify raw reads: they fold only the recorded `coverage.*` records
+through the counting module (`SmartRun::fold` with the replay session kind, which can never credit a vehicle
+ledger) and send nothing. One function, `mobile::coverage::derive`, validates, orders and folds the parts of a run for
+both. A join of two consecutive parts is verified when the earlier part ended `rotated`, the record count matches and
+the run clock does not go backwards; only then may a segment span the rotation. A run is complete
+(`run_complete: true`, `figures: "exact"`) only when part 1 through the part with `run_end` are all supplied and
+every join is verified. Otherwise it is marked partial in the data (`partial: true`, `figures:
+"supplied_parts_only"`, `partial_reasons` from `missing_start`, `missing_parts` with `missing_parts: [numbers]`,
+`unverified_join` and `no_run_end`) and no segment is bridged over a missing or unverified join (a derived break, never
+written to a file). A single rotated part is partial; a rotated file's `complete: true` never implies a complete run.
+
+A coverage record that cannot be trusted is never skipped, because a skipped boundary or failed read could overstate
+the valid time. It invalidates the run it may affect (`coverage_invalid: true` with the reason in `issues`, no counts,
+time or status), or every run of the set when its run cannot be read: missing or corrupt envelope type, `ok` not true,
+`data` not an object, unknown action, outcome, boundary, session or run action, missing or backwards `run_offset_us`,
+an orphan or duplicate record (including the same signal/read evidence repeated across a rotation), a malformed `part`,
+part number above 64, two parts with the same number (also the same file twice), a `previous_part_records` that differs
+from the real count, offsets running backwards across a join, a record after `run_end`, more than 64 parts. A
+Knowledge revision that differs from the embedded pin in any part stops the derivation (`knowledge_pin_mismatch`);
+the raw evidence stays available. Recordings without `coverage.*` records (every file written before this change) open
+as before and contribute no coverage (`coverage: null`).
+Starting a new live or demo session clears the prior replay's coverage; only opening a recording derives it again.
+
+The report takes several files: `obdentic-mobile-report part1.jsonl part2.jsonl part3.jsonl` prints
+`{"schema":"OBDENTIC-MOBILE-REPORT-SET","version":1,"files":[…],"coverage":{…}}`, and the `coverage` section is the
+same whatever the argument order. One file prints its report with the `coverage` of that file as a one-part set.
+Replay scans every automatic recording in the app's folder under the recording's size and line limits for run ids,
+including markers after earlier runs. It includes related files transitively (`replay.coverage.part`, `replay.coverage`;
+at most 65 supplied files, so an excessive run is invalidated). A deleted or unavailable part is not supplied, so the
+run is partial. The result is kept in the service state as `coverage`; this slice adds no screen (#340 shows it).
+
 ## Semantic assistant tool bridge (REQ-041)
 
 `MobileCore` offers an in-process, versioned tool interface for a future assistant runtime. It is the contract
