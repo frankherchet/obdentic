@@ -128,7 +128,7 @@ final class LiveGridAcceptance {
         }
         if (inView < 8) {
             float density = activity.getResources().getDisplayMetrics().density;
-            return "only " + inView + " of " + tiles.size() + " tiles on the first screen (viewport " + Math.round(scroll.getWidth() / density) + "x" + Math.round(scroll.getHeight() / density) + " dp, first tile y=" + firstTop(tiles) + ", viewport top " + s[1] + ")";
+            return "only " + inView + " of " + tiles.size() + " tiles on the first screen (viewport " + Math.round(scroll.getWidth() / density) + "x" + Math.round(scroll.getHeight() / density) + " dp, first tile y=" + firstTop(tiles) + ", viewport top " + s[1] + ", last tile bottom " + (t[1] + tiles.get(tiles.size() - 1).getHeight()) + ", viewport bottom " + (s[1] + scroll.getHeight()) + ")";
         }
         FormatAcceptance.noSemanticIds(root);
         return "";

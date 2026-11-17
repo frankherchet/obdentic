@@ -66,20 +66,24 @@ final class PendingFeedbackAcceptance {
         Button usable = awaitButton(inst, START);
         require(onMain(inst,() -> usable.isEnabled()), "REQ-021.3 button usable again after expiry");
 
-        // REQ-021.1/.2/.5: a real start and stop through the button. The pending text is read in the same main-thread turn as the tap,
-        // because the 500 ms refresh replaces it with the final state as soon as the service reports the recording.
-        String[] tapped = {""};
-        inst.runOnMainSync(() -> { usable.performClick(); tapped[0] = ((MainActivity)current).lastAnnouncement; });
-        require(START_PENDING.equals(tapped[0]), "REQ-021.1/.5 the tap announces the pending text: "+tapped[0]);
+        // Read feedback in the tap's main-thread turn. A fast worker may already have completed; in that case
+        // require both the final announcement and its observed recording state, never a fabricated pending state.
+        String[] tapped = {""}; boolean[] startedAtTap = {false};
+        inst.runOnMainSync(() -> { usable.performClick(); tapped[0] = ((MainActivity)current).lastAnnouncement;
+            startedAtTap[0] = !service.snapshot().optString("recording").isEmpty() && !pending.isPending("rec.start"); });
+        require(START_PENDING.equals(tapped[0]) || (startedAtTap[0] && "Aufzeichnung starten abgeschlossen".equals(tapped[0])),
+            "REQ-021.1/.5 the tap announces pending work or an observed completion: "+tapped[0]);
         until(() -> !service.snapshot().optString("recording").isEmpty(), "demo recording started");
         String name = service.snapshot().getString("recording");
         Button stop = awaitButton(inst, STOP);
         require(!pending.isPending("rec.start") && onMain(inst,() -> stop.isEnabled()), "REQ-021.2 start observed: pending ended, stop label shown and usable");
         String finalAnnouncement = announcement(inst, current);
         require(!START_PENDING.equals(finalAnnouncement), "REQ-021.5 final state announced: "+finalAnnouncement);
-        String[] stopTapped = {""};
-        inst.runOnMainSync(() -> { stop.performClick(); stopTapped[0] = ((MainActivity)current).lastAnnouncement; });
-        require(STOP_PENDING.equals(stopTapped[0]), "REQ-021.1/.5 stop announces the pending text: "+stopTapped[0]);
+        String[] stopTapped = {""}; boolean[] stoppedAtTap = {false};
+        inst.runOnMainSync(() -> { stop.performClick(); stopTapped[0] = ((MainActivity)current).lastAnnouncement;
+            stoppedAtTap[0] = service.snapshot().optString("recording").isEmpty() && !pending.isPending("rec.stop"); });
+        require(STOP_PENDING.equals(stopTapped[0]) || (stoppedAtTap[0] && "Aufzeichnung stoppen abgeschlossen".equals(stopTapped[0])),
+            "REQ-021.1/.5 stop announces pending work or an observed completion: "+stopTapped[0]);
         until(() -> service.snapshot().optString("recording").isEmpty(), "demo recording stopped");
         Button restart = awaitButton(inst, START);
         require(!pending.isPending("rec.stop") && onMain(inst,() -> restart.isEnabled()), "REQ-021.2 stop observed: pending ended, start label shown and usable");

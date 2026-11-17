@@ -222,7 +222,7 @@ public class MainActivity extends Activity {
         for(Map.Entry<String,JSONObject> entry:shown.entrySet()){
             String id=entry.getKey();JSONObject s=entry.getValue();
             if(col==0){row=new LinearLayout(this);row.setOrientation(LinearLayout.HORIZONTAL);LinearLayout.LayoutParams rp=new LinearLayout.LayoutParams(-1,-2);rp.setMargins(0,dp(6),0,0);body.addView(row,rp);}
-            LinearLayout tile=new LinearLayout(this);tile.setOrientation(LinearLayout.VERTICAL);tile.setPadding(dp(10),dp(8),dp(10),dp(8));tile.setBackground(surface(CARD,20));tile.setTag("live-tile");
+            LinearLayout tile=new LinearLayout(this);tile.setOrientation(LinearLayout.VERTICAL);tile.setPadding(dp(10),dp(6),dp(10),dp(6));tile.setBackground(surface(CARD,20));tile.setTag("live-tile");
             LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(0,-2,1);tp.setMargins(col==0?0:dp(3),0,col==columns-1?0:dp(3),0);row.addView(tile,tp);
             TextView name=text(signalLabel(id,s),13,MUTED);name.setSingleLine(true);name.setEllipsize(android.text.TextUtils.TruncateAt.END);tile.addView(name);
             TextView number=text("—",24,TEXT);number.setTypeface(Typeface.MONOSPACE);number.setFontFeatureSettings("tnum");number.setSingleLine(true);number.setEllipsize(android.text.TextUtils.TruncateAt.END);tile.addView(number);valueViews.put(id,number);
