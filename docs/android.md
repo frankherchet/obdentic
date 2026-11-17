@@ -331,7 +331,14 @@ format version stays 1):
   `unsupported`, `rejected` with `response_code`, `empty`, `error`/`no_answer`/`session_restricted` with `reason`),
   `implausible`, `static_identity`, `identity_confirmed`, versions, `run_offset_us` and `evidence` (the `at` and
   `offset_us` of the raw read record, plus `in_previous_file` when a rotation fell between the read and the fact).
-  A fact never carries the value; it stays in the raw `read` record. A read whose classification fails is still
+  A fact never carries the value; it stays in the raw `read` record. Nor does it carry the text of an error or of a
+  wire line, which can quote a VIN, an ECU serial number or an adapter identifier: a `reason` is one of a closed set
+  (`timeout`, `no_data`, `session_state`, `malformed_response`, `read_failed`, `no_usable_answer`,
+  `undecodable_value`, `classification_failed`) chosen by the classifier. Replay rejects any reason outside this vocabulary
+  too; it never republishes arbitrary recorded error text. A standard Mode 01 negative response (`7F 01 <nrc>`) is a
+  `rejected` fact with its `response_code`, never an `error`: the core adds it to the failed
+  read as `negative_response` (`{"service":1,"nrc":…}`, taken from the same observation that stays in the raw
+  record) and the classifier reads that structure, not the error text. A read whose classification fails is still
   written, as an `error` fact with the reason `classification_failed`, because a lost failure could let the two
   readings around it count as one continuous segment.
 - `coverage.boundary`: `class` `gap` (with the start of a `measurement.gap`), `disconnect` (before the end of a
@@ -359,12 +366,13 @@ A coverage record that cannot be trusted is never skipped, because a skipped bou
 the valid time. It invalidates the run it may affect (`coverage_invalid: true` with the reason in `issues`, no counts,
 time or status), or every run of the set when its run cannot be read: missing or corrupt envelope type, `ok` not true,
 `data` not an object, unknown action, outcome, boundary, session or run action, missing or backwards `run_offset_us`,
-an orphan or duplicate record, a malformed `part`, part number above 64, two parts with the same number (also the same
-file twice), a `previous_part_records` that differs from the real count, offsets running backwards across a join,
-a record after `run_end`, more than 64 parts. A
+an orphan or duplicate record (including the same signal/read evidence repeated across a rotation), a malformed `part`,
+part number above 64, two parts with the same number (also the same file twice), a `previous_part_records` that differs
+from the real count, offsets running backwards across a join, a record after `run_end`, more than 64 parts. A
 Knowledge revision that differs from the embedded pin in any part stops the derivation (`knowledge_pin_mismatch`);
 the raw evidence stays available. Recordings without `coverage.*` records (every file written before this change) open
 as before and contribute no coverage (`coverage: null`).
+Starting a new live or demo session clears the prior replay's coverage; only opening a recording derives it again.
 
 The report takes several files: `obdentic-mobile-report part1.jsonl part2.jsonl part3.jsonl` prints
 `{"schema":"OBDENTIC-MOBILE-REPORT-SET","version":1,"files":[…],"coverage":{…}}`, and the `coverage` section is the

@@ -32,7 +32,7 @@ final class ComponentSmartAcceptance {
     /** Answers like the demo adapter, except for the steered trigger inputs and the engine's DIDs; every command is logged with its target. */
     private static final class Link implements ObdService.Link {
         final ObdService.Link delegate; final List<String> commands = Collections.synchronizedList(new ArrayList<>());
-        volatile String target = ""; volatile boolean open = true, pedalMissing, failActivation; volatile int regen; volatile String pedal = "20";
+        volatile String target = ""; volatile boolean open = true, pedalMissing, pedalRejected, failActivation; volatile int regen; volatile String pedal = "20";
         Link(ObdService.Link delegate) { this.delegate = delegate; }
         public boolean isOpen() { return open && delegate.isOpen(); }
         public void close() { open = false; delegate.close(); }
@@ -42,7 +42,7 @@ final class ComponentSmartAcceptance {
             if (!open) throw new IOException("simulated link lost");
             if (compact.startsWith("ATSH")) target = compact.substring(4);
             commands.add(target + ":" + compact);
-            if (compact.equals("014A")) return pedalMissing ? "NO DATA\r>" : "7E8 03 41 4A " + pedal + "\r>";
+            if (compact.equals("014A")) return pedalMissing ? "NO DATA\r>" : pedalRejected ? "7E8 03 7F 01 12\r>" : "7E8 03 41 4A " + pedal + "\r>";
             if (compact.equals("1003")) return !target.equals("7E0") ? "NO DATA\r>" : failActivation ? "7E8 03 7F 10 22\r>" : "7E8 06 50 03 00 32 01 F4\r>";
             if (compact.equals("1001")) return target.equals("7E0") ? "7E8 02 50 01\r>" : "NO DATA\r>";
             if (compact.equals("3E80")) return "NO DATA\r>";
@@ -95,9 +95,18 @@ final class ComponentSmartAcceptance {
             reconnect(service, link, false);
             continuingAndEnding(service, link, dir, vin, user);
             coverageRace(service, link, dir); // REQ-038.9 (#344 review): a rotation right before a raw read never misplaces its fact's evidence
+            coverageNegativeResponse(service, link, dir); // REQ-038.9 (#344 review): a standard negative response is a rejection with its NRC; facts never copy error text
             replay(service, link, dir, before, chain);
             coverage(service, link, dir, chain); // REQ-038.9 (#339): the same three files, as facts and as the rebuilt whole run
             coverageDiscovery(service, link, dir, chain); // REQ-038.9 (#344 review): parts are found anywhere in the folder; untrusted records invalidate
+            require(service.snapshot().optJSONObject("coverage") != null, "REQ-038.9 replay coverage exists before leaving replay");
+            connect(service);
+            require(service.snapshot().isNull("coverage"), "REQ-038.9 a live connection cannot inherit replay coverage");
+            open(service, chain.get(0));
+            require(service.snapshot().optJSONObject("coverage") != null, "REQ-038.9 reopening derives coverage again");
+            service.setDemo();
+            waitFor(() -> "demo".equals(service.snapshot().optString("mode")) && "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"), "demo after replay");
+            require(service.snapshot().isNull("coverage"), "REQ-038.9 demo cannot inherit replay coverage");
         } finally {
             service.rotateAfterSmart = ""; service.rotateMs = 30L * 60 * 1000;
             service.disconnect(); service.connector = savedConnector; service.vehicles = savedStore; service.permissionOverride = savedPermission; service.bluetoothOverride = savedBluetooth;
@@ -473,6 +482,53 @@ final class ComponentSmartAcceptance {
     private static boolean holdsRead(List<JSONObject> events, JSONObject evidence) {
         for (JSONObject e : events) if ("read".equals(e.optString("action")) && e.optLong("at") == evidence.optLong("at") && e.optLong("offset_us") == evidence.optLong("offset_us")) return true;
         return false;
+    }
+
+    private static final Set<String> CLOSED_REASONS = new HashSet<>(Arrays.asList("timeout", "no_data", "session_state", "malformed_response", "read_failed", "no_usable_answer", "undecodable_value", "classification_failed"));
+
+    /** All records of the automatic files made since {@code known}, in file order. */
+    private static List<JSONObject> autoEvents(File dir, Set<String> known) throws Exception {
+        List<String> made = new ArrayList<>(names(dir)); made.removeAll(known); made.removeIf(n -> !n.endsWith("-auto.jsonl")); Collections.sort(made);
+        List<JSONObject> events = new ArrayList<>(); for (String n : made) events.addAll(read(new File(dir, n)));
+        return events;
+    }
+
+    /**
+     * REQ-038.9 (#339, review of #344): a standard negative response to a Mode 01 read (7F 01 12) is a rejection with its code in the fact, not a failed
+     * read, because the core passes it on as structure; and no fact of the run copies the wording of an error or of a wire line - a reason, when there is
+     * one, comes from the closed set. Live, simulated adapter, no session; the pedal input answers 7F 01 12 for a while.
+     */
+    private static void coverageNegativeResponse(ObdService service, Link[] link, File dir) throws Exception {
+        Set<String> known = names(dir);
+        reconnect(service, link, false);
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started for the negative response");
+        waitFor(() -> smart(service).optJSONArray("triggers").length() == 6, "trigger rows before the negative response");
+        link[0].pedalRejected = true;
+        waitFor(() -> { for (JSONObject e : autoEvents(dir, known)) if (rejectedPedal(e)) return true; return false; }, "the rejected pedal read left its fact");
+        link[0].pedalRejected = false;
+        waitFor(() -> { for (JSONObject e : autoEvents(dir, known)) if ("read".equals(e.optString("action")) && e.getJSONObject("result").optBoolean("ok") && PEDAL.equals(e.optString("argument"))) return true; return false; }, "the pedal answers again");
+        service.disconnect(); waitFor(() -> "disconnected".equals(service.snapshot().optString("phase")) && service.snapshot().optString("autoRecording").isEmpty(), "disconnected after the negative response");
+        List<JSONObject> events = autoEvents(dir, known); int rejected = 0;
+        for (JSONObject e : events) {
+            if (!"coverage.fact".equals(e.optString("action"))) continue;
+            JSONObject data = e.getJSONObject("result").getJSONObject("data"); String text = e.toString();
+            require(!text.contains("OBD-II") && !text.contains("NO DATA") && !text.contains("ELM327") && !data.has("error") && !data.has("negative_response"), "REQ-038.9 a fact never copies the text of an error or a wire line: " + e);
+            if (data.has("reason")) require(CLOSED_REASONS.contains(data.optString("reason")), "REQ-038.9 a reason comes from the closed set: " + e);
+            if (!rejectedPedal(e)) continue;
+            rejected++;
+            require(data.optInt("response_code", -1) == 0x12 && !data.has("reason"), "REQ-038.9 the negative response is a rejection with its code, not an error: " + e);
+            JSONObject evidence = data.getJSONObject("evidence"); boolean raw = false;
+            for (JSONObject r : events) if ("read".equals(r.optString("action")) && r.optLong("at") == evidence.optLong("at") && r.optLong("offset_us") == evidence.optLong("offset_us")) {
+                JSONObject negative = r.getJSONObject("result").optJSONObject("negative_response"); raw = negative != null && negative.optInt("service") == 1 && negative.optInt("nrc") == 0x12;
+            }
+            require(raw, "REQ-038.9 the evidence reference names the raw read that carries the structured negative response: " + e);
+        }
+        require(rejected > 0, "REQ-038.9 the rejected reads left facts");
+    }
+    private static boolean rejectedPedal(JSONObject e) throws Exception {
+        if (!"coverage.fact".equals(e.optString("action"))) return false;
+        JSONObject data = e.getJSONObject("result").getJSONObject("data");
+        return PEDAL.equals(data.optString("signal_key")) && "rejected".equals(data.optString("outcome"));
     }
 
     /** Synthetic recordings of the shape the service writes: header, filler wire lines and coverage records, one file per part. Never any vehicle data. */

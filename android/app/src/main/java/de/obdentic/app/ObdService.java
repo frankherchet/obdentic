@@ -294,6 +294,7 @@ public final class ObdService extends Service {
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
             put(state,"uds",new JSONObject()); put(state,"udsCandidates",0);
             put(state,"replayFile","");
+            put(state,"coverage",JSONObject.NULL);
             put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"availability",new JSONObject()); put(state,"replayPartial",false);
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
@@ -882,7 +883,6 @@ public final class ObdService extends Service {
             if(token!=generation)return;
             synchronized(stateLock) { values.clear(); } resetSessionData(); replayFilename=filename; set("replayFile",filename);
             destroyCore(); core=NativeCore.create((command,timeout) -> { throw new IOException("Offline replay cannot access an adapter"); });
-            set("coverage",JSONObject.NULL); // derived below, from the facts in the recording only
             File file=recordingFile(filename);
             if(file.length()>64L*1024*1024) throw new IOException("Aufnahme größer als 64 MiB");
             try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(file),StandardCharsets.UTF_8))) {
@@ -1440,6 +1440,7 @@ public final class ObdService extends Service {
         boolean confirmed=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin());
         JSONObject evidence=new JSONObject(); put(evidence,"at",read.optLong("at")); put(evidence,"offset_us",read.optLong("offset_us"));
         JSONObject outcome=new JSONObject(); put(outcome,"ok",result.optBoolean("ok")); if(result.has("error")) put(outcome,"error",result.optString("error")); if(data!=null) put(outcome,"data",data);
+        JSONObject negative=result.optJSONObject("negative_response"); if(negative!=null) put(outcome,"negative_response",negative); // a standard negative response: the core's structured rejection with its NRC, the one thing the classifier reads besides the error's wording
         JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"key",key); put(argument,"run_offset_us",origin); put(argument,"session",session);
         put(argument,"identity_confirmed",confirmed); put(argument,"evidence",evidence); put(argument,"read",outcome);
         JSONObject fact=coverageCore("coverage.fact",argument);
@@ -1603,17 +1604,6 @@ public final class ObdService extends Service {
                 case "0144":data="80 00";break;
                 case "0159":data="0B B8";break;
                 case "015C":data="82";break;
-                case "015D":data="69 00";break;
-                case "015E":data="00 64";break;
-                case "0161":case "0162":data="96";break;
-                case "0163":data="01 90";break;
-                default:return null;
-            }
-            return String.format(Locale.ROOT,"7E8 %02X 41 %s %s\r>",2+data.split(" ").length,command.substring(2),data);
-        }
-    }
-}
-               case "015C":data="82";break;
                 case "015D":data="69 00";break;
                 case "015E":data="00 64";break;
                 case "0161":case "0162":data="96";break;

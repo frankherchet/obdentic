@@ -234,10 +234,15 @@ fn parse(record: &Value) -> Result<Record, Invalid> {
             let identity_confirmed = flag("identity_confirmed")
                 .ok_or_else(|| invalid("identity_confirmed is missing"))?;
             let reason = || {
-                data.get("reason")
+                let reason = data
+                    .get("reason")
                     .and_then(text)
-                    .map(str::to_owned)
-                    .ok_or_else(|| invalid("reason is missing"))
+                    .ok_or_else(|| invalid("reason is missing"))?;
+                if REASONS.contains(&reason) {
+                    Ok(reason.to_owned())
+                } else {
+                    Err(invalid("reason is not in the closed set"))
+                }
             };
             let outcome = match data.get("outcome").and_then(Value::as_str) {
                 Some("decoded") => match data.get("value_kind").and_then(Value::as_str) {
@@ -485,6 +490,30 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
         return Err(issues);
     }
 
+    // One fact per read attempt, across every part of the run: its evidence reference names the raw read
+    // it classifies, in its own file or (`in_previous_file`) in the part before it.
+    let mut classified: BTreeSet<(&str, u64, &str)> = BTreeSet::new();
+    for piece in &pieces {
+        for item in &piece.items {
+            let Item::Read(Fact {
+                body: FactBody::Reading(reading),
+                ..
+            }) = item
+            else {
+                continue;
+            };
+            let (raw, owner) = match reading.evidence.0.strip_suffix(":previous_file") {
+                Some(raw) => (raw, piece.part.saturating_sub(1)),
+                None => (reading.evidence.0.as_str(), piece.part),
+            };
+            if !classified.insert((reading.signal_key.as_str(), owner, raw)) {
+                issues.push("coverage.fact: a second fact for the same read of a signal".into());
+            }
+        }
+    }
+    if !issues.is_empty() {
+        return Err(issues);
+    }
     let mut facts = Vec::new();
     for (index, piece) in pieces.iter().enumerate() {
         if index > 0 && !matches!(joins[index - 1].2, Join::Verified) {
@@ -649,23 +678,29 @@ fn pin_revision() -> &'static str {
     })
 }
 
-/// How much of an error text a fact keeps as its reason.
-const REASON_LIMIT: usize = 120;
-
-fn reason_of(text: &str) -> String {
-    let flat: String = text
-        .chars()
-        .map(|char| if char.is_control() { ' ' } else { char })
-        .take(REASON_LIMIT)
-        .collect();
-    let flat = flat.trim();
-    if flat.is_empty() {
-        "no reason given"
-    } else {
-        flat
-    }
-    .to_owned()
-}
+/// The closed set of reasons a fact may carry (REQ-038.9). A fact holds classes and references, never the
+/// text of an error: that text can quote a response, a VIN, an ECU serial number or an adapter identifier.
+const REASON_TIMEOUT: &str = "timeout";
+const REASON_NO_DATA: &str = "no_data";
+const REASON_SESSION: &str = "session_state";
+const REASON_MALFORMED: &str = "malformed_response";
+const REASON_FAILED: &str = "read_failed";
+const REASON_NO_USABLE_ANSWER: &str = "no_usable_answer";
+const REASON_UNDECODABLE_VALUE: &str = "undecodable_value";
+/// Written by Android when the core could not classify a read; the fact still ends the signal's segments.
+const REASON_CLASSIFICATION_FAILED: &str = "classification_failed";
+/// Every reason a recorded fact may carry; replay rejects any other text, so a hand-made or foreign
+/// recording cannot put free text into the ledger.
+const REASONS: [&str; 8] = [
+    REASON_TIMEOUT,
+    REASON_NO_DATA,
+    REASON_SESSION,
+    REASON_MALFORMED,
+    REASON_FAILED,
+    REASON_NO_USABLE_ANSWER,
+    REASON_UNDECODABLE_VALUE,
+    REASON_CLASSIFICATION_FAILED,
+];
 
 /// The pure classification of one live `read` result (REQ-038.5) into the outcome fields of a
 /// fact. The value of the read is never copied: only its class survives.
@@ -725,7 +760,7 @@ fn classify(read: &Value, catalog: Option<&KnowledgeCatalog>) -> serde_json::Map
                     }
                     None => {
                         set("outcome", json!("error"));
-                        set("reason", json!("value is not a number or text"));
+                        set("reason", json!(REASON_UNDECODABLE_VALUE));
                     }
                 },
             }
@@ -733,35 +768,46 @@ fn classify(read: &Value, catalog: Option<&KnowledgeCatalog>) -> serde_json::Map
             set("outcome", json!("rejected"));
             set("response_code", json!(nrc));
         } else {
+            // The Knowledge decoder's text may quote the response; the fact keeps the class only.
             set("outcome", json!("no_answer"));
-            set(
-                "reason",
-                json!(reason_of(data["error"].as_str().unwrap_or(""))),
-            );
+            set("reason", json!(REASON_NO_USABLE_ANSWER));
         }
+    } else if let Some(nrc) = read["negative_response"]["nrc"]
+        .as_u64()
+        .filter(|nrc| u8::try_from(*nrc).is_ok())
+    {
+        // A standard negative response arrives as structure; its error text is never read for it.
+        set("outcome", json!("rejected"));
+        set("response_code", json!(nrc));
     } else {
-        let error = read["error"].as_str().unwrap_or("");
-        let lower = error.to_lowercase();
+        let lower = read["error"].as_str().unwrap_or("").to_lowercase();
         if lower.contains("does not advertise support") || lower.contains("rejected unsupported") {
             set("outcome", json!("unsupported"));
         } else if lower.contains("session") || lower.contains("not sent") {
             set("outcome", json!("session_restricted"));
-            set("reason", json!(reason_of(error)));
-        } else if [
-            "timeout",
-            "timed out",
-            "no data",
-            "no response",
-            "no answer",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
+            set("reason", json!(REASON_SESSION));
+        } else if lower.contains("timeout") || lower.contains("timed out") {
+            set("outcome", json!("no_answer"));
+            set("reason", json!(REASON_TIMEOUT));
+        } else if ["no data", "no response", "no answer"]
+            .iter()
+            .any(|needle| lower.contains(needle))
         {
             set("outcome", json!("no_answer"));
-            set("reason", json!(reason_of(error)));
+            set("reason", json!(REASON_NO_DATA));
         } else {
             set("outcome", json!("error"));
-            set("reason", json!(reason_of(error)));
+            let malformed = ["malformed", "unexpected", "conflicting", "truncated"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+            set(
+                "reason",
+                json!(if malformed {
+                    REASON_MALFORMED
+                } else {
+                    REASON_FAILED
+                }),
+            );
         }
     }
     fields.insert("implausible".into(), json!(implausible));
@@ -1357,7 +1403,7 @@ mod tests {
                     RUN,
                     "engine.rpm",
                     secs(12),
-                    json!({"outcome":"error","reason":"x","session":"programming"}),
+                    json!({"outcome":"error","reason":"read_failed","session":"programming"}),
                 )),
                 "unknown session state",
             ),
@@ -1377,7 +1423,7 @@ mod tests {
                     RUN,
                     "engine.rpm",
                     secs(2),
-                    json!({"outcome":"error","reason":"x"}),
+                    json!({"outcome":"error","reason":"read_failed"}),
                 )),
                 "goes backwards",
             ),
@@ -1388,7 +1434,7 @@ mod tests {
                         RUN,
                         "engine.rpm",
                         secs(12),
-                        json!({"outcome":"error","reason":"x"}),
+                        json!({"outcome":"error","reason":"read_failed"}),
                     );
                     fact["result"]["data"]
                         .as_object_mut()
@@ -1470,6 +1516,118 @@ mod tests {
         assert_eq!(unrelated["coverage_invalid"], false);
         assert_eq!(unrelated["run_complete"], true);
         assert_eq!(entry(unrelated, "vehicle.speed")["valid_time_ms"], 40_000);
+    }
+
+    #[test]
+    fn req_038_9_a_fact_repeated_in_the_next_part_invalidates_the_run() {
+        // The same raw read classified in part 1 and again in part 2 through `in_previous_file`.
+        let reference = |signal: &str, previous: bool, offset: u64| {
+            let mut fact = fact_with(
+                RUN,
+                signal,
+                secs(3),
+                json!({"outcome":"decoded","value_kind":"numeric","finite":true}),
+            );
+            fact["result"]["data"]["evidence"] = if previous {
+                json!({"at":at(secs(2)),"offset_us":offset,"in_previous_file":true})
+            } else {
+                json!({"at":at(secs(2)),"offset_us":offset})
+            };
+            fact
+        };
+        let parts = |second: Value| {
+            vec![
+                part(vec![start(RUN, 0), read("engine.rpm", 2)], Some("rotated")),
+                part(
+                    vec![
+                        resume(RUN, 2, 2, secs(3)),
+                        second,
+                        boundary(RUN, "run_end", secs(4)),
+                    ],
+                    None,
+                ),
+            ]
+        };
+        let set = derive_with_pin(&parts(reference("engine.rpm", true, secs(2))), PIN);
+        assert_invalid(&set, RUN, "second fact for the same read");
+        // another signal, or a read of the second file that merely shares the numbers, is no duplicate
+        for second in [
+            reference("vehicle.speed", true, secs(2)),
+            reference("engine.rpm", false, secs(2)),
+        ] {
+            let set = derive_with_pin(&parts(second), PIN);
+            assert_eq!(set["runs"][0]["coverage_invalid"], false, "{set}");
+        }
+    }
+
+    #[test]
+    fn req_038_9_a_recorded_reason_outside_the_closed_set_invalidates_the_run() {
+        for reason in ["link failure for WVWZZZ1JZXW000001", "TIMEOUT", ""] {
+            let set = derive_with_pin(
+                &[part(
+                    vec![
+                        start(RUN, 0),
+                        fact_with(
+                            RUN,
+                            "engine.rpm",
+                            secs(2),
+                            json!({"outcome":"error","reason":reason}),
+                        ),
+                        boundary(RUN, "run_end", secs(4)),
+                    ],
+                    None,
+                )],
+                PIN,
+            );
+            assert_invalid(&set, RUN, "reason");
+            assert!(!set.to_string().contains("WVWZZZ"), "{set}");
+        }
+        // the fallback Android writes for an unclassifiable read is part of the closed set
+        let set = derive_with_pin(
+            &[part(
+                vec![
+                    start(RUN, 0),
+                    failed_read("engine.rpm", 2),
+                    boundary(RUN, "run_end", secs(4)),
+                ],
+                None,
+            )],
+            PIN,
+        );
+        assert_eq!(set["runs"][0]["coverage_invalid"], false, "{set}");
+    }
+
+    #[test]
+    fn req_038_9_a_second_fact_for_one_read_invalidates_the_run() {
+        // #339: one fact per read attempt; a repeated record must not count as a second observation.
+        let set = derive_with_pin(
+            &[part(
+                vec![
+                    start(RUN, 0),
+                    read("engine.rpm", 2),
+                    read("engine.rpm", 2),
+                    boundary(RUN, "run_end", secs(4)),
+                ],
+                None,
+            )],
+            PIN,
+        );
+        assert_invalid(&set, RUN, "second fact for the same read");
+        // another signal at the same time, or the same signal at another time, is no duplicate
+        let set = derive_with_pin(
+            &[part(
+                vec![
+                    start(RUN, 0),
+                    read("engine.rpm", 2),
+                    read("vehicle.speed", 2),
+                    read("engine.rpm", 3),
+                    boundary(RUN, "run_end", secs(4)),
+                ],
+                None,
+            )],
+            PIN,
+        );
+        assert_eq!(set["runs"][0]["coverage_invalid"], false, "{set}");
     }
 
     #[test]
@@ -1685,7 +1843,7 @@ mod tests {
             (
                 json!({"ok":true,"data":{"key":"x","status":"unavailable","nrc":null,
                     "error":"Knowledge DID unavailable"}}),
-                json!({"outcome":"no_answer","reason":"Knowledge DID unavailable"}),
+                json!({"outcome":"no_answer","reason":"no_usable_answer"}),
             ),
             (
                 json!({"ok":false,"error":"vehicle does not advertise support for engine.rpm"}),
@@ -1693,20 +1851,32 @@ mod tests {
             ),
             (
                 json!({"ok":false,"error":"Knowledge DID is not enabled for this ECU session"}),
-                json!({"outcome":"session_restricted",
-                    "reason":"Knowledge DID is not enabled for this ECU session"}),
+                json!({"outcome":"session_restricted","reason":"session_state"}),
             ),
             (
                 json!({"ok":false,"error":"adapter timeout after 2s"}),
-                json!({"outcome":"no_answer","reason":"adapter timeout after 2s"}),
+                json!({"outcome":"no_answer","reason":"timeout"}),
+            ),
+            (
+                json!({"ok":false,"error":"ELM327 rejected 010C: NO DATA"}),
+                json!({"outcome":"no_answer","reason":"no_data"}),
+            ),
+            (
+                json!({"ok":false,"error":"malformed ELM327 response line: \"7E8 XY\""}),
+                json!({"outcome":"error","reason":"malformed_response"}),
             ),
             (
                 json!({"ok":false,"error":"link failure"}),
-                json!({"outcome":"error","reason":"link failure"}),
+                json!({"outcome":"error","reason":"read_failed"}),
             ),
             (
                 json!({"ok":true,"data":{"key":"x","value":{"nested":1}}}),
-                json!({"outcome":"error","reason":"value is not a number or text"}),
+                json!({"outcome":"error","reason":"undecodable_value"}),
+            ),
+            (
+                json!({"ok":false,"error":"negative OBD-II response: 7E8 03 7F 01 12",
+                    "negative_response":{"service":1,"nrc":18}}),
+                json!({"outcome":"rejected","response_code":18}),
             ),
         ];
         for (read, expected) in table {
@@ -1716,6 +1886,139 @@ mod tests {
             }
             assert!(!fact.to_string().contains("812"), "no value in {fact}");
             assert!(!fact.to_string().contains("WVW"), "no value in {fact}");
+        }
+    }
+
+    #[test]
+    fn req_038_9_standard_negative_response_is_a_rejection_with_its_code_not_an_error() {
+        // #339: structure decides; the text of the error is not consulted for a rejection and not kept.
+        for (nrc, error) in [
+            (0x12, "negative OBD-II response: 7E8 03 7F 01 12"),
+            (0x31, "negative OBD-II response: 7E8 03 7F 01 31"),
+            (0x78, "anything, even a timeout or a session"),
+        ] {
+            let fact = classify_read(
+                json!({"ok":false,"error":error,"negative_response":{"service":1,"nrc":nrc}}),
+                None,
+            );
+            assert_eq!(fact["outcome"], "rejected", "{fact}");
+            assert_eq!(fact["response_code"], nrc, "{fact}");
+            assert!(fact.get("reason").is_none(), "{fact}");
+            assert!(!fact.to_string().contains("negative OBD"), "{fact}");
+        }
+        // the same read without the structure is only a failed read: the text is never parsed into a code
+        let fact = classify_read(
+            json!({"ok":false,"error":"negative OBD-II response: 7E8 03 7F 01 12"}),
+            None,
+        );
+        assert_eq!(fact["outcome"], "error", "{fact}");
+        assert!(fact.get("response_code").is_none(), "{fact}");
+        // a code that is no byte is no rejection either
+        let fact = classify_read(
+            json!({"ok":false,"error":"x","negative_response":{"service":1,"nrc":300}}),
+            None,
+        );
+        assert_eq!(fact["outcome"], "error", "{fact}");
+        // the produced rejection is a record the derivation accepts, and it counts as rejected (never as a value)
+        let fact = classify_read(
+            json!({"ok":false,"error":"x","negative_response":{"service":1,"nrc":18}}),
+            None,
+        );
+        let mut opening = start(RUN, 0);
+        opening["result"]["data"]["knowledge_revision"] = json!(pin_revision());
+        let set = derive(&[part(
+            vec![
+                opening,
+                record("coverage.fact", secs(3), fact),
+                boundary(RUN, "run_end", secs(4)),
+            ],
+            None,
+        )]);
+        assert_eq!(set["runs"][0]["coverage_invalid"], false, "{set}");
+        assert_eq!(
+            set["runs"][0]["entries"][0]["latest"]["state"], "rejected",
+            "{set}"
+        );
+        assert_eq!(
+            set["runs"][0]["entries"][0]["latest"]["response_code"], 18,
+            "{set}"
+        );
+    }
+
+    #[test]
+    fn req_038_9_facts_never_copy_error_text_that_can_name_a_vehicle_or_adapter() {
+        const SECRETS: [&str; 6] = [
+            "WVWZZZ1JZXW000001",
+            "SN-4711-0815",
+            "AA:BB:CC:00:00:97",
+            "123456 km",
+            "ELM327 v1.5 Carly-Secret",
+            "7E8 10 14 49 02 01 57 56 57",
+        ];
+        const CLOSED: [&str; 7] = [
+            "timeout",
+            "no_data",
+            "session_state",
+            "malformed_response",
+            "read_failed",
+            "no_usable_answer",
+            "undecodable_value",
+        ];
+        let secret = SECRETS.join(" ");
+        let errors = [
+            format!("adapter timeout after 2s on {secret}"),
+            format!("ELM327 rejected 010C: NO DATA {secret}"),
+            format!("active UDS session does not match {secret}; Mode 01 read not sent"),
+            format!("malformed ELM327 response line: {secret:?}"),
+            format!("conflicting 010C responses (responders: {secret})"),
+            format!("link failure {secret}"),
+            secret.clone(),
+            String::new(),
+        ];
+        let mut reads = Vec::new();
+        for error in &errors {
+            reads.push(json!({"ok":false,"error":error}));
+            reads.push(
+                json!({"ok":true,"data":{"key":"x","status":"unavailable","nrc":null,
+                "error":error}}),
+            );
+        }
+        reads.push(json!({"ok":true,"data":{"key":"x","value":{"vin":secret}}}));
+        for read in reads {
+            let fact = classify_read(read.clone(), None);
+            let text = fact.to_string();
+            for secret in SECRETS {
+                assert!(
+                    !text.contains(secret),
+                    "{secret} copied from {read} into {fact}"
+                );
+            }
+            assert!(!text.to_lowercase().contains("carly"), "{fact}");
+            if let Some(reason) = fact.get("reason") {
+                assert!(
+                    CLOSED.contains(&reason.as_str().unwrap()),
+                    "reason outside the closed set in {fact}"
+                );
+            }
+            // the fact is a record the derivation accepts as it is
+            let mut opening = start(RUN, 0);
+            opening["result"]["data"]["knowledge_revision"] = json!(pin_revision());
+            let set = derive(&[part(
+                vec![
+                    opening,
+                    record("coverage.fact", secs(3), fact),
+                    boundary(RUN, "run_end", secs(4)),
+                ],
+                None,
+            )]);
+            assert_eq!(set["runs"][0]["coverage_invalid"], false, "{set}");
+            let ledger = set.to_string();
+            for secret in SECRETS {
+                assert!(
+                    !ledger.contains(secret),
+                    "{secret} reached the ledger of {read}"
+                );
+            }
         }
     }
 

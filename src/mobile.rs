@@ -166,7 +166,12 @@ impl<E: Exchange> MobileCore<E> {
             return self.assistant_action(tool_action, argument);
         }
         if action == "replay.coverage.part" {
-            return coverage::accept_part(&mut self.coverage_parts, argument);
+            // A hand-over that fails leaves no half-staged set behind for the next replay to inherit.
+            let handed = coverage::accept_part(&mut self.coverage_parts, argument);
+            if handed.is_err() {
+                self.coverage_parts.clear();
+            }
+            return handed;
         }
         if action == "replay.coverage" {
             return coverage::derive_parts(std::mem::take(&mut self.coverage_parts));
@@ -377,8 +382,10 @@ impl<E: Exchange> MobileCore<E> {
             }
         }
         let uds_at_request = self.uds_snapshot();
+        let mut expected_responder = None;
         let read = if self.engine.is_some() {
             let targeted = self.targeted_read(request)?;
+            expected_responder = Some(targeted.expected_responder().as_str().to_owned());
             self.runtime.block_on(
                 self.session
                     .as_mut()
@@ -401,6 +408,11 @@ impl<E: Exchange> MobileCore<E> {
                     "observations".into(),
                     json!(response_observations_json(&error.observations)),
                 );
+                if let Some(negative) =
+                    negative_response_json(&error.observations, expected_responder.as_deref())
+                {
+                    extras.insert("negative_response".into(), negative);
+                }
                 extras.insert("uds".into(), uds_at_request);
                 if in_session {
                     extras.insert("uds_state_after_read".into(), self.uds_snapshot());
@@ -1377,6 +1389,30 @@ fn response_observations_json(observations: &[crate::elm::ResponseObservation]) 
         .collect()
 }
 
+/// The structured rejection of a standard Mode 01 read: `7F 01 <nrc>` as the answer of the responder the read
+/// was addressed to, or of every responder of a functional read, which must then agree on the code. Only the
+/// final exchange counts (a retry replaces the answer before it); any other frame in it, another service,
+/// a short frame or a second code makes it no rejection.
+fn negative_response_json(
+    observations: &[crate::elm::ResponseObservation],
+    expected: Option<&str>,
+) -> Option<Value> {
+    let mut found = None;
+    for response in &observations.last()?.responses {
+        if expected.is_some_and(|expected| response.responder.as_deref() != Some(expected)) {
+            continue;
+        }
+        let &[0x7f, 0x01, nrc] = response.payload.as_slice() else {
+            return None;
+        };
+        if found.is_some_and(|seen| seen != nrc) {
+            return None;
+        }
+        found = Some(nrc);
+    }
+    found.map(|nrc| json!({"service":1,"nrc":nrc}))
+}
+
 fn diagnostic_evidence(responses: &crate::elm::DiagnosticResponses) -> Value {
     json!(responses
         .as_slice()
@@ -1662,6 +1698,138 @@ mod tests {
         );
         assert_eq!(run(&mut core, "read", "dtc.clear")["ok"], false);
         assert_eq!(run(&mut core, "read", "vehicle.speed")["ok"], false);
+    }
+
+    #[test]
+    fn a_failed_coverage_hand_over_leaves_no_staged_parts_for_the_next_replay() {
+        // #339: parts staged before a failure must not join the next, unrelated replay.
+        let mut core = core(&[]);
+        let good = json!({"records":[{"action":"coverage.boundary"}],"ended":null}).to_string();
+        assert_eq!(run(&mut core, "replay.coverage.part", &good)["ok"], true);
+        let bad = json!({"records":"x","ended":null}).to_string();
+        assert_eq!(run(&mut core, "replay.coverage.part", &bad)["ok"], false);
+        let next = run(&mut core, "replay.coverage.part", &good);
+        assert_eq!(next["data"]["parts"], 1, "{next}");
+    }
+
+    #[test]
+    fn a_standard_negative_response_reaches_the_failed_read_as_structured_rejection() {
+        // #339: the NRC is data of the failed read, not only a fragment of its error text.
+        let mut core = core(&[
+            ("010C\r", "7E8 03 7F 01 12\r>"),
+            ("010C\r", "NO DATA\r>"),
+            ("010C\r", "7E8 03 7F 22 31\r>"),
+            ("010C\r", "7E8 02 7F 01 12\r>"),
+            ("010C\r", "7E8 03 7F 01 12 34\r>"),
+            ("010C\r", "7E8 03 7F 01 12\r7E9 03 7F 01 31\r>"),
+            ("010C\r", "7E8 03 7F 01 12 34\r7E9 03 7F 01 12\r>"),
+        ]);
+        assert_eq!(run(&mut core, "initialize", "")["ok"], true);
+
+        let rejected = run(&mut core, "read", "engine.rpm");
+        assert_eq!(rejected["ok"], false, "{rejected}");
+        assert!(rejected["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("negative OBD-II response"));
+        assert_eq!(rejected["negative_response"], json!({"service":1,"nrc":18}));
+        assert_eq!(
+            rejected["observations"][0]["responses"][0]["payload"],
+            json!([0x7f, 0x01, 0x12])
+        );
+
+        let silent = run(&mut core, "read", "engine.rpm");
+        assert_eq!(silent["ok"], false, "{silent}");
+        assert!(silent.get("negative_response").is_none(), "{silent}");
+
+        let other_service = run(&mut core, "read", "engine.rpm");
+        assert_eq!(other_service["ok"], false, "{other_service}");
+        assert!(
+            other_service.get("negative_response").is_none(),
+            "{other_service}"
+        );
+        // a wrong declared length, trailing bytes and two responders that disagree are no rejection either
+        for answer in [
+            "7E8 02 7F 01 12\r>",
+            "7E8 03 7F 01 12 34\r>",
+            "7E8 03 7F 01 12\r7E9 03 7F 01 31\r>",
+            "7E8 03 7F 01 12 34\r7E9 03 7F 01 12\r>",
+        ] {
+            let read = run(&mut core, "read", "engine.rpm");
+            assert_eq!(read["ok"], false, "{answer}: {read}");
+            assert!(read.get("negative_response").is_none(), "{answer}: {read}");
+        }
+    }
+
+    #[test]
+    fn a_negative_response_counts_for_the_addressed_responder_only() {
+        let observation = |frames: &[(&str, &[u8])]| crate::elm::ResponseObservation {
+            responses: frames
+                .iter()
+                .map(
+                    |(responder, payload)| crate::capture_events::ResponderEvidence {
+                        responder: Some((*responder).to_owned()),
+                        payload: payload.to_vec(),
+                    },
+                )
+                .collect(),
+            selected_responder: None,
+            selection_error: None,
+        };
+        let disagreeing = [observation(&[
+            ("7E8", &[0x7f, 0x01, 0x12]),
+            ("7E9", &[0x7f, 0x01, 0x31]),
+        ])];
+        // the addressed responder's own answer counts, wherever it stands among the frames
+        for (expected, nrc) in [("7E8", 0x12), ("7E9", 0x31)] {
+            assert_eq!(
+                negative_response_json(&disagreeing, Some(expected)),
+                Some(json!({"service":1,"nrc":nrc}))
+            );
+        }
+        assert_eq!(negative_response_json(&disagreeing, Some("7EA")), None);
+        assert_eq!(
+            negative_response_json(&disagreeing, None),
+            None,
+            "functional: conflicting codes are no rejection"
+        );
+        let agreeing = [observation(&[
+            ("7E8", &[0x7f, 0x01, 0x12]),
+            ("7E9", &[0x7f, 0x01, 0x12]),
+        ])];
+        assert_eq!(
+            negative_response_json(&agreeing, None),
+            Some(json!({"service":1,"nrc":0x12}))
+        );
+        // another service, a short frame or a positive frame beside it make the answer no rejection
+        for frames in [
+            &[("7E8", &[0x7f, 0x22, 0x31][..])][..],
+            &[("7E8", &[0x7f, 0x01][..])][..],
+            &[
+                ("7E8", &[0x7f, 0x01, 0x12][..]),
+                ("7E9", &[0x41, 0x0c, 0, 0][..]),
+            ][..],
+        ] {
+            assert_eq!(negative_response_json(&[observation(frames)], None), None);
+        }
+        // a positive frame of another responder does not hide the addressed rejection
+        let mixed = [observation(&[
+            ("7E8", &[0x7f, 0x01, 0x12]),
+            ("7E9", &[0x41, 0x0c, 0, 0]),
+        ])];
+        assert_eq!(
+            negative_response_json(&mixed, Some("7E8")),
+            Some(json!({"service":1,"nrc":0x12}))
+        );
+        // only the final exchange of a retried read decides
+        let retried = [
+            observation(&[("7E8", &[0x41, 0x0d, 0x00])]),
+            observation(&[("7E8", &[0x7f, 0x01, 0x12])]),
+        ];
+        assert_eq!(
+            negative_response_json(&retried, None),
+            Some(json!({"service":1,"nrc":0x12}))
+        );
     }
 
     #[test]

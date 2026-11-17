@@ -1328,12 +1328,12 @@ pub(crate) async fn read_elm_with_evidence<E>(
 where
     E: ElmExchange,
 {
-    let first = match read_elm_responses(exchange, request).await {
+    let first = match read_elm_exchange(exchange, request).await {
         Ok(first) => first,
-        Err(error) => {
+        Err(failure) => {
             return Err(ReadEvidenceError {
-                error,
-                observations: Vec::new(),
+                observations: failure.observations(None),
+                error: failure.error,
             });
         }
     };
@@ -1344,13 +1344,15 @@ where
         }),
         Err(error) if should_retry_stale_mode01_response(&first, request.pid()) => {
             let mut observations = vec![first.observation(Some(error.clone()))];
-            let retry = match read_elm_responses(exchange, request).await {
+            let retry = match read_elm_exchange(exchange, request).await {
                 Ok(retry) => retry,
-                Err(retry_error) => {
+                Err(retry_failure) => {
+                    observations.extend(retry_failure.observations(None));
                     return Err(ReadEvidenceError {
                         error: format!(
-                            "{error}; first ELM response={}; retry failed: {retry_error}",
-                            first.raw_response().escape_default()
+                            "{error}; first ELM response={}; retry failed: {}",
+                            first.raw_response().escape_default(),
+                            retry_failure.error
                         ),
                         observations,
                     });
@@ -1381,13 +1383,15 @@ where
             if error.starts_with(&format!("conflicting 01{:02X} responses", request.pid())) =>
         {
             let mut observations = vec![first.observation(Some(error.clone()))];
-            let retry = match read_elm_responses(exchange, request).await {
+            let retry = match read_elm_exchange(exchange, request).await {
                 Ok(retry) => retry,
-                Err(retry_error) => {
+                Err(retry_failure) => {
+                    observations.extend(retry_failure.observations(None));
                     return Err(ReadEvidenceError {
                         error: format!(
-                            "{error}; first ELM response={}; retry failed: {retry_error}",
-                            first.raw_response().escape_default()
+                            "{error}; first ELM response={}; retry failed: {}",
+                            first.raw_response().escape_default(),
+                            retry_failure.error
                         ),
                         observations,
                     });
@@ -1444,7 +1448,7 @@ where
         *configured = Some(key);
     }
 
-    match read_elm_responses(exchange, request.request()).await {
+    match read_elm_exchange(exchange, request.request()).await {
         Ok(responses) => match targeted_payload(&responses, request.expected_responder()) {
             Ok(payload) => Ok(ReadEvidence {
                 payload,
@@ -1459,12 +1463,12 @@ where
                 ],
             }),
         },
-        Err(error) => {
+        Err(failure) => {
             // Unknown adapter state: reconfigure before the next read.
             *configured = None;
             Err(ReadEvidenceError {
-                error,
-                observations: Vec::new(),
+                observations: failure.observations(Some(request.expected_responder())),
+                error: failure.error,
             })
         }
     }
@@ -1578,20 +1582,59 @@ fn targeted_payload_with(
     select(responses, expected)
 }
 
-pub(crate) async fn read_elm_responses<E>(
+/// A Mode 01 exchange that gave no usable response. A standard negative response keeps its payload
+/// (`7F <service> <nrc>`) next to the error text, so it reaches the caller as evidence, not only as text.
+struct ReadFailure {
+    error: String,
+    negative: Option<DiagnosticResponses>,
+}
+
+impl ReadFailure {
+    fn text(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            negative: None,
+        }
+    }
+
+    /// The observations this failure leaves in a read's evidence. A targeted read names its expected responder.
+    fn observations(&self, expected: Option<&ResponderIdentity>) -> Vec<ResponseObservation> {
+        self.negative
+            .iter()
+            .map(|negative| match expected {
+                Some(expected) => {
+                    negative.observation_for_target(expected, Some(self.error.clone()))
+                }
+                None => negative.observation(Some(self.error.clone())),
+            })
+            .collect()
+    }
+}
+
+async fn read_elm_exchange<E>(
     exchange: &mut E,
     request: ReadRequest,
-) -> Result<DiagnosticResponses, String>
+) -> Result<DiagnosticResponses, ReadFailure>
 where
     E: ElmExchange,
 {
     let command = obd_command(request);
-    let response = exchange.exchange(&command, COMMAND_TIMEOUT).await?;
+    let response = exchange
+        .exchange(&command, COMMAND_TIMEOUT)
+        .await
+        .map_err(ReadFailure::text)?;
     match normalize_mode01_responses(&response, request.pid(), request.data_len()) {
         Ok(responses) => Ok(responses),
         Err(error) => match normalize_stale_mode01_responses(&response, request.pid()) {
             Ok(responses) => Ok(responses),
-            Err(_) => Err(error),
+            Err(_) => {
+                let frames = negative_response_frames(&response, request.pid());
+                Err(ReadFailure {
+                    negative: (!frames.is_empty())
+                        .then(|| DiagnosticResponses::new(frames, &response)),
+                    error,
+                })
+            }
         },
     }
 }
@@ -2591,6 +2634,109 @@ pub(crate) fn normalize_pid_support_page_with_evidence(
     ))
 }
 
+/// The `7F <service> <nrc>` bytes of one ELM response line (responder header already removed), with or
+/// without an ISO-TP length prefix.
+fn negative_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let negative = if bytes.len() > 1 && bytes[1] == 0x7f && (bytes[0] as usize) < bytes.len() {
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    (negative.first() == Some(&0x7f)).then_some(negative)
+}
+
+/// One response line's bytes (responder header removed) as a standard negative response `[7F, service, nrc]`:
+/// bare, or behind the ISO-TP single-frame length 3, and followed by nothing but padding. A line that declares
+/// another length, or carries other trailing bytes, is not a negative response.
+fn framed_negative(bytes: &[u8]) -> Option<[u8; 3]> {
+    let (frame, prefixed) = match bytes {
+        [3, 0x7f, ..] => (&bytes[1..], true),
+        [0x7f, ..] => (bytes, false),
+        _ => return None,
+    };
+    let [0x7f, service, nrc, padding @ ..] = frame else {
+        return None;
+    };
+    padding
+        .iter()
+        .all(|byte| matches!(byte, 0x00 | 0xaa) || (prefixed && *byte == 0x55))
+        .then_some([0x7f, *service, *nrc])
+}
+
+/// The frames of a Mode 01 answer that failed because of a standard negative response, one per well-formed line
+/// in order: a validated negative response as `[7F, service, nrc]`, any other frame as it is, so that a caller
+/// can tell a rejection from a mixed or conflicting answer. Empty when no line is a validated negative response.
+fn negative_response_frames(response: &str, pid: u8) -> Vec<DiagnosticResponse> {
+    let mut frames = Vec::new();
+    let mut negative = false;
+    for raw_line in response.split(['\r', '\n']) {
+        let line = raw_line.trim().trim_end_matches('>').trim();
+        let upper = line.to_ascii_uppercase();
+        let compact = upper.split_ascii_whitespace().collect::<String>();
+        if line.is_empty()
+            || compact == format!("01{pid:02X}")
+            || upper.starts_with("SEARCHING")
+            || upper.starts_with("BUS INIT")
+        {
+            continue;
+        }
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let header = tokens.first().filter(|token| token.len() == 3).copied();
+        let data = if header.is_some() {
+            &tokens[1..]
+        } else {
+            &tokens[..]
+        };
+        let responder = match header {
+            Some(header) if header.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+                Some(ResponderIdentity::ElmHeader(header.to_ascii_uppercase()))
+            }
+            Some(_) => return Vec::new(),
+            None => None,
+        };
+        let mut bytes = Vec::new();
+        for token in data {
+            if token.len() % 2 != 0 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Vec::new(); // unparseable evidence must not become a clean rejection beside another line
+            }
+            for pair in token.as_bytes().as_chunks::<2>().0 {
+                let digits = std::str::from_utf8(pair).unwrap_or_default(); // hexadecimal, checked above
+                bytes.push(u8::from_str_radix(digits, 16).unwrap_or_default());
+            }
+        }
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        let payload = if let Some(frame) = framed_negative(&bytes) {
+            negative = true;
+            frame.to_vec()
+        } else {
+            // an ISO-TP single frame's payload without its length and padding, any other line as it is; a
+            // malformed negative response keeps its bytes whole so it can never pass for a validated one
+            let declared = match bytes.split_first() {
+                Some((&length, rest))
+                    if length > 0
+                        && usize::from(length) <= rest.len()
+                        && negative_payload(&bytes).is_none() =>
+                {
+                    Some(usize::from(length))
+                }
+                _ => None,
+            };
+            match declared {
+                Some(length) => bytes[1..=length].to_vec(),
+                None => bytes,
+            }
+        };
+        frames.push(DiagnosticResponse { responder, payload });
+    }
+    if negative {
+        frames
+    } else {
+        Vec::new()
+    }
+}
+
 fn mode01_responses(
     response: &str,
     pid: u8,
@@ -2651,12 +2797,7 @@ fn mode01_responses(
             }
         }
         let expected_len = data_len + 2;
-        let negative = if bytes.len() > 1 && bytes[1] == 0x7f && (bytes[0] as usize) < bytes.len() {
-            &bytes[1..]
-        } else {
-            &bytes[..]
-        };
-        if negative.first() == Some(&0x7f) {
+        if negative_payload(&bytes).is_some() {
             return Err(format!("negative OBD-II response: {line}"));
         }
         let mut search_from = 0;
@@ -3205,7 +3346,9 @@ mod tests {
     async fn generic_mode01_exchange_normalizes_without_adapter_backend() {
         let mut exchange = ScriptedExchange::new(["7E8 04 41 0C 1A F8\r>"]);
         let request = crate::prepare_read("engine.rpm").unwrap();
-        let responses = read_elm_responses(&mut exchange, request).await.unwrap();
+        let responses = read_elm_exchange(&mut exchange, request)
+            .await
+            .unwrap_or_else(|failure| panic!("{}", failure.error));
         assert_eq!(exchange.commands(), ["010C\r"]);
         assert_eq!(responses.as_slice()[0].payload, [0x41, 0x0c, 0x1a, 0xf8]);
         assert_eq!(
@@ -3233,6 +3376,221 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error == "010D response not found"));
         assert_eq!(exchange.commands(), ["010D\r", "010D\r"]);
+    }
+
+    #[tokio::test]
+    async fn standard_negative_response_stays_evidence_beside_its_error_text() {
+        // #339: the rejection of a standard read keeps its responder, service and NRC as structured evidence.
+        for (answer, responder) in [
+            ("7E8 03 7F 01 12\r>", Some("7E8")),
+            ("7E8 7F 01 12\r>", Some("7E8")),
+            ("03 7F 01 12\r>", None),
+            ("7e8 03 7f 01 31\r>", Some("7E8")),
+        ] {
+            let mut exchange = ScriptedExchange::new([answer]);
+            let request = crate::prepare_read("engine.rpm").unwrap();
+
+            let error = read_elm_with_evidence(&mut exchange, request)
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.error.starts_with("negative OBD-II response"),
+                "{answer}"
+            );
+            assert_eq!(error.observations.len(), 1, "{answer}");
+            let responses = &error.observations[0].responses;
+            assert_eq!(responses.len(), 1, "{answer}");
+            assert_eq!(responses[0].responder.as_deref(), responder, "{answer}");
+            assert_eq!(&responses[0].payload[..2], [0x7f, 0x01], "{answer}");
+            assert_eq!(responses[0].payload.len(), 3, "{answer}");
+            assert_eq!(exchange.commands(), ["010C\r"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_that_are_no_negative_response_carry_no_such_evidence() {
+        for answer in ["NO DATA\r>", "7XZ 03 7F 01 12\r>", "?\r>"] {
+            let mut exchange = ScriptedExchange::new([answer]);
+            let request = crate::prepare_read("engine.rpm").unwrap();
+
+            let error = read_elm_with_evidence(&mut exchange, request)
+                .await
+                .unwrap_err();
+
+            assert!(error.observations.is_empty(), "{answer}");
+        }
+    }
+
+    fn frames(error: &ReadEvidenceError, observation: usize) -> Vec<(Option<String>, Vec<u8>)> {
+        error.observations[observation]
+            .responses
+            .iter()
+            .map(|response| (response.responder.clone(), response.payload.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn only_a_correctly_framed_negative_response_is_structured_evidence() {
+        // a declared length that is not 3 and trailing bytes that are no padding
+        for answer in [
+            "7E8 02 7F 01 12\r>",
+            "7E8 03 7F 01 12 34\r>",
+            "7E8 7F 01 12 55\r>",
+            "7E8 05 7F 01 12 00 00\r>",
+        ] {
+            let mut exchange = ScriptedExchange::new([answer]);
+            let request = crate::prepare_read("engine.rpm").unwrap();
+
+            let error = read_elm_with_evidence(&mut exchange, request)
+                .await
+                .unwrap_err();
+
+            assert!(error.error.starts_with("negative OBD-II"), "{answer}");
+            assert!(error.observations.is_empty(), "{answer}");
+        }
+        // padding is no content
+        for answer in [
+            "7E8 03 7F 01 12 00 00 00 00\r>",
+            "7E8 03 7F 01 12 55 55 55 55\r>",
+            "7E8 03 7F 01 12 AA AA AA AA\r>",
+            "7E8 7F 01 12 00 AA\r>",
+        ] {
+            let mut exchange = ScriptedExchange::new([answer]);
+            let request = crate::prepare_read("engine.rpm").unwrap();
+
+            let error = read_elm_with_evidence(&mut exchange, request)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                frames(&error, 0),
+                [(Some("7E8".to_owned()), vec![0x7f, 0x01, 0x12])],
+                "{answer}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_frame_of_a_negative_answer_is_kept_in_order() {
+        let mut exchange = ScriptedExchange::new([
+            "7E9 03 7F 01 31\r7E8 03 7F 01 12\r>",
+            "7E8 03 7F 01 12\r7E9 04 41 0C 00 00\r>",
+        ]);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+
+        let conflicting = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+        let mixed = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            frames(&conflicting, 0),
+            [
+                (Some("7E9".to_owned()), vec![0x7f, 0x01, 0x31]),
+                (Some("7E8".to_owned()), vec![0x7f, 0x01, 0x12])
+            ]
+        );
+        assert_eq!(
+            frames(&mixed, 0),
+            [
+                (Some("7E8".to_owned()), vec![0x7f, 0x01, 0x12]),
+                (Some("7E9".to_owned()), vec![0x41, 0x0c, 0x00, 0x00])
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_negative_line_beside_a_valid_one_keeps_its_bytes_whole() {
+        let mut exchange = ScriptedExchange::new(["7E8 03 7F 01 12 34\r7E9 03 7F 01 12\r>"]);
+        let request = crate::prepare_read("engine.rpm").unwrap();
+
+        let error = read_elm_with_evidence(&mut exchange, request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            frames(&error, 0),
+            [
+                (Some("7E8".to_owned()), vec![0x03, 0x7f, 0x01, 0x12, 0x34]),
+                (Some("7E9".to_owned()), vec![0x7f, 0x01, 0x12])
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_line_beside_a_rejection_disqualifies_rejection_evidence() {
+        for answer in [
+            "7E8 03 7F 01 ZZ\r7E8 03 7F 01 12\r>",
+            "7E8 03 7F 01 12\r7E8 03 7F 01 ZZ\r>",
+            "XYZ 03 7F 01 12\r7E8 03 7F 01 12\r>",
+            "7E8\r7E8 03 7F 01 12\r>",
+        ] {
+            let mut exchange = ScriptedExchange::new([answer]);
+            let request = crate::prepare_read("engine.rpm").unwrap();
+            let error = read_elm_with_evidence(&mut exchange, request)
+                .await
+                .unwrap_err();
+            assert!(error.observations.is_empty(), "{answer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_targeted_read_keeps_the_addressed_rejection_among_other_responders() {
+        let mut exchange =
+            ScriptedExchange::new(["OK\r>", "OK\r>", "7E9 03 7F 01 31\r7E8 03 7F 01 12\r>"]);
+        let request = TargetedReadRequest::new(
+            crate::prepare_read("engine.rpm").unwrap(),
+            crate::topology::RequestTarget::concrete(
+                crate::topology::ProtocolContext::new(
+                    crate::topology::Protocol::Obd2,
+                    crate::topology::AddressingContext::Physical,
+                ),
+                crate::topology::RequestAddress::new("elm-header", "7E0"),
+            ),
+            ResponderIdentity::ElmHeader("7E8".into()),
+        )
+        .unwrap();
+
+        let error = read_elm_targeted_with_evidence(&mut exchange, &mut None, &request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            frames(&error, 0),
+            [
+                (Some("7E9".to_owned()), vec![0x7f, 0x01, 0x31]),
+                (Some("7E8".to_owned()), vec![0x7f, 0x01, 0x12])
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_negative_response_to_the_retry_of_a_read_stays_evidence() {
+        let stale = "7E9 06 41 00 98 18 00 01 AA\r>";
+        let conflicting = "7E8 03 41 0D 10\r7E9 03 41 0D 20\r>";
+        for first in [stale, conflicting] {
+            let mut exchange = ScriptedExchange::new([first, "7E8 03 7F 01 12\r>"]);
+            let request = crate::prepare_read("vehicle.speed").unwrap();
+
+            let error = read_elm_with_evidence(&mut exchange, request)
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.error.contains("retry failed: negative OBD-II"),
+                "{first}"
+            );
+            assert_eq!(error.observations.len(), 2, "{first}");
+            assert_eq!(
+                frames(&error, 1),
+                [(Some("7E8".to_owned()), vec![0x7f, 0x01, 0x12])],
+                "{first}"
+            );
+            assert_eq!(exchange.commands(), ["010D\r", "010D\r"]);
+        }
     }
 
     #[tokio::test]
