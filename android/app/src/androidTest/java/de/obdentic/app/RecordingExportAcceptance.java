@@ -19,13 +19,14 @@ import java.util.*;
  * persistence of the chosen URI, not as the picker UI).
  */
 final class RecordingExportAcceptance {
+    /** REQ-044.3: INTERNET and the dataSync service permission of the ChatGPT account are the only additions since REQ-018.8; export itself adds none. */
     private static final List<String> ALLOWED = Arrays.asList("android.permission.BLUETOOTH", "android.permission.BLUETOOTH_ADMIN",
         "android.permission.ACCESS_FINE_LOCATION", "android.permission.BLUETOOTH_SCAN", "android.permission.BLUETOOTH_CONNECT",
         "android.permission.POST_NOTIFICATIONS", "android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
-        "android.permission.WAKE_LOCK");
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC", "android.permission.INTERNET", "android.permission.WAKE_LOCK");
     private static final List<String> ALWAYS = Arrays.asList("android.permission.BLUETOOTH_SCAN", "android.permission.BLUETOOTH_CONNECT",
         "android.permission.POST_NOTIFICATIONS", "android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
-        "android.permission.WAKE_LOCK");
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC", "android.permission.INTERNET", "android.permission.WAKE_LOCK");
 
     static void run(ObdService service, Context context) throws Exception {
         File recordings = new File(context.getFilesDir(), "recordings");
@@ -142,12 +143,14 @@ final class RecordingExportAcceptance {
             waitFor(() -> service.snapshot().optString("phase").equals("ready") && !service.snapshot().optBoolean("busy"), "return to demo after export test");
             service.setSignals(new JSONArray()); SystemClock.sleep(800); // the engine-drive profile selected signals; stop polling so later steps see no background traffic
 
-            // REQ-018.8: no new permissions
+            // REQ-018.8, REQ-044.3: export adds no permission; the ChatGPT account adds INTERNET and the dataSync service permission and nothing else
             String[] requested = context.getPackageManager().getPackageInfo(context.getPackageName(), PackageManager.GET_PERMISSIONS).requestedPermissions;
             List<String> list = Arrays.asList(requested);
-            require(ALLOWED.containsAll(list) && list.containsAll(ALWAYS), "REQ-018.8 only the existing permissions: " + list);
-            for (String forbidden : new String[]{"android.permission.INTERNET", "android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE", "android.permission.MANAGE_EXTERNAL_STORAGE"})
+            require(ALLOWED.containsAll(list) && list.containsAll(ALWAYS), "REQ-018.8/REQ-044.3 only the permissions of the app plus INTERNET and the dataSync service permission: " + list);
+            for (String forbidden : new String[]{"android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE", "android.permission.MANAGE_EXTERNAL_STORAGE"})
                 require(!list.contains(forbidden), "REQ-018.8 no " + forbidden);
+            android.content.pm.ApplicationInfo info = context.getApplicationInfo();
+            require((info.flags & android.content.pm.ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC) == 0 && (info.flags & android.content.pm.ApplicationInfo.FLAG_ALLOW_BACKUP) == 0, "REQ-044.3 cleartext traffic stays disabled, no backup");
         } finally {
             service.exportTarget = null;
             for (String name : created) { File f = new File(recordings, name); if (f.isFile()) f.delete(); }

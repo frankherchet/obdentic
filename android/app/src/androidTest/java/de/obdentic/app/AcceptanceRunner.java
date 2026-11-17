@@ -96,6 +96,12 @@ public final class AcceptanceRunner extends Instrumentation {
             RecordingListAcceptance.run(this, service);
             passed("Recordings tab with 3000 extra recordings (REQ-028.13): opens fast, lists the newest 30, states how many older ones are not shown, snapshots stay fast; debug tab is one full-height window that follows the newest line (REQ-033.1)");
             passed("Pending feedback (REQ-021): disabled pending button with text, indicator and content description, tap while pending ignored, state survives tab switch and Activity recreation, ends on the observed target state, time-limit message and usable button, announcements, real recording start and stop");
+            AccountAcceptance.run(getTargetContext());
+            passed("ChatGPT account engine (#327, REQ-042 to REQ-044) against a fake authorization server and fake browser: authorization request, loopback listener, callback checks, code exchange, ID-token validation, plan-scope-missing state, status, one-time dialog, one account, no browser/port, Keystore-encrypted record, unreadable record, access token and refresh rotation (serialized, earliest_refresh_at, terminal and temporary errors, invalid_client), revocation with retries, races with disconnect, no requests without an account, minimal requests, no path to the vehicle session, log masking");
+            AccountTransportAcceptance.run();
+            passed("ChatGPT account HTTPS transport against a local TLS server (REQ-042.7, REQ-044.2): form POST, app-name-only User-Agent, redirects not followed, 1 MiB read limit, error codes, read timeout, plain HTTP and untrusted certificates refused");
+            AccountUiAcceptance.run(this, (MainActivity) activity, service, getTargetContext());
+            passed("ChatGPT account section (#327): reachable in two taps, card and single sign-in button, pending feedback, cancel, status and e-mail, Using ChatGPT plan with Manage usage, one-time dialog, disconnect confirmation, inactive plan state, expired and unreachable states, return link takes no value, sign-in service type, notification, stop within 2 s and debug switch");
 
             job("inventory");
             require(service.snapshot().optJSONObject("vehicle").optBoolean("engine_target_validated"), "Evidenced engine target");

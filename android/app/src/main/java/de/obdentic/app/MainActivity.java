@@ -101,6 +101,8 @@ public class MainActivity extends Activity {
     public volatile Dialog activeSignalSelector;
     private Button chip;
     private TextView debugLog;
+    /** The account dialogs, for the phone acceptance. */
+    volatile Dialog firstUseDialog, disconnectDialog;
     private int tab=0;
     private static final int SHOWN_RECORDS=30;
     private String shownRecords(){JSONArray r=array("records"),shown=new JSONArray();for(int i=0;i<Math.min(r.length(),SHOWN_RECORDS);i++)shown.put(r.opt(i));return shown.toString();}
@@ -135,7 +137,7 @@ public class MainActivity extends Activity {
     @Override protected void onStart(){super.onStart();getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}
     @Override protected void onStop(){getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);super.onStop();}
     @Override protected void onResume(){super.onResume();resumed=this;handler.post(poll);if(service()!=null)service().resumeIfBlocked();}
-    @Override protected void onPause(){handler.removeCallbacks(poll);if(resumed==this)resumed=null;super.onPause();}
+    @Override protected void onPause(){handler.removeCallbacks(poll);if(resumed==this)resumed=null;if(firstUseDialog!=null)firstUseDialog.dismiss();super.onPause();}
     @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
     private ObdService service(){return ObdService.current;}
     private void act(Runnable action){try{if(service()!=null)action.run();else toast("Dienst startet. Bitte kurz warten.");}catch(Exception e){toast(e.getMessage()==null?"Aktion fehlgeschlagen":e.getMessage());}refresh();}
@@ -185,12 +187,14 @@ public class MainActivity extends Activity {
         if(tab==2)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+state.optString("recording")+"|"+state.optString("replayFile");
         if(tab==3)key+="|"+(array("debug").length()==0);
         if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
+        if(tab==4||tab==6)key+="|"+ChatGptAccount.get(this).snapshot().version;
         if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->{if(debugLog!=null)scroll.fullScroll(View.FOCUS_DOWN);else scroll.scrollTo(0,y);});}
         updateValues();
         updateUdsStatus();
         updateSmartStatus();
         announceSmartSet();
         announceGap();
+        accountDialog();
         if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText())){debugLog.setText(content);scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));}}
     }
     private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
@@ -202,7 +206,50 @@ public class MainActivity extends Activity {
     private static boolean positiveUdsResponse(Object response){if(response instanceof JSONArray){JSONArray bytes=(JSONArray)response;return bytes.length()>0&&bytes.optInt(0,-1)==0x62;}if(response instanceof String)return ((String)response).trim().toLowerCase(java.util.Locale.ROOT).startsWith("62");return false;}
     private boolean udsCandidatesExpected(){if(state.optInt("udsCandidates",0)>0)return true;JSONArray candidates=state.optJSONArray("udsCandidates");if(candidates!=null&&candidates.length()>0)return true;for(int i=0;i<array("signals").length();i++){JSONObject signal=array("signals").optJSONObject(i);if(signal==null)continue;String protocol=signalField(signal,"protocol").toLowerCase(java.util.Locale.ROOT),session=signalField(signal,"session_requirement").toLowerCase(java.util.Locale.ROOT);if(protocol.equals("uds")||signal.optBoolean("session_required")||session.contains("extended")||session.contains("required"))return true;}return false;}
     private void buildNav(){nav.removeAllViews();nav.setWeightSum(5);String[] titles={"Live","Diagnose","Aufnahmen","Debug","Adapter"};for(int i=0;i<titles.length;i++){final int next=i;Button b=button(titles[i],()->{tab=next;structure="";scroll.scrollTo(0,0);buildNav();refresh();});b.setTextSize(12);b.setMinWidth(0);b.setMinimumWidth(0);b.setPadding(dp(2),dp(4),dp(2),dp(4));b.setTextColor(tab==i?BG:MUTED);b.setBackground(surface(tab==i?ACCENT:CARD,12));b.setBackgroundTintList(null);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(48),1);p.setMargins(dp(2),0,dp(2),0);nav.addView(b,p);}}
-    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;udsRemaining=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;default:connection();}}
+    /** REQ-042.1, REQ-042.10, REQ-042.12: the optional ChatGPT account section. Never touches the vehicle service. */
+    private void accountTab(){
+        ChatGptAccount account=ChatGptAccount.get(this);ChatGptAccount.Snapshot s=account.snapshot();
+        title("ChatGPT-Konto","Optional · die App funktioniert auch ohne Konto");
+        LinearLayout c=card();
+        boolean connected=s.status==ChatGptAccount.Status.CONNECTED||s.status==ChatGptAccount.Status.UNREACHABLE||s.status==ChatGptAccount.Status.PLAN_MISSING;
+        boolean signingIn=s.phase==ChatGptAccount.Phase.WAITING||s.phase==ChatGptAccount.Phase.EXCHANGING;
+        if(!connected){note(c,"Use your ChatGPT plan",ACCENT);note(c,"Berechtigte KI-Anfragen nutzen deinen ChatGPT-Plan. Beim Verbinden werden keine Fahrzeugdaten gesendet. Die App funktioniert auch ohne Konto.",MUTED);}
+        TextView status=text(s.status.label,18,TEXT);status.setTypeface(null,Typeface.BOLD);status.setPadding(0,dp(4),0,dp(4));c.addView(status);
+        if(connected&&!s.email.isEmpty())note(c,"Konto: "+s.email,TEXT);
+        if(s.status==ChatGptAccount.Status.PLAN_MISSING)note(c,"Die Anmeldung ist gespeichert, aber die Nutzung deines ChatGPT-Plans ist noch nicht erlaubt. Der Assistent bleibt inaktiv. Erlaube die Plan-Nutzung im Browser, wenn du erneut fortfährst.",MUTED);
+        if(s.status==ChatGptAccount.Status.CONNECTED)c.addView(new PlanIndicatorView(this,account));
+        if(!s.message.isEmpty()&&!s.message.equals(s.status.label))note(c,s.message,MUTED);
+        if(s.phase==ChatGptAccount.Phase.WAITING)note(c,"Warte auf den Browser … Melde dich dort an und kehre dann zu OBDentic zurück.",ACCENT);
+        if(s.phase==ChatGptAccount.Phase.EXCHANGING)note(c,"Anmeldung wird abgeschlossen …",ACCENT);
+        boolean offerSignIn=s.status==ChatGptAccount.Status.NOT_CONNECTED||s.status==ChatGptAccount.Status.EXPIRED||s.status==ChatGptAccount.Status.PLAN_MISSING;
+        if(offerSignIn)accountButton(c,"Continue with ChatGPT","Anmeldung läuft …",signingIn,s.phase==ChatGptAccount.Phase.IDLE,()->{account.signIn();structure="";refresh();});
+        if(s.phase==ChatGptAccount.Phase.WAITING)addButton(c,"Anmeldung abbrechen",()->{account.cancel();structure="";refresh();});
+        if(connected)accountButton(c,"Trennen …","Trenne …",s.phase==ChatGptAccount.Phase.DISCONNECTING,s.phase==ChatGptAccount.Phase.IDLE,this::confirmDisconnect);
+    }
+    /** REQ-042.12: a button with immediate pending feedback (disabled, text, progress indicator, content description) like {@link #actionButton}. */
+    private void accountButton(LinearLayout parent,String idle,String pendingText,boolean pending,boolean enabled,Runnable onTap){
+        Button b=button(pending?pendingText:idle,onTap);b.setEnabled(enabled&&!pending);
+        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,dp(5),0,dp(3));
+        if(!pending){parent.addView(b,p);return;}
+        b.setContentDescription(pendingText);
+        LinearLayout r=row();ProgressBar bar=new ProgressBar(this,null,android.R.attr.progressBarStyleSmall);bar.setIndeterminate(true);bar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        r.addView(bar,new LinearLayout.LayoutParams(dp(28),dp(28)));r.addView(b,new LinearLayout.LayoutParams(0,-2,1));parent.addView(r,p);
+    }
+    /** REQ-043.10: disconnecting asks first. */
+    private void confirmDisconnect(){
+        disconnectDialog=new AlertDialog.Builder(this).setTitle("ChatGPT-Konto trennen?").setMessage("Der Zugriff wird bei ChatGPT widerrufen und die Anmeldung auf diesem Gerät gelöscht. Danach arbeitet die App wie zuvor ohne Konto.")
+            .setPositiveButton("Trennen",(d,w)->{ChatGptAccount.get(this).disconnect();structure="";refresh();}).setNegativeButton("Abbrechen",null).show();
+    }
+    /** REQ-042.11: the one-time confirmation after the first connection with the plan permission; shown until 'Got it'. */
+    private void accountDialog(){
+        ChatGptAccount account=ChatGptAccount.get(this);
+        if(firstUseDialog!=null||resumed!=this||!account.firstUseDue())return;
+        firstUseDialog=new AlertDialog.Builder(this).setTitle("You're using your ChatGPT plan").setCancelable(false)
+            .setMessage("Berechtigte KI-Anfragen nutzen jetzt deinen ChatGPT-Plan (eligible AI requests use your ChatGPT plan). Die Nutzung lässt sich in den ChatGPT-Einstellungen verwalten.")
+            .setPositiveButton("Got it",(d,w)->account.firstUseAcknowledged()).create();
+        firstUseDialog.setOnDismissListener(d->firstUseDialog=null);firstUseDialog.show();
+    }
+    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;udsRemaining=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;case 6:accountTab();break;default:connection();}}
     private void live(){
         title("Live-Messwerte","Werte und Verlauf auf einen Blick");
         addButton(body,"Messwerte auswählen",this::chooseSignals).setEnabled(state.optString("recording").isEmpty()&&!(smartActive(state)&&!state.optString("mode","live").equals("replay")));
@@ -682,6 +729,8 @@ public class MainActivity extends Activity {
         JSONArray devices=array("devices");if(devices.length()==0)note(c,"Noch keine Adapter gefunden. Adapter mit Strom versorgen, Bluetooth einschalten und Suche starten.",MUTED);
         for(int i=0;i<devices.length();i++){JSONObject d=devices.optJSONObject(i);if(d==null)continue;String address=d.optString("address"),name=d.optString("name","Bluetooth-Gerät");LinearLayout device=card();note(device,name,TEXT);note(device,address+" · "+d.optInt("rssi")+" dBm",MUTED);actionButton(device,CONNECT,":"+address,"Verbinden",!state.optBoolean("busy"),()->perform(CONNECT,":"+address,()->service().connect(address)));}
         LinearLayout demo=card();note(demo,"OHNE FAHRZEUG TESTEN",ACCENT);note(demo,"Die Demo liefert simulierte Messwerte und Diagnoseantworten. Aufnahmen und Export lassen sich damit am Schreibtisch prüfen.",MUTED);addButton(demo,"Demo starten",()->act(()->{service().setDemo();tab=0;structure="";buildNav();}));
+        LinearLayout account=card();note(account,"CHATGPT-KONTO (OPTIONAL)",ACCENT);note(account,ChatGptAccount.get(this).snapshot().status.label,MUTED);
+        addButton(account,"Konto öffnen",()->{tab=6;structure="";scroll.scrollTo(0,0);buildNav();refresh();});
     }
     private void requestScan(){ArrayList<String> missing=new ArrayList<>();if(Build.VERSION.SDK_INT>=31){missing.add(Manifest.permission.BLUETOOTH_SCAN);missing.add(Manifest.permission.BLUETOOTH_CONNECT);}else missing.add(Manifest.permission.ACCESS_FINE_LOCATION);if(Build.VERSION.SDK_INT>=33)missing.add(Manifest.permission.POST_NOTIFICATIONS);missing.removeIf(p->checkSelfPermission(p)==PackageManager.PERMISSION_GRANTED);if(!missing.isEmpty()){scanAfterPermission=true;requestPermissions(missing.toArray(new String[0]),7);}else perform(SCAN,"",()->service().scan());}
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==7&&scanAfterPermission){scanAfterPermission=false;boolean allowed=true;for(int i=0;i<permissions.length;i++)if(!permissions[i].equals(Manifest.permission.POST_NOTIFICATIONS)&&results[i]!=PackageManager.PERMISSION_GRANTED)allowed=false;if(allowed)perform(SCAN,"",()->service().scan());else new AlertDialog.Builder(this).setTitle("Bluetooth-Berechtigung fehlt").setMessage("Erlaube Geräte in der Nähe in den Android-App-Einstellungen, um den Adapter zu suchen und zu verbinden.").setPositiveButton("Einstellungen",(d,w)->startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())))).setNegativeButton("Schließen",null).show();}}
