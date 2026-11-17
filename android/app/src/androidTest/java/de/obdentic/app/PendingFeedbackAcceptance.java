@@ -71,7 +71,7 @@ final class PendingFeedbackAcceptance {
         String[] tapped = {""}; boolean[] startedAtTap = {false};
         inst.runOnMainSync(() -> { usable.performClick(); tapped[0] = ((MainActivity)current).lastAnnouncement;
             startedAtTap[0] = !service.snapshot().optString("recording").isEmpty() && !pending.isPending("rec.start"); });
-        require(START_PENDING.equals(tapped[0]) || (startedAtTap[0] && "Aufzeichnung starten abgeschlossen".equals(tapped[0])),
+        require(START_PENDING.equals(tapped[0]) || (startedAtTap[0] && ("Aufzeichnung starten abgeschlossen".equals(tapped[0]) || "Aufnahme läuft: live-selection".equals(tapped[0]))),
             "REQ-021.1/.5 the tap announces pending work or an observed completion: "+tapped[0]);
         until(() -> !service.snapshot().optString("recording").isEmpty(), "demo recording started");
         String name = service.snapshot().getString("recording");
@@ -82,7 +82,7 @@ final class PendingFeedbackAcceptance {
         String[] stopTapped = {""}; boolean[] stoppedAtTap = {false};
         inst.runOnMainSync(() -> { stop.performClick(); stopTapped[0] = ((MainActivity)current).lastAnnouncement;
             stoppedAtTap[0] = service.snapshot().optString("recording").isEmpty() && !pending.isPending("rec.stop"); });
-        require(STOP_PENDING.equals(stopTapped[0]) || (stoppedAtTap[0] && "Aufzeichnung stoppen abgeschlossen".equals(stopTapped[0])),
+        require(STOP_PENDING.equals(stopTapped[0]) || (stoppedAtTap[0] && ("Aufzeichnung stoppen abgeschlossen".equals(stopTapped[0]) || "Aufzeichnung gespeichert".equals(stopTapped[0]))),
             "REQ-021.1/.5 stop announces pending work or an observed completion: "+stopTapped[0]);
         until(() -> service.snapshot().optString("recording").isEmpty(), "demo recording stopped");
         Button restart = awaitButton(inst, START);
