@@ -38,7 +38,7 @@ Single-context layout: `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`
   obsolete Cargo 1.61; run Rust commands with
   `rtk env PATH=/Users/frankherchet/.cargo/bin:/opt/local/bin:/usr/bin:/bin cargo +1.98.0 ...`.
 - Before handoff, run the smallest relevant checks; for the current codebase this includes `cargo test`, `cargo clippy --all-targets -- -D warnings`, and Swift compilation when the BLE probe changes.
-- A meaningful feature or bug-fix task is complete only after its relevant checks pass, its intended changes are committed to a feature branch, its pull request is merged into `main`, and the merge is visible on `origin/main`.
+- A meaningful feature or bug-fix task is complete only after its relevant checks pass, its intended changes are committed to a feature branch, its pull request is merged into `main`, the merge is visible on `origin/main`, and a release containing the changes has been built successfully.
 
 ## Harness-specific configuration
 
@@ -168,6 +168,7 @@ Build the test APK and run relevant simulated phone acceptance for affected Andr
 - Policy: `agent`. **agent:** the agent merges its own PR as soon as every check in `xp-ship` passes and CI (if any) is green. **human:** a human reviews and merges.
 - Command: `gh pr merge <n> --squash --delete-branch`
 - Unattended runs (headless) never merge changes to these paths: `.github/`, `AGENTS.md`, `CLAUDE.md`.
+- **Release after features and fixes:** after completing one or more features or bug fixes, always build a new release at the end of the work, even when several changes are bundled into one release. Use the release process in `docs/android.md` after the changes are merged into `main` and CI is green; wait for the release workflow to succeed. A debug build, a merged PR, or a planned release does not satisfy this rule. If the release cannot be built, report the failure and leave the work incomplete.
 
 ### Human gates
 Only a human may:
