@@ -379,7 +379,7 @@ requirements:
       - id: REQ-018.7
         text: Every exported file is byte-identical to its internal recording, and export never deletes, moves or modifies an internal recording.
       - id: REQ-018.8
-        text: The app declares exactly the same permissions as before; neither internet access nor a storage permission is added.
+        text: Recording export needs and adds no permission of its own and never uses the network; no storage permission is added. Since REQ-044.3 the only permissions beyond the export release are INTERNET and the dataSync foreground-service permission of the optional ChatGPT account.
       - id: REQ-018.9
         text: Exporting never runs on the thread that talks to the adapter; while an export copies files, live polling, connection handling and jobs continue without waiting for it.
 
