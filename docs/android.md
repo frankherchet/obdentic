@@ -654,6 +654,11 @@ afterwards). It emits synthetic screenshots and a demo recording as instrumentat
 artifacts (also stored in the app-specific acceptance directory). Passing this test
 does **not** establish live BLE or vehicle acceptance.
 
+Acceptance checks always address the `MainActivity` that is currently resumed (`MainActivity.resumed`), never the instance
+returned by the launch: a replaced Activity no longer polls and would show stale tiles. The first-screen tile check (#239)
+needs a phone-sized viewport; on an emulator set e.g. `wm size 1080x2220` and `wm density 440` (reset afterwards with
+`wm size reset` / `wm density reset`), and select it with `adb -s emulator-5554` so a connected phone is untouched.
+
 Real vehicle acceptance remains a separate required gate:
 
 Tracked separately in [acceptance issue #178](https://github.com/frankherchet/obdentic/issues/178).

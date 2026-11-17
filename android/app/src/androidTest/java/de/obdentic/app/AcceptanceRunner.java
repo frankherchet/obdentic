@@ -43,6 +43,7 @@ public final class AcceptanceRunner extends Instrumentation {
             Intent launch = new Intent(getTargetContext(), MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             activity = startActivitySync(launch);
+            activity = LiveGridAcceptance.front(this::onMain, 15000);
             waitFor(() -> (activity.getWindow().getAttributes().flags & android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0,"Visible Activity keeps the screen awake");
             passed("The visible app keeps the display awake");
             waitFor(() -> ObdService.current != null, "service creation");
@@ -83,12 +84,13 @@ public final class AcceptanceRunner extends Instrumentation {
                 numeric = values.getJSONObject(i).optDouble("value", -1) > 0;
             }
             require(numeric, "RPM decoded from raw adapter response");
+            activity = LiveGridAcceptance.front(this::onMain, 15000); // the launched Activity may have been replaced; only the one in front keeps polling and rendering
             capture(activity,"Live","acceptance-live.png");
             FormatAcceptance.names(service.snapshot().getJSONArray("signals"));
             final Activity liveActivity=activity;
-            require(onMain(() -> hasText(liveActivity.getWindow().getDecorView(),"Drehzahl",true)),"#232 live card shows the short name Drehzahl");
+            waitFor(() -> onMain(() -> hasText(liveActivity.getWindow().getDecorView(),"Drehzahl",true)),"#232 live card shows the short name Drehzahl");
             runOnMainSync(() -> FormatAcceptance.noSemanticIds(liveActivity.getWindow().getDecorView()));
-            activity = LiveGridAcceptance.run(this, this::onMain, service, liveActivity); // #239 pins portrait for the check; the Activity may be recreated
+            activity = LiveGridAcceptance.run(this, this::onMain, service); // #239 pins portrait for the check; the Activity may be recreated
             service.setSignals(new JSONArray());
             waitIdle();
             passed("Live RPM/coolant readings and changing observation selection");
