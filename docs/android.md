@@ -16,8 +16,8 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 - The engine baseline, drive and OBD expansion profiles of the catalog, offered as built-in
   presets ("Vorlage · Motor-Grundwerte", "Fahrt", "OBD-Zusatzwerte", "Weitere OBD-Werte") under
   Live → Messwerte auswählen → Preset anwenden (REQ-025.6); unsupported signals are skipped.
-  There is no recording-profile chooser: "Gewählte Messwerte aufzeichnen" in Live starts a
-  recording of the selection and the same button stops it (REQ-025.7).
+  There is no recording-profile chooser: "Gewählte Messwerte aufzeichnen" below the Live tiles starts a
+  recording of the selection; while recording, "Aufzeichnung stoppen" stays above the tiles (REQ-025.7).
 - Five OBDentic component presets ("dpf", "egr", "cooling", "turbo", "rail", German names) in the same
   "Preset anwenden" list (REQ-035) and the user-started smart analysis (REQ-036), see below.
 - Private recording, foreground connected-device service, screen-off operation,
@@ -654,10 +654,12 @@ afterwards). It emits synthetic screenshots and a demo recording as instrumentat
 artifacts (also stored in the app-specific acceptance directory). Passing this test
 does **not** establish live BLE or vehicle acceptance.
 
-Acceptance checks always address the `MainActivity` that is currently resumed (`MainActivity.resumed`), never the instance
-returned by the launch: a replaced Activity no longer polls and would show stale tiles. The first-screen tile check (#239)
-needs a phone-sized viewport; on an emulator set e.g. `wm size 1080x2220` and `wm density 440` (reset afterwards with
-`wm size reset` / `wm density reset`), and select it with `adb -s emulator-5554` so a connected phone is untouched.
+Live-grid acceptance follows the `MainActivity` that is currently resumed (`MainActivity.resumed`); a configuration change
+can replace the instance returned by launch. The first-screen tile check (#239) needs a phone-sized viewport, for example
+1080x2220 at 440 dpi. Prefer a dedicated API 33 AVD with those physical dimensions; another session can change a shared
+emulator's `wm size` during a run. If overriding geometry, use `wm size 1080x2220` / `wm density 440` and restore it afterwards
+with `wm size reset` / `wm density reset`. Select the intended emulator explicitly (`adb -s <emulator-serial>`); never target
+the connected phone implicitly. The grid check keeps its eight-tile assertion and saves a synthetic `acceptance-grid.png`.
 
 Real vehicle acceptance remains a separate required gate:
 

@@ -209,8 +209,8 @@ public class MainActivity extends Activity {
         JSONArray selected=array("selected");
         boolean recordingNow=!state.optString("recording").isEmpty();
         boolean canRecordSelection=!state.optString("mode","live").equals("replay")&&state.optString("phase").equals("ready")&&!state.optBoolean("busy")&&!recordingNow&&selected.length()>0&&smartRecordingBlocker(state)==null;
-        // REQ-025.7: the one place to start and stop a recording of the selection
-        actionButton(body,recordingNow?REC_STOP:REC_START,"",recordingNow?"Aufzeichnung stoppen":"Gewählte Messwerte aufzeichnen",recordingNow||canRecordSelection,()->{if(recordingNow)perform(REC_STOP,"",()->service().stopRecording());else perform(REC_START,"",()->service().startRecording("live-selection"));});
+        // Keep stopping an active recording immediately reachable; inactive setup belongs below the measurements.
+        if(recordingNow)actionButton(body,REC_STOP,"","Aufzeichnung stoppen",true,()->perform(REC_STOP,"",()->service().stopRecording()));
         if(!state.optString("recording").isEmpty())note(body,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);
         gapCard();
         JSONArray values=array("values");
@@ -235,6 +235,7 @@ public class MainActivity extends Activity {
             col=(col+1)%columns;
         }
         while(col!=0&&col<columns){row.addView(new View(this),new LinearLayout.LayoutParams(0,1,1));col++;}
+        if(!recordingNow)actionButton(body,REC_START,"","Gewählte Messwerte aufzeichnen",canRecordSelection,()->perform(REC_START,"",()->service().startRecording("live-selection")));
         // below the tiles: the first screen keeps its tile density (#239)
         smartCard();
         if(!recordingNow&&smartRecordingBlocker(state)!=null)note(body,smartRecordingBlocker(state),MUTED);
