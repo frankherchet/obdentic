@@ -120,7 +120,9 @@ final class ReconnectAcceptance {
             int offOpens = fake.opens.size(); fake.last.up = false;
             waitFor(() -> service.snapshot().optString("phase").equals("error"), "loss with automatic connection off");
             SystemClock.sleep(2600);
-            require(fake.opens.size() == offOpens && !service.snapshot().optBoolean("autoPending") && !service.snapshot().optString("message").contains("neuer Versuch"), "REQ-020.6 no attempt while switched off");
+            JSONObject offState = service.snapshot();
+            require(fake.opens.size() == offOpens && !offState.optBoolean("autoPending") && !offState.optString("message").contains("neuer Versuch"),
+                "REQ-020.6 no attempt while switched off: opens " + offOpens + " -> " + fake.opens.size() + ", pending=" + offState.optBoolean("autoPending") + ", message=" + offState.optString("message"));
             service.setAutoConnect(true); ready(service);
             require(ObdService.autoConnectEnabled(context) && fake.opens.size() == offOpens + 1, "REQ-020.6 switching on connects the known adapter again");
 
