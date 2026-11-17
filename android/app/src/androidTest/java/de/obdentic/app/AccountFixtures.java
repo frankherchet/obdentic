@@ -80,6 +80,8 @@ final class AccountFixtures {
         volatile Handler token, revoke, jwks, discovery, any;
         /** Everything secret that was handed out, for the "never logged" checks. */
         final List<String> secrets = Collections.synchronizedList(new ArrayList<>());
+        /** The refresh tokens that were issued and not yet used or revoked. */
+        final java.util.Set<String> live = Collections.synchronizedSet(new java.util.HashSet<>());
 
         FakeAuth() throws Exception { key = AccountFixtures.key(); }
 
@@ -126,7 +128,7 @@ final class AccountFixtures {
                 if (token != null) return token.handle(r);
                 return issue(r);
             }
-            if (r.to(REVOKE_URL)) return revoke != null ? revoke.handle(r) : json(200, "{}");
+            if (r.to(REVOKE_URL)) { live.remove(r.form.get("token")); return revoke != null ? revoke.handle(r) : json(200, "{}"); }
             throw new IOException("unexpected request " + r.method + " " + r.url);
         }
 
@@ -138,10 +140,13 @@ final class AccountFixtures {
         /** The default token endpoint: authorization_code and refresh_token grants. */
         AccountHttp.Response issue(Req r) throws IOException {
             try {
+                if ("refresh_token".equals(r.form.get("grant_type")) && !live.remove(r.form.get("refresh_token"))) { // single-use rotation: a spent or unknown token is refused
+                    return json(400, new JSONObject().put("error", "refresh_token_reused").toString());
+                }
                 int n = counter.incrementAndGet();
                 JSONObject o = new JSONObject();
                 if (!omitAccess) { String a = "access-" + n; secrets.add(a); o.put("access_token", a); }
-                if (!omitRefresh) { String rt = "refresh-" + n; secrets.add(rt); o.put("refresh_token", rt); }
+                if (!omitRefresh) { String rt = "refresh-" + n; secrets.add(rt); live.add(rt); o.put("refresh_token", rt); }
                 if (!omitIdToken && "authorization_code".equals(r.form.get("grant_type"))) {
                     String id = idToken(r.form.get("client_id"));
                     secrets.add(id);

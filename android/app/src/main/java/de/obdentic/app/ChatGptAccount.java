@@ -144,6 +144,10 @@ final class ChatGptAccount {
     private boolean cancelRequested;
     private String message = "";
     private boolean expired, unreachable, loaded;
+    /** True while {@code record} is a rotated credential that storage does not hold yet: the one valid refresh token, retried on every access. */
+    private boolean unsaved;
+    /** The attempt that started the sign-in service and has not stopped it; only that attempt may stop it. */
+    private long keepaliveOwner;
     private AccountStore.Record record;
     private LoopbackListener listener;
     private volatile JSONObject discovery;
@@ -175,9 +179,9 @@ final class ChatGptAccount {
         return record;
     }
 
-    /** Forgets the cached record; the next call reads the file again. */
+    /** Forgets the cached record; the next call reads the file again. A rotated record that is not stored yet is kept. */
     void reload() {
-        synchronized (state) { loaded = false; version++; }
+        synchronized (state) { if (!unsaved) loaded = false; version++; }
     }
 
     Snapshot snapshot() {
@@ -238,6 +242,7 @@ final class ChatGptAccount {
             message = "";
             id = ++signInId;
             cancelRequested = false;
+            keepaliveOwner = id;
             startEpoch = epoch;
             changed();
         }
@@ -275,7 +280,12 @@ final class ChatGptAccount {
             text = "Anmeldung fehlgeschlagen";
         } finally {
             closeListener(id);
-            config.keepalive.stop(); // REQ-044.5: within 2 s after the attempt ends
+            synchronized (state) {
+                if (keepaliveOwner == id) { // a newer attempt owns the service when the user disconnected and signed in again meanwhile
+                    keepaliveOwner = 0;
+                    config.keepalive.stop(); // REQ-044.5: within 2 s after the attempt ends
+                }
+            }
         }
         synchronized (state) {
             if (signInId == id) {
@@ -329,7 +339,7 @@ final class ChatGptAccount {
             throw new CancellationException();
         }
         synchronized (state) {
-            if (signInId != id) throw new CancellationException();
+            if (signInId != id || cancelRequested) throw new CancellationException(); // a cancel after the callback arrived still wins (REQ-042.5)
             phase = Phase.EXCHANGING;
             changed();
         }
@@ -383,6 +393,7 @@ final class ChatGptAccount {
             store.saveClientId(clientId);
             record = rec;
             loaded = true;
+            unsaved = false;
             epoch++;
             expired = false;
             unreachable = false;
@@ -515,7 +526,19 @@ final class ChatGptAccount {
     private Held held() {
         synchronized (state) {
             AccountStore.Record r = phase == Phase.DISCONNECTING ? null : current();
+            if (r != null && unsaved) persistPending(r);
             return r == null ? null : new Held(r, epoch);
+        }
+    }
+
+    /** Callers hold {@code state}. Retries the write of a rotated record whose first write failed (REQ-043.5). */
+    private void persistPending(AccountStore.Record r) {
+        try {
+            store.save(r);
+            unsaved = false;
+            log("pending record stored");
+        } catch (Exception e) {
+            log("pending record write failed " + e.getClass().getSimpleName());
         }
     }
 
@@ -562,14 +585,14 @@ final class ChatGptAccount {
                     discard(refresh, r.clientId);
                     return new Token(null, Failure.NOT_CONNECTED);
                 }
+                boolean stored = true;
                 try {
-                    store.save(n); // REQ-043.5: complete before the old refresh token is dropped and before the caller gets the new token
+                    store.save(n); // REQ-043.5: complete before the old refresh token is dropped
                 } catch (Exception e) {
                     log("store write failed " + e.getClass().getSimpleName());
-                    unreachable = true; // memory keeps agreeing with storage: the old record stays, the rotated one is not delivered
-                    changed();
-                    return new Token(null, Failure.UNREACHABLE);
+                    stored = false; // the old refresh token is spent now: the rotated record is the only valid one and stays in memory until it is stored
                 }
+                unsaved = !stored;
                 record = n;
                 unreachable = false;
                 changed();
@@ -600,6 +623,7 @@ final class ChatGptAccount {
                 if (dropClientId) store.deleteClientId();
                 record = null;
                 loaded = true;
+                unsaved = false;
                 expired = true;
                 unreachable = false;
                 message = dropClientId ? MSG_INVALID_CLIENT : MSG_EXPIRED;
@@ -624,6 +648,7 @@ final class ChatGptAccount {
             store.deleteClientId();
             record = null;
             loaded = true;
+            unsaved = false;
             expired = false;
             unreachable = false;
             changed();
@@ -661,6 +686,7 @@ final class ChatGptAccount {
             store.deleteRecord();
             record = null;
             loaded = true;
+            unsaved = false;
             epoch++;
             expired = false;
             unreachable = false;

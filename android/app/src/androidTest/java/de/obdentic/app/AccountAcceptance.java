@@ -794,6 +794,8 @@ final class AccountAcceptance {
 
     private static void reviewFindings(Context ctx) throws Exception {
         refreshNeedsDurableWrite(ctx);
+        cancelAfterTheCallbackArrived(ctx);
+        oldAttemptDoesNotStopTheNewService(ctx);
         staleRefreshAfterDisconnect(ctx);
         reauthorizationKeepsTheSubject(ctx);
         noRefreshBeforeEarliest(ctx);
@@ -802,7 +804,7 @@ final class AccountAcceptance {
         failedInitialStorage(ctx);
     }
 
-    /** REQ-043.5: a rotated credential that is not durably stored is not delivered and not adopted. */
+    /** REQ-043.5: a rotated credential whose write fails is the only valid one: kept in memory, delivered, written again at the next access. */
     private static void refreshNeedsDurableWrite(Context ctx) throws Exception {
         Fixture f = new Fixture(ctx);
         try {
@@ -811,13 +813,74 @@ final class AccountAcceptance {
             f.auth.clock.addAndGet(3500 * 1000L);
             f.store.failSave = true;
             ChatGptAccount.Token t = f.account.accessToken();
-            require(t.value == null && t.failure == ChatGptAccount.Failure.UNREACHABLE, "REQ-043.5 a refresh whose write fails delivers no token: " + t.value + " " + t.failure);
+            require(t.value != null && !t.value.equals(before.accessToken), "REQ-043.5 the rotated access token is delivered although the write failed: " + t.failure);
+            require(f.store.load().refreshToken.equals(before.refreshToken) && f.account.snapshot().status == ChatGptAccount.Status.CONNECTED, "the failed write left the file alone");
             f.store.failSave = false;
-            require(f.store.load().refreshToken.equals(before.refreshToken), "REQ-043.5 the stored record is unchanged after the failed write");
-            ChatGptAccount.Token again = f.account.accessToken();
-            require(again.value != null && f.auth.to(TOKEN_URL).get(f.auth.count(TOKEN_URL) - 1).form.get("refresh_token").equals(before.refreshToken),
-                "REQ-043.5 the in-memory record stayed consistent with storage: the next refresh uses the stored refresh token");
-            require(f.store.load().accessToken.equals(again.value), "REQ-043.5 the retry is stored before it is delivered");
+            ChatGptAccount.Token same = f.account.accessToken();
+            require(same.value != null && same.value.equals(t.value) && f.auth.count(TOKEN_URL) == 2, "no second refresh for a valid access token");
+            AccountStore.Record stored = f.store.load();
+            require(stored.refreshToken.equals(f.auth.latest("refresh-")) && stored.accessToken.equals(t.value), "REQ-043.5 the rotated record is written at the next opportunity");
+            f.auth.clock.addAndGet(3500 * 1000L);
+            ChatGptAccount.Token next = f.account.accessToken();
+            require(next.value != null && !next.value.equals(t.value) && f.auth.count(TOKEN_URL) == 3, "REQ-043.5 the next refresh uses the rotated, not the spent, refresh token: " + next.failure);
+        } finally { collect(f); f.close(); }
+
+        Fixture g = new Fixture(ctx);
+        try {
+            g.connect();
+            g.auth.clock.addAndGet(3500 * 1000L);
+            g.store.failSave = true;
+            require(g.account.accessToken().value != null, "rotated with a failed write");
+            String newest = g.auth.latest("refresh-");
+            g.account.disconnect();
+            g.waitIdle();
+            waitUntil(() -> g.auth.count(REVOKE_URL) == 1, 5000, "the sign-out revokes");
+            require(g.auth.to(REVOKE_URL).get(0).form.get("token").equals(newest), "REQ-043.10 the newest refresh token is the one revoked");
+        } finally { collect(g); g.close(); }
+    }
+
+    /** REQ-042.5: a cancel wins over a callback that already arrived. */
+    private static void cancelAfterTheCallbackArrived(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            f.config.launcher = url -> {
+                f.browser.open(url); // answers the callback through the real socket
+                try { waitUntil(() -> !f.browser.callbackResponse.isEmpty(), 5000, "callback delivered"); } catch (Exception e) { throw new IllegalStateException(e); }
+                SystemClock.sleep(200);
+                f.account.cancel(); // the future is complete, the attempt has not read it yet
+            };
+            f.signInAndWait();
+            require(f.auth.count(TOKEN_URL) == 0 && f.store.load() == null && f.account.snapshot().status == ChatGptAccount.Status.NOT_CONNECTED, "REQ-042.5 a cancelled attempt exchanges nothing and stores nothing");
+            require(f.account.snapshot().message.contains("abgebrochen"), "REQ-042.5 cancel message: " + f.account.snapshot().message);
+        } finally { collect(f); f.close(); }
+    }
+
+    /** REQ-044.5: a superseded attempt that ends late leaves the service of the newer attempt running. */
+    private static void oldAttemptDoesNotStopTheNewService(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            CountDownLatch inLauncher = latch(), release = latch();
+            int[] calls = new int[1];
+            f.browser.callback = null;
+            f.config.launcher = url -> {
+                if (++calls[0] == 1) {
+                    inLauncher.countDown();
+                    try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                } else f.browser.open(url);
+            };
+            require(f.account.signIn(), "first attempt");
+            await(inLauncher);
+            f.account.disconnect();
+            f.waitIdle();
+            require(f.account.signIn(), "second attempt");
+            waitUntil(() -> f.browser.opened.size() == 1, 5000, "second attempt waits for the browser");
+            release.countDown();
+            SystemClock.sleep(600); // the first attempt ends now
+            require(f.keepalive.starts.get() == 2 && f.keepalive.stops.get() == 0 && f.account.snapshot().phase == ChatGptAccount.Phase.WAITING,
+                "REQ-044.5 the old attempt did not stop the service of the new one: stops=" + f.keepalive.stops.get());
+            f.account.cancel();
+            f.waitIdle();
+            waitUntil(() -> f.keepalive.stops.get() == 1, 3000, "REQ-044.5 the new attempt stops the service when it ends");
         } finally { collect(f); f.close(); }
     }
 
