@@ -79,6 +79,10 @@ public final class UdsAcceptance {
                 "REQ-027.6 the session header does not claim that OBD2 is paused");
             require(fake[0].commands.contains("7E0:1003"), "REQ-027.1 exactly the closed 10 03 activation command is sent to engine target");
 
+            // The session flag flips before the activation job has finished and the catalog was re-read for the new session:
+            // wait for the completed service state (idle worker, session active) and the session signal in the catalog.
+            waitFor(() -> !service.snapshot().optBoolean("busy") && service.snapshot().optJSONObject("uds").optBoolean("active")
+                && firstSessionSignal(service.snapshot().optJSONArray("signals")) != null, "REQ-027.2 extended-session signal appears in the active catalog after activation completed");
             JSONObject candidate = firstSessionSignal(service.snapshot().optJSONArray("signals"));
             require(candidate != null, "REQ-027.2 extended-session signal appears in the active catalog");
             String semantic = candidate.optString("semantic");

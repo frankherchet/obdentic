@@ -59,27 +59,31 @@ final class PendingFeedbackAcceptance {
 
         // REQ-021.3: no result within the (injected, short) limit.
         pending.start(new PendingActions.Spec("rec.start","Aufzeichnung starten","Aufzeichnung wird gestartet …",1500,(n,b2)->false),"",service.snapshot(),SystemClock.elapsedRealtime());
-        awaitButton(inst, START_PENDING);
-        until(() -> onMain(inst,() -> hasText(current.getWindow().getDecorView(),"Keine Rückmeldung · Aufzeichnung starten")), "time limit message in the status line");
+        awaitAnnouncement(inst, current, "Keine Rückmeldung · Aufzeichnung starten", "REQ-021.5 expiry announced"); // before anything else can replace it
+        awaitButton(inst, START);
+        require(onMain(inst,() -> hasText(current.getWindow().getDecorView(),"Keine Rückmeldung · Aufzeichnung starten")), "REQ-021.3 time limit message in the status line");
         require(pending.signature().equals("[]"), "REQ-021.3 pending cleared on expiry");
         Button usable = awaitButton(inst, START);
         require(onMain(inst,() -> usable.isEnabled()), "REQ-021.3 button usable again after expiry");
-        awaitAnnouncement(inst, current, "Keine Rückmeldung · Aufzeichnung starten", "REQ-021.5 expiry announced");
 
-        // REQ-021.1/.2/.5: a real start and stop through the button. The pending text is read in the same main-thread turn as the tap,
-        // because the 500 ms refresh replaces it with the final state as soon as the service reports the recording.
-        String[] tapped = {""};
-        inst.runOnMainSync(() -> { usable.performClick(); tapped[0] = ((MainActivity)current).lastAnnouncement; });
-        require(START_PENDING.equals(tapped[0]), "REQ-021.1/.5 the tap announces the pending text: "+tapped[0]);
+        // Read feedback in the tap's main-thread turn. A fast worker may already have completed; in that case
+        // require both the final announcement and its observed recording state, never a fabricated pending state.
+        String[] tapped = {""}; boolean[] startedAtTap = {false};
+        inst.runOnMainSync(() -> { usable.performClick(); tapped[0] = ((MainActivity)current).lastAnnouncement;
+            startedAtTap[0] = !service.snapshot().optString("recording").isEmpty() && !pending.isPending("rec.start"); });
+        require(START_PENDING.equals(tapped[0]) || (startedAtTap[0] && "Aufzeichnung starten abgeschlossen".equals(tapped[0])),
+            "REQ-021.1/.5 the tap announces pending work or an observed completion: "+tapped[0]);
         until(() -> !service.snapshot().optString("recording").isEmpty(), "demo recording started");
         String name = service.snapshot().getString("recording");
         Button stop = awaitButton(inst, STOP);
         require(!pending.isPending("rec.start") && onMain(inst,() -> stop.isEnabled()), "REQ-021.2 start observed: pending ended, stop label shown and usable");
         String finalAnnouncement = announcement(inst, current);
         require(!START_PENDING.equals(finalAnnouncement), "REQ-021.5 final state announced: "+finalAnnouncement);
-        String[] stopTapped = {""};
-        inst.runOnMainSync(() -> { stop.performClick(); stopTapped[0] = ((MainActivity)current).lastAnnouncement; });
-        require(STOP_PENDING.equals(stopTapped[0]), "REQ-021.1/.5 stop announces the pending text: "+stopTapped[0]);
+        String[] stopTapped = {""}; boolean[] stoppedAtTap = {false};
+        inst.runOnMainSync(() -> { stop.performClick(); stopTapped[0] = ((MainActivity)current).lastAnnouncement;
+            stoppedAtTap[0] = service.snapshot().optString("recording").isEmpty() && !pending.isPending("rec.stop"); });
+        require(STOP_PENDING.equals(stopTapped[0]) || (stoppedAtTap[0] && "Aufzeichnung stoppen abgeschlossen".equals(stopTapped[0])),
+            "REQ-021.1/.5 stop announces pending work or an observed completion: "+stopTapped[0]);
         until(() -> service.snapshot().optString("recording").isEmpty(), "demo recording stopped");
         Button restart = awaitButton(inst, START);
         require(!pending.isPending("rec.stop") && onMain(inst,() -> restart.isEnabled()), "REQ-021.2 stop observed: pending ended, start label shown and usable");
@@ -124,11 +128,20 @@ final class PendingFeedbackAcceptance {
     private static String announcement(Instrumentation inst, Activity a) throws Exception {
         FutureTask<String> task = new FutureTask<>(() -> ((MainActivity)a).lastAnnouncement); inst.runOnMainSync(task); return task.get();
     }
-    /** Waits until the announcement equals the expected text; a failure shows the last value that was seen. */
+    /**
+     * Waits until the announcement equals the expected text; a failure lists every distinct announcement that was seen. Polls every
+     * 20 ms because the Activity keeps only the last announcement and any later one (gap, smart analysis) replaces it.
+     */
     private static void awaitAnnouncement(Instrumentation inst, Activity a, String expected, String name) throws Exception {
-        String[] last = {""};
-        try { until(() -> expected.equals(last[0] = announcement(inst, a)), name); }
-        catch(AssertionError e) { throw new AssertionError(name+": last announcement \""+last[0]+"\""); }
+        List<String> seen = new java.util.ArrayList<>();
+        long until = SystemClock.elapsedRealtime() + 20000;
+        while(SystemClock.elapsedRealtime() < until) {
+            String now = announcement(inst, a);
+            if(expected.equals(now)) return;
+            if(seen.isEmpty() || !seen.get(seen.size()-1).equals(now)) seen.add(now);
+            SystemClock.sleep(20);
+        }
+        throw new AssertionError(name+": announcements seen "+seen);
     }
     private static Button findButton(View view, String text) {
         if(view instanceof Button && text.contentEquals(((Button)view).getText())) return (Button)view;
