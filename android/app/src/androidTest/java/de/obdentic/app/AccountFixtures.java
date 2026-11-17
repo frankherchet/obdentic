@@ -303,7 +303,7 @@ final class AccountFixtures {
 
         FlakyStore(Context context, String name) { super(context, name); }
 
-        @Override synchronized void save(Record record) throws java.security.GeneralSecurityException, IOException, org.json.JSONException {
+        @Override public synchronized void save(Record record) throws java.security.GeneralSecurityException, IOException, org.json.JSONException {
             if (failSave) throw new IOException("injected write failure");
             super.save(record);
         }

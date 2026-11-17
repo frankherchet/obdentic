@@ -11,11 +11,11 @@ import android.widget.TextView;
  * REQ-042.10: the OpenAI UI guideline pair 'Using ChatGPT plan' and the 'Manage usage' link, as one view that the account section
  * shows now and the assistant screen can place near its composer later. Visible only while the plan is connected and usable.
  */
-final class PlanIndicatorView extends LinearLayout {
-    static final String INDICATOR = "Using ChatGPT plan", MANAGE = "Manage usage";
+public final class PlanIndicatorView extends LinearLayout {
+    public static final String INDICATOR = "Using ChatGPT plan", MANAGE = "Manage usage";
     private static final int TEXT = 0xffedf3fa, ACCENT = 0xff63dfc1;
 
-    PlanIndicatorView(Context context, ChatGptAccount account) {
+    public PlanIndicatorView(Context context, ChatGptAccount account) {
         super(context);
         setOrientation(HORIZONTAL);
         setGravity(Gravity.CENTER_VERTICAL);

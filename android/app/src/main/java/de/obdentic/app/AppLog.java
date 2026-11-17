@@ -34,7 +34,7 @@ public final class AppLog {
     public static void logUncaught(Thread thread, Throwable error) { write("FATAL", "uncaught", "thread " + thread.getName(), error); }
 
     /** REQ-029.4; REQ-043.2: text shaped like a JWT or a 'Bearer' value is replaced as well. */
-    static String scrub(String text) {
+    public static String scrub(String text) {
         if (text == null) return "";
         String secrets = BEARER.matcher(JWT.matcher(text).replaceAll("[jwt]")).replaceAll("Bearer [token]");
         return ADDRESS.matcher(HEX.matcher(VIN.matcher(secrets).replaceAll("[VIN]")).replaceAll("[hex]")).replaceAll("…$1");
