@@ -1092,19 +1092,21 @@ requirements:
     title: Connect a ChatGPT account with explicit consent and a visible plan indicator
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "Conversation 2026-11-17: refinement of the Android ChatGPT account feature under epic #317; docs/adr/0005-android-chatgpt-plan-access.md"
     description: >
       A user connects one eligible ChatGPT account to the Android app through the
       open-source direct Sign in with ChatGPT flow (system browser, loopback
       callback, PKCE, platform APIs only). Connecting is an explicit opt-in, the
       app shows whether the ChatGPT plan is in use, and every failure leaves the
-      user with a clear state and no stored credential. This requirement covers
+      user with a clear state. A sign-in without the plan permission is kept, as
+      OpenAI advises, but the assistant stays inactive until the permission is
+      granted; every other failure stores no credential. This requirement covers
       connecting only: no model request, no transmitted diagnostic facts and no
       usage-limit handling, which belong to the assistant features.
     acceptance:
       - id: REQ-042.1
-        text: "The main navigation reaches an account section in at most two taps without a vehicle connection. With no account it shows a card 'Use your ChatGPT plan' that says eligible AI requests use the user's ChatGPT plan, that connecting sends no vehicle data and that the app works without an account, plus the single button 'Continue with ChatGPT'. No other control starts a sign-in."
+        text: "The main navigation reaches an account section in at most two taps without a vehicle connection. With no account it shows a card 'Use your ChatGPT plan' that says eligible AI requests use the user's ChatGPT plan, that connecting sends no vehicle data and that the app works without an account, plus the single button 'Continue with ChatGPT'. That button is the only control that starts a sign-in; it also repeats the authorization in REQ-042.9."
       - id: REQ-042.2
         text: "A tap on 'Continue with ChatGPT' starts the loopback listener first and opens the system browser only once it accepts connections, with an authorization request to https://auth.openai.com/api/accounts/authorize carrying: client_id (the saved issued client id, else dynamic_agent_client for the first registration), agent_name_hint=OBDentic only on first registration, a random ext_agent_host_id created once and reused for every later sign-in, response_type=code, redirect_uri=http://127.0.0.1:<port>/auth/callback (never localhost), scope 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct', resource=https://api.openai.com/v1, and a fresh random state, nonce and PKCE S256 challenge per attempt. It carries no API key, no login_hint, no id_token_hint and no vehicle data."
       - id: REQ-042.3
@@ -1118,15 +1120,15 @@ requirements:
       - id: REQ-042.7
         text: "The code exchange is an HTTPS POST (form encoded) to the token endpoint with grant_type=authorization_code, the client id, the code, the PKCE verifier, the exact redirect_uri of the authorization request and resource=https://api.openai.com/v1, with 30-second connect and read timeouts, no redirect followed and a response read limit of 1 MiB. A network failure shows 'Keine Verbindung zu ChatGPT · erneut versuchen'. An HTTP error shows its status and an error code of at most 64 characters from letters, digits and '_.:-' and never the response body. Both store nothing."
       - id: REQ-042.8
-        text: "A credential is stored only when the response holds access, refresh and ID tokens and the granted scope contains chatgpt.tokens.use.direct, and the ID token is valid: RS256 signature checked against a key of the JWKS named in the discovery document, issuer https://auth.openai.com, audience containing the client id, expiry in the future (60 seconds leeway), nonce equal to the attempt's. Any other result stores nothing, shows the cause, and revokes an obtained refresh token on a best-effort basis."
+        text: "A credential is stored only when the response holds access, refresh and ID tokens and the ID token is valid: RS256 signature checked against a key of the JWKS named in the discovery document, issuer https://auth.openai.com, audience containing the client id, expiry in the future (60 seconds leeway), nonce equal to the attempt's. The granted scope is stored with the record. Any other result stores nothing, shows the cause, and revokes an obtained refresh token on a best-effort basis. A valid response whose scope lacks chatgpt.tokens.use.direct is handled by REQ-042.9."
       - id: REQ-042.9
-        text: "When consent is declined or the granted scope lacks chatgpt.tokens.use.direct, the section shows 'ChatGPT-Plan-Nutzung nicht freigegeben' and explains how to enable it. No token is stored, the saved client id is kept, and no API-key or other billing alternative is offered. The next 'Continue with ChatGPT' repeats the authorization with the saved client id, the complete scope set and prompt=consent."
+        text: "When the user signs in but declines the plan permission, so that an otherwise valid response (REQ-042.8) has a granted scope without chatgpt.tokens.use.direct, the sign-in is kept: the record is stored with its granted scope and the assistant is inactive. The section shows the account e-mail address with the status 'ChatGPT-Plan-Nutzung nicht freigegeben' and explains how to enable it; it never shows the indicator 'Using ChatGPT plan' and offers no API-key or other billing alternative. While inactive, a caller asking for an access token gets the result 'plan not enabled' without any network request, so no inference request can be made. 'Continue with ChatGPT' and the disconnect button stay available; the button repeats the authorization with the saved client id, the complete scope set and prompt=consent. A successful repeat replaces the record, revokes the replaced refresh token on a best-effort basis and activates the plan; a failed or cancelled repeat leaves the inactive record unchanged."
       - id: REQ-042.10
-        text: "The account section shows exactly one status: 'Nicht verbunden', 'Verbunden' with the account e-mail address and the indicator 'Using ChatGPT plan', 'Anmeldung abgelaufen', 'ChatGPT nicht erreichbar' (credentials kept) or 'ChatGPT-Plan-Nutzung nicht freigegeben'. While connected, a link 'Manage usage' next to the indicator opens https://chatgpt.com/settings/usage in the system browser, or says that no browser is available. The indicator and link are one reusable view that the assistant screen can place near its composer."
+        text: "The account section shows exactly one status: 'Nicht verbunden', 'Verbunden' with the account e-mail address and the indicator 'Using ChatGPT plan', 'Anmeldung abgelaufen', 'ChatGPT nicht erreichbar' (credentials kept) or 'ChatGPT-Plan-Nutzung nicht freigegeben' (account e-mail address shown, credentials kept, REQ-042.9). While connected with the plan permission, a link 'Manage usage' next to the indicator opens https://chatgpt.com/settings/usage in the system browser, or says that no browser is available. The indicator and link are one reusable view that the assistant screen can place near its composer."
       - id: REQ-042.11
-        text: "After the first successful connection on this installation a dialog 'You're using your ChatGPT plan' explains that eligible AI requests use the user's ChatGPT plan and can be managed in ChatGPT settings, with a 'Got it' button. The dialog is not shown again on later sign-ins, also after sign-out, and survives restart of the app."
+        text: "After the first successful connection with the plan permission on this installation a dialog 'You're using your ChatGPT plan' explains that eligible AI requests use the user's ChatGPT plan and can be managed in ChatGPT settings, with a 'Got it' button. The dialog is not shown again on later sign-ins, also after sign-out, and survives restart of the app. It is not shown for a sign-in without the plan permission."
       - id: REQ-042.12
-        text: "Exactly one account is supported: while one is connected 'Continue with ChatGPT' is not offered and a second attempt cannot start. A second tap during an attempt is ignored, and both buttons show immediate pending feedback (REQ-021). Using another account requires disconnecting first."
+        text: "Exactly one account is supported: while one is connected with the plan permission 'Continue with ChatGPT' is not offered and a second attempt cannot start; in the inactive state of REQ-042.9 it offers only the re-authorization of that sign-in. A second tap during an attempt is ignored, and both buttons show immediate pending feedback (REQ-021). Using another account requires disconnecting first."
       - id: REQ-042.13
         text: "Without an installed browser, or when no loopback port can be bound, the attempt stops before anything is opened, says why, closes any listener and stores nothing."
 
@@ -1134,7 +1136,7 @@ requirements:
     title: Protect, refresh and remove the ChatGPT credentials
     type: functional
     priority: must
-    status: draft
+    status: accepted
     source: "Conversation 2026-11-17: refinement of the Android ChatGPT account feature under epic #317; docs/adr/0005-android-chatgpt-plan-access.md"
     description: >
       Access, refresh and ID tokens never leave protected app-private storage,
@@ -1149,9 +1151,9 @@ requirements:
       - id: REQ-043.3
         text: "A record that cannot be read (corrupt file, unknown format, Keystore key missing or invalidated) is deleted together with its key, the section shows 'Nicht verbunden' with the hint to connect again, and no other function of the app is affected and the app does not crash."
       - id: REQ-043.4
-        text: "A caller asking for an access token gets the stored one without a request while it is valid for at least 300 more seconds. Otherwise the token is refreshed first, but never before the earliest_refresh_at time of the token response when one was given. The refresh is a form-encoded POST with grant_type=refresh_token, the saved issued client id (never dynamic_agent_client), the refresh token and resource=https://api.openai.com/v1, without scope."
+        text: "A caller asking for an access token gets the stored one without a request while it is valid for at least 300 more seconds. Otherwise the token is refreshed first, but never before the earliest_refresh_at time of the token response when one was given. The refresh is a form-encoded POST with grant_type=refresh_token, the saved issued client id (never dynamic_agent_client), the refresh token and resource=https://api.openai.com/v1, without scope. While the stored scope lacks chatgpt.tokens.use.direct (REQ-042.9) the caller gets 'plan not enabled' and no request, not even a refresh, is made."
       - id: REQ-043.5
-        text: "A refresh response is used only when it holds a new access token and a replacement refresh token and its scope still contains chatgpt.tokens.use.direct. The new record is written completely before the old refresh token is discarded and before the new access token is returned to the caller. A response that fails this check is handled like a terminal refresh error (REQ-043.7)."
+        text: "A refresh response is used only when it holds a new access token and a replacement refresh token. The new record, with its granted scope, is written completely before the old refresh token is discarded and before the new access token is returned to the caller. A response without these tokens is handled like a terminal refresh error (REQ-043.7). A response whose scope lacks chatgpt.tokens.use.direct is stored the same way and moves the sign-in to the inactive state of REQ-042.9; no access token is returned to the caller."
       - id: REQ-043.6
         text: "Refreshes are serialized: with two simultaneous callers needing a refresh, exactly one refresh request is sent and both receive the new access token."
       - id: REQ-043.7
@@ -1173,7 +1175,7 @@ requirements:
     title: Keep cloud access optional, minimal and separate from local diagnostics
     type: constraint
     priority: must
-    status: draft
+    status: accepted
     source: "docs/adr/0005-android-chatgpt-plan-access.md; docs/project-goals.md §7: AI-assisted diagnostics (subsection added by the Android ChatGPT account feature)"
     description: >
       The first network access of the app serves only the optional ChatGPT
