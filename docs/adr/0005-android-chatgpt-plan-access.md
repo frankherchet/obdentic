@@ -1,6 +1,6 @@
 # 0005. ChatGPT plan access for the Android assistant
 Date: 2026-11-14, updated 2026-11-17 with the S8/S12 rerun
-Status: proposed
+Status: accepted
 
 ## Context
 Epic #317 and spike #324 investigate whether a native Android client can use a user's ChatGPT plan for streamed, function-calling diagnostic assistance without a backend. The prototype used only synthetic vehicle data; it did not connect to an adapter or vehicle. The real phone ran Android 16, SDK 36, with Chrome (`com.android.chrome`) as its default browser.
@@ -36,9 +36,9 @@ Usage-limit errors, network loss during a stream, multiple accounts and Codex ap
 3. No cloud assistant for now; continue semantic and offline groundwork independently.
 
 ## Decision
-**Proposed GO** for an opt-in ChatGPT-plan cloud integration (option 1) under the spike's predeclared acceptance rule: S3, S4, S5, S8, S9 and S10 all pass. S8 failed on 2026-11-14 because the test's instructions conflicted with its prompt; it passed twice on 2026-11-17 with a non-conflicting prompt, and S12 (refresh and subsequent S8) also passed. This is a proposal: the status stays `proposed` until the maintainer accepts it.
+**GO** for an opt-in ChatGPT-plan cloud integration (option 1) under the spike's predeclared acceptance rule: S3, S4, S5, S8, S9 and S10 all pass. S8 failed on 2026-11-14 because the test's instructions conflicted with its prompt; it passed twice on 2026-11-17 with a non-conflicting prompt, and S12 (refresh and subsequent S8) also passed. Accepted by the maintainer (frankherchet) on 2026-11-17.
 
-Open before #327: the maintainer must confirm OpenAI open-source-client eligibility and the SIWC/DevKit terms for this app; neither is confirmed by this ADR. #327, #328 and #329 are unblocked only after the maintainer accepts this ADR and that eligibility is confirmed. Return-link behavior (not measured) and the need for the foreground `dataSync` service must be settled in #327. #325 and #326 can continue as groundwork for #19 and #20 using a scripted model in tests.
+Maintainer statement, 2026-11-17: the flow works with OpenAI. This ADR does not itself verify OpenAI's terms for open-source clients; the maintainer owns that confirmation. #327, #328 and #329 are unblocked. Return-link behavior (not measured) and the need for the foreground `dataSync` service must be settled in #327. #325 and #326 can continue as groundwork for #19 and #20 using a scripted model in tests.
 
 Any cloud integration must be explicit opt-in, without an API-key fallback. The application-side closed validator and policy, not model instructions or tool schemas, are the safety boundary. S11's zero rejected calls in this small synthetic sample is not proof of injection resistance. Usage-limit errors, network loss during a stream and multiple accounts remain untested.
 
@@ -48,6 +48,6 @@ Any cloud integration must be explicit opt-in, without an API-key fallback. The 
 - ChatGPT Plus's five-hour usage limit is shared across apps. Required UI includes **Continue with ChatGPT**, a one-time “You're using your ChatGPT plan” confirmation, a “Using ChatGPT plan” indicator and a “Manage usage” link to https://chatgpt.com/settings/usage.
 - Conversation history must be resent with every request. #328 must minimize, preview and obtain consent for transmitted facts; no raw capture, VIN, ECU serial or adapter identifier is sent by default.
 - The ChatGPT-plan route does not support audio input or transcription. #329 must use Android speech services and consider their privacy and connectivity properties separately.
-- The repository license is now Apache-2.0 (PR #337, merged to `main`), which resolves the earlier no-license concern. OpenAI open-source-client eligibility and the SIWC/DevKit terms still need the maintainer's confirmation before #327.
+- The repository license is now Apache-2.0 (PR #337, merged to `main`), which resolves the earlier no-license concern. The maintainer confirmed on 2026-11-17 that the flow works with OpenAI; this ADR does not verify OpenAI's terms.
 - Proposed text for a new subsection of `docs/project-goals.md` section 7, to apply in #327 only after this ADR is accepted: “Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.” No project-goals change is made by this ADR.
 - For #327, this measurement identifies a possible OAuth, storage and network-permission route but does not approve its production flow or resolve foreground-service UX. For #325, tool validation remains a closed application responsibility; tool placement and budgets remain open. For #328, history resending and explicit disclosure are required; concrete data minimization and loop budgets remain open.
