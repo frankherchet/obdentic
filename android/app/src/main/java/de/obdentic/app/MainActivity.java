@@ -209,8 +209,8 @@ public class MainActivity extends Activity {
         JSONArray selected=array("selected");
         boolean recordingNow=!state.optString("recording").isEmpty();
         boolean canRecordSelection=!state.optString("mode","live").equals("replay")&&state.optString("phase").equals("ready")&&!state.optBoolean("busy")&&!recordingNow&&selected.length()>0&&smartRecordingBlocker(state)==null;
-        // REQ-025.7: the one place to start and stop a recording of the selection
-        actionButton(body,recordingNow?REC_STOP:REC_START,"",recordingNow?"Aufzeichnung stoppen":"Gewählte Messwerte aufzeichnen",recordingNow||canRecordSelection,()->{if(recordingNow)perform(REC_STOP,"",()->service().stopRecording());else perform(REC_START,"",()->service().startRecording("live-selection"));});
+        // Keep stopping an active recording immediately reachable; inactive setup belongs below the measurements.
+        if(recordingNow)actionButton(body,REC_STOP,"","Aufzeichnung stoppen",true,()->perform(REC_STOP,"",()->service().stopRecording()));
         if(!state.optString("recording").isEmpty())note(body,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);
         gapCard();
         JSONArray values=array("values");
@@ -222,19 +222,20 @@ public class MainActivity extends Activity {
         for(Map.Entry<String,JSONObject> entry:shown.entrySet()){
             String id=entry.getKey();JSONObject s=entry.getValue();
             if(col==0){row=new LinearLayout(this);row.setOrientation(LinearLayout.HORIZONTAL);LinearLayout.LayoutParams rp=new LinearLayout.LayoutParams(-1,-2);rp.setMargins(0,dp(6),0,0);body.addView(row,rp);}
-            LinearLayout tile=new LinearLayout(this);tile.setOrientation(LinearLayout.VERTICAL);tile.setPadding(dp(10),dp(10),dp(10),dp(10));tile.setBackground(surface(CARD,20));tile.setTag("live-tile");
+            LinearLayout tile=new LinearLayout(this);tile.setOrientation(LinearLayout.VERTICAL);tile.setPadding(dp(10),dp(6),dp(10),dp(6));tile.setBackground(surface(CARD,20));tile.setTag("live-tile");
             LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(0,-2,1);tp.setMargins(col==0?0:dp(3),0,col==columns-1?0:dp(3),0);row.addView(tile,tp);
             TextView name=text(signalLabel(id,s),13,MUTED);name.setSingleLine(true);name.setEllipsize(android.text.TextUtils.TruncateAt.END);tile.addView(name);
             TextView number=text("—",24,TEXT);number.setTypeface(Typeface.MONOSPACE);number.setFontFeatureSettings("tnum");number.setSingleLine(true);number.setEllipsize(android.text.TextUtils.TruncateAt.END);tile.addView(number);valueViews.put(id,number);
-            SparklineView graph=new SparklineView(this,ACCENT);tile.addView(graph,new LinearLayout.LayoutParams(-1,dp(28)));graphViews.put(id,graph);
+            SparklineView graph=new SparklineView(this,ACCENT);tile.addView(graph,new LinearLayout.LayoutParams(-1,dp(20)));graphViews.put(id,graph);
             TextView range=text("",11,MUTED);range.setSingleLine(true);range.setEllipsize(android.text.TextUtils.TruncateAt.END);range.setTag("live-range");tile.addView(range);rangeViews.put(id,range);
             TextView freshness=text("",11,0xffffca75);freshness.setVisibility(View.GONE);tile.addView(freshness);freshnessViews.put(id,freshness);
             String reason=missingReason(id,null);if(!reason.isEmpty()){number.setText("Nicht verfügbar");number.setTextSize(15);number.setTextColor(0xffffca75);freshness.setText(reason);freshness.setVisibility(View.VISIBLE);number.setContentDescription(signalLabel(id,s)+": Nicht verfügbar. "+reason);}
-            String protocol=signalProtocolLabel(s,udsActive(state));if(!protocol.isEmpty()){TextView meta=text(protocol,10,ACCENT);meta.setTag("live-protocol");tile.addView(meta);}
+            String protocol=signalProtocolLabel(s,udsActive(state));if(!protocol.isEmpty()&&(!protocol.equals("OBD2")||udsActive(state))){TextView meta=text(protocol,10,ACCENT);meta.setTag("live-protocol");tile.addView(meta);}
             String validation=knowledgeValidationBadge(s);if(!validation.isEmpty()){TextView meta=text(validation,10,MUTED);meta.setTag("live-validation");tile.addView(meta);}
             col=(col+1)%columns;
         }
         while(col!=0&&col<columns){row.addView(new View(this),new LinearLayout.LayoutParams(0,1,1));col++;}
+        if(!recordingNow)actionButton(body,REC_START,"","Gewählte Messwerte aufzeichnen",canRecordSelection,()->perform(REC_START,"",()->service().startRecording("live-selection")));
         // below the tiles: the first screen keeps its tile density (#239)
         smartCard();
         if(!recordingNow&&smartRecordingBlocker(state)!=null)note(body,smartRecordingBlocker(state),MUTED);
