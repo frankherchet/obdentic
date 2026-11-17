@@ -372,19 +372,23 @@ disconnect confirmation, and when a caller (the assistant, #328) asks for an acc
   `agent_name_hint=OBDentic` on the first registration and the saved issued client id afterwards; a random `ext_agent_host_id` is created
   once. Scope: `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`, `resource=https://api.openai.com/v1`.
   The callback page is static, never echoes its parameters and links back with `obdentic://account` (`ReturnActivity`, which takes no
-  value from the intent). State, error, code and client-id checks end the attempt without a code exchange; a cancel ends it within 1 s,
-  300 s without a callback end it with a timeout message. The ID token is accepted only with an RS256 signature from the discovery
+  value from the intent). The listener serves at most 8 connections at once, cuts a request after 3 s and closes accepted connections when
+  the attempt ends. State, error, code and client-id checks end the attempt without a code exchange; a cancel ends it within 1 s (also
+  while the listener is still being opened, and then without launching the browser), 300 s without a callback end it with a timeout message.
+  A sign-in whose credential cannot be stored is revoked and leaves no file or key behind. The ID token is accepted only with an RS256 signature from the discovery
   document's JWKS, issuer `https://auth.openai.com`, the client id as audience, an expiry in the future (60 s leeway) and the attempt's
   nonce.
 - **Plan permission missing:** a valid sign-in whose granted scope lacks `chatgpt.tokens.use.direct` is kept (as OpenAI advises) but
   inactive: no access token is handed out and no inference request is possible until **Continue with ChatGPT** repeats the
-  authorization with `prompt=consent`.
+  authorization with `prompt=consent`. A repeat that returns another subject than the stored one is rejected: the stored account stays and the
+  new credential is revoked.
 - **Storage** (`AccountStore`): one app-private file encrypted with an AES-256-GCM key of the Android Keystore (fresh IV per write,
   temporary file, sync, atomic rename), excluded from backup and device transfer. After a sign-out, expiry or an unreadable record only the
   host id and the issued client id remain; the Keystore key is deleted. No token, e-mail address, authorization code, verifier, state,
   nonce, URL or header is ever logged: events use a fixed vocabulary and the log masking also replaces JWT-shaped and `Bearer` text.
 - **Refresh:** an access token valid for at least 300 s is used as is; otherwise one serialized refresh (never before
-  `earliest_refresh_at`) rotates the tokens, and the complete new record is written before the caller gets the new token. HTTP 400/401
+  `earliest_refresh_at`, also after the access token expired) rotates the tokens, and the complete new record is written before the caller gets the
+  new token; when that write fails the refresh fails, nothing is delivered and the previous record stays. HTTP 400/401
   with a terminal code deletes the tokens at once; network errors, timeouts, 429 and 5xx keep them and retry only on the next request.
 - **Disconnect:** asks first, revokes the refresh token at the discovery document's `revocation_endpoint` (up to three attempts, 1 s and
   3 s apart, 10 s timeouts) and deletes the credentials locally in every case; an unconfirmed revocation is said so. Disconnecting

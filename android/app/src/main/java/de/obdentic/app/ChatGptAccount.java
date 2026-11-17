@@ -140,6 +140,8 @@ final class ChatGptAccount {
     private final ReentrantLock refreshLock = new ReentrantLock();
     private Phase phase = Phase.IDLE;
     private long epoch, signInId, version;
+    /** Set by {@link #cancel()} for the running attempt, also while its listener does not exist yet. */
+    private boolean cancelRequested;
     private String message = "";
     private boolean expired, unreachable, loaded;
     private AccountStore.Record record;
@@ -235,6 +237,7 @@ final class ChatGptAccount {
             phase = Phase.WAITING;
             message = "";
             id = ++signInId;
+            cancelRequested = false;
             startEpoch = epoch;
             changed();
         }
@@ -249,7 +252,9 @@ final class ChatGptAccount {
     /** REQ-042.5: ends a waiting attempt. */
     void cancel() {
         synchronized (state) {
-            if (phase == Phase.WAITING && listener != null) listener.close();
+            if (phase != Phase.WAITING) return;
+            cancelRequested = true; // the attempt checks this before it publishes a listener and before it opens the browser
+            if (listener != null) listener.close();
         }
     }
 
@@ -299,11 +304,14 @@ final class ChatGptAccount {
             throw new Stop("Kein freier lokaler Port für die Anmeldung", "no_port");
         }
         synchronized (state) {
-            if (signInId != id) { l.close(); throw new CancellationException(); }
+            if (signInId != id || cancelRequested) { l.close(); throw new CancellationException(); }
             listener = l;
         }
         String redirect = "http://127.0.0.1:" + l.port() + LoopbackListener.PATH;
         try {
+            synchronized (state) {
+                if (signInId != id || cancelRequested) throw new CancellationException(); // REQ-042.5: no browser after a cancel
+            }
             config.launcher.open(authorizeUrl(saved, hostId, redirect, oauthState, nonce, Oidc.challenge(verifier), reauth)); // REQ-042.2: the listener already accepts
         } catch (ActivityNotFoundException e) {
             throw new Stop("Kein Browser gefunden · Anmeldung nicht möglich", "no_browser");
@@ -360,10 +368,16 @@ final class ChatGptAccount {
                 throw new CancellationException();
             }
             replaced = current();
+            if (replaced != null && !replaced.subject.equals(claims.subject)) { // REQ-042.12: a browser account switch is not a re-authorization
+                discard(refresh, clientId);
+                throw new Stop("Anderes ChatGPT-Konto · die bestehende Anmeldung bleibt, bitte mit dem verbundenen Konto bestätigen", "subject_changed");
+            }
             try {
                 store.save(rec);
             } catch (Exception e) {
                 log("store write failed " + e.getClass().getSimpleName());
+                if (replaced == null) store.deleteRecord(); // no remnant of the failed write: file artifacts and the key created for it
+                discard(refresh, clientId); // REQ-042.8: the grant that cannot be kept is revoked
                 throw new Stop("Anmeldung konnte nicht gespeichert werden", "store");
             }
             store.saveClientId(clientId);
@@ -472,24 +486,36 @@ final class ChatGptAccount {
      * off the main thread. Without the plan permission it answers PLAN_NOT_ENABLED without any request (REQ-042.9).
      */
     Token accessToken() {
-        AccountStore.Record r = readyRecord();
-        if (r == null) return failure();
-        Token t = usable(r);
+        Held h = held();
+        if (h == null) return failure();
+        Token t = usable(h.record);
         if (t != null) return t;
         refreshLock.lock(); // REQ-043.6: one refresh at a time; a waiting caller re-checks the record afterwards
         try {
-            r = readyRecord();
-            if (r == null) return failure();
-            t = usable(r);
-            return t != null ? t : refresh(r);
+            h = held();
+            if (h == null) return failure();
+            t = usable(h.record);
+            return t != null ? t : refresh(h.record, h.epoch);
         } finally {
             refreshLock.unlock();
         }
     }
 
-    private AccountStore.Record readyRecord() {
+    /** A record with the epoch it was read in, taken under one lock so that work on it can tell when it was superseded. */
+    private static final class Held {
+        final AccountStore.Record record;
+        final long epoch;
+
+        Held(AccountStore.Record record, long epoch) {
+            this.record = record;
+            this.epoch = epoch;
+        }
+    }
+
+    private Held held() {
         synchronized (state) {
-            return phase == Phase.DISCONNECTING ? null : current();
+            AccountStore.Record r = phase == Phase.DISCONNECTING ? null : current();
+            return r == null ? null : new Held(r, epoch);
         }
     }
 
@@ -497,18 +523,21 @@ final class ChatGptAccount {
         synchronized (state) { return new Token(null, expired ? Failure.EXPIRED : Failure.NOT_CONNECTED); }
     }
 
-    /** The stored token when it can be handed out without a refresh, a refusal when the plan is not enabled, else null. */
+    /** The stored token when it can be handed out without a refresh, a refusal when none can be, else null (a refresh is due and allowed). */
     private Token usable(AccountStore.Record r) {
         if (!r.hasPlan()) return new Token(null, Failure.PLAN_NOT_ENABLED);
         long now = config.clock.getAsLong();
         if (r.expiresAtMs - now >= REFRESH_MARGIN_MS) return new Token(r.accessToken, null);
-        if (r.earliestRefreshMs > now && r.expiresAtMs > now) return new Token(r.accessToken, null); // never refresh before earliest_refresh_at
+        if (r.earliestRefreshMs > now) { // REQ-043.4: never refresh before earliest_refresh_at, not even after the access token expired
+            return r.expiresAtMs > now ? new Token(r.accessToken, null) : new Token(null, Failure.UNREACHABLE);
+        }
         return null;
     }
 
-    private Token refresh(AccountStore.Record r) {
-        long startEpoch;
-        synchronized (state) { startEpoch = epoch; }
+    private Token refresh(AccountStore.Record r, long startEpoch) {
+        synchronized (state) {
+            if (epoch != startEpoch) return new Token(null, Failure.NOT_CONNECTED); // REQ-043.13: disconnected or replaced since the record was read; nothing is sent
+        }
         Map<String, String> f = new LinkedHashMap<>();
         f.put("grant_type", "refresh_token");
         f.put("client_id", r.clientId);
@@ -537,6 +566,9 @@ final class ChatGptAccount {
                     store.save(n); // REQ-043.5: complete before the old refresh token is dropped and before the caller gets the new token
                 } catch (Exception e) {
                     log("store write failed " + e.getClass().getSimpleName());
+                    unreachable = true; // memory keeps agreeing with storage: the old record stays, the rotated one is not delivered
+                    changed();
+                    return new Token(null, Failure.UNREACHABLE);
                 }
                 record = n;
                 unreachable = false;

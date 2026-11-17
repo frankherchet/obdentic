@@ -246,7 +246,7 @@ final class AccountFixtures {
     /** An account over its own store, fake server, fake browser and fake keep-alive. */
     static final class Fixture {
         final Context context;
-        final AccountStore store;
+        final FlakyStore store;
         final FakeAuth auth;
         final FakeBrowser browser;
         final CountingKeepalive keepalive = new CountingKeepalive();
@@ -256,7 +256,7 @@ final class AccountFixtures {
 
         Fixture(Context context) throws Exception {
             this.context = context;
-            store = new AccountStore(context, "account-test-" + System.nanoTime());
+            store = new FlakyStore(context, "account-test-" + System.nanoTime());
             auth = new FakeAuth();
             browser = new FakeBrowser(auth);
             config = new ChatGptAccount.Config();
@@ -289,6 +289,18 @@ final class AccountFixtures {
             account.disconnect();
             try { waitIdle(); } catch (Exception ignored) { /* cleanup */ }
             store.deleteAll();
+        }
+    }
+
+    /** A store whose writes can be made to fail. */
+    static final class FlakyStore extends AccountStore {
+        volatile boolean failSave;
+
+        FlakyStore(Context context, String name) { super(context, name); }
+
+        @Override synchronized void save(Record record) throws java.security.GeneralSecurityException, IOException, org.json.JSONException {
+            if (failSave) throw new IOException("injected write failure");
+            super.save(record);
         }
     }
 

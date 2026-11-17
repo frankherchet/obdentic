@@ -25,7 +25,7 @@ import org.json.JSONObject;
  * (fresh IV per write, atomic replace), plus the two values that outlive a sign-out: the random host id and the issued client id.
  * App backup and device transfer exclude all of it (manifest and data extraction rules).
  */
-final class AccountStore {
+class AccountStore {
     private static final String TRANSFORM = "AES/GCM/NoPadding";
     private static final int IV_LEN = 12, FORMAT = 1;
     private static final String RECORD = "credential.bin", TEMP = "credential.bin.tmp";
@@ -130,7 +130,7 @@ final class AccountStore {
         return key;
     }
 
-    /** Writes the record: temporary file, sync, atomic rename. A failure leaves the previous record (or none). */
+    /** Writes the record: temporary file, sync, atomic rename. A failure leaves the previous record (or none) and no temporary file. */
     synchronized void save(Record record) throws GeneralSecurityException, IOException, JSONException {
         Cipher c = Cipher.getInstance(TRANSFORM);
         c.init(Cipher.ENCRYPT_MODE, key()); // the Keystore picks a fresh random IV for every encryption
@@ -138,13 +138,18 @@ final class AccountStore {
         byte[] ct = c.doFinal(record.toJson().toString().getBytes(StandardCharsets.UTF_8));
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("no_directory");
         File tmp = new File(dir, TEMP);
-        try (FileOutputStream out = new FileOutputStream(tmp)) {
-            out.write(FORMAT);
-            out.write(iv);
-            out.write(ct);
-            out.getFD().sync();
+        try {
+            try (FileOutputStream out = new FileOutputStream(tmp)) {
+                out.write(FORMAT);
+                out.write(iv);
+                out.write(ct);
+                out.getFD().sync();
+            }
+            Files.move(tmp.toPath(), new File(dir, RECORD).toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException | RuntimeException e) {
+            tmp.delete(); // a failed write leaves no temporary file with ciphertext behind
+            throw e;
         }
-        Files.move(tmp.toPath(), new File(dir, RECORD).toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
     /** Null when no record exists; throws when the file cannot be decrypted or parsed (REQ-043.3). */

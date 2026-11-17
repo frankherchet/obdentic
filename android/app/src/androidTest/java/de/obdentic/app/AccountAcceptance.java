@@ -61,6 +61,7 @@ final class AccountAcceptance {
             invalidClient(context);
             disconnect(context);
             raceWithDisconnect(context);
+            reviewFindings(context);
             nothingWithoutAccount(context);
             requestsAreMinimal(context);
             manifestPermissions(context);
@@ -787,6 +788,197 @@ final class AccountAcceptance {
             SystemClock.sleep(300);
             require(out[0].value == null && y.store.load() == null && y.account.snapshot().status == ChatGptAccount.Status.NOT_CONNECTED, "REQ-043.13 disconnect during a refresh: the new token is never stored or returned");
         } finally { collect(y); y.close(); }
+    }
+
+    // ---------------------------------------------------------------- independent security review of #347
+
+    private static void reviewFindings(Context ctx) throws Exception {
+        refreshNeedsDurableWrite(ctx);
+        staleRefreshAfterDisconnect(ctx);
+        reauthorizationKeepsTheSubject(ctx);
+        noRefreshBeforeEarliest(ctx);
+        listenerIsBounded();
+        cancelBeforeTheListenerExists(ctx);
+        failedInitialStorage(ctx);
+    }
+
+    /** REQ-043.5: a rotated credential that is not durably stored is not delivered and not adopted. */
+    private static void refreshNeedsDurableWrite(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            f.connect();
+            AccountStore.Record before = f.store.load();
+            f.auth.clock.addAndGet(3500 * 1000L);
+            f.store.failSave = true;
+            ChatGptAccount.Token t = f.account.accessToken();
+            require(t.value == null && t.failure == ChatGptAccount.Failure.UNREACHABLE, "REQ-043.5 a refresh whose write fails delivers no token: " + t.value + " " + t.failure);
+            f.store.failSave = false;
+            require(f.store.load().refreshToken.equals(before.refreshToken), "REQ-043.5 the stored record is unchanged after the failed write");
+            ChatGptAccount.Token again = f.account.accessToken();
+            require(again.value != null && f.auth.to(TOKEN_URL).get(f.auth.count(TOKEN_URL) - 1).form.get("refresh_token").equals(before.refreshToken),
+                "REQ-043.5 the in-memory record stayed consistent with storage: the next refresh uses the stored refresh token");
+            require(f.store.load().accessToken.equals(again.value), "REQ-043.5 the retry is stored before it is delivered");
+        } finally { collect(f); f.close(); }
+    }
+
+    /** REQ-043.12/13: a caller paused after it captured the record cannot refresh or store after a disconnect. */
+    private static void staleRefreshAfterDisconnect(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            f.connect();
+            f.auth.clock.addAndGet(3500 * 1000L);
+            CountDownLatch paused = latch(), release = latch();
+            Thread[] caller = new Thread[1];
+            int[] calls = new int[1];
+            f.config.clock = () -> {
+                if (Thread.currentThread() == caller[0] && ++calls[0] == 2) { // after the caller holds the refresh lock and its record
+                    paused.countDown();
+                    try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                }
+                return f.auth.clock.get();
+            };
+            ChatGptAccount.Token[] out = new ChatGptAccount.Token[1];
+            caller[0] = new Thread(() -> out[0] = f.account.accessToken());
+            int requests = f.auth.count(TOKEN_URL);
+            caller[0].start();
+            await(paused);
+            f.account.disconnect();
+            f.waitIdle();
+            release.countDown();
+            caller[0].join(10000);
+            require(out[0] != null && out[0].value == null, "REQ-043.13 a caller paused before the disconnect gets no token");
+            require(f.auth.count(TOKEN_URL) == requests, "REQ-043.13 no refresh request is sent with the superseded record");
+            require(f.store.load() == null && f.account.snapshot().status == ChatGptAccount.Status.NOT_CONNECTED, "REQ-043.12 nothing is stored after the disconnect");
+        } finally { collect(f); f.close(); }
+    }
+
+    /** REQ-042.12: a browser account switch during re-authorization changes nothing. */
+    private static void reauthorizationKeepsTheSubject(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            f.auth.scope = "openid profile email offline_access resource.invoke";
+            f.signInAndWait();
+            AccountStore.Record kept = f.store.load();
+            require(kept != null && !kept.hasPlan(), "inactive record to start from");
+            f.auth.scope = ChatGptAccount.SCOPE;
+            f.auth.subject = "subject-other";
+            f.auth.email = "other@example.test";
+            f.signInAndWait();
+            AccountStore.Record after = f.store.load();
+            require(after.subject.equals(kept.subject) && after.refreshToken.equals(kept.refreshToken) && after.email.equals(kept.email),
+                "REQ-042.12 a re-authorization for another subject leaves the stored account untouched");
+            require(f.account.snapshot().status == ChatGptAccount.Status.PLAN_MISSING && f.account.snapshot().email.equals(kept.email) && !f.account.snapshot().message.isEmpty(),
+                "REQ-042.12 the account stays and the user is told: " + f.account.snapshot().message);
+            String rejected = f.auth.latest("refresh-");
+            waitUntil(() -> f.auth.count(REVOKE_URL) == 1, 5000, "the rejected credential is revoked");
+            require(f.auth.to(REVOKE_URL).get(0).form.get("token").equals(rejected) && !rejected.equals(kept.refreshToken), "REQ-042.12 the rejected refresh token is the one revoked");
+        } finally { collect(f); f.close(); }
+    }
+
+    /** REQ-043.4: nothing is sent between the expiry of the access token and earliest_refresh_at. */
+    private static void noRefreshBeforeEarliest(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            f.auth.earliest = f.auth.now() / 1000 + 7200;
+            f.connect();
+            f.auth.clock.addAndGet(3700 * 1000L); // expired, earliest_refresh_at still ahead
+            int before = f.auth.requests.size();
+            ChatGptAccount.Token t = f.account.accessToken();
+            require(t.value == null && f.auth.requests.size() == before, "REQ-043.4 no refresh request between expiry and earliest_refresh_at: " + t.value);
+            require(f.store.load() != null, "REQ-043.4 the credential is kept meanwhile");
+            f.auth.earliest = null;
+            f.auth.clock.addAndGet(3600 * 1000L);
+            require(f.account.accessToken().value != null && f.auth.count(TOKEN_URL) == 2, "REQ-043.4 refresh once earliest_refresh_at has passed");
+        } finally { collect(f); f.close(); }
+    }
+
+    /** REQ-042.3: bounded handlers, an absolute request deadline, accepted sockets closed with the attempt. */
+    private static void listenerIsBounded() throws Exception {
+        LoopbackListener l = LoopbackListener.open(0, 60_000, true);
+        int port = l.port();
+        List<Socket> idle = new ArrayList<>();
+        try {
+            for (int i = 0; i < 40; i++) idle.add(new Socket("127.0.0.1", port));
+            SystemClock.sleep(300);
+            int handlers = 0;
+            for (Thread t : Thread.getAllStackTraces().keySet()) if (t.getName().equals("account-callback-connection") && t.isAlive()) handlers++;
+            require(handlers <= 8, "REQ-042.3 concurrent connection handlers are bounded: " + handlers);
+
+            // a request that drips bytes is cut at an absolute deadline
+            Socket slow = new Socket("127.0.0.1", port);
+            slow.setSoTimeout(500);
+            long start = SystemClock.elapsedRealtime();
+            boolean closed = false;
+            try {
+                while (SystemClock.elapsedRealtime() - start < 9000 && !closed) {
+                    try { slow.getOutputStream().write('G'); slow.getOutputStream().flush(); } catch (IOException e) { closed = true; break; }
+                    try { if (slow.getInputStream().read() < 0) closed = true; } catch (SocketTimeoutException drip) { /* still open */ } catch (IOException e) { closed = true; }
+                }
+            } finally { slow.close(); }
+            require(closed && SystemClock.elapsedRealtime() - start < 8000, "REQ-042.3 a dripping request ends at the absolute deadline");
+        } finally {
+            Socket held = new Socket("127.0.0.1", port);
+            l.close();
+            held.setSoTimeout(1000);
+            boolean eof;
+            try { eof = held.getInputStream().read() < 0; } catch (SocketTimeoutException e) { eof = false; } catch (IOException e) { eof = true; }
+            require(eof, "REQ-042.3 closing the attempt closes accepted connections");
+            held.close();
+            for (Socket s : idle) s.close();
+        }
+    }
+
+    /** REQ-042.5: a cancel while the listener is still being created ends the attempt without a browser launch. */
+    private static void cancelBeforeTheListenerExists(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            CountDownLatch entered = latch(), release = latch();
+            LoopbackListener[] made = new LoopbackListener[1];
+            f.config.opener = (port, timeout, link) -> {
+                entered.countDown();
+                try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                made[0] = LoopbackListener.open(port, timeout, link);
+                return made[0];
+            };
+            require(f.account.signIn() && f.account.snapshot().phase == ChatGptAccount.Phase.WAITING, "sign-in shows waiting");
+            await(entered);
+            f.account.cancel();
+            release.countDown();
+            f.waitIdle();
+            require(f.browser.opened.isEmpty(), "REQ-042.5 no browser is launched after the cancel");
+            require(f.account.snapshot().message.contains("abgebrochen") && f.auth.count(TOKEN_URL) == 0 && f.store.load() == null, "REQ-042.5 cancelled: " + f.account.snapshot().message);
+            waitUntil(() -> made[0] != null && canBind(made[0].port()), 1000, "REQ-042.3 the late listener is released");
+            waitUntil(() -> f.keepalive.stops.get() == 1, 3000, "REQ-044.5 keep-alive stopped");
+        } finally { collect(f); f.close(); }
+    }
+
+    /** REQ-042.8: an obtained grant that cannot be stored is revoked, nothing is left behind, a previous inactive record stays. */
+    private static void failedInitialStorage(Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        File blocker = new File(f.store.directory(), "credential.bin");
+        try {
+            require(blocker.mkdirs() && new File(blocker, "x").createNewFile(), "test setup: a non-empty directory blocks the final rename");
+            f.signInAndWait();
+            require(f.account.snapshot().status == ChatGptAccount.Status.NOT_CONNECTED && f.account.snapshot().message.equals("Anmeldung konnte nicht gespeichert werden"), "REQ-042.8 storage failure reported: " + f.account.snapshot().message);
+            String grant = f.auth.latest("refresh-");
+            waitUntil(() -> f.auth.count(REVOKE_URL) == 1 && f.auth.to(REVOKE_URL).get(0).form.get("token").equals(grant), 5000, "REQ-042.8 the obtained grant is revoked");
+            require(!new File(f.store.directory(), "credential.bin.tmp").exists() && !keyExists(f), "REQ-042.8 no temporary file and no Keystore key remain");
+            require(f.store.clientId() == null, "REQ-042.8 no client id kept for a sign-in that was not stored");
+        } finally { deleteTree(blocker); collect(f); f.close(); }
+
+        Fixture g = new Fixture(ctx);
+        try {
+            g.auth.scope = "openid profile email offline_access resource.invoke";
+            g.signInAndWait();
+            AccountStore.Record kept = g.store.load();
+            g.auth.scope = ChatGptAccount.SCOPE;
+            g.store.failSave = true;
+            g.signInAndWait();
+            g.store.failSave = false;
+            require(g.store.load().refreshToken.equals(kept.refreshToken) && g.account.snapshot().status == ChatGptAccount.Status.PLAN_MISSING, "REQ-042.8 the previous inactive record is preserved");
+            String grant = g.auth.latest("refresh-");
+            waitUntil(() -> g.auth.count(REVOKE_URL) == 1 && g.auth.to(REVOKE_URL).get(0).form.get("token").equals(grant) && !grant.equals(kept.refreshToken), 5000, "REQ-042.8 the unstored grant is revoked, the kept one is not");
+        } finally { collect(g); g.close(); }
     }
 
     // ---------------------------------------------------------------- REQ-044
