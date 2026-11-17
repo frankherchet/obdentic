@@ -387,14 +387,17 @@ disconnect confirmation, and when a caller (the assistant, #328) asks for an acc
   host id and the issued client id remain; the Keystore key is deleted. No token, e-mail address, authorization code, verifier, state,
   nonce, URL or header is ever logged: events use a fixed vocabulary and the log masking also replaces JWT-shaped and `Bearer` text.
 - **Refresh:** an access token valid for at least 300 s is used as is; otherwise one serialized refresh (never before
-  `earliest_refresh_at`, also after the access token expired) rotates the tokens, and the complete new record is written before the caller gets the
-  new token. Refresh tokens are single use, so a failed write does not discard the rotated record: it is the only valid one and stays in memory, the
-  access token is delivered, the write is retried on every later access (before any further refresh) and a sign-out revokes the newest
-  token; only an app that dies before a retry succeeds is left with a stored token that has been spent (it then ends as *Anmeldung abgelaufen*). HTTP 400/401
-  with a terminal code deletes the tokens at once; network errors, timeouts, 429 and 5xx keep them and retry only on the next request.
+  `earliest_refresh_at`, also after the access token expired) rotates the tokens. Before sending a refresh, the encrypted record
+  is atomically saved with `rotation_pending: true`; a failed marker
+  write sends no request. A valid replacement clears the marker in the same atomic record write. If that write fails, the newest
+  tokens remain in memory, the access token is delivered and storage is retried on later access. After process death, a pending
+  marker means the stored token may already be spent: even HTTP 200 for its revocation cannot confirm that the replacement grant
+  was revoked. Lost responses retain the marker too. HTTP 400/401 with a terminal code deletes the tokens at once; network errors,
+  timeouts, 429 and 5xx keep them and retry only on the next request.
 - **Disconnect:** asks first, revokes the refresh token at the discovery document's `revocation_endpoint` (up to three attempts, 1 s and
-  3 s apart, 10 s timeouts) and deletes the credentials locally in every case; an unconfirmed revocation is said so. Disconnecting
-  cancels any sign-in or refresh in progress.
+  3 s apart, 10 s timeouts) and deletes the credentials locally in every case. An unconfirmed revocation is stated explicitly,
+  including unresolved rotation after a restart, with an actionable **Manage usage** link even while disconnected.
+  Disconnecting cancels any sign-in or refresh in progress.
 - **`INTERNET` and the sign-in service:** `INTERNET` is declared as one single-line tag (`tools/verify-release-apk.sh` compares single-line
   tags and now refuses a split tag), cleartext traffic stays disabled, and the only use is HTTPS to `auth.openai.com` (discovery, keys,
   token, revocation). While a sign-in waits for the browser a foreground service of type `dataSync` (`SignInService`, notification

@@ -794,6 +794,7 @@ final class AccountAcceptance {
 
     private static void reviewFindings(Context ctx) throws Exception {
         refreshNeedsDurableWrite(ctx);
+        rotationSurvivesRestart(ctx);
         cancelAfterTheCallbackArrived(ctx);
         oldAttemptDoesNotStopTheNewService(ctx);
         staleRefreshAfterDisconnect(ctx);
@@ -811,7 +812,7 @@ final class AccountAcceptance {
             f.connect();
             AccountStore.Record before = f.store.load();
             f.auth.clock.addAndGet(3500 * 1000L);
-            f.store.failSave = true;
+            f.auth.token = r -> { f.store.failSave = true; return f.auth.issue(r); };
             ChatGptAccount.Token t = f.account.accessToken();
             require(t.value != null && !t.value.equals(before.accessToken), "REQ-043.5 the rotated access token is delivered although the write failed: " + t.failure);
             require(f.store.load().refreshToken.equals(before.refreshToken) && f.account.snapshot().status == ChatGptAccount.Status.CONNECTED, "the failed write left the file alone");
@@ -829,7 +830,7 @@ final class AccountAcceptance {
         try {
             g.connect();
             g.auth.clock.addAndGet(3500 * 1000L);
-            g.store.failSave = true;
+            g.auth.token = r -> { g.store.failSave = true; return g.auth.issue(r); };
             require(g.account.accessToken().value != null, "rotated with a failed write");
             String newest = g.auth.latest("refresh-");
             g.account.disconnect();
@@ -837,6 +838,51 @@ final class AccountAcceptance {
             waitUntil(() -> g.auth.count(REVOKE_URL) == 1, 5000, "the sign-out revokes");
             require(g.auth.to(REVOKE_URL).get(0).form.get("token").equals(newest), "REQ-043.10 the newest refresh token is the one revoked");
         } finally { collect(g); g.close(); }
+    }
+
+    /** REQ-043.5/.10/.11: durable uncertainty prevents a spent token's HTTP 200 from claiming revocation. */
+    private static void rotationSurvivesRestart(Context ctx) throws Exception {
+        for (String failure : new String[]{"replacement_write", "lost_response", "before_response", "marker_write", "none", "recovered"}) {
+            Fixture f = new Fixture(ctx);
+            try {
+                f.connect();
+                AccountStore.Record original = f.store.load();
+                org.json.JSONObject legacy = original.toJson();
+                legacy.remove("rotation_pending");
+                require(!AccountStore.Record.fromJson(legacy).rotationPending, "REQ-043.5 old records load without uncertainty");
+                f.auth.clock.addAndGet(3500 * 1000L);
+                int before = f.auth.count(TOKEN_URL);
+                f.store.failSave = failure.equals("marker_write");
+                f.auth.token = r -> {
+                    try {
+                        require(f.store.load().rotationPending, "REQ-043.5 marker is durable before the request");
+                        if (failure.equals("before_response")) throw new IOException("connection lost before response");
+                        AccountHttp.Response response = f.auth.issue(r);
+                        f.store.failSave = failure.equals("replacement_write") || failure.equals("recovered");
+                        if (failure.equals("lost_response")) throw new IOException("response lost after rotation");
+                        return response;
+                    } catch (IOException e) { throw e; } catch (Exception e) { throw new IOException(e); }
+                };
+                f.account.accessToken();
+                if (failure.equals("marker_write"))
+                    require(f.auth.count(TOKEN_URL) == before && !f.store.load().rotationPending, "REQ-043.5 no rotation without a durable marker");
+                f.store.failSave = false;
+                if (failure.equals("recovered")) f.account.accessToken();
+                boolean uncertain = failure.equals("replacement_write") || failure.equals("lost_response") || failure.equals("before_response");
+                // New store and engine: no in-memory pending record or store cache can rescue the rotated token.
+                f.config.store = new AccountStore(ctx, f.store.directory().getName());
+                ChatGptAccount restarted = f.restarted();
+                require(f.config.store.load().rotationPending == uncertain, "REQ-043.5 restart sees durable rotation state: " + failure);
+                restarted.disconnect();
+                waitUntil(() -> restarted.snapshot().phase == ChatGptAccount.Phase.IDLE, 15000, "restarted disconnect");
+                require(restarted.snapshot().revocationUnconfirmed == uncertain, "REQ-043.11 revocation certainty after " + failure);
+                require(restarted.snapshot().message.equals(uncertain ? ChatGptAccount.MSG_UNCONFIRMED : ChatGptAccount.MSG_REVOKED),
+                    "REQ-043.11 no false revocation assurance after " + failure);
+                if (failure.equals("replacement_write") || failure.equals("lost_response"))
+                    require(f.auth.live.contains(f.auth.latest("refresh-")), "REQ-043.11 the lost replacement grant really remains on the server");
+                assertDeleted(f, true, "REQ-043.12 restart after " + failure);
+            } finally { collect(f); f.close(); }
+        }
     }
 
     /** REQ-042.5: a cancel wins over a callback that already arrived. */
@@ -980,14 +1026,18 @@ final class AccountAcceptance {
             } finally { slow.close(); }
             require(closed && SystemClock.elapsedRealtime() - start < 8000, "REQ-042.3 a dripping request ends at the absolute deadline");
         } finally {
-            Socket held = new Socket("127.0.0.1", port);
-            l.close();
-            held.setSoTimeout(1000);
-            boolean eof;
-            try { eof = held.getInputStream().read() < 0; } catch (SocketTimeoutException e) { eof = false; } catch (IOException e) { eof = true; }
-            require(eof, "REQ-042.3 closing the attempt closes accepted connections");
-            held.close();
             for (Socket s : idle) s.close();
+            try {
+                waitUntil(() -> l.acceptedCount() == 0, 5000, "speculative connections drained");
+                try (Socket held = new Socket("127.0.0.1", port)) {
+                    waitUntil(() -> l.acceptedCount() == 1, 1000, "held socket accepted before close");
+                    l.close();
+                    held.setSoTimeout(1000);
+                    boolean eof;
+                    try { eof = held.getInputStream().read() < 0; } catch (SocketTimeoutException e) { eof = false; } catch (IOException e) { eof = true; }
+                    require(eof, "REQ-042.3 closing the attempt closes accepted connections");
+                }
+            } finally { l.close(); }
         }
     }
 

@@ -78,6 +78,9 @@ final class LoopbackListener implements Closeable {
     /** The first callback's parameters (code, state, error, client_id); fails with TimeoutException or CancellationException. */
     CompletableFuture<Map<String, String>> result() { return result; }
 
+    /** Test synchronization: a TCP handshake alone does not mean accept() has registered its socket. */
+    int acceptedCount() { synchronized (accepted) { return accepted.size(); } }
+
     /** Ends the attempt: the port is released and a pending result is cancelled. */
     @Override public void close() {
         synchronized (this) { done = true; }

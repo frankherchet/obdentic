@@ -219,6 +219,7 @@ public class MainActivity extends Activity {
         if(s.status==ChatGptAccount.Status.PLAN_MISSING)note(c,"Die Anmeldung ist gespeichert, aber die Nutzung deines ChatGPT-Plans ist noch nicht erlaubt. Der Assistent bleibt inaktiv. Erlaube die Plan-Nutzung im Browser, wenn du erneut fortfährst.",MUTED);
         if(s.status==ChatGptAccount.Status.CONNECTED)c.addView(new PlanIndicatorView(this,account));
         if(!s.message.isEmpty()&&!s.message.equals(s.status.label))note(c,s.message,MUTED);
+        if(s.revocationUnconfirmed)addButton(c,"Manage usage",()->{if(!account.openUsage())new AlertDialog.Builder(this).setMessage("Kein Browser gefunden · ChatGPT-Einstellungen konnten nicht geöffnet werden").setPositiveButton("OK",null).show();});
         if(s.phase==ChatGptAccount.Phase.WAITING)note(c,"Warte auf den Browser … Melde dich dort an und kehre dann zu OBDentic zurück.",ACCENT);
         if(s.phase==ChatGptAccount.Phase.EXCHANGING)note(c,"Anmeldung wird abgeschlossen …",ACCENT);
         boolean offerSignIn=s.status==ChatGptAccount.Status.NOT_CONNECTED||s.status==ChatGptAccount.Status.EXPIRED||s.status==ChatGptAccount.Status.PLAN_MISSING;

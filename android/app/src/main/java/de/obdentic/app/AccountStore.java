@@ -34,9 +34,10 @@ class AccountStore {
     static final class Record {
         final String clientId, accessToken, refreshToken, idToken, scope, email, subject;
         final long expiresAtMs, earliestRefreshMs;
+        final boolean rotationPending;
 
         Record(String clientId, String accessToken, String refreshToken, String idToken, String scope, String email, String subject,
-               long expiresAtMs, long earliestRefreshMs) {
+               long expiresAtMs, long earliestRefreshMs, boolean rotationPending) {
             this.clientId = clientId;
             this.accessToken = accessToken;
             this.refreshToken = refreshToken;
@@ -46,6 +47,7 @@ class AccountStore {
             this.subject = subject;
             this.expiresAtMs = expiresAtMs;
             this.earliestRefreshMs = earliestRefreshMs;
+            this.rotationPending = rotationPending;
         }
 
         /** REQ-042.9: the permission to use the ChatGPT plan is part of the granted scope. */
@@ -58,13 +60,17 @@ class AccountStore {
         }
 
         Record refreshed(String access, String refresh, String newScope, long expiresAt, long earliest) {
-            return new Record(clientId, access, refresh, idToken, newScope, email, subject, expiresAt, earliest);
+            return new Record(clientId, access, refresh, idToken, newScope, email, subject, expiresAt, earliest, false);
+        }
+
+        Record pendingRotation() {
+            return new Record(clientId, accessToken, refreshToken, idToken, scope, email, subject, expiresAtMs, earliestRefreshMs, true);
         }
 
         JSONObject toJson() throws JSONException {
             return new JSONObject().put("v", FORMAT).put("client_id", clientId).put("access_token", accessToken).put("refresh_token", refreshToken)
                 .put("id_token", idToken).put("scope", scope).put("email", email).put("subject", subject)
-                .put("expires_at", expiresAtMs).put("earliest_refresh", earliestRefreshMs);
+                .put("expires_at", expiresAtMs).put("earliest_refresh", earliestRefreshMs).put("rotation_pending", rotationPending);
         }
 
         static Record fromJson(JSONObject o) throws JSONException {
@@ -72,7 +78,7 @@ class AccountStore {
             String access = o.getString("access_token"), refresh = o.getString("refresh_token");
             if (access.isEmpty() || refresh.isEmpty()) throw new JSONException("empty");
             return new Record(o.getString("client_id"), access, refresh, o.getString("id_token"), o.getString("scope"), o.getString("email"),
-                o.getString("subject"), o.getLong("expires_at"), o.getLong("earliest_refresh"));
+                o.getString("subject"), o.getLong("expires_at"), o.getLong("earliest_refresh"), o.optBoolean("rotation_pending", false));
         }
     }
 

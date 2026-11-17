@@ -63,13 +63,15 @@ final class ChatGptAccount {
         final String email, message;
         /** Changes whenever anything shown changes. */
         final long version;
+        final boolean revocationUnconfirmed;
 
-        Snapshot(Status status, Phase phase, String email, String message, long version) {
+        Snapshot(Status status, Phase phase, String email, String message, long version, boolean revocationUnconfirmed) {
             this.status = status;
             this.phase = phase;
             this.email = email;
             this.message = message;
             this.version = version;
+            this.revocationUnconfirmed = revocationUnconfirmed;
         }
     }
 
@@ -146,6 +148,7 @@ final class ChatGptAccount {
     private boolean expired, unreachable, loaded;
     /** True while {@code record} is a rotated credential that storage does not hold yet: the one valid refresh token, retried on every access. */
     private boolean unsaved;
+    private boolean revocationUnconfirmed;
     /** The attempt that started the sign-in service and has not stopped it; only that attempt may stop it. */
     private long keepaliveOwner;
     private AccountStore.Record record;
@@ -189,7 +192,7 @@ final class ChatGptAccount {
             AccountStore.Record r = current();
             Status s = r == null ? (expired ? Status.EXPIRED : Status.NOT_CONNECTED)
                 : !r.hasPlan() ? Status.PLAN_MISSING : unreachable ? Status.UNREACHABLE : Status.CONNECTED;
-            return new Snapshot(s, phase, r == null ? "" : r.email, message, version);
+            return new Snapshot(s, phase, r == null ? "" : r.email, message, version, revocationUnconfirmed);
         }
     }
 
@@ -370,7 +373,7 @@ final class ChatGptAccount {
         }
         long now = config.clock.getAsLong();
         AccountStore.Record rec = new AccountStore.Record(clientId, access, refresh, idToken, t.optString("scope", ""), claims.email, claims.subject,
-            now + t.optLong("expires_in", 0) * 1000L, Oidc.earliestRefreshMs(t.opt("earliest_refresh_at")));
+            now + t.optLong("expires_in", 0) * 1000L, Oidc.earliestRefreshMs(t.opt("earliest_refresh_at")), false);
         AccountStore.Record replaced;
         synchronized (state) {
             if (signInId != id || epoch != startEpoch) { // REQ-043.13: disconnected meanwhile
@@ -560,6 +563,14 @@ final class ChatGptAccount {
     private Token refresh(AccountStore.Record r, long startEpoch) {
         synchronized (state) {
             if (epoch != startEpoch) return new Token(null, Failure.NOT_CONNECTED); // REQ-043.13: disconnected or replaced since the record was read; nothing is sent
+            try {
+                // The old token may be spent as soon as the request leaves, even if its response is lost.
+                AccountStore.Record pending = r.pendingRotation();
+                store.save(pending);
+                record = pending;
+            } catch (Exception e) {
+                return temporary(startEpoch, "rotation_marker_storage");
+            }
         }
         Map<String, String> f = new LinkedHashMap<>();
         f.put("grant_type", "refresh_token");
@@ -618,6 +629,7 @@ final class ChatGptAccount {
     private Token terminal(long startEpoch, String why, boolean dropClientId) {
         synchronized (state) {
             if (epoch == startEpoch) {
+                revocationUnconfirmed |= record != null && record.rotationPending;
                 epoch++;
                 store.deleteRecord();
                 if (dropClientId) store.deleteClientId();
@@ -626,7 +638,7 @@ final class ChatGptAccount {
                 unsaved = false;
                 expired = true;
                 unreachable = false;
-                message = dropClientId ? MSG_INVALID_CLIENT : MSG_EXPIRED;
+                message = (dropClientId ? MSG_INVALID_CLIENT : MSG_EXPIRED) + (revocationUnconfirmed ? " · " + MSG_UNCONFIRMED : "");
                 changed();
             }
         }
@@ -681,7 +693,8 @@ final class ChatGptAccount {
     }
 
     private void runDisconnect(AccountStore.Record r) {
-        boolean confirmed = r != null && revoke(r.refreshToken, r.clientId);
+        boolean revoked = r != null && revoke(r.refreshToken, r.clientId);
+        boolean confirmed = revoked && !r.rotationPending;
         synchronized (state) {
             store.deleteRecord();
             record = null;
@@ -691,7 +704,8 @@ final class ChatGptAccount {
             expired = false;
             unreachable = false;
             phase = Phase.IDLE;
-            message = r == null ? "Nicht verbunden" : confirmed ? MSG_REVOKED : MSG_UNCONFIRMED;
+            revocationUnconfirmed |= r != null && !confirmed;
+            message = revocationUnconfirmed ? MSG_UNCONFIRMED : r == null ? "Nicht verbunden" : MSG_REVOKED;
             changed();
         }
         log("disconnect end revoked=" + confirmed);

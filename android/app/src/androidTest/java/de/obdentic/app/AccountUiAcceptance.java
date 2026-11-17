@@ -216,9 +216,34 @@ final class AccountUiAcceptance {
             ChatGptAccount.install(null);
             f.close();
         }
+        unconfirmedUsageAction(inst, activity, ctx);
         signInService(inst, activity, ctx);
         JSONObject vehicleAfter = service.snapshot();
         require(keys(vehicleBefore).equals(keys(vehicleAfter)), "REQ-044.4 the vehicle service snapshot has the same capabilities with and without account activity: " + keys(vehicleBefore) + " vs " + keys(vehicleAfter));
+    }
+
+    /** REQ-043.11: the cleanup link remains actionable after disconnect, without a connected-plan indicator. */
+    private static void unconfirmedUsageAction(Instrumentation inst, Activity activity, Context ctx) throws Exception {
+        Fixture f = new Fixture(ctx);
+        try {
+            f.connect();
+            f.account.firstUseAcknowledged();
+            f.auth.clock.addAndGet(3500 * 1000L);
+            f.auth.token = r -> { f.store.failSave = true; return f.auth.issue(r); };
+            f.account.accessToken();
+            f.store.failSave = false;
+            ChatGptAccount restarted = f.restarted();
+            ChatGptAccount.install(restarted);
+            restarted.disconnect();
+            waitUntil(() -> restarted.snapshot().phase == ChatGptAccount.Phase.IDLE, 15000, "uncertain disconnect");
+            openAccountSection(inst, activity);
+            waitText(inst, activity, "Widerruf nicht bestätigt", true, "REQ-043.11 uncertainty visible");
+            require(!all(inst, activity).contains("Using ChatGPT plan") && count(inst, activity, "Manage usage") == 1,
+                "REQ-043.11 disconnected cleanup action without plan indicator");
+            click(inst, activity, "Manage usage");
+            require(f.usageOpened.size() == 1 && f.usageOpened.get(0).equals("https://chatgpt.com/settings/usage"),
+                "REQ-043.11 cleanup action opens the usage settings");
+        } finally { ChatGptAccount.install(null); f.close(); }
     }
 
     private static List<String> keys(JSONObject o) {
