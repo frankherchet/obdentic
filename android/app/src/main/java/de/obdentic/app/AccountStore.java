@@ -25,18 +25,18 @@ import org.json.JSONObject;
  * (fresh IV per write, atomic replace), plus the two values that outlive a sign-out: the random host id and the issued client id.
  * App backup and device transfer exclude all of it (manifest and data extraction rules).
  */
-class AccountStore {
+public class AccountStore {
     private static final String TRANSFORM = "AES/GCM/NoPadding";
     private static final int IV_LEN = 12, FORMAT = 1;
     private static final String RECORD = "credential.bin", TEMP = "credential.bin.tmp";
 
     /** The decrypted record. Tokens and account identity live here and nowhere else. */
-    static final class Record {
-        final String clientId, accessToken, refreshToken, idToken, scope, email, subject;
-        final long expiresAtMs, earliestRefreshMs;
-        final boolean rotationPending;
+    public static final class Record {
+        public final String clientId, accessToken, refreshToken, idToken, scope, email, subject;
+        public final long expiresAtMs, earliestRefreshMs;
+        public final boolean rotationPending;
 
-        Record(String clientId, String accessToken, String refreshToken, String idToken, String scope, String email, String subject,
+        public Record(String clientId, String accessToken, String refreshToken, String idToken, String scope, String email, String subject,
                long expiresAtMs, long earliestRefreshMs, boolean rotationPending) {
             this.clientId = clientId;
             this.accessToken = accessToken;
@@ -51,29 +51,29 @@ class AccountStore {
         }
 
         /** REQ-042.9: the permission to use the ChatGPT plan is part of the granted scope. */
-        boolean hasPlan() { return hasPlan(scope); }
+        public boolean hasPlan() { return hasPlan(scope); }
 
-        static boolean hasPlan(String scope) {
+        public static boolean hasPlan(String scope) {
             if (scope == null) return false;
             for (String s : scope.split("\\s+")) if (s.equals(ChatGptAccount.PLAN_SCOPE)) return true;
             return false;
         }
 
-        Record refreshed(String access, String refresh, String newScope, long expiresAt, long earliest) {
+        public Record refreshed(String access, String refresh, String newScope, long expiresAt, long earliest) {
             return new Record(clientId, access, refresh, idToken, newScope, email, subject, expiresAt, earliest, false);
         }
 
-        Record pendingRotation() {
+        public Record pendingRotation() {
             return new Record(clientId, accessToken, refreshToken, idToken, scope, email, subject, expiresAtMs, earliestRefreshMs, true);
         }
 
-        JSONObject toJson() throws JSONException {
+        public JSONObject toJson() throws JSONException {
             return new JSONObject().put("v", FORMAT).put("client_id", clientId).put("access_token", accessToken).put("refresh_token", refreshToken)
                 .put("id_token", idToken).put("scope", scope).put("email", email).put("subject", subject)
                 .put("expires_at", expiresAtMs).put("earliest_refresh", earliestRefreshMs).put("rotation_pending", rotationPending);
         }
 
-        static Record fromJson(JSONObject o) throws JSONException {
+        public static Record fromJson(JSONObject o) throws JSONException {
             if (o.getInt("v") != FORMAT) throw new JSONException("version");
             String access = o.getString("access_token"), refresh = o.getString("refresh_token");
             if (access.isEmpty() || refresh.isEmpty()) throw new JSONException("empty");
@@ -87,19 +87,19 @@ class AccountStore {
     private final SharedPreferences prefs, ui;
 
     /** {@code name} separates independent stores: "account" in the app, a unique name in the acceptance run. */
-    AccountStore(Context context, String name) {
+    public AccountStore(Context context, String name) {
         dir = new File(context.getFilesDir(), name);
         alias = "obdentic-" + name;
         prefs = context.getSharedPreferences(name, Context.MODE_PRIVATE);
         ui = context.getSharedPreferences(name + "-ui", Context.MODE_PRIVATE);
     }
 
-    File directory() { return dir; }
+    public File directory() { return dir; }
 
     // ---------------------------------------------------------------- values kept after sign-out (REQ-043.12)
 
     /** A random id created once and reused for every sign-in (REQ-042.2). */
-    synchronized String hostId() {
+    public synchronized String hostId() {
         String id = prefs.getString("host_id", null);
         if (id == null) {
             id = "urn:uuid:" + UUID.randomUUID();
@@ -109,16 +109,16 @@ class AccountStore {
     }
 
     /** The client id issued by the first registration, or null. */
-    synchronized String clientId() { return prefs.getString("client_id", null); }
+    public synchronized String clientId() { return prefs.getString("client_id", null); }
 
-    synchronized void saveClientId(String clientId) { prefs.edit().putString("client_id", clientId).commit(); }
+    public synchronized void saveClientId(String clientId) { prefs.edit().putString("client_id", clientId).commit(); }
 
-    synchronized void deleteClientId() { prefs.edit().remove("client_id").commit(); }
+    public synchronized void deleteClientId() { prefs.edit().remove("client_id").commit(); }
 
     /** The one-time dialog of REQ-042.11: "" never due, "due" until confirmed, "done" afterwards. Kept outside the account values. */
-    synchronized String firstUse() { return ui.getString("first_use", ""); }
+    public synchronized String firstUse() { return ui.getString("first_use", ""); }
 
-    synchronized void setFirstUse(String value) { ui.edit().putString("first_use", value).commit(); }
+    public synchronized void setFirstUse(String value) { ui.edit().putString("first_use", value).commit(); }
 
     // ---------------------------------------------------------------- the encrypted record
 
@@ -137,7 +137,7 @@ class AccountStore {
     }
 
     /** Writes the record: temporary file, sync, atomic rename. A failure leaves the previous record (or none) and no temporary file. */
-    synchronized void save(Record record) throws GeneralSecurityException, IOException, JSONException {
+    public synchronized void save(Record record) throws GeneralSecurityException, IOException, JSONException {
         Cipher c = Cipher.getInstance(TRANSFORM);
         c.init(Cipher.ENCRYPT_MODE, key()); // the Keystore picks a fresh random IV for every encryption
         byte[] iv = c.getIV();
@@ -159,7 +159,7 @@ class AccountStore {
     }
 
     /** Null when no record exists; throws when the file cannot be decrypted or parsed (REQ-043.3). */
-    synchronized Record load() throws GeneralSecurityException, IOException, JSONException {
+    public synchronized Record load() throws GeneralSecurityException, IOException, JSONException {
         File f = new File(dir, RECORD);
         if (!f.isFile()) return null;
         byte[] all = Files.readAllBytes(f.toPath());
@@ -170,7 +170,7 @@ class AccountStore {
     }
 
     /** Deletes the record file and the Keystore key; host id and client id stay (REQ-043.12). */
-    synchronized void deleteRecord() {
+    public synchronized void deleteRecord() {
         File[] files = dir.listFiles();
         if (files != null) for (File f : files) f.delete();
         dir.delete();
@@ -184,7 +184,7 @@ class AccountStore {
     }
 
     /** Test cleanup: everything of this store. */
-    synchronized void deleteAll() {
+    public synchronized void deleteAll() {
         deleteRecord();
         prefs.edit().clear().commit();
         ui.edit().clear().commit();

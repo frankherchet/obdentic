@@ -18,15 +18,15 @@ import java.io.File;
  * network-allowed state. It is started only by the tap on 'Continue with ChatGPT', stopped when the attempt ends, and never runs otherwise.
  */
 public final class SignInService extends Service {
-    static final String CHANNEL = "account";
-    static final String TITLE = "ChatGPT-Anmeldung läuft";
-    static final int NOTIFICATION_ID = 2;
+    public static final String CHANNEL = "account";
+    public static final String TITLE = "ChatGPT-Anmeldung läuft";
+    public static final int NOTIFICATION_ID = 2;
     /** Debug builds only: with this file in the app's files directory the service is not started (phone measurement of REQ-044.6). */
-    static final String DEBUG_SWITCH = "debug-no-signin-service";
-    static volatile boolean running;
+    public static final String DEBUG_SWITCH = "debug-no-signin-service";
+    public static volatile boolean running;
 
     /** Starts the service from the visible app. */
-    static void start(Context app) {
+    public static void start(Context app) {
         if (disabledForMeasurement(app)) return;
         try {
             app.startForegroundService(new Intent(app, SignInService.class));
@@ -35,11 +35,11 @@ public final class SignInService extends Service {
         }
     }
 
-    static void stop(Context app) {
+    public static void stop(Context app) {
         app.stopService(new Intent(app, SignInService.class));
     }
 
-    static boolean disabledForMeasurement(Context context) {
+    public static boolean disabledForMeasurement(Context context) {
         return (context.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0 && new File(context.getFilesDir(), DEBUG_SWITCH).exists();
     }
 

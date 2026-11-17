@@ -17,24 +17,24 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 /** Pure OAuth/OIDC helpers (REQ-042.2, REQ-042.8): random values, PKCE, callback parsing and ID-token validation. No I/O. */
-final class Oidc {
+public final class Oidc {
     private static final SecureRandom RNG = new SecureRandom();
     private static final Base64.Encoder B64URL = Base64.getUrlEncoder().withoutPadding();
     /** REQ-042.8: clock leeway for the ID-token expiry. */
-    static final long LEEWAY_MS = 60_000;
+    public static final long LEEWAY_MS = 60_000;
     private static final int MIN_RSA_BITS = 2048;
 
     private Oidc() {}
 
     /** 32 random bytes, base64url: state, nonce, PKCE verifier and the host id suffix. */
-    static String random() {
+    public static String random() {
         byte[] b = new byte[32];
         RNG.nextBytes(b);
         return B64URL.encodeToString(b);
     }
 
     /** PKCE S256. */
-    static String challenge(String verifier) {
+    public static String challenge(String verifier) {
         try {
             return B64URL.encodeToString(MessageDigest.getInstance("SHA-256").digest(verifier.getBytes(StandardCharsets.US_ASCII)));
         } catch (GeneralSecurityException e) {
@@ -42,12 +42,12 @@ final class Oidc {
         }
     }
 
-    static boolean same(String a, String b) {
+    public static boolean same(String a, String b) {
         return a != null && b != null && MessageDigest.isEqual(a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
     }
 
     /** First value of every key of a query string; malformed pairs are skipped. */
-    static Map<String, String> query(String raw) {
+    public static Map<String, String> query(String raw) {
         Map<String, String> out = new HashMap<>();
         if (raw == null) return out;
         int pairs = 0;
@@ -66,7 +66,7 @@ final class Oidc {
     }
 
     /** REQ-044.2: an endpoint taken from the discovery document must be HTTPS on the account host (default port, no user info). */
-    static boolean sameHostHttps(String url, String host) {
+    public static boolean sameHostHttps(String url, String host) {
         try {
             URI u = new URI(url);
             return "https".equals(u.getScheme()) && host.equals(u.getHost()) && (u.getPort() == -1 || u.getPort() == 443) && u.getUserInfo() == null;
@@ -76,7 +76,7 @@ final class Oidc {
     }
 
     /** Parses {@code earliest_refresh_at}: epoch seconds or milliseconds, or an ISO-8601 instant; 0 when absent or unreadable. */
-    static long earliestRefreshMs(Object value) {
+    public static long earliestRefreshMs(Object value) {
         try {
             if (value instanceof Number) {
                 long n = ((Number) value).longValue();
@@ -94,20 +94,20 @@ final class Oidc {
     }
 
     /** Claims taken from a validated ID token. */
-    static final class IdToken {
-        final String subject, email;
+    public static final class IdToken {
+        public final String subject, email;
 
-        IdToken(String subject, String email) {
+        public IdToken(String subject, String email) {
             this.subject = subject;
             this.email = email;
         }
     }
 
     /** Thrown with a cause from a fixed vocabulary: format, algorithm, key, signature, issuer, audience, expired, nonce, subject. */
-    static final class Invalid extends Exception {
-        final String cause;
+    public static final class Invalid extends Exception {
+        public final String cause;
 
-        Invalid(String cause) {
+        public Invalid(String cause) {
             super(cause);
             this.cause = cause;
         }
@@ -121,7 +121,7 @@ final class Oidc {
      * REQ-042.8: RS256 signature against a key of {@code jwks}, issuer, audience containing the client id, expiry in the
      * future (60 s leeway), nonce and a subject.
      */
-    static IdToken validateIdToken(String jwt, JSONObject jwks, String issuer, String clientId, String nonce, long nowMs) throws Invalid {
+    public static IdToken validateIdToken(String jwt, JSONObject jwks, String issuer, String clientId, String nonce, long nowMs) throws Invalid {
         if (jwt == null) throw new Invalid("format");
         String[] p = jwt.split("\\.", -1);
         if (p.length != 3 || p[2].isEmpty()) throw new Invalid("format");

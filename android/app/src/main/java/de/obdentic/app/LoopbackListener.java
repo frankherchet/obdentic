@@ -24,15 +24,15 @@ import java.util.concurrent.TimeoutException;
  * REQ-042.3: the OAuth redirect target. Binds only 127.0.0.1, serves one static page for {@code GET /auth/callback},
  * answers everything else with 404 without ending the attempt, and closes after the first callback, the timeout or {@link #close()}.
  */
-final class LoopbackListener implements Closeable {
-    static final String PATH = "/auth/callback";
+public final class LoopbackListener implements Closeable {
+    public static final String PATH = "/auth/callback";
     /** The link of the callback page carries no parameters; the app takes no value from it (REQ-042.6). */
-    static final String RETURN_LINK = "obdentic://account";
+    public static final String RETURN_LINK = "obdentic://account";
     private static final int HEAD_LIMIT = 8192;
     /** Connections served at the same time; more are closed at once (a browser needs one, speculative connections a few). */
-    static final int MAX_HANDLERS = 8;
+    public static final int MAX_HANDLERS = 8;
     /** Absolute time one request may take from accept to the end of its head. */
-    static final long REQUEST_DEADLINE_MS = 3000;
+    public static final long REQUEST_DEADLINE_MS = 3000;
 
     private final ServerSocket server;
     private final CompletableFuture<Map<String, String>> result = new CompletableFuture<>();
@@ -46,7 +46,7 @@ final class LoopbackListener implements Closeable {
     }
 
     /** Opens the listener on {@code preferredPort}, or on another free port when that one is taken. */
-    static LoopbackListener open(int preferredPort, long timeoutMs, boolean returnLink) throws IOException {
+    public static LoopbackListener open(int preferredPort, long timeoutMs, boolean returnLink) throws IOException {
         InetAddress lo = InetAddress.getByAddress(new byte[]{127, 0, 0, 1});
         ServerSocket s;
         try {
@@ -73,13 +73,13 @@ final class LoopbackListener implements Closeable {
         return s;
     }
 
-    int port() { return server.getLocalPort(); }
+    public int port() { return server.getLocalPort(); }
 
     /** The first callback's parameters (code, state, error, client_id); fails with TimeoutException or CancellationException. */
-    CompletableFuture<Map<String, String>> result() { return result; }
+    public CompletableFuture<Map<String, String>> result() { return result; }
 
     /** Test synchronization: a TCP handshake alone does not mean accept() has registered its socket. */
-    int acceptedCount() { synchronized (accepted) { return accepted.size(); } }
+    public int acceptedCount() { synchronized (accepted) { return accepted.size(); } }
 
     /** Ends the attempt: the port is released and a pending result is cancelled. */
     @Override public void close() {
@@ -181,7 +181,7 @@ final class LoopbackListener implements Closeable {
     }
 
     /** Static page: never echoes the code, state or error (REQ-042.3). */
-    String page() {
+    public String page() {
         return "<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             + "<title>OBDentic</title></head><body><p>Anmeldung \u00fcbermittelt.</p>"
             + (returnLink ? "<p><a href=\"" + RETURN_LINK + "\">Zur\u00fcck zu OBDentic</a></p>" : "<p>Wechsle jetzt zur\u00fcck zur App OBDentic.</p>")

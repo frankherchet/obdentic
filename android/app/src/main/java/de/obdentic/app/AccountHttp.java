@@ -15,54 +15,54 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /** REQ-042.7, REQ-044.2: the only network code of the ChatGPT account. Platform HTTPS only, no redirects, bounded reads. */
-final class AccountHttp {
+public final class AccountHttp {
     /** REQ-042.7: responses are read up to 1 MiB. */
-    static final int LIMIT = 1 << 20;
-    static final int LONG_TIMEOUT_MS = 30_000;
+    public static final int LIMIT = 1 << 20;
+    public static final int LONG_TIMEOUT_MS = 30_000;
 
     private AccountHttp() {}
 
     /** One request; {@code body} is form encoded, null for a GET. */
-    static final class Request {
-        final String method, url, body;
-        final int timeoutMs;
+    public static final class Request {
+        public final String method, url, body;
+        public final int timeoutMs;
 
-        Request(String method, String url, String body, int timeoutMs) {
+        public Request(String method, String url, String body, int timeoutMs) {
             this.method = method;
             this.url = url;
             this.body = body;
             this.timeoutMs = timeoutMs;
         }
 
-        static Request get(String url, int timeoutMs) { return new Request("GET", url, null, timeoutMs); }
+        public static Request get(String url, int timeoutMs) { return new Request("GET", url, null, timeoutMs); }
 
-        static Request post(String url, Map<String, String> form, int timeoutMs) throws IOException {
+        public static Request post(String url, Map<String, String> form, int timeoutMs) throws IOException {
             return new Request("POST", url, form(form), timeoutMs);
         }
     }
 
-    static final class Response {
-        final int status;
-        final String body;
+    public static final class Response {
+        public final int status;
+        public final String body;
         /** The server sent more than {@link #LIMIT} bytes; {@link #body} holds the first part only. */
-        final boolean truncated;
+        public final boolean truncated;
 
-        Response(int status, String body, boolean truncated) {
+        public Response(int status, String body, boolean truncated) {
             this.status = status;
             this.body = body == null ? "" : body;
             this.truncated = truncated;
         }
 
-        boolean ok() { return status >= 200 && status < 300 && !truncated; }
+        public boolean ok() { return status >= 200 && status < 300 && !truncated; }
 
         /** The JSON body, or null when it is not a complete JSON object. */
-        JSONObject json() {
+        public JSONObject json() {
             if (truncated) return null;
             try { return new JSONObject(body); } catch (JSONException e) { return null; }
         }
 
         /** Error code of an error response ("error":"x" or "error":{"code":"x"}); "" when absent or not a valid code. */
-        String errorCode() {
+        public String errorCode() {
             JSONObject o = json();
             if (o == null) return "";
             Object e = o.opt("error");
@@ -72,7 +72,7 @@ final class AccountHttp {
     }
 
     /** REQ-042.7: at most 64 characters from letters, digits and '_.:-'. */
-    static boolean validCode(String code) {
+    public static boolean validCode(String code) {
         if (code == null || code.isEmpty() || code.length() > 64) return false;
         for (int i = 0; i < code.length(); i++) {
             char c = code.charAt(i);
@@ -81,12 +81,12 @@ final class AccountHttp {
         return true;
     }
 
-    interface Transport {
+    public interface Transport {
         /** Throws an IOException for every network level failure (no connection, timeout, TLS, not HTTPS). */
         Response send(Request request) throws IOException;
     }
 
-    static String form(Map<String, String> params) throws IOException {
+    public static String form(Map<String, String> params) throws IOException {
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, String> e : params.entrySet()) {
             if (sb.length() > 0) sb.append('&');
@@ -96,13 +96,13 @@ final class AccountHttp {
     }
 
     /** HttpsURLConnection transport. The two optional arguments exist only for the local test server of the acceptance run. */
-    static final class HttpsTransport implements Transport {
+    public static final class HttpsTransport implements Transport {
         private final SSLSocketFactory sockets;
         private final HostnameVerifier names;
 
-        HttpsTransport() { this(null, null); }
+        public HttpsTransport() { this(null, null); }
 
-        HttpsTransport(SSLSocketFactory sockets, HostnameVerifier names) {
+        public HttpsTransport(SSLSocketFactory sockets, HostnameVerifier names) {
             this.sockets = sockets;
             this.names = names;
         }

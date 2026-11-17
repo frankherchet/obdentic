@@ -102,7 +102,7 @@ public class MainActivity extends Activity {
     private Button chip;
     private TextView debugLog;
     /** The account dialogs, for the phone acceptance. */
-    volatile Dialog firstUseDialog, disconnectDialog;
+    public volatile Dialog firstUseDialog, disconnectDialog;
     private int tab=0;
     private static final int SHOWN_RECORDS=30;
     private String shownRecords(){JSONArray r=array("records"),shown=new JSONArray();for(int i=0;i<Math.min(r.length(),SHOWN_RECORDS);i++)shown.put(r.opt(i));return shown.toString();}
