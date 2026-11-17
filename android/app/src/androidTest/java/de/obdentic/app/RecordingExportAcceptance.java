@@ -47,6 +47,15 @@ final class RecordingExportAcceptance {
             RecordingExporter.setAuto(context, false); RecordingExporter.setFolder(context, "");
             require(!RecordingExporter.auto(context), "REQ-018.4 flag can be turned off again");
 
+            // Own the completed fixtures: a fresh install must not depend on files left by earlier acceptance steps/runs.
+            for (int i = 0; i < 3; i++) {
+                service.startRecording("engine-drive");
+                waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "completed export fixture starts");
+                created.add(service.snapshot().getString("recording"));
+                service.stopRecording();
+                waitFor(() -> service.snapshot().optString("recording").isEmpty(), "completed export fixture closes");
+            }
+
             // REQ-018.3: an active recording exists while exporting
             service.startRecording("engine-drive");
             waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "export test recording starts");
