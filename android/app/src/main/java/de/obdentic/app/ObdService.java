@@ -269,6 +269,7 @@ public final class ObdService extends Service {
     }
     /** REQ-020.3: once a second until the pause is over; shows when the next attempt follows. */
     private void retryTick() {
+        if(policy.state()!=ReconnectPolicy.State.WAITING) return; // a queued timer is obsolete after stop, switch-off, blocking or a new connection
         long left=nextAttemptAt-SystemClock.elapsedRealtime();
         if(left > 0) {
             if(phase().equals("error")) message(retryNote+" · neuer Versuch in "+(left+999)/1000+" s"+(pendingProfile.isEmpty() ? "" : " · Aufnahme wird fortgesetzt"),false); // REQ-029.7: the countdown is not logged

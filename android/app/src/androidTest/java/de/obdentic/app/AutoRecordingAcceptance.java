@@ -47,6 +47,8 @@ final class AutoRecordingAcceptance {
             service.disconnect(); waitFor(() -> service.snapshot().optString("autoRecording").isEmpty(), "recording closed on disconnect");
             JSONObject end = new JSONObject(lastLine(firstFile));
             require(end.optString("type").equals("session_end") && end.optString("reason").equals("disconnected"), "REQ-028.2 session_end on disconnect: " + end);
+            // The close seals the app log after the recording state clears; baseline only once that seal is visible.
+            waitFor(() -> { for (File f : AppLog.sealed()) if (new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8).contains("rec end " + first + " reason disconnected")) return true; return false; }, "the previous connection's log is sealed");
 
             // REQ-028.12: an attempt that never reaches the adapter writes no file and seals no log
             reachable[0] = false; Set<String> beforeFail = names(dir); List<File> sealedBefore = AppLog.sealed();

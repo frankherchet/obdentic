@@ -56,13 +56,23 @@ final class AppLogAcceptance {
             File blocked = new File(context.getCacheDir(), "applog-blocked-" + System.nanoTime()); require(blocked.createNewFile(), "test setup: a file where the log folder should be");
             AppLog.setDirectory(blocked); AppLog.i("unit", "ignored"); AppLog.e("unit", "ignored", new IOException("x")); AppLog.seal();
             service.connect(ADAPTER); ready(service); service.runJob("dtc.scan"); waitFor(() -> service.snapshot().optJSONObject("diagnostics").length() > 0, "job with an unwritable log");
-            service.disconnect(); blocked.delete(); AppLog.setDirectory(work);
+            service.disconnect();
+            // The queued close of this connection logs "rec end" and seals right after the recording state clears; let it finish
+            // against the blocked folder, so it cannot seal the next connection's first lines into this one's file.
+            waitFor(() -> service.snapshot().optString("autoRecording").isEmpty() && "disconnected".equals(service.snapshot().optString("phase")), "blocked-log connection closed");
+            SystemClock.sleep(500);
+            blocked.delete(); AppLog.setDirectory(work);
 
             // REQ-029.2: attempt, ready, job, recording and the sealed log per connection
-            int sealedBefore = AppLog.sealed().size();
             service.connect(ADAPTER); ready(service); service.runJob("inventory"); waitFor(() -> !service.snapshot().optBoolean("busy"), "inventory job");
-            service.disconnect(); waitFor(() -> AppLog.sealed().size() > sealedBefore, "log sealed when the connection ends");
-            String session = read(AppLog.sealed().get(0));
+            String sessionRecording = service.snapshot().optString("autoRecording");
+            require(!sessionRecording.isEmpty(), "REQ-029.2 the connection owns its automatic recording");
+            String ended = "rec end " + sessionRecording + " reason disconnected";
+            File[] sessionLog = new File[1];
+            service.disconnect();
+            // A queued close of the preceding connection may seal another log first; await this session's own close.
+            waitFor(() -> { for (File f : AppLog.sealed()) if (read(f).contains(ended)) { sessionLog[0] = f; return true; } return false; }, "this connection's log is sealed");
+            String session = read(sessionLog[0]);
             for (String needle : new String[]{"service create", "conn attempt simulated …00:07", "conn ready …00:07", "job initialize start", "job inventory end ok=true", "rec start", "profile session-auto", "conn disconnect requested", "rec end"})
                 if (!session.contains(needle) && !needle.equals("service create")) throw new AssertionError("REQ-029.2 session log lacks '" + needle + "': " + session);
             require(!new File(work, "app.log").exists() || read(new File(work, "app.log")).trim().isEmpty(), "REQ-029.1 the active log was sealed at the end of the connection");
@@ -70,12 +80,12 @@ final class AppLogAcceptance {
             // REQ-029.2 / .3: a failed attempt, its stack trace and the reconnect delay
             service.setAutoConnect(true); service.connect(ADAPTER); ready(service); service.disconnect();
             reachable[0] = false; service.autoStart();
-            waitFor(() -> { try { return read(new File(work, "app.log")).contains("reconnect"); } catch (IOException e) { return false; } }, "reconnect delay logged");
-            String failed = read(AppLog.sealed().get(0)) + read(new File(work, "app.log")); // the failure ends a connection, so it sits in the sealed file
+            waitFor(() -> { String logs = allLogs(work); return logs.contains("ERROR conn attempt failed: Adapter nicht erreichbar") && logs.contains("INFO reconnect") && logs.contains("next attempt in 2 s"); }, "failed attempt and reconnect delay logged");
+            String failed = allLogs(work); // a seal of the preceding connection may move lines into a sealed file at any moment
             require(failed.contains("ERROR conn attempt failed: Adapter nicht erreichbar") && failed.contains("java.io.IOException: Adapter nicht erreichbar") && failed.contains("at de.obdentic.app"), "REQ-029.3 failed attempt logged with stack trace: " + failed);
             require(failed.contains("INFO reconnect") && failed.contains("next attempt in 2 s"), "REQ-029.2 reconnect delay logged: " + failed);
             SystemClock.sleep(1500);
-            String countdown = read(new File(work, "app.log"));
+            String countdown = allLogs(work);
             require(!countdown.contains("neuer Versuch in 1 s"), "REQ-029.7 the once-per-second countdown is not logged: " + countdown);
             service.disconnect(); service.setAutoConnect(false);
 
@@ -130,6 +140,12 @@ final class AppLogAcceptance {
         throw new AssertionError("Timeout: " + name);
     }
     private static long testerPresents(AvailabilityAcceptance.Link link) { return new ArrayList<>(link.commands).stream().filter(c -> c.equals("7E0:3E80")).count(); }
-    private static String allLogs(File work) throws IOException { String all = ""; for (File f : AppLog.sealed()) all += read(f); if (new File(work, "app.log").exists()) all += read(new File(work, "app.log")); return all; }
+    /** Active file first: when a seal renames it meanwhile, the sealed listing taken afterwards holds its lines. */
+    private static String allLogs(File work) throws IOException {
+        String all = "";
+        try { all += read(new File(work, "app.log")); } catch (IOException renamedOrAbsent) { /* sealed meanwhile, or nothing written yet */ }
+        for (File f : AppLog.sealed()) { try { all += read(f); } catch (IOException deleted) { /* beyond the newest 50 */ } }
+        return all;
+    }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
 }
