@@ -273,6 +273,10 @@ The AI-facing surface must not expose arbitrary raw CAN/UDS/ELM commands and mus
 
 When a mutating service mode is eventually active, AI-assisted operation still requires a separately reviewed interface policy; the existence of the process capability alone does not imply that MCP/agent tooling automatically receives that operation.
 
+### Cloud inference and accounts
+
+Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.
+
 ## 8. Evidence, provenance and reproducibility
 
 OBDentic should make diagnosis explainable and repeatable.

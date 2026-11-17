@@ -1,6 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <instrumentation android:name="de.obdentic.app.AcceptanceRunner" android:targetPackage="${testedApp}" android:label="Offline phone acceptance" />
     <instrumentation android:name="de.obdentic.app.RecordingAuditRunner" android:targetPackage="${testedApp}" android:label="Offline recording audit" />
+    <instrumentation android:name="de.obdentic.app.AccountAcceptanceRunner" android:targetPackage="${testedApp}" android:label="ChatGPT account acceptance (simulated)" />
     <instrumentation
         android:name="de.obdentic.app.HardwareAcceptanceRunner"
         android:targetPackage="${testedApp}"

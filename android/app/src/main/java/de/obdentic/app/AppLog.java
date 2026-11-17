@@ -11,7 +11,8 @@ import java.util.regex.Pattern;
 /** REQ-029: operational debug log, separate from the replayable vehicle evidence. Never throws, never carries VINs or raw adapter traffic. */
 public final class AppLog {
     private static final Pattern VIN = Pattern.compile("\\b[A-HJ-NPR-Z0-9]{17}\\b"), HEX = Pattern.compile("\\b(?:[0-9A-Fa-f]{2} ){5,}[0-9A-Fa-f]{2}\\b"),
-        ADDRESS = Pattern.compile("\\b(?:[0-9A-Fa-f]{2}:){4}([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})\\b");
+        ADDRESS = Pattern.compile("\\b(?:[0-9A-Fa-f]{2}:){4}([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})\\b"),
+        JWT = Pattern.compile("\\beyJ[A-Za-z0-9_-]*\\.eyJ[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]*"), BEARER = Pattern.compile("(?i)\\bBearer\\s+[^\\s,;\"']+");
     private static final int KEEP = 50;
     public static volatile long maxBytes = 1024 * 1024;
     private static File dir;
@@ -32,10 +33,11 @@ public final class AppLog {
     public static void e(String tag, String message, Throwable error) { write("ERROR", tag, message, error); }
     public static void logUncaught(Thread thread, Throwable error) { write("FATAL", "uncaught", "thread " + thread.getName(), error); }
 
-    /** REQ-029.4 */
+    /** REQ-029.4; REQ-043.2: text shaped like a JWT or a 'Bearer' value is replaced as well. */
     static String scrub(String text) {
         if (text == null) return "";
-        return ADDRESS.matcher(HEX.matcher(VIN.matcher(text).replaceAll("[VIN]")).replaceAll("[hex]")).replaceAll("…$1");
+        String secrets = BEARER.matcher(JWT.matcher(text).replaceAll("[jwt]")).replaceAll("Bearer [token]");
+        return ADDRESS.matcher(HEX.matcher(VIN.matcher(secrets).replaceAll("[VIN]")).replaceAll("[hex]")).replaceAll("…$1");
     }
     private static synchronized void write(String level, String tag, String message, Throwable error) {
         StringBuilder line = new StringBuilder(new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.ROOT).format(new Date())).append(' ').append(level).append(' ').append(tag).append(' ').append(scrub(message));
