@@ -10,6 +10,8 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 - Carly BLE scan, explicit connect/disconnect and recoverable permission errors.
 - 50 standard semantic measurements, vehicle-advertised support, live trends and sample age.
 - The Live tab shows signals as compact tiles (2 columns portrait, 3 landscape) with short name, value, sparkline and session min/max; a stale age ("vor N s") appears only after 10 s.
+  Ordinary OBD2 tiles omit a redundant protocol line; mixed extended-session polling still labels OBD2 beside UDS. Compact
+  vertical padding and 20 dp sparklines retain the eight-complete-tile portrait acceptance without shrinking value text.
 - VIN where readable and a **partial** functional responder inventory; this is not
   a full manufacturer installation list.
 - Stored Mode 03 DTCs, scoped by responder.

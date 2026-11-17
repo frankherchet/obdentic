@@ -119,7 +119,7 @@ final class LiveGridAcceptance {
         int inView = 0;
         for (View tile : tiles) {
             tile.getLocationOnScreen(t);
-            if (t[1] >= s[1] && t[1] < s[1] + scroll.getHeight()) inView++;
+            if (t[1] >= s[1] && t[1] + tile.getHeight() <= s[1] + scroll.getHeight()) inView++;
             else continue;
             ViewGroup g = (ViewGroup) tile;
             String name = ((TextView) g.getChildAt(0)).getText().toString(), value = ((TextView) g.getChildAt(1)).getText().toString();
