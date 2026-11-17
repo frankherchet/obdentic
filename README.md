@@ -89,6 +89,16 @@ presentation, including the ECU/group selector; it cannot supply diagnostic byte
 See [Android workbench](docs/android.md), [Knowledge loading](docs/knowledge-db.md)
 and [ADR 0003](docs/adr/0003-uds-extended-session-reads.md).
 
+The closed, versioned semantic tool interface of `semantic_tools.rs` (five read-only tools, session-bound
+signal ids, a 20-read/1-scan/60 s budget per diagnosis) runs through the same `MobileCore` and session owner
+(`mobile/assistant.rs`) and reuses `mobile/report.rs` for offline recording inspection; see
+[Android workbench](docs/android.md#semantic-assistant-tool-bridge-req-041).
+
+`coverage_ledger.rs` is the pure measurement-coverage model of REQ-038: facts folded into a run ledger and a
+vehicle ledger count qualifying samples, valid measured time and contiguous segments per signal and goal
+context, keep the latest availability state apart, and make no health claim. It has no I/O, clock or adapter;
+recording the facts (#339) and persisting the vehicle ledger (#340) follow.
+
 In a ready live session the Android app marks a measurement gap ("Keine aktuellen Messwerte")
 once a selected signal has produced a value and none arrives for 10 seconds while reads are
 attempted. It asserts no ignition or connection state, probes one known-working selected
@@ -197,6 +207,12 @@ Captures are intended to remain local. They preserve enough transport and respon
 VIN is used as a local vehicle-identity anchor where necessary, but it is not intended as a normal capture/log field. Raw Bluetooth captures, authentication material and other sensitive vehicle-specific evidence should remain local and untracked.
 
 Adapter-specific findings for the current Carly CUA-V200, including its hardware architecture, BLE/GATT interface, ELM-compatible dialect and source references, are documented in [`docs/carly-cua-v200.md`](docs/carly-cua-v200.md). Research notes live under [`docs/research/`](docs/research/).
+
+## License
+
+The main repository, including its source code, documentation and profiles, is licensed under the [Apache License, Version 2.0](LICENSE) (`Apache-2.0`), except for the Knowledge submodule and third-party material.
+
+The separate Knowledge repository (the `knowledge` submodule) is not covered by this license and keeps its own terms. Third-party materials, such as dependencies and referenced documents, are likewise not covered; they retain their own applicable terms.
 
 ## Roadmap
 
