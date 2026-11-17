@@ -63,6 +63,7 @@ final class AccountAcceptance {
             raceWithDisconnect(context);
             nothingWithoutAccount(context);
             requestsAreMinimal(context);
+            manifestPermissions(context);
             noPathToTheVehicle();
             logMasking();
             logsCarryNoSecrets(logs);
@@ -837,6 +838,18 @@ final class AccountAcceptance {
             } finally { collect(d); d.close(); }
         }
         require(Oidc.sameHostHttps("https://auth.openai.com/a", "auth.openai.com") && Oidc.sameHostHttps("https://auth.openai.com:443/a", "auth.openai.com") && !Oidc.sameHostHttps("https://auth.openai.com.evil.example/a", "auth.openai.com"), "REQ-044.2 same-host rule");
+    }
+
+    /** REQ-044.3 (with REQ-018.8): the installed app asks for INTERNET and the dataSync service permission, no storage permission, and no cleartext traffic. */
+    private static void manifestPermissions(Context ctx) throws Exception {
+        java.util.List<String> p = Arrays.asList(ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), android.content.pm.PackageManager.GET_PERMISSIONS).requestedPermissions);
+        require(p.contains("android.permission.INTERNET") && p.contains("android.permission.FOREGROUND_SERVICE_DATA_SYNC") && p.contains("android.permission.FOREGROUND_SERVICE"), "REQ-044.3 INTERNET and the dataSync service permissions are declared: " + p);
+        require(Arrays.asList("android.permission.BLUETOOTH", "android.permission.BLUETOOTH_ADMIN", "android.permission.ACCESS_FINE_LOCATION", "android.permission.BLUETOOTH_SCAN", "android.permission.BLUETOOTH_CONNECT",
+            "android.permission.POST_NOTIFICATIONS", "android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE", "android.permission.FOREGROUND_SERVICE_DATA_SYNC", "android.permission.INTERNET",
+            "android.permission.WAKE_LOCK").containsAll(p), "REQ-044.3 no permission beyond INTERNET and the dataSync service permission was added to the existing ones: " + p);
+        for (String s : p) require(!s.contains("STORAGE"), "REQ-018.8 no storage permission: " + s);
+        android.content.pm.ApplicationInfo info = ctx.getApplicationInfo();
+        require((info.flags & android.content.pm.ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC) == 0, "REQ-044.3 cleartext traffic stays disabled");
     }
 
     private static void noPathToTheVehicle() {
