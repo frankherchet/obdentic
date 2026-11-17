@@ -1087,3 +1087,120 @@ requirements:
         text: "Tool names and arguments cannot expose or execute arbitrary CAN, UDS or ELM commands, SecurityAccess, RoutineControl, coding, adaptation, actuator tests or any write, regardless of process capability or model output."
       - id: REQ-041.12
         text: "The tool bridge is usable without a model, account or network, and its semantic snapshot tool is not part of this initial interface."
+
+  - id: REQ-042
+    title: Connect a ChatGPT account with explicit consent and a visible plan indicator
+    type: functional
+    priority: should
+    status: draft
+    source: "Conversation 2026-11-17: refinement of the Android ChatGPT account feature under epic #317; docs/adr/0005-android-chatgpt-plan-access.md"
+    description: >
+      A user connects one eligible ChatGPT account to the Android app through the
+      open-source direct Sign in with ChatGPT flow (system browser, loopback
+      callback, PKCE, platform APIs only). Connecting is an explicit opt-in, the
+      app shows whether the ChatGPT plan is in use, and every failure leaves the
+      user with a clear state and no stored credential. This requirement covers
+      connecting only: no model request, no transmitted diagnostic facts and no
+      usage-limit handling, which belong to the assistant features.
+    acceptance:
+      - id: REQ-042.1
+        text: "The main navigation reaches an account section in at most two taps without a vehicle connection. With no account it shows a card 'Use your ChatGPT plan' that says eligible AI requests use the user's ChatGPT plan, that connecting sends no vehicle data and that the app works without an account, plus the single button 'Continue with ChatGPT'. No other control starts a sign-in."
+      - id: REQ-042.2
+        text: "A tap on 'Continue with ChatGPT' starts the loopback listener first and opens the system browser only once it accepts connections, with an authorization request to https://auth.openai.com/api/accounts/authorize carrying: client_id (the saved issued client id, else dynamic_agent_client for the first registration), agent_name_hint=OBDentic only on first registration, a random ext_agent_host_id created once and reused for every later sign-in, response_type=code, redirect_uri=http://127.0.0.1:<port>/auth/callback (never localhost), scope 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct', resource=https://api.openai.com/v1, and a fresh random state, nonce and PKCE S256 challenge per attempt. It carries no API key, no login_hint, no id_token_hint and no vehicle data."
+      - id: REQ-042.3
+        text: "The listener binds only 127.0.0.1, uses port 1455 and another free port only if 1455 is taken, and serves one result page only for 'GET /auth/callback'. Every other path or method gets 404 and does not end the attempt. The page is static and never echoes code, state or error. The listener is closed within 1 second after the first callback on that path, after 300 seconds without one, or on cancel, and the port can be bound again afterwards."
+      - id: REQ-042.4
+        text: "A callback whose state differs from the attempt's state, a callback with error=access_denied, a callback with another error, a callback without code, and a first-registration callback without an issued client id (missing, or still dynamic_agent_client) each end the attempt without a code exchange. The message names the cause ('Antwort ungültig', 'Anmeldung abgebrochen', the error code from a fixed vocabulary, 'Registrierung unvollständig'), nothing is stored, and 'Continue with ChatGPT' is offered again."
+      - id: REQ-042.5
+        text: "While the app waits for the browser the section shows the waiting state and a cancel button that ends the attempt within 1 second. Without a callback after 300 seconds the attempt ends with 'Zeitüberschreitung · erneut versuchen'. If the app is closed or its process killed while waiting, no credential is stored and the next start shows the not-connected state."
+      - id: REQ-042.6
+        text: "The callback page offers a link 'Zurück zu OBDentic' that opens the app through a link without parameters and without code or token. The app takes no value from that intent. The sign-in result appears whether the user returns through that link, the app switcher or the Back button, because the result comes from the attempt state and not from the intent."
+      - id: REQ-042.7
+        text: "The code exchange is an HTTPS POST (form encoded) to the token endpoint with grant_type=authorization_code, the client id, the code, the PKCE verifier, the exact redirect_uri of the authorization request and resource=https://api.openai.com/v1, with 30-second connect and read timeouts, no redirect followed and a response read limit of 1 MiB. A network failure shows 'Keine Verbindung zu ChatGPT · erneut versuchen'. An HTTP error shows its status and an error code of at most 64 characters from letters, digits and '_.:-' and never the response body. Both store nothing."
+      - id: REQ-042.8
+        text: "A credential is stored only when the response holds access, refresh and ID tokens and the granted scope contains chatgpt.tokens.use.direct, and the ID token is valid: RS256 signature checked against a key of the JWKS named in the discovery document, issuer https://auth.openai.com, audience containing the client id, expiry in the future (60 seconds leeway), nonce equal to the attempt's. Any other result stores nothing, shows the cause, and revokes an obtained refresh token on a best-effort basis."
+      - id: REQ-042.9
+        text: "When consent is declined or the granted scope lacks chatgpt.tokens.use.direct, the section shows 'ChatGPT-Plan-Nutzung nicht freigegeben' and explains how to enable it. No token is stored, the saved client id is kept, and no API-key or other billing alternative is offered. The next 'Continue with ChatGPT' repeats the authorization with the saved client id, the complete scope set and prompt=consent."
+      - id: REQ-042.10
+        text: "The account section shows exactly one status: 'Nicht verbunden', 'Verbunden' with the account e-mail address and the indicator 'Using ChatGPT plan', 'Anmeldung abgelaufen', 'ChatGPT nicht erreichbar' (credentials kept) or 'ChatGPT-Plan-Nutzung nicht freigegeben'. While connected, a link 'Manage usage' next to the indicator opens https://chatgpt.com/settings/usage in the system browser, or says that no browser is available. The indicator and link are one reusable view that the assistant screen can place near its composer."
+      - id: REQ-042.11
+        text: "After the first successful connection on this installation a dialog 'You're using your ChatGPT plan' explains that eligible AI requests use the user's ChatGPT plan and can be managed in ChatGPT settings, with a 'Got it' button. The dialog is not shown again on later sign-ins, also after sign-out, and survives restart of the app."
+      - id: REQ-042.12
+        text: "Exactly one account is supported: while one is connected 'Continue with ChatGPT' is not offered and a second attempt cannot start. A second tap during an attempt is ignored, and both buttons show immediate pending feedback (REQ-021). Using another account requires disconnecting first."
+      - id: REQ-042.13
+        text: "Without an installed browser, or when no loopback port can be bound, the attempt stops before anything is opened, says why, closes any listener and stores nothing."
+
+  - id: REQ-043
+    title: Protect, refresh and remove the ChatGPT credentials
+    type: functional
+    priority: must
+    status: draft
+    source: "Conversation 2026-11-17: refinement of the Android ChatGPT account feature under epic #317; docs/adr/0005-android-chatgpt-plan-access.md"
+    description: >
+      Access, refresh and ID tokens never leave protected app-private storage,
+      stay valid through refresh without user action, and are revoked and removed
+      when the user disconnects. A temporary failure never signs the user out;
+      a confirmed terminal failure never keeps unusable tokens.
+    acceptance:
+      - id: REQ-043.1
+        text: "The credential record (issued client id, access, refresh and ID token, expiry, granted scopes, account e-mail and subject) exists only as an app-private file encrypted with an AES-256-GCM key held in the Android Keystore, with a fresh IV for each write and written atomically (temporary file, sync, rename), so a failed write leaves the previous record or none. It is excluded from backup and device transfer and is readable again after the app process is killed and after a restart of the phone."
+      - id: REQ-043.2
+        text: "No token, authorization code, PKCE verifier, state, nonce, authorization URL, Authorization header, e-mail address or account subject appears in the app log, Logcat, the Debug tab, a recording, an exported or shared file or a notification. Account events in the log use only an event name, an HTTP status and an error code from a fixed vocabulary, and the log masking (REQ-029.4) also replaces text shaped like a JWT or a 'Bearer' value with a placeholder."
+      - id: REQ-043.3
+        text: "A record that cannot be read (corrupt file, unknown format, Keystore key missing or invalidated) is deleted together with its key, the section shows 'Nicht verbunden' with the hint to connect again, and no other function of the app is affected and the app does not crash."
+      - id: REQ-043.4
+        text: "A caller asking for an access token gets the stored one without a request while it is valid for at least 300 more seconds. Otherwise the token is refreshed first, but never before the earliest_refresh_at time of the token response when one was given. The refresh is a form-encoded POST with grant_type=refresh_token, the saved issued client id (never dynamic_agent_client), the refresh token and resource=https://api.openai.com/v1, without scope."
+      - id: REQ-043.5
+        text: "A refresh response is used only when it holds a new access token and a replacement refresh token and its scope still contains chatgpt.tokens.use.direct. The new record is written completely before the old refresh token is discarded and before the new access token is returned to the caller. A response that fails this check is handled like a terminal refresh error (REQ-043.7)."
+      - id: REQ-043.6
+        text: "Refreshes are serialized: with two simultaneous callers needing a refresh, exactly one refresh request is sent and both receive the new access token."
+      - id: REQ-043.7
+        text: "A refresh answered with HTTP 400 or 401 and the code invalid_grant, invalid_refresh_token, token_expired, refresh_token_expired, refresh_token_invalidated or refresh_token_reused deletes the access, refresh and ID tokens, e-mail and subject at once and shows 'Anmeldung abgelaufen · bitte erneut mit ChatGPT anmelden'. The saved client id and the host id stay for the next sign-in. This also covers the 30-day refresh-token lifetime and a disconnection in ChatGPT settings."
+      - id: REQ-043.8
+        text: "A refresh that fails with a network error, a timeout, HTTP 429 or a 5xx status keeps every credential, shows 'ChatGPT nicht erreichbar', and starts no background retry; the next request by a caller tries again. Credentials are never deleted because of such a failure."
+      - id: REQ-043.9
+        text: "An invalid_client answer to a refresh or an authorization removes the saved client id together with the tokens, shows that the registration is invalid, and makes the next sign-in register a new client."
+      - id: REQ-043.10
+        text: "A tap on the disconnect button asks for confirmation, then sends a form-encoded POST to the revocation_endpoint of the discovery document with token=<refresh token>, token_type_hint=refresh_token and the issued client id. After HTTP 200 the section shows 'Abgemeldet · Zugriff widerrufen' and the local tokens are deleted."
+      - id: REQ-043.11
+        text: "When revocation fails with a network error, a timeout or a 5xx status, it is attempted at most three times (1 and 3 seconds apart, each with a 10-second timeout). Then the local tokens are deleted anyway and the section says that remote revocation was not confirmed and that access can be removed in ChatGPT settings under 'Manage usage'."
+      - id: REQ-043.12
+        text: "After disconnecting, or after any deletion in REQ-043.3, REQ-043.7 or REQ-043.9, the app-private storage holds no access, refresh or ID token, no e-mail address and no account subject, the Keystore key is deleted, and the app makes no further request with the old tokens. Only the host id, and the issued client id unless REQ-043.9 removed it, remain."
+      - id: REQ-043.13
+        text: "Disconnecting while a sign-in or a refresh is in progress cancels that work, and no token from it is stored afterwards, whatever the order of events."
+
+  - id: REQ-044
+    title: Keep cloud access optional, minimal and separate from local diagnostics
+    type: constraint
+    priority: must
+    status: draft
+    source: "docs/adr/0005-android-chatgpt-plan-access.md; docs/project-goals.md §7: AI-assisted diagnostics (subsection added by the Android ChatGPT account feature)"
+    description: >
+      The first network access of the app serves only the optional ChatGPT
+      account. Vehicle communication, recording, replay and every local
+      diagnostic function work unchanged without an account and without a
+      network, the sign-in sends no vehicle data, and neither the account nor
+      its network access can change what the process may do to a vehicle.
+      REQ-018.8 states that recording export adds no permission; that stays
+      true, export adds none. Behavior that depends on the real phone is
+      measured on the phone and recorded as a separate acceptance, never
+      concluded from simulated runs.
+    acceptance:
+      - id: REQ-044.1
+        text: "With no account, and also with every network request failing or the phone in airplane mode, connecting, live measurement, recording, replay, export, diagnostics and every other existing function behave as before. The app makes no network request at start or while any tab is open; requests happen only after 'Continue with ChatGPT', after the disconnect confirmation, and when a caller asks for an access token while an account is connected. No error dialog, notification or service appears because of a missing account or network."
+      - id: REQ-044.2
+        text: "Every request made for the account goes over HTTPS to auth.openai.com and sends only the fields named in REQ-042.2, REQ-042.7, REQ-043.4 and REQ-043.10 plus the ID-token key fetch; endpoints taken from the discovery document are used only when they are HTTPS on the same host. A test that records all requests finds no VIN, ECU or adapter identifier, recording content, device address or other device identifier besides the random host id and the app name. Redirects are not followed."
+      - id: REQ-044.3
+        text: "The release manifest declares INTERNET as one single-line tag '<uses-permission android:name=\"android.permission.INTERNET\" />' so tools/verify-release-apk.sh accepts the built release APK, and adds no other permission besides the one in REQ-044.5. cleartext traffic stays disabled, no Gradle dependency is added, and the permission assertion of the acceptance run (REQ-018.8) allows INTERNET and still rejects storage permissions."
+      - id: REQ-044.4
+        text: "Connecting, refreshing or disconnecting an account changes no vehicle capability: the process capability, the list of diagnostic jobs and the assistant tool interface (REQ-041.1) are identical with and without a connected account, the account code has no path to the session owner or the adapter transport, and it sends no vehicle traffic."
+      - id: REQ-044.5
+        text: "While a sign-in waits for the browser, a foreground service of type dataSync with the ongoing notification 'ChatGPT-Anmeldung läuft' keeps the process in a network-allowed state. It is started only by a tap on 'Continue with ChatGPT', stops within 2 seconds after the attempt ends by success, failure, cancel or timeout, and never runs without a pending sign-in. Its permission is one single-line tag in the manifest. A debug-build-only switch disables it for the measurement in REQ-044.6."
+      - id: REQ-044.6
+        text: "On the real phone (Xiaomi Mi 9T, Android 16, Chrome as default browser) three consecutive sign-ins with the service disabled, each with at least 60 seconds of consent in the browser, decide whether the service stays. It, its permission and its notification remain in the release app only if at least one of the three fails because the network is blocked for the app (for example UnknownHostException) and a repeated sign-in with the service then completes; if all three complete the token exchange, all three are removed."
+      - id: REQ-044.7
+        text: "On the real phone with Chrome, three sign-ins in which the user taps 'Zurück zu OBDentic' each bring OBDentic to the foreground with the sign-in result shown within 3 seconds. If any of them does not, the link is removed from the callback page and the page tells the user to switch back to the app instead."
+      - id: REQ-044.8
+        text: "A phone checklist in the AI acceptance issue covers, without vehicle or adapter traffic and with only sign-in data leaving the phone: first connection with consent and the one-time dialog, the indicator and 'Manage usage' opening ChatGPT usage settings, still connected after force-stop and relaunch, disconnect then connect again with the saved client id, disconnect in airplane mode with the unconfirmed-revocation message, and the measurements of REQ-044.6 and REQ-044.7. Its results are recorded as sanitized pass or fail without tokens, e-mail, subject or client id, and no simulated check counts as phone evidence."
+      - id: REQ-044.9
+        text: "docs/project-goals.md section 7 gains a subsection 'Cloud inference and accounts' with the text: 'Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.' docs/android.md describes the account feature, the INTERNET permission and its sole use, the sign-in service as decided by REQ-044.6, and no longer says the app has no internet permission."
