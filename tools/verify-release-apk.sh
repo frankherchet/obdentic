@@ -13,6 +13,10 @@ bt="$(ls -d "$sdk_dir"/build-tools/*/ 2>/dev/null | sort -V | tail -1 || true)"
 bt="${bt%/}"
 [[ -x "$bt/apksigner" && -x "$bt/aapt2" ]] || { echo "No Android build-tools (apksigner, aapt2) under $sdk_dir" >&2; exit 1; }
 fail() { echo "verify-release-apk: FAIL: $*" >&2; exit 1; }
+# The comparison below reads single-line tags only (REQ-044.3): a permission split over several lines would silently drop out of it.
+if awk '/<uses-permission/ && !/\/>/ { bad = 1 } END { exit !bad }' "$manifest"; then
+  fail "AndroidManifest.xml has a uses-permission tag that is not on a single line (e.g. <uses-permission android:name=\"android.permission.INTERNET\" />)"
+fi
 
 certs="$("$bt/apksigner" verify --print-certs "$apk")" || fail "apksigner could not verify the signature"
 grep -q 'CN=Android Debug' <<<"$certs" && fail "APK is signed with the Android debug certificate"

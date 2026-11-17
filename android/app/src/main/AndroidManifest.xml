@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <application android:label="${appLabel}" android:theme="@android:style/Theme.Material.NoActionBar"
         android:icon="@drawable/ic_obdentic" android:dataExtractionRules="@xml/data_extraction_rules"
@@ -18,7 +20,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".ReturnActivity" android:exported="true" android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="obdentic" android:host="account" />
+            </intent-filter>
+        </activity>
         <service android:name=".ObdService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <service android:name=".SignInService" android:exported="false" android:foregroundServiceType="dataSync" />
         <provider android:name=".RecordingProvider" android:authorities="${applicationId}.files"
             android:exported="false" android:grantUriPermissions="true" />
     </application>

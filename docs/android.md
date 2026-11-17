@@ -424,6 +424,63 @@ Software verification uses the scripted adapter and synthetic recordings (`src/m
 The JNI route is covered by the build only; nothing here is real-phone, adapter or vehicle evidence, which stays
 with #330.
 
+## ChatGPT account (REQ-042, REQ-043, REQ-044)
+
+An **optional** ChatGPT account lets eligible AI requests use the user's ChatGPT plan (epic #317, ADR 0005). It is the app's first and
+only network feature: connecting sends no vehicle data, nothing in the app needs the account, and live measurement, recording, replay,
+export and diagnostics work unchanged without an account or network (REQ-044.1). The account code has no path to the vehicle session,
+the adapter transport or the diagnostic jobs (REQ-044.4); it makes no request at start, only after **Continue with ChatGPT**, after the
+disconnect confirmation, and when a caller (the assistant, #328) asks for an access token.
+
+- **Where:** Adapter → **Konto öffnen** (two taps, no vehicle needed) opens the account section. It shows exactly one status:
+  *Nicht verbunden*, *Verbunden* (with the account e-mail address, only here, and the indicator **Using ChatGPT plan** with the link
+  **Manage usage** → `https://chatgpt.com/settings/usage`), *Anmeldung abgelaufen*, *ChatGPT nicht erreichbar* (credentials kept) or
+  *ChatGPT-Plan-Nutzung nicht freigegeben*. The indicator and link are one view (`PlanIndicatorView`) that the assistant screen can reuse.
+  The first connection with the plan permission shows the one-time dialog **You're using your ChatGPT plan** (**Got it**).
+- **Sign-in** (`ChatGptAccount`, `Oidc`, `LoopbackListener`): the system browser, a loopback callback on `127.0.0.1:1455` (another free
+  port only if taken) and PKCE S256, platform APIs only, no Gradle dependency. `client_id` is `dynamic_agent_client` with
+  `agent_name_hint=OBDentic` on the first registration and the saved issued client id afterwards; a random `ext_agent_host_id` is created
+  once. Scope: `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`, `resource=https://api.openai.com/v1`.
+  The callback page is static, never echoes its parameters and links back with `obdentic://account` (`ReturnActivity`, which takes no
+  value from the intent). The listener serves at most 8 connections at once, cuts a request after 3 s and closes accepted connections when
+  the attempt ends. State, error, code and client-id checks end the attempt without a code exchange; a cancel ends it within 1 s, also when the callback already arrived (also
+  while the listener is still being opened, and then without launching the browser), 300 s without a callback end it with a timeout message.
+  A sign-in whose credential cannot be stored is revoked and leaves no file or key behind. The ID token is accepted only with an RS256 signature from the discovery
+  document's JWKS, issuer `https://auth.openai.com`, the client id as audience, an expiry in the future (60 s leeway) and the attempt's
+  nonce.
+- **Plan permission missing:** a valid sign-in whose granted scope lacks `chatgpt.tokens.use.direct` is kept (as OpenAI advises) but
+  inactive: no access token is handed out and no inference request is possible until **Continue with ChatGPT** repeats the
+  authorization with `prompt=consent`. A repeat that returns another subject than the stored one is rejected: the stored account stays and the
+  new credential is revoked.
+- **Storage** (`AccountStore`): one app-private file encrypted with an AES-256-GCM key of the Android Keystore (fresh IV per write,
+  temporary file, sync, atomic rename), excluded from backup and device transfer. After a sign-out, expiry or an unreadable record only the
+  host id and the issued client id remain; the Keystore key is deleted. No token, e-mail address, authorization code, verifier, state,
+  nonce, URL or header is ever logged: events use a fixed vocabulary and the log masking also replaces JWT-shaped and `Bearer` text.
+- **Refresh:** an access token valid for at least 300 s is used as is; otherwise one serialized refresh (never before
+  `earliest_refresh_at`, also after the access token expired) rotates the tokens. Before sending a refresh, the encrypted record
+  is atomically saved with `rotation_pending: true`; a failed marker
+  write sends no request. A valid replacement clears the marker in the same atomic record write. If that write fails, the newest
+  tokens remain in memory, the access token is delivered and storage is retried on later access. After process death, a pending
+  marker means the stored token may already be spent: even HTTP 200 for its revocation cannot confirm that the replacement grant
+  was revoked. Lost responses retain the marker too. HTTP 400/401 with a terminal code deletes the tokens at once; network errors,
+  timeouts, 429 and 5xx keep them and retry only on the next request.
+- **Disconnect:** asks first, revokes the refresh token at the discovery document's `revocation_endpoint` (up to three attempts, 1 s and
+  3 s apart, 10 s timeouts) and deletes the credentials locally in every case. An unconfirmed revocation is stated explicitly,
+  including unresolved rotation after a restart, with an actionable **Manage usage** link even while disconnected.
+  Disconnecting cancels any sign-in or refresh in progress.
+- **`INTERNET` and the sign-in service:** `INTERNET` is declared as one single-line tag (`tools/verify-release-apk.sh` compares single-line
+  tags and now refuses a split tag), cleartext traffic stays disabled, and the only use is HTTPS to `auth.openai.com` (discovery, keys,
+  token, revocation). While a sign-in waits for the browser a foreground service of type `dataSync` (`SignInService`, notification
+  *ChatGPT-Anmeldung läuft*, permission `FOREGROUND_SERVICE_DATA_SYNC`) keeps the process in a network-allowed state; it starts with
+  the tap, stops within 2 s after the attempt ends and never runs otherwise. Debug builds only: a file `debug-no-signin-service` in the
+  app's files directory (`adb shell run-as de.obdentic.app.debug touch files/debug-no-signin-service`) switches it off for the
+  measurement of REQ-044.6; whether the service and the callback page's return link stay is decided by the phone measurements
+  (REQ-044.6, REQ-044.7), which are part of the real-phone checklist in #330.
+- **Verification:** `AccountAcceptance`, `AccountTransportAcceptance` and `AccountUiAcceptance` (part of `AcceptanceRunner`, also
+  `am instrument -w de.obdentic.app.debug.test/de.obdentic.app.AccountAcceptanceRunner` on its own) use an in-process fake authorization
+  server, a fake browser that answers the loopback callback through a real socket and a local TLS server with a Keystore-generated
+  certificate for the HTTPS transport. They never contact OpenAI and are not phone evidence (REQ-044.8).
+
 ## Adapter throughput (Diagnose)
 
 "Adapter-Leistung messen" in the Diagnose tab runs a closed, read-only job (`adapter.throughput`, REQ-022). It
@@ -537,9 +594,9 @@ If the folder was deleted or its permission revoked, export stops with "Export-O
 nicht verfügbar · bitte neu wählen", the stored choice is cleared and nothing
 internal changes. A copy that fails midway removes the incomplete target file.
 Copies are byte-identical; export never deletes, moves or modifies the internal
-recordings. It needs no storage permission and no network: the application's
-permissions are unchanged (no `INTERNET`, no storage permission), using the Storage
-Access Framework folder grant and the internal read-only content provider.
+recordings. It needs no storage permission and no network and adds no permission of its own
+(REQ-018.8); the app's only network permission, `INTERNET`, belongs to the optional ChatGPT account
+(see above). Export uses the Storage Access Framework folder grant and the internal read-only content provider.
 Uninstalling the application
 removes its private files, so export recordings you need to keep first.
 
@@ -655,7 +712,7 @@ versionCode = workflow run number), verifies it with `tools/verify-release-apk.s
 (not debug-signed, not debuggable, not the test APK, no captures, exactly the
 permissions of `AndroidManifest.xml`) and uploads it with the Firebase CLI to the
 tester group. Pull requests, branch pushes and untagged commits never sign or
-upload. The app contains no Firebase SDK and no internet permission; the App
+upload. The app contains no Firebase SDK; its only network use is the optional ChatGPT account (`INTERNET`); the App
 Tester app on the phone does the notifying and installing. Local debug builds are
 unchanged and need no keystore; `:app:assembleRelease` without the signing
 environment fails on purpose.
