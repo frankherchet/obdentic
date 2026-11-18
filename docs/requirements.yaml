@@ -1510,7 +1510,7 @@ requirements:
     title: Run a typed assistant diagnosis on one selected saved recording
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "M6 Android assistant kickoff; offline recording diagnosis"
     depends_on: [REQ-041, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046]
     description: >
@@ -1548,7 +1548,7 @@ requirements:
     title: Run a bounded typed assistant diagnosis in an existing live vehicle session
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "M6 Android assistant kickoff; live session diagnosis"
     depends_on: [REQ-041, REQ-045, REQ-046, REQ-050]
     description: >
@@ -1577,7 +1577,7 @@ requirements:
     title: Keep Android account-only and real-vehicle assistant acceptance distinct
     type: constraint
     priority: should
-    status: draft
+    status: accepted
     source: "M6 Android assistant kickoff; independent real-device acceptance"
     depends_on: [REQ-044]
     description: >
@@ -1602,7 +1602,7 @@ requirements:
     title: Inspect a deterministic semantic snapshot through the typed mobile bridge
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "M6 Android assistant kickoff; semantic snapshots"
     depends_on: [REQ-041, REQ-045]
     acceptance:
@@ -1621,7 +1621,7 @@ requirements:
     title: Make optional Android voice local and subordinate to typed diagnosis
     type: functional
     priority: could
-    status: draft
+    status: accepted
     source: "M6 Android assistant kickoff; optional voice"
     depends_on: [REQ-050, REQ-051]
     acceptance:
