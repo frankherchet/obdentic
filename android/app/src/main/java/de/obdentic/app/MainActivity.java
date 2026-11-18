@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
+import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -17,6 +18,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
@@ -103,6 +105,7 @@ public class MainActivity extends Activity {
     private TextView debugLog;
     /** The account dialogs, for the phone acceptance. */
     public volatile Dialog firstUseDialog, disconnectDialog;
+    private AlertDialog networkSettingsDialog;
     private int tab=0;
     private static final int SHOWN_RECORDS=30;
     private String shownRecords(){JSONArray r=array("records"),shown=new JSONArray();for(int i=0;i<Math.min(r.length(),SHOWN_RECORDS);i++)shown.put(r.opt(i));return shown.toString();}
@@ -137,7 +140,7 @@ public class MainActivity extends Activity {
     @Override protected void onStart(){super.onStart();getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}
     @Override protected void onStop(){getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);super.onStop();}
     @Override protected void onResume(){super.onResume();resumed=this;handler.post(poll);if(service()!=null)service().resumeIfBlocked();}
-    @Override protected void onPause(){handler.removeCallbacks(poll);if(resumed==this)resumed=null;if(firstUseDialog!=null)firstUseDialog.dismiss();super.onPause();}
+    @Override protected void onPause(){handler.removeCallbacks(poll);if(resumed==this)resumed=null;if(firstUseDialog!=null)firstUseDialog.dismiss();if(networkSettingsDialog!=null)networkSettingsDialog.dismiss();super.onPause();}
     @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
     private ObdService service(){return ObdService.current;}
     private void act(Runnable action){try{if(service()!=null)action.run();else toast("Dienst startet. Bitte kurz warten.");}catch(Exception e){toast(e.getMessage()==null?"Aktion fehlgeschlagen":e.getMessage());}refresh();}
@@ -195,6 +198,7 @@ public class MainActivity extends Activity {
         announceSmartSet();
         announceGap();
         accountDialog();
+        showNetworkSettingsPrompt();
         if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText())){debugLog.setText(content);scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));}}
     }
     private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
@@ -249,6 +253,31 @@ public class MainActivity extends Activity {
             .setMessage("Berechtigte KI-Anfragen nutzen jetzt deinen ChatGPT-Plan (eligible AI requests use your ChatGPT plan). Die Nutzung lässt sich in den ChatGPT-Einstellungen verwalten.")
             .setPositiveButton("Got it",(d,w)->account.firstUseAcknowledged()).create();
         firstUseDialog.setOnDismissListener(d->firstUseDialog=null);firstUseDialog.show();
+    }
+    /** REQ-042.13: only a denied sign-in socket offers the app's Android network settings. */
+    private void showNetworkSettingsPrompt() {
+        if (tab != 6 || resumed != this || networkSettingsDialog != null
+            || !ChatGptAccount.get(this).takeNetworkSettingsPrompt()) return;
+        networkSettingsDialog = new AlertDialog.Builder(this).setTitle("Netzwerkzugriff für OBDentic erlauben")
+            .setMessage("Öffne die Android-Einstellungen und erlaube OBDentic den Netzwerkzugriff und WLAN-Daten. Falls sich die App-Info öffnet, findest du den Schalter unter „WLAN-Datennutzung“. Tippe danach erneut auf „Continue with ChatGPT“.")
+            .setPositiveButton("Einstellungen öffnen", (d, w) -> openNetworkSettings())
+            .setNegativeButton("Abbrechen", null).create();
+        networkSettingsDialog.setOnDismissListener(d -> networkSettingsDialog = null);
+        networkSettingsDialog.show();
+    }
+
+    private void openNetworkSettings() {
+        Uri app = Uri.fromParts("package", getPackageName(), null);
+        // Despite its name this action opens the app's data usage page on Android and LineageOS.
+        try {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS, app));
+        } catch (ActivityNotFoundException | SecurityException unavailable) {
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, app));
+            } catch (ActivityNotFoundException | SecurityException noAppInfo) {
+                toast("App-Info konnte nicht geöffnet werden. Öffne sie in den Android-Einstellungen.");
+            }
+        }
     }
     private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;udsRemaining=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;case 6:accountTab();break;default:connection();}}
     private void live(){

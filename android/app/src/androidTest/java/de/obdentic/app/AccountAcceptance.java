@@ -467,9 +467,9 @@ final class AccountAcceptance {
         } finally { collect(f); f.close(); }
         Fixture p = new Fixture(ctx);
         try {
-            p.config.opener = (port, t, r) -> { throw new IOException("no port"); };
+            p.config.opener = (port, t, r) -> { throw new IOException("listener unavailable"); };
             p.signInAndWait();
-            require(p.account.snapshot().message.contains("Kein freier lokaler Port") && p.browser.opened.isEmpty() && p.store.load() == null, "REQ-042.13 no port: nothing opened, nothing stored");
+            require(p.account.snapshot().message.contains("Lokaler Anmeldedienst") && p.browser.opened.isEmpty() && p.store.load() == null, "REQ-042.13 listener failure: nothing opened, nothing stored");
         } finally { collect(p); p.close(); }
     }
 

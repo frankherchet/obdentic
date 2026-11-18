@@ -1,5 +1,7 @@
 package de.obdentic.app;
 
+import android.system.ErrnoException;
+import android.system.OsConstants;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
@@ -52,6 +54,7 @@ public final class LoopbackListener implements Closeable {
         try {
             s = bind(lo, preferredPort);
         } catch (BindException e) {
+            if (preferredPort == 0 || socketErrno(e) != OsConstants.EADDRINUSE) throw e;
             s = bind(lo, 0);
         }
         LoopbackListener l = new LoopbackListener(s, returnLink);
@@ -66,11 +69,19 @@ public final class LoopbackListener implements Closeable {
         try {
             s.setReuseAddress(true);
             s.bind(new InetSocketAddress(lo, port), 8);
-        } catch (IOException e) {
-            s.close();
+        } catch (IOException | SecurityException e) {
+            try { s.close(); } catch (IOException closeError) { e.addSuppressed(closeError); }
             throw e;
         }
         return s;
+    }
+
+    /** Android wraps the native socket error in a Java exception. Do not classify by the exception's text. */
+    static int socketErrno(Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof ErrnoException) return ((ErrnoException) cause).errno;
+        }
+        return 0;
     }
 
     public int port() { return server.getLocalPort(); }
