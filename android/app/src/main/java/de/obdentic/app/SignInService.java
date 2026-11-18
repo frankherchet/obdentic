@@ -24,19 +24,30 @@ public final class SignInService extends Service {
     /** Debug builds only: with this file in the app's files directory the service is not started (phone measurement of REQ-044.6). */
     public static final String DEBUG_SWITCH = "debug-no-signin-service";
     public static volatile boolean running;
+    private static final Object lifecycle = new Object();
+    private static boolean stopRequested;
+    private static SignInService active;
 
     /** Starts the service from the visible app. */
     public static void start(Context app) {
         if (disabledForMeasurement(app)) return;
-        try {
-            app.startForegroundService(new Intent(app, SignInService.class));
-        } catch (RuntimeException e) {
-            AppLog.w("account", "sign-in service not started " + e.getClass().getSimpleName());
+        synchronized (lifecycle) {
+            stopRequested = false;
+            try {
+                app.startForegroundService(new Intent(app, SignInService.class));
+            } catch (RuntimeException e) {
+                AppLog.w("account", "sign-in service not started " + e.getClass().getSimpleName());
+            }
         }
     }
 
     public static void stop(Context app) {
-        app.stopService(new Intent(app, SignInService.class));
+        synchronized (lifecycle) {
+            stopRequested = true;
+            // stopSelf uses this instance's Android token, unlike stopService, which can
+            // stop a newer instance that has not yet entered the foreground.
+            if (active != null) active.stopSelf();
+        }
     }
 
     public static boolean disabledForMeasurement(Context context) {
@@ -52,13 +63,21 @@ public final class SignInService extends Service {
         Notification notification = builder.build();
         if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         else startForeground(NOTIFICATION_ID, notification);
-        running = true;
+        synchronized (lifecycle) { active = this; running = true; }
     }
 
-    @Override public int onStartCommand(Intent intent, int flags, int startId) { return START_NOT_STICKY; }
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        synchronized (lifecycle) {
+            // A fast failure can request stop before onCreate. Promote first, then stop.
+            if (stopRequested) stopSelfResult(startId);
+        }
+        return START_NOT_STICKY;
+    }
 
     @Override public void onDestroy() {
-        running = false;
+        synchronized (lifecycle) {
+            if (active == this) { active = null; running = false; }
+        }
         super.onDestroy();
     }
 
