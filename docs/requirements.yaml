@@ -1405,3 +1405,53 @@ requirements:
         text: "Failure condition retrieved prose contains instructions posing as policy or vehicle operations → different success: Return it only as source text where relevant; execute zero adapter commands and make zero policy or capability changes."
       - id: REQ-048.9
         text: "Normal flow: The disclosure preview shows only the selected excerpts and source revisions. REQ-045 records the full local retrieval response separately from the exact approved subset actually sent."
+
+  - id: REQ-049
+    title: Query a selected recording locally with bounded work and exact source links
+    type: functional
+    priority: should
+    status: draft
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-041, REQ-045]
+    description: >
+      An analyst can select evidence and calculate statistics without granting
+      filesystem access or opening the entire recording as model context.
+      Query semantics use the shared replay interpretation; no independent
+      vehicle decoder or mandatory index is required.
+    acceptance:
+      - id: REQ-049.1
+        text: "Normal flow: One user-selected logical recording is opened through an opaque handle, including multiple rotation parts. A local offline query filters by time, signal, ECU and event type and projects only the requested fields without adapter or network access."
+      - id: REQ-049.2
+        text: "Normal flow: A synthetic window with RPM values 800 and 1200 in separate parts and another sample outside the window returns count 2 and mean 1000; original-event references resolve to those exact source events."
+      - id: REQ-049.3
+        text: "Normal flow: A mixed synthetic recording can select DTC and UDS events separately and resolve their original-event references without returning unrelated samples."
+      - id: REQ-049.4
+        text: "Normal flow: Repeating the same paginated query on the same selected recording gives the same page contents, order and continuation boundaries with no skips or duplicates across rotation parts."
+      - id: REQ-049.5
+        text: "Failure condition a rotation part is missing → different success: Identify the gap and mark the result partial or not evaluable; do not report a complete aggregate or a healthy diagnosis from it."
+      - id: REQ-049.6
+        text: "Failure condition a recording line is malformed → different success: Identify corrupt evidence and mark the response partial or not evaluable; do not silently treat the line as zero or healthy evidence."
+      - id: REQ-049.7
+        text: "Failure condition the Knowledge pin is missing, invalid or mismatched → safe stop: Return a pin error and mark the query not evaluable rather than decoding against a different version."
+      - id: REQ-049.8
+        text: "Failure condition a recording schema is unrecognized → safe stop: Return an explicit schema error and do not report a complete result."
+      - id: REQ-049.9
+        text: "Failure condition the handle is invalid or refers to an unselected recording → safe stop: Refuse with a typed handle error and do not open the referenced file."
+      - id: REQ-049.10
+        text: "Failure condition a raw path, unrelated file or the agent's own audit is requested → safe stop: Refuse with a typed scope error before any access."
+      - id: REQ-049.11
+        text: "Failure condition a jq-style expression is unsupported → safe stop: Refuse with a typed syntax or policy outcome before execution; expressions cannot access the filesystem, load modules, start processes or recurse without a bound."
+      - id: REQ-049.12
+        text: "Failure condition the user cancels a query in progress → safe stop: End it, identify cancellation and label any returned prefix partial, never a complete aggregate."
+      - id: REQ-049.13
+        text: "Failure condition a query would exceed the agreed row budget → safe stop: The boundary test finishes exactly at the row cap; one row beyond it stops with a typed limit and any returned prefix is labeled partial."
+      - id: REQ-049.14
+        text: "Failure condition a query would exceed the agreed byte budget → safe stop: The boundary test finishes exactly at the byte cap; one byte beyond it stops with a typed limit and any returned prefix is labeled partial."
+      - id: REQ-049.15
+        text: "Failure condition a query would exceed the agreed work budget → safe stop: At the agreed number of measured work units the boundary test can finish; a next unit is not executed and any returned prefix is labeled partial."
+      - id: REQ-049.16
+        text: "Failure condition a query would exceed the agreed time budget → safe stop: With controlled time the boundary test can finish at the limit but not run past it; return the time limit and mark any prefix partial."
+      - id: REQ-049.17
+        text: "Failure condition a query would exceed the agreed intermediate-memory budget → safe stop: A boundary fixture completes at the cap; an operation that would go beyond it is not performed and any returned prefix is labeled partial."
+      - id: REQ-049.18
+        text: "Normal flow: REQ-045 records the query, its local outcome and the exact approved subset actually sent as distinguishable events; no whole recording is sent by default."
