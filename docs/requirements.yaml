@@ -1273,3 +1273,63 @@ requirements:
         text: "Normal flow: Deletion and rotation affect whole sessions per the agreed retention policy. An active session is never evicted."
       - id: REQ-045.27
         text: "Failure condition storage is full → safe stop: Report storage exhaustion and follow the persistence stop rules; do not silently discard older sessions to make room."
+
+  - id: REQ-046
+    title: Reproduce agent and vehicle-session outcomes offline through the real core
+    type: functional
+    priority: must
+    status: draft
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; ADR 0006"
+    depends_on: [REQ-041]
+    description: >
+      Maintainers can run reviewable synthetic Rust scenarios through the production
+      adapter exchange seam, session, mobile core and assistant policy. The
+      harness is not vehicle acceptance. Only the combined audit acceptance
+      depends on REQ-045; the harness foundation is independently testable.
+    acceptance:
+      - id: REQ-046.1
+        text: "Normal flow: Running the same versioned synthetic scenario twice through the existing ElmExchange/ScriptedExchange seam (and the mobile acceptance fakes where applicable) with the real ElmSession, MobileCore and assistant policy yields the same TX order, RX attribution, virtual timestamps and tool outcomes. Scenarios use virtual time, with no sleeps, BLE, account, cloud or private recording."
+      - id: REQ-046.2
+        text: "Normal flow: Across the scripted runs at most one adapter request is outstanding, including during a pending reply, timeout and reconnect."
+      - id: REQ-046.3
+        text: "Normal flow: Inventory, signal listing, a supported Mode 01 PID, an approved Knowledge read and a DTC scan produce the exact expected TX sequence and matching RX, responder and tool references. Local listing itself adds no TX."
+      - id: REQ-046.4
+        text: "Failure condition a Mode 01 PID is unsupported → different success: Report unsupported with the exact expected traffic for the fixture and no fabricated value."
+      - id: REQ-046.5
+        text: "Normal flow: Varying routing/filter selectors, adapter reset and prompt behavior, single or multi-frame replies and modeled ECU session state changes the observed response accordingly; order alone cannot select the next reply."
+      - id: REQ-046.6
+        text: "Failure condition a targeted Knowledge read receives NRC 0x21 (busy) → different success: The scenario records it as intermediate, uses only a decisive reply from that exchange, and reports missing evidence with the busy response if none arrives. Check exact TX; no unbounded retry."
+      - id: REQ-046.7
+        text: "Failure condition a targeted Knowledge read receives NRC 0x78 (pending) → different success: A decisive reply within the allowed exchange determines the result; a pending-only expiry yields no value. Check exact TX and the virtual deadline."
+      - id: REQ-046.8
+        text: "Failure condition the target replies NRC 0x31 (out of range) → safe stop: Show the negative response as decisive, with no decoded value; do not continue the read as though it were pending. Check exact TX."
+      - id: REQ-046.9
+        text: "Failure condition the requested ECU returns a reply for a different operation → safe stop: The reply does not supply a value or evidence for the requested operation; the trace retains the actual reply and outcome."
+      - id: REQ-046.10
+        text: "Failure condition one valid response is duplicated → back on track: Do not count the duplicate as another completed request or an independent measurement; show the actual RX and exact TX."
+      - id: REQ-046.11
+        text: "Failure condition a non-target ECU supplies the only response → safe stop: Show missing target evidence and its actual source, never a value attributed to the requested ECU."
+      - id: REQ-046.12
+        text: "Failure condition a response arrives after its exchange expired → safe stop: Keep the timeout; do not use the late reply to satisfy that or a subsequent request."
+      - id: REQ-046.13
+        text: "Failure condition a valid reply arrives in fragments → back on track: Attribute only the complete valid reply; incomplete fragments alone never produce a value."
+      - id: REQ-046.14
+        text: "Failure condition a frame is malformed → safe stop: The named scenario exposes malformed or missing evidence, the actual RX and exact TX, without a fabricated value or zero-as-healthy."
+      - id: REQ-046.15
+        text: "Failure condition the adapter prompt is missing → safe stop: Show bounded timeout and exact TX; no new adapter exchange starts on assumed readiness."
+      - id: REQ-046.16
+        text: "Failure condition adapter routing is unconfirmed → safe stop: Do not continue diagnosis with an assumed target; the exact trace identifies the stop and any existing bounded cleanup."
+      - id: REQ-046.17
+        text: "Failure condition returning to the expected session fails → safe stop: Do not continue diagnosis with assumed session state; the exact trace identifies the stop and any existing bounded cleanup."
+      - id: REQ-046.18
+        text: "Failure condition the adapter disconnects during a pending request → safe stop: Report disconnect for that request. Reconnecting cannot fulfill it with a late response; a new request requires newly established state."
+      - id: REQ-046.19
+        text: "Normal flow: Classify every one of the 35 accepted ADR 0006 scenarios as production-path now, reference-model only or awaiting multi-ECU production support; use the virtual clock for keepalive, response attribution and expiry. Reference-model/future scenarios never count as passing production or hardware acceptance."
+      - id: REQ-046.20
+        text: "Normal flow: A scripted model calling assistant.tools, assistant.begin and assistant.tool investigates synthetic EGR/MAF evidence and requests an allowed follow-up."
+      - id: REQ-046.21
+        text: "Failure condition the EGR/MAF scenario lacks a fact needed for the diagnosis → different success: The scripted result gives an unknown outcome for that fact instead of a confident diagnosis."
+      - id: REQ-046.22
+        text: "Failure condition a scripted request is raw, unknown or mutating → safe stop: Each receives a typed refusal with exactly zero additional TX."
+      - id: REQ-046.23
+        text: "Normal flow: Combined acceptance with REQ-045 reconstructs the complete synthetic diagnosis offline, correlating actual scripted attempts, approved and refused tools and source evidence with the transport trace. Neither the foundation nor this acceptance depends on real runtime/model integration."
