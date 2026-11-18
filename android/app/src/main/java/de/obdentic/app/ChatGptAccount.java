@@ -220,13 +220,13 @@ public final class ChatGptAccount {
         }
     }
 
-    /** A foreground account screen may offer recovery once for this sign-in attempt. */
-    boolean takeNetworkSettingsPrompt() {
-        synchronized (state) {
-            boolean show = networkSettingsPrompt;
-            networkSettingsPrompt = false;
-            return show;
-        }
+    /** Recovery stays available until the user decides, including across Activity recreation. */
+    boolean networkSettingsPromptDue() {
+        synchronized (state) { return networkSettingsPrompt; }
+    }
+
+    void dismissNetworkSettingsPrompt() {
+        synchronized (state) { networkSettingsPrompt = false; }
     }
 
     // ---------------------------------------------------------------- sign-in (REQ-042)

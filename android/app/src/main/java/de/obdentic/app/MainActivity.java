@@ -256,12 +256,17 @@ public class MainActivity extends Activity {
     }
     /** REQ-042.13: only a denied sign-in socket offers the app's Android network settings. */
     private void showNetworkSettingsPrompt() {
-        if (tab != 6 || resumed != this || networkSettingsDialog != null
-            || !ChatGptAccount.get(this).takeNetworkSettingsPrompt()) return;
+        if (tab != 6 || resumed != this || networkSettingsDialog != null) return;
+        ChatGptAccount account = ChatGptAccount.get(this);
+        if (!account.networkSettingsPromptDue()) return;
         networkSettingsDialog = new AlertDialog.Builder(this).setTitle("Netzwerkzugriff für OBDentic erlauben")
             .setMessage("Öffne die Android-Einstellungen und erlaube OBDentic den Netzwerkzugriff und WLAN-Daten. Falls sich die App-Info öffnet, findest du den Schalter unter „WLAN-Datennutzung“. Tippe danach erneut auf „Continue with ChatGPT“.")
-            .setPositiveButton("Einstellungen öffnen", (d, w) -> openNetworkSettings())
-            .setNegativeButton("Abbrechen", null).create();
+            .setPositiveButton("Einstellungen öffnen", (d, w) -> {
+                account.dismissNetworkSettingsPrompt();
+                openNetworkSettings();
+            })
+            .setNegativeButton("Abbrechen", (d, w) -> account.dismissNetworkSettingsPrompt())
+            .setOnCancelListener(d -> account.dismissNetworkSettingsPrompt()).create();
         networkSettingsDialog.setOnDismissListener(d -> networkSettingsDialog = null);
         networkSettingsDialog.show();
     }
