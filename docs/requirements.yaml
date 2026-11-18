@@ -1532,7 +1532,7 @@ requirements:
       - id: REQ-050.6
         text: "Failure condition the recording's Knowledge pin does not match → safe stop: Show the pin mismatch, start no inference with the recording evidence, and do not silently replay or decode against another revision."
       - id: REQ-050.7
-        text: "Failure condition user declines disclosure or no eligible ChatGPT-plan permission is active → different success: No cloud diagnosis request starts; local replay stays usable. No alternative billing route or API-key setup is offered."
+        text: "Failure condition the user declines disclosure or no eligible ChatGPT-plan permission is active → different success: Initial denial or missing permission prevents any cloud diagnosis request from starting. Renewed denial stops further sends and preserves already approved exchanges as specified in REQ-045.8. Local replay remains usable; no alternative billing route or API key is offered."
       - id: REQ-050.8
         text: "Failure condition a reply requests a live read, a mutation, raw protocol, an unselected recording or an unknown tool → safe stop: Return a typed refusal before transport or unauthorized file access. Use only the tool bridge's current, closed recording vocabulary."
       - id: REQ-050.9
