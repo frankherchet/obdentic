@@ -379,7 +379,7 @@ requirements:
       - id: REQ-018.7
         text: Every exported file is byte-identical to its internal recording, and export never deletes, moves or modifies an internal recording.
       - id: REQ-018.8
-        text: Recording export needs and adds no permission of its own and never uses the network; no storage permission is added. Since REQ-044.3 the only permissions beyond the export release are INTERNET and the dataSync foreground-service permission of the optional ChatGPT account.
+        text: Recording export needs and adds no permission of its own and never uses the network; no storage permission is added. The separate account and optional microphone permissions under REQ-044.3 and REQ-054.1 are not used by export.
       - id: REQ-018.9
         text: Exporting never runs on the thread that talks to the adapter; while an export copies files, live polling, connection handling and jobs continue without waiting for it.
 
@@ -1189,11 +1189,11 @@ requirements:
       concluded from simulated runs.
     acceptance:
       - id: REQ-044.1
-        text: "With no account, and also with every network request failing or the phone in airplane mode, connecting, live measurement, recording, replay, export, diagnostics and every other existing function behave as before. The app makes no network request at start or while any tab is open; requests happen only after 'Continue with ChatGPT', after the disconnect confirmation, and when a caller asks for an access token while an account is connected. No error dialog, notification or service appears because of a missing account or network."
+        text: "With no account, and also with every network request failing or the phone in airplane mode, connecting, live measurement, recording, replay, export, diagnostics and every other existing local function behave as before. Starting the app or opening a tab does not initiate network traffic. Account requests happen only after 'Continue with ChatGPT', after disconnect confirmation, or when a caller explicitly needs an access token for an approved request while an account is connected. Assistant inference separately requires REQ-050.2 and REQ-050.4. No error dialog, notification or service appears solely because an account or network is missing."
       - id: REQ-044.2
         text: "Every request made for the account goes over HTTPS to auth.openai.com and sends only the fields named in REQ-042.2, REQ-042.7, REQ-043.4 and REQ-043.10 plus the ID-token key fetch; endpoints taken from the discovery document are used only when they are HTTPS on the same host. A test that records all requests finds no VIN, ECU or adapter identifier, recording content, device address or other device identifier besides the random host id and the app name. Redirects are not followed."
       - id: REQ-044.3
-        text: "The release manifest declares INTERNET as one single-line tag '<uses-permission android:name=\"android.permission.INTERNET\" />' so tools/verify-release-apk.sh accepts the built release APK, and adds no other permission besides the one in REQ-044.5. cleartext traffic stays disabled, no Gradle dependency is added, and the permission assertion of the acceptance run (REQ-018.8) allows INTERNET and still rejects storage permissions."
+        text: "The release manifest declares INTERNET as one single-line tag '<uses-permission android:name=\"android.permission.INTERNET\" />' so tools/verify-release-apk.sh accepts the built release APK. The account feature requires no other permission besides the one in REQ-044.5; optional local dictation alone may add RECORD_AUDIO under REQ-054.1. Cleartext traffic stays disabled, the account feature adds no Gradle dependency, and the recording export check (REQ-018.8) still rejects storage permissions."
       - id: REQ-044.4
         text: "Connecting, refreshing or disconnecting an account changes no vehicle capability: the process capability, the list of diagnostic jobs and the assistant tool interface (REQ-041.1) are identical with and without a connected account, the account code has no path to the session owner or the adapter transport, and it sends no vehicle traffic."
       - id: REQ-044.5
@@ -1205,7 +1205,7 @@ requirements:
       - id: REQ-044.8
         text: "A phone checklist in the AI acceptance issue covers, without vehicle or adapter traffic and with only sign-in data leaving the phone: first connection with consent and the one-time dialog, the indicator and 'Manage usage' opening ChatGPT usage settings, still connected after force-stop and relaunch, disconnect then connect again with the saved client id, disconnect in airplane mode with the unconfirmed-revocation message, and the measurements of REQ-044.6 and REQ-044.7. Its results are recorded as sanitized pass or fail without tokens, e-mail, subject or client id, and no simulated check counts as phone evidence."
       - id: REQ-044.9
-        text: "docs/project-goals.md section 7 gains a subsection 'Cloud inference and accounts' with the text: 'Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.' docs/android.md describes the account feature, the INTERNET permission and its sole use, the sign-in service as decided by REQ-044.6, and no longer says the app has no internet permission."
+        text: "docs/project-goals.md section 7 gains a subsection 'Cloud inference and accounts' with the text: 'Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.' docs/android.md describes the account use of INTERNET and the sign-in service as decided by REQ-044.6. When inference ships, document its distinct opt-in use under REQ-050.2 and REQ-050.4."
 
   - id: REQ-045
     title: Reconstruct a complete diagnostic agent run from its local audit
@@ -1234,7 +1234,7 @@ requirements:
       - id: REQ-045.7
         text: "Normal flow: A memo read and mutation, a Knowledge lookup and a recording query use the same tool lifecycle audit. For each, the complete local outcome is distinguishable from the exact subset sent externally."
       - id: REQ-045.8
-        text: "Failure condition the user denies disclosure → safe stop: Record the decision and make zero external requests for the attempted diagnosis."
+        text: "Failure condition the user denies initial or renewed disclosure → safe stop: Record the decision. For initial denial make zero external requests for this diagnosis. For later denial retain the previously approved exchanges in the audit, never dispatch the denied request, and send nothing further for that diagnosis."
       - id: REQ-045.9
         text: "Normal flow: Inspecting audit events triggers no tools, model calls or vehicle access."
       - id: REQ-045.10
@@ -1524,7 +1524,7 @@ requirements:
       - id: REQ-050.2
         text: "Normal flow: Before the first eligible cloud request, show the diagnostic facts and metadata about to leave the app. A later request with new diagnostic content requires renewed confirmation; the full request preview remains inspectable. Only approved semantic excerpts and reviewed necessary instructions/tool data are sent, never a full recording, raw frames, VIN, ECU or adapter identifiers, or credential data in the diagnostic JSON."
       - id: REQ-050.3
-        text: "Normal flow: A user-started diagnosis reports progress and starts at most four model request attempts and processes at most twelve tool proposals, including refused proposals. Start no new work once 60 seconds have elapsed since the first model attempt. Running work is bounded and cancellation remains available."
+        text: "Normal flow: A user-started diagnosis reports progress, attempts at most four model requests and processes at most twelve tool proposals including refusals. Set a monotonic 60-second diagnosis deadline from the first model attempt. At the deadline the runtime stops the diagnosis, cancels any in-flight model request and starts no more work; an already-started live exchange is governed by REQ-051.7."
       - id: REQ-050.4
         text: "Normal flow: Use the accepted ChatGPT-plan account and one model client behind the same audited interface as the scripted client. REQ-045 records actual sends, streams and outcomes; inspection resolves evidence without re-running a model or tool."
       - id: REQ-050.5
@@ -1536,7 +1536,7 @@ requirements:
       - id: REQ-050.8
         text: "Failure condition a reply requests a live read, a mutation, raw protocol, an unselected recording or an unknown tool → safe stop: Return a typed refusal before transport or unauthorized file access. Use only the tool bridge's current, closed recording vocabulary."
       - id: REQ-050.9
-        text: "Failure condition the user cancels or a request, call or time budget is exhausted → safe stop: Start no additional work and show cancellation or the exhausted budget. Audit the actual terminal outcome; do not fabricate a final diagnosis from a partial response."
+        text: "Failure condition the user cancels or a request, call or time budget is exhausted → safe stop: Start no additional work and show cancellation or the exhausted budget. If the deadline interrupts an in-flight stream, cancel it and do not use late content as a final diagnosis. Audit the actual terminal outcome rather than fabricate completion."
       - id: REQ-050.10
         text: "Failure condition the network fails, the provider reports a usage limit, or the stream ends incomplete → try again: Show the specific outcome and keep replay and any evidence received so far accessible. No automatic retry or assertion of a complete diagnosis."
       - id: REQ-050.11
@@ -1569,7 +1569,7 @@ requirements:
       - id: REQ-051.6
         text: "Failure condition a requested signal is unavailable, stale, from another target or would require a session change → different success: Return the existing typed outcome, preserve provenance and report the evidence gap rather than forcing a read, changing target/session or assuming health."
       - id: REQ-051.7
-        text: "Failure condition a user cancels or a budget expires during an exchange → safe stop: No further request starts; the existing bounded cleanup/timeout remains attached to that exchange. The audit distinguishes an unfinished exchange from a completed reading."
+        text: "Failure condition the user cancels or a budget expires during a live exchange → safe stop: Stop the diagnosis immediately and start no further diagnostic requests. The already-started exchange may finish under its existing transport timeout and bounded safety cleanup. Do not use late results to resume diagnosis; the audit records whether the exchange finished."
       - id: REQ-051.8
         text: "Failure condition the account expires, the provider limits usage, or the network fails mid-stream → try again: End this diagnosis with the specific outcome and preserve the partial audit and local vehicle functions. No automatic retry, billing fallback or continued autonomous reads."
 
@@ -1592,7 +1592,7 @@ requirements:
       - id: REQ-052.3
         text: "Failure condition the tester cancels, disconnects or interrupts a run → safe stop: In each case observe no new work after the stop, explicit terminal or partial status and no silently resumed diagnosis after reconnect."
       - id: REQ-052.4
-        text: "Failure condition the tester declines disclosure, declines export or loses network access → safe stop: Record separate outcomes; there is no diagnostic send on denied disclosure, no in-app export on cancellation, and no false success on network loss."
+        text: "Failure condition the tester declines disclosure, declines export or loses network access → safe stop: Record separate outcomes. The denied request and subsequent requests for that diagnosis are not dispatched, no in-app export is created on cancellation, and network loss is not shown as a success."
       - id: REQ-052.5
         text: "Failure condition no vehicle availability is explicitly confirmed for the agreed bounded session → safe stop: Do not open a live vehicle session for acceptance. Synthetic harness and account-only results remain independently reportable and never count as vehicle evidence."
       - id: REQ-052.6
@@ -1626,7 +1626,7 @@ requirements:
     depends_on: [REQ-050, REQ-051]
     acceptance:
       - id: REQ-054.1
-        text: "Normal flow: Explicit mic activation requests microphone permission on first use and uses an available Android on-device recognizer. The resulting German or English text, where installed, fills the editable typed composer and never sends or starts diagnosis without the ordinary user action and disclosure gate."
+        text: "Normal flow: The Android manifest declares RECORD_AUDIO only for optional dictation. Explicit mic activation requests it on first use and uses an available Android on-device recognizer. The resulting German or English text, where installed, fills the editable typed composer and never sends or starts diagnosis without the ordinary user action and disclosure gate."
       - id: REQ-054.2
         text: "Normal flow: The user explicitly plays a completed answer using an available local Android TTS voice, can stop playback, and can use the entire typed flow without activating voice. Neither raw audio nor speech synthesis is sent to the ChatGPT-plan endpoint."
       - id: REQ-054.3
