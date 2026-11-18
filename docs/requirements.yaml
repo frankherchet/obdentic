@@ -1374,3 +1374,34 @@ requirements:
         text: "Normal flow: Memos are app-private, excluded from backup and transfer, and never silently exported."
       - id: REQ-047.14
         text: "Normal flow: Before disclosure show only the memo excerpts selected for the outgoing request. REQ-045 records the retrieval, mutation, outcome and exact subset sent, if any; the full private memo store does not leave the client."
+
+  - id: REQ-048
+    title: Retrieve local diagnostic evidence with verifiable citations
+    type: functional
+    priority: should
+    status: draft
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-041, REQ-045]
+    description: >
+      The assistant can look up bounded diagnostic evidence using the pinned
+      effective Vehicle Knowledge and separately classified documents. Retrieval
+      never defines a vehicle operation or grants authority to execute one.
+    acceptance:
+      - id: REQ-048.1
+        text: "Normal flow: With two source revisions and conflicting synthetic ECU applicability, repeating a query offline at the same pin returns the same ordered, bounded results. Every hit includes stable source ID, revision, citation, applicability, evidence grade and match reason."
+      - id: REQ-048.2
+        text: "Normal flow: Given a cited ID and revision, a targeted follow-up returns that exact bounded source passage and its provenance, not a passage from another revision."
+      - id: REQ-048.3
+        text: "Normal flow: A result identifies whether it is general prose or a machine-readable pinned definition; the same term in both sources does not change the effective definition."
+      - id: REQ-048.4
+        text: "Failure condition only a VIN prefix matches or a result is incompatible or experimental → different success: Label the unsupported applicability or evidence status; do not present it as an available vehicle function or authorize traffic."
+      - id: REQ-048.5
+        text: "Failure condition the local index is missing or stale → safe stop: Report its missing or mismatched version and do not return hits presented as current."
+      - id: REQ-048.6
+        text: "Failure condition the expected Knowledge pin is missing or stale → safe stop: Return a version error; do not silently substitute a corpus or revision."
+      - id: REQ-048.7
+        text: "Failure condition a source lacks cleared redistribution or indexing rights → safe stop: Exclude the source from the index and results."
+      - id: REQ-048.8
+        text: "Failure condition retrieved prose contains instructions posing as policy or vehicle operations → different success: Return it only as source text where relevant; execute zero adapter commands and make zero policy or capability changes."
+      - id: REQ-048.9
+        text: "Normal flow: The disclosure preview shows only the selected excerpts and source revisions. REQ-045 records the full local retrieval response separately from the exact approved subset actually sent."
