@@ -1211,7 +1211,7 @@ requirements:
     title: Reconstruct a complete diagnostic agent run from a private local audit
     type: functional
     priority: must
-    status: draft
+    status: accepted
     source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
     depends_on: [REQ-041, REQ-043, REQ-044]
     description: >
@@ -1278,7 +1278,7 @@ requirements:
     title: Reproduce agent and vehicle-session outcomes offline through the real core
     type: functional
     priority: must
-    status: draft
+    status: accepted
     source: "M6 Android diagnostic assistant scope update, 2026-11-18; ADR 0006"
     depends_on: [REQ-041]
     description: >
@@ -1338,7 +1338,7 @@ requirements:
     title: Keep evidence-backed diagnostic memos private to each local vehicle
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
     depends_on: [REQ-013, REQ-045]
     description: >
@@ -1374,12 +1374,16 @@ requirements:
         text: "Normal flow: Memos are app-private, excluded from backup and transfer, and never silently exported."
       - id: REQ-047.14
         text: "Normal flow: Before disclosure show only the memo excerpts selected for the outgoing request. REQ-045 records the retrieval, mutation, outcome and exact subset sent, if any; the full private memo store does not leave the client."
+      - id: REQ-047.15
+        text: "Normal flow: A model-authored hypothesis can be saved without per-item confirmation for a verified selected vehicle. It is labeled unverified and attributed to the model; saving it initiates no vehicle read."
+      - id: REQ-047.16
+        text: "Failure condition the model requests deletion or confirmation of a memo → safe stop: Refuse the operation and leave the memo unchanged; deletion and confirmation remain user-controlled."
 
   - id: REQ-048
     title: Retrieve local diagnostic evidence with verifiable citations
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
     depends_on: [REQ-041, REQ-045]
     description: >
@@ -1410,7 +1414,7 @@ requirements:
     title: Query a selected recording locally with bounded work and exact source links
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
     depends_on: [REQ-041, REQ-045]
     description: >
