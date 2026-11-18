@@ -1505,3 +1505,131 @@ requirements:
         text: "Normal flow: Recording queries add at most 8 MiB to a like-for-like Android release APK."
       - id: REQ-049.24
         text: "Failure condition one projected result cannot fit in the 64 KiB page by itself → try again: Return a typed output limit and allow a narrower projection. Do not silently skip the event or return a cursor that cannot advance."
+
+  - id: REQ-050
+    title: Run a typed assistant diagnosis on one selected saved recording
+    type: functional
+    priority: should
+    status: draft
+    source: "M6 Android assistant kickoff; offline recording diagnosis"
+    depends_on: [REQ-041, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046]
+    description: >
+      The user opens an existing saved recording and asks a typed question.
+      Diagnosis does not require a connected vehicle; deterministic acceptance
+      uses a scripted client offline. Real cloud inference is separate and
+      optional, and does not replace local replay.
+    acceptance:
+      - id: REQ-050.1
+        text: "Normal flow: In the saved recording replay the user can start the typed assistant with that recording identified and fixed for the diagnosis. In a fully offline scripted EGR/MAF fixture it uses the existing recording tool, starts zero adapter and network requests, and returns findings, uncertainty, missing evidence and resolvable recording-event references."
+      - id: REQ-050.2
+        text: "Normal flow: Before the first eligible cloud request, show the diagnostic facts and metadata about to leave the app. A later request with new diagnostic content requires renewed confirmation; the full request preview remains inspectable. Only approved semantic excerpts and reviewed necessary instructions/tool data are sent, never a full recording, raw frames, VIN, ECU or adapter identifiers, or credential data in the diagnostic JSON."
+      - id: REQ-050.3
+        text: "Normal flow: A user-started diagnosis reports progress and starts at most four model request attempts and processes at most twelve tool proposals, including refused proposals. Start no new work once 60 seconds have elapsed since the first model attempt. Running work is bounded and cancellation remains available."
+      - id: REQ-050.4
+        text: "Normal flow: Use the accepted ChatGPT-plan account and one model client behind the same audited interface as the scripted client. REQ-045 records actual sends, streams and outcomes; inspection resolves evidence without re-running a model or tool."
+      - id: REQ-050.5
+        text: "Failure condition no recording is selected or the selected recording becomes unavailable → try again: Identify the missing source and start no diagnosis on another recording; the user may select one explicitly."
+      - id: REQ-050.6
+        text: "Failure condition the recording's Knowledge pin does not match → safe stop: Show the pin mismatch, start no inference with the recording evidence, and do not silently replay or decode against another revision."
+      - id: REQ-050.7
+        text: "Failure condition user declines disclosure or no eligible ChatGPT-plan permission is active → different success: No cloud diagnosis request starts; local replay stays usable. No alternative billing route or API-key setup is offered."
+      - id: REQ-050.8
+        text: "Failure condition a reply requests a live read, a mutation, raw protocol, an unselected recording or an unknown tool → safe stop: Return a typed refusal before transport or unauthorized file access. Use only the tool bridge's current, closed recording vocabulary."
+      - id: REQ-050.9
+        text: "Failure condition the user cancels or a request, call or time budget is exhausted → safe stop: Start no additional work and show cancellation or the exhausted budget. Audit the actual terminal outcome; do not fabricate a final diagnosis from a partial response."
+      - id: REQ-050.10
+        text: "Failure condition the network fails, the provider reports a usage limit, or the stream ends incomplete → try again: Show the specific outcome and keep replay and any evidence received so far accessible. No automatic retry or assertion of a complete diagnosis."
+      - id: REQ-050.11
+        text: "Failure condition evidence is absent, stale or not attributable to the selected recording → different success: Leave the fact unknown or explicitly stale and distinguish any inference from evidence; never present an unknown fact as zero or evidence of health."
+      - id: REQ-050.12
+        text: "Failure condition the next serialized diagnostic request exceeds 128 KiB UTF-8 JSON → try again: Show the size limit before dispatch and let the user reduce context explicitly. Do not send a truncated or recomposed payload without new preview and confirmation."
+
+  - id: REQ-051
+    title: Run a bounded typed assistant diagnosis in an existing live vehicle session
+    type: functional
+    priority: should
+    status: draft
+    source: "M6 Android assistant kickoff; live session diagnosis"
+    depends_on: [REQ-041, REQ-045, REQ-046, REQ-050]
+    description: >
+      A user can ask a typed diagnostic question while the vehicle is stationary.
+      The existing session owner executes only supported read-only work; the
+      runtime, private-data disclosure rules and audit are shared with recording diagnosis.
+    acceptance:
+      - id: REQ-051.1
+        text: "Normal flow: A user starts a typed diagnosis in a connected session with fresh observed vehicle speed zero. The assistant shows the active source, read progress and cancellation, obtains only currently supported typed facts from the existing session owner, and finishes with facts, uncertainty and exact capture evidence references."
+      - id: REQ-051.2
+        text: "Normal flow: Use the same four-attempt, twelve-proposal, 60-second and 128 KiB request ceilings, preview/confirmation and actual-send audit as recorded diagnosis. Also enforce REQ-041 live budgets and existing session rules; the stricter applicable budget always wins. No second owner, new restricted diagnostic session, raw operation or write is exposed."
+      - id: REQ-051.3
+        text: "Failure condition the session owner is busy with a job or observation that cannot share the serialized path → try again: Return the existing busy outcome without queueing, preempting that job, or taking another connection; the user may explicitly try again."
+      - id: REQ-051.4
+        text: "Failure condition speed is nonzero, unknown, or stale under the existing 10-second freshness contract → safe stop: Do not start the interactive live diagnosis, or stop starting work if the condition changes during it. Do not prompt for more input while movement is possible, start new probing solely to establish stationary state, or auto-resume."
+      - id: REQ-051.5
+        text: "Failure condition the session disconnects or changes during diagnosis → safe stop: End the affected work, expire affected identifiers and never use late results as evidence for a new session. After reconnecting the user may explicitly start a new diagnosis under a newly confirmed session; no automatic replay."
+      - id: REQ-051.6
+        text: "Failure condition a requested signal is unavailable, stale, from another target or would require a session change → different success: Return the existing typed outcome, preserve provenance and report the evidence gap rather than forcing a read, changing target/session or assuming health."
+      - id: REQ-051.7
+        text: "Failure condition a user cancels or a budget expires during an exchange → safe stop: No further request starts; the existing bounded cleanup/timeout remains attached to that exchange. The audit distinguishes an unfinished exchange from a completed reading."
+      - id: REQ-051.8
+        text: "Failure condition the account expires, the provider limits usage, or the network fails mid-stream → try again: End this diagnosis with the specific outcome and preserve the partial audit and local vehicle functions. No automatic retry, billing fallback or continued autonomous reads."
+
+  - id: REQ-052
+    title: Keep Android account-only and real-vehicle assistant acceptance distinct
+    type: constraint
+    priority: should
+    status: draft
+    source: "M6 Android assistant kickoff; independent real-device acceptance"
+    depends_on: [REQ-044]
+    description: >
+      The account-only checklist is independent of live diagnosis. Only the
+      live assistant acceptance needs the live assistant, audit and harness
+      under REQ-045, REQ-046 and REQ-051.
+    acceptance:
+      - id: REQ-052.1
+        text: "Normal flow: The REQ-044.6–.8 account-only device checklist can be run without adapter, vehicle or assistant model requests and recorded separately before live diagnosis is available. It publishes sanitized pass/fail only."
+      - id: REQ-052.2
+        text: "Normal flow: In a separately approved bounded stationary phone/adapter/vehicle session, a user-started diagnosis establishes the actual read-only progression, provenance, one session owner and no additional commands beyond the allowed trace. Offline inspection reconstructs the resulting audit and opens its source references without the vehicle or network."
+      - id: REQ-052.3
+        text: "Failure condition the tester cancels, disconnects or interrupts a run → safe stop: In each case observe no new work after the stop, explicit terminal or partial status and no silently resumed diagnosis after reconnect."
+      - id: REQ-052.4
+        text: "Failure condition the tester declines disclosure, declines export or loses network access → safe stop: Record separate outcomes; there is no diagnostic send on denied disclosure, no in-app export on cancellation, and no false success on network loss."
+      - id: REQ-052.5
+        text: "Failure condition no vehicle availability is explicitly confirmed for the agreed bounded session → safe stop: Do not open a live vehicle session for acceptance. Synthetic harness and account-only results remain independently reportable and never count as vehicle evidence."
+      - id: REQ-052.6
+        text: "Normal flow: Report the approved run scope and sanitized outcomes only. Actual audit, recordings, credentials and device/vehicle identifiers stay local; simulation and hardware evidence are labeled separately."
+
+  - id: REQ-053
+    title: Inspect a deterministic semantic snapshot through the typed mobile bridge
+    type: functional
+    priority: should
+    status: draft
+    source: "M6 Android assistant kickoff; semantic snapshots"
+    depends_on: [REQ-041, REQ-045]
+    acceptance:
+      - id: REQ-053.1
+        text: "Normal flow: The first closed snapshot tool exposes the deterministic engine family built by the shared snapshot core. For equivalent catalog and samples containing RPM, speed, coolant temperature, load and MAF, live and replay report the same facts, sample times, availability and units with provenance identifying the actual source of each. Snapshot construction starts zero vehicle traffic."
+      - id: REQ-053.2
+        text: "Normal flow: In replay the tool reads only the user-selected recording and existing time cursor, treating each value's time and age separately. It does not select a recording, advance the cursor, interpolate samples or emit a diagnosis."
+      - id: REQ-053.3
+        text: "Failure condition a known snapshot field is missing, unsupported, stale or has a read/decode error → different success: Show the state, timestamp/age where known and source; a missing value is never zero and a stale value is never reported as fresh."
+      - id: REQ-053.4
+        text: "Failure condition the request names an unknown snapshot family, raw selector or unselected recording, or the pin is invalid → safe stop: Refuse with a typed outcome before fetching evidence or sending any adapter command."
+      - id: REQ-053.5
+        text: "Normal flow: The snapshot invocation and result use the same audit and disclosure contract as existing assistant tools. Opaque source references preserve provenance without exposing vehicle identifiers or an executable address."
+
+  - id: REQ-054
+    title: Make optional Android voice local and subordinate to typed diagnosis
+    type: functional
+    priority: could
+    status: draft
+    source: "M6 Android assistant kickoff; optional voice"
+    depends_on: [REQ-050, REQ-051]
+    acceptance:
+      - id: REQ-054.1
+        text: "Normal flow: Explicit mic activation requests microphone permission on first use and uses an available Android on-device recognizer. The resulting German or English text, where installed, fills the editable typed composer and never sends or starts diagnosis without the ordinary user action and disclosure gate."
+      - id: REQ-054.2
+        text: "Normal flow: The user explicitly plays a completed answer using an available local Android TTS voice, can stop playback, and can use the entire typed flow without activating voice. Neither raw audio nor speech synthesis is sent to the ChatGPT-plan endpoint."
+      - id: REQ-054.3
+        text: "Failure condition mic permission is denied or the on-device recognizer, selected language or local TTS voice is unavailable → different success: Explain the unavailable option and preserve typing/readable text; do not fall back to a network speech service."
+      - id: REQ-054.4
+        text: "Failure condition the user cancels voice, the app leaves the foreground or the live stationary check fails → safe stop: Stop the affected recognition/playback and do not send a late transcript, prompt for attention, or auto-resume. Voice never starts its own adapter traffic."
