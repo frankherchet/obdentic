@@ -448,6 +448,10 @@ disconnect confirmation, and when a caller (the assistant, #328) asks for an acc
   A sign-in whose credential cannot be stored is revoked and leaves no file or key behind. The ID token is accepted only with an RS256 signature from the discovery
   document's JWKS, issuer `https://auth.openai.com`, the client id as audience, an expiry in the future (60 s leeway) and the attempt's
   nonce.
+  If Android denies the local socket (#352, REQ-042.13), the account screen offers **Einstellungen öffnen** or **Abbrechen**.
+  The button opens this app's data usage in Android, falling back to its app info. On LineageOS, allow **Netzwerkzugriff**
+  and **WLAN-Daten** under **WLAN-Datennutzung**. Return and tap **Continue with ChatGPT** again; no settings change or retry
+  happens automatically. A port conflict, another socket failure or loss of connectivity does not offer the dialog.
 - **Plan permission missing:** a valid sign-in whose granted scope lacks `chatgpt.tokens.use.direct` is kept (as OpenAI advises) but
   inactive: no access token is handed out and no inference request is possible until **Continue with ChatGPT** repeats the
   authorization with `prompt=consent`. A repeat that returns another subject than the stored one is rejected: the stored account stays and the

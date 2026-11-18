@@ -1130,7 +1130,7 @@ requirements:
       - id: REQ-042.12
         text: "Exactly one account is supported: while one is connected with the plan permission 'Continue with ChatGPT' is not offered and a second attempt cannot start; in the inactive state of REQ-042.9 it offers only the re-authorization of that sign-in. A second tap during an attempt is ignored, and both buttons show immediate pending feedback (REQ-021). Using another account requires disconnecting first."
       - id: REQ-042.13
-        text: "Without an installed browser, or when no loopback port can be bound, the attempt stops before anything is opened, says why, closes any listener and stores nothing."
+        text: "Without an installed browser, or when the local listener cannot start, the attempt stops before the browser opens, says why, closes any listener and stores no credentials. If the operating system explicitly denies the socket, the account screen offers to open the app's network settings, falling back to its app info when necessary, or to cancel. The settings only open on confirmation. The user must tap sign-in again after returning. Port conflicts, other I/O errors and offline errors do not offer this dialog."
 
   - id: REQ-043
     title: Protect, refresh and remove the ChatGPT credentials

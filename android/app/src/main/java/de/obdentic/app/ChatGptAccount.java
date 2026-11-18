@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.system.OsConstants;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -37,6 +38,7 @@ public final class ChatGptAccount {
     public static final String MSG_UNCONFIRMED = "Abgemeldet · Widerruf nicht bestätigt. Der Zugriff lässt sich in den ChatGPT-Einstellungen unter „Manage usage“ entfernen.";
     public static final String MSG_UNREADABLE = "Nicht verbunden · die gespeicherte Anmeldung war nicht lesbar, bitte erneut mit ChatGPT verbinden";
     public static final String MSG_INVALID_CLIENT = "Registrierung ungültig · beim nächsten Anmelden registriert sich die App neu";
+    private static final String SOCKET_DENIED = "socket_denied";
 
     /** REQ-043.7 */
     private static final Set<String> TERMINAL = new HashSet<>(Arrays.asList("invalid_grant", "invalid_refresh_token", "token_expired",
@@ -145,6 +147,7 @@ public final class ChatGptAccount {
     /** Set by {@link #cancel()} for the running attempt, also while its listener does not exist yet. */
     private boolean cancelRequested;
     private String message = "";
+    private boolean networkSettingsPrompt;
     private boolean expired, unreachable, loaded;
     /** True while {@code record} is a rotated credential that storage does not hold yet: the one valid refresh token, retried on every access. */
     private boolean unsaved;
@@ -217,6 +220,15 @@ public final class ChatGptAccount {
         }
     }
 
+    /** Recovery stays available until the user decides, including across Activity recreation. */
+    boolean networkSettingsPromptDue() {
+        synchronized (state) { return networkSettingsPrompt; }
+    }
+
+    void dismissNetworkSettingsPrompt() {
+        synchronized (state) { networkSettingsPrompt = false; }
+    }
+
     // ---------------------------------------------------------------- sign-in (REQ-042)
 
     private static final class Stop extends Exception {
@@ -243,6 +255,7 @@ public final class ChatGptAccount {
             reauth = existing != null;
             phase = Phase.WAITING;
             message = "";
+            networkSettingsPrompt = false;
             id = ++signInId;
             cancelRequested = false;
             keepaliveOwner = id;
@@ -294,6 +307,7 @@ public final class ChatGptAccount {
             if (signInId == id) {
                 phase = Phase.IDLE;
                 message = text == null ? "" : text;
+                networkSettingsPrompt = !cancelRequested && SOCKET_DENIED.equals(result);
                 changed();
             }
         }
@@ -313,8 +327,13 @@ public final class ChatGptAccount {
         LoopbackListener l;
         try {
             l = config.opener.open(config.preferredPort, config.callbackTimeoutMs, config.returnLink);
-        } catch (IOException e) {
-            throw new Stop("Kein freier lokaler Port für die Anmeldung", "no_port");
+        } catch (IOException | SecurityException e) {
+            int errno = LoopbackListener.socketErrno(e);
+            if (e instanceof SecurityException || errno == OsConstants.EACCES || errno == OsConstants.EPERM) {
+                throw new Stop("Android verweigert den lokalen Netzwerkzugriff für die Anmeldung", SOCKET_DENIED);
+            }
+            if (errno == OsConstants.EADDRINUSE) throw new Stop("Lokaler Port für die Anmeldung belegt", "no_port");
+            throw new Stop("Lokaler Anmeldedienst konnte nicht gestartet werden", "listener_open");
         }
         synchronized (state) {
             if (signInId != id || cancelRequested) { l.close(); throw new CancellationException(); }
@@ -683,6 +702,7 @@ public final class ChatGptAccount {
             r = current();
             phase = Phase.DISCONNECTING;
             message = "";
+            networkSettingsPrompt = false;
             changed();
         }
         log("disconnect start connected=" + (r != null));
