@@ -1206,3 +1206,70 @@ requirements:
         text: "A phone checklist in the AI acceptance issue covers, without vehicle or adapter traffic and with only sign-in data leaving the phone: first connection with consent and the one-time dialog, the indicator and 'Manage usage' opening ChatGPT usage settings, still connected after force-stop and relaunch, disconnect then connect again with the saved client id, disconnect in airplane mode with the unconfirmed-revocation message, and the measurements of REQ-044.6 and REQ-044.7. Its results are recorded as sanitized pass or fail without tokens, e-mail, subject or client id, and no simulated check counts as phone evidence."
       - id: REQ-044.9
         text: "docs/project-goals.md section 7 gains a subsection 'Cloud inference and accounts' with the text: 'Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.' docs/android.md describes the account feature, the INTERNET permission and its sole use, the sign-in service as decided by REQ-044.6, and no longer says the app has no internet permission."
+
+  - id: REQ-045
+    title: Reconstruct a complete diagnostic agent run from a private local audit
+    type: functional
+    priority: must
+    status: draft
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-041, REQ-043, REQ-044]
+    description: >
+      The user can inspect actual model exchanges and tool activity without
+      reopening a connection, account or model. A versioned JSONL audit is
+      distinct from the vehicle recording and remains honest after interruption.
+    acceptance:
+      - id: REQ-045.1
+        text: "Normal flow: A synthetic diagnosis with two turns, one retry and multiple tool calls reconstructs chronologically from versioned JSONL alone. The start records runtime, build and model versions, Knowledge pin, opaque vehicle reference, configuration and budgets; a monotone sequence, wall and monotonic times, and applicable session_id, turn_id, request_id and tool_call_id correlate events without conflating attempts."
+      - id: REQ-045.2
+        text: "Normal flow: At the client send boundary, the reconstructed request JSON equals the actual JSON by value, preserving array order and exact string contents in instructions, all messages, tools and schemas, options and the selected memo, Knowledge and recording-query excerpts. A pre-send preview is not evidence of dispatch; HTTP framing and authentication metadata are not part of the audit."
+      - id: REQ-045.3
+        text: "Normal flow: Reconstruct all received response items and streaming deltas in order, the original tool argument strings, and the final content, refusal, finish or incomplete status and usage when supplied; missing items or usage are not fabricated."
+      - id: REQ-045.4
+        text: "Normal flow: For an allowed call, the trace identifies the proposal and exact arguments, policy result and reason, effective operation, execution start and end, result and evidence reference."
+      - id: REQ-045.5
+        text: "Failure condition policy denies a proposed tool → safe stop: Record the original arguments, denial and reason, but no execution start or end; no tool work occurs."
+      - id: REQ-045.6
+        text: "Failure condition an allowed tool fails during execution → safe stop: Record its start, terminal error and available evidence, not a successful outcome."
+      - id: REQ-045.7
+        text: "Normal flow: A memo read and mutation, a Knowledge lookup and a recording query use the same tool lifecycle audit. For each, the complete local outcome is distinguishable from the exact subset sent externally."
+      - id: REQ-045.8
+        text: "Failure condition the user denies disclosure → safe stop: Record the decision and make zero external requests for the attempted diagnosis."
+      - id: REQ-045.9
+        text: "Normal flow: Inspecting audit events triggers no tools, model calls or vehicle access."
+      - id: REQ-045.10
+        text: "Failure condition an outbound audit entry cannot be persisted before dispatch → safe stop: Do not dispatch the request or tool, including offline tools."
+      - id: REQ-045.11
+        text: "Failure condition audit persistence fails during a request or tool → safe stop: Cancel in-flight work where possible; start no subsequent call or automatic retry. Do not report the audit or diagnosis as complete because an error record could not be written."
+      - id: REQ-045.12
+        text: "Failure condition no durable end marker, a sequence gap, a torn line or an open attempt → safe stop: For each case the offline inspector shows the last evidenced action and marks the affected run incomplete or unknown; an unconfirmed dispatch is not presented as sent or as not sent."
+      - id: REQ-045.13
+        text: "Failure condition a request times out → safe stop: The trace preserves received events and shows timeout, not success."
+      - id: REQ-045.14
+        text: "Failure condition the model network request fails → safe stop: The trace shows the network failure for the affected attempt and the evidence already received; any permitted later retry has a distinct request identity."
+      - id: REQ-045.15
+        text: "Failure condition a usage limit ends the request → safe stop: The trace shows the limit outcome and only usage supplied by the provider."
+      - id: REQ-045.16
+        text: "Failure condition the user cancels → safe stop: Retain the recorded trace and cancellation outcome; start no further work for that diagnosis."
+      - id: REQ-045.17
+        text: "Failure condition the vehicle session disconnects during diagnosis → safe stop: Retain the available trace with the disconnect outcome; do not infer the pending tool result."
+      - id: REQ-045.18
+        text: "Failure condition the app process terminates mid-stream → safe stop: The inspector shows the persisted prefix and an incomplete or unknown outcome; it does not invent a terminal response."
+      - id: REQ-045.19
+        text: "Normal flow: Offline inspection of a synthetic session shows the actual transcript, calls and status. It separately identifies whether the audit is complete and whether the diagnosis succeeded. Links identify exact source evidence in the separate recording; neither side is sampled or truncated to make the audit appear complete, and whole recordings are not embedded."
+      - id: REQ-045.20
+        text: "Failure condition a linked recording is missing → different success: The transcript remains readable and shows the source reference as unresolved."
+      - id: REQ-045.21
+        text: "Normal flow: Synthetic secret markers injected into authorization or account metadata are absent from the private JSONL, export and error output."
+      - id: REQ-045.22
+        text: "Failure condition an outgoing diagnostic payload contains disallowed secret material → safe stop: Reject it before sending without logging the forbidden material. Never alter the private record of a payload that was actually sent to make it appear compliant."
+      - id: REQ-045.23
+        text: "Normal flow: The local audit is app-private and excluded from backup and device transfer."
+      - id: REQ-045.24
+        text: "Normal flow: Export requires explicit session selection, a sensitive-data warning and a redaction preview before the user confirms the output; the private source audit remains unchanged."
+      - id: REQ-045.25
+        text: "Failure condition the user cancels export → safe stop: No export is created."
+      - id: REQ-045.26
+        text: "Normal flow: Deletion and rotation affect whole sessions per the agreed retention policy. An active session is never evicted."
+      - id: REQ-045.27
+        text: "Failure condition storage is full → safe stop: Report storage exhaustion and follow the persistence stop rules; do not silently discard older sessions to make room."
