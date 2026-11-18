@@ -1333,3 +1333,44 @@ requirements:
         text: "Failure condition a scripted request is raw, unknown or mutating → safe stop: Each receives a typed refusal with exactly zero additional TX."
       - id: REQ-046.23
         text: "Normal flow: Combined acceptance with REQ-045 reconstructs the complete synthetic diagnosis offline, correlating actual scripted attempts, approved and refused tools and source evidence with the transport trace. Neither the foundation nor this acceptance depends on real runtime/model integration."
+
+  - id: REQ-047
+    title: Keep evidence-backed diagnostic memos private to each local vehicle
+    type: functional
+    priority: should
+    status: draft
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-013, REQ-045]
+    description: >
+      A user can preserve diagnostic history without letting model conjecture
+      become evidence or altering reviewed Vehicle Knowledge. Local ownership
+      follows the private vehicle record, not an account, replay or model.
+    acceptance:
+      - id: REQ-047.1
+        text: "Normal flow: With two synthetic private vehicle records selected in turn, creating and searching a memo shows it only on the selected vehicle, including after offline restart and after ChatGPT account disconnect."
+      - id: REQ-047.2
+        text: "Normal flow: Updating a memo preserves its source, author, creation and update times, Knowledge pin, status, contradictions and predecessor; the other vehicle's record stays unchanged."
+      - id: REQ-047.3
+        text: "Normal flow: Linking evidence to a memo on the selected vehicle resolves to the exact recording event and distinguishes the evidence from a hypothesis."
+      - id: REQ-047.4
+        text: "Normal flow: Archiving a memo removes it from the active list and keeps it available in that vehicle's archive."
+      - id: REQ-047.5
+        text: "Normal flow: Confirmed user deletion removes the memo from active, archived and search results, including after restart, without deleting the recording or another vehicle's memo. Existing audit entries remain until separately removed by the user's audit controls; deletion explains that distinction."
+      - id: REQ-047.6
+        text: "Failure condition a vehicle identity is unknown or ambiguous → safe stop: Refuse persistent memo reads and writes rather than falling back to another local vehicle."
+      - id: REQ-047.7
+        text: "Failure condition a replay belongs to another vehicle or cannot be tied to the selected record → safe stop: Refuse persistent reads and writes in that context. Replay does not create or select a private vehicle record."
+      - id: REQ-047.8
+        text: "Failure condition model text claims a hypothesis is proven without independent evidence → safe stop: Keep it unverified and distinguish the disagreement or missing evidence from the model's claim."
+      - id: REQ-047.9
+        text: "Failure condition the linked source recording is gone → different success: The memo remains visible with unavailable evidence, not an invented observation."
+      - id: REQ-047.10
+        text: "Failure condition writing the memo fails → safe stop: The previous store stays intact, the app shows the failure, and a retry is not reported as completed."
+      - id: REQ-047.11
+        text: "Failure condition memo migration fails → safe stop: Keep the prior store unchanged and report the failed migration; no silently empty replacement."
+      - id: REQ-047.12
+        text: "Normal flow: Reopening a pending question from a memo sends no automatic vehicle read. Memo operations never change effective Knowledge or process capabilities."
+      - id: REQ-047.13
+        text: "Normal flow: Memos are app-private, excluded from backup and transfer, and never silently exported."
+      - id: REQ-047.14
+        text: "Normal flow: Before disclosure show only the memo excerpts selected for the outgoing request. REQ-045 records the retrieval, mutation, outcome and exact subset sent, if any; the full private memo store does not leave the client."
