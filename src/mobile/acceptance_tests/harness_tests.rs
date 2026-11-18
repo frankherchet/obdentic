@@ -114,6 +114,18 @@ fn req_046_1_3_20_the_same_scenario_gives_the_same_trace_and_tool_results() {
     assert_eq!(comparable(&first), comparable(&second));
     assert_eq!(values(&first), values(&second));
 
+    // REQ-046.3 inventory: Carly identity and generic initialization, the functional page, the VIN read, the
+    // targeted engine validation. Initialization appears twice because `establish` initializes and inventory's
+    // functional restore is followed by a fresh reset.
+    let boot: Vec<&str> = first.trace[..first.diagnosis_from]
+        .iter()
+        .map(|t| t.wire.as_str())
+        .collect();
+    assert_eq!(boot[..EXPECTED_INVENTORY_TX.len()], EXPECTED_INVENTORY_TX);
+    // ECU discovery: only targeted read-only identification requests, each behind its own header and filter.
+    assert!(boot[EXPECTED_INVENTORY_TX.len()..].iter().all(|wire| {
+        wire.starts_with("ATSH ") || wire.starts_with("ATCRA") || wire.starts_with("22F1")
+    }));
     // REQ-046.3: the exact TX order of the diagnosis and the matching tool references.
     let wires: Vec<&str> = first.trace[first.diagnosis_from..]
         .iter()
@@ -144,6 +156,32 @@ fn req_046_1_3_20_the_same_scenario_gives_the_same_trace_and_tool_results() {
 
 /// Targeted RPM, the re-initialization before a functional scan, stored and pending DTCs, then the targeted MAF
 /// and Knowledge reads.
+const EXPECTED_INVENTORY_TX: [&str; 23] = [
+    "ATI\r",
+    "AT@1\r",
+    "ATZ\r",
+    "ATE0\r",
+    "ATL0\r",
+    "ATS1\r",
+    "ATH1\r",
+    "ATSP0\r",
+    "0100\r",
+    "ATI\r",
+    "AT@1\r",
+    "ATZ\r",
+    "ATE0\r",
+    "ATL0\r",
+    "ATS1\r",
+    "ATH1\r",
+    "ATSP0\r",
+    "0100\r",
+    "0100\r",
+    "0902\r",
+    "ATSH 7E0\r",
+    "ATCRA 7E8\r",
+    "010C\r",
+];
+
 const EXPECTED_DIAGNOSIS_TX: [&str; 16] = [
     "ATSH 7E0\r",
     "ATCRA 7E8\r",
