@@ -1208,7 +1208,7 @@ requirements:
         text: "docs/project-goals.md section 7 gains a subsection 'Cloud inference and accounts' with the text: 'Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.' docs/android.md describes the account feature, the INTERNET permission and its sole use, the sign-in service as decided by REQ-044.6, and no longer says the app has no internet permission."
 
   - id: REQ-045
-    title: Reconstruct a complete diagnostic agent run from a private local audit
+    title: Reconstruct a complete diagnostic agent run from its local audit
     type: functional
     priority: must
     status: accepted
@@ -1264,15 +1264,27 @@ requirements:
       - id: REQ-045.22
         text: "Failure condition an outgoing diagnostic payload contains disallowed secret material → safe stop: Reject it before sending without logging the forbidden material. Never alter the private record of a payload that was actually sent to make it appear compliant."
       - id: REQ-045.23
-        text: "Normal flow: The local audit is app-private and excluded from backup and device transfer."
+        text: "Normal flow: Before the first audited session, the user explicitly selects a directory on shared internal device storage. The app warns that full unencrypted JSONL files will be visible in the file manager and can be copied or backed up outside OBDentic without its export preview. The app itself does not upload or back up the audit or select a remote provider. The model cannot select or change the directory."
       - id: REQ-045.24
-        text: "Normal flow: Export requires explicit session selection, a sensitive-data warning and a redaction preview before the user confirms the output; the private source audit remains unchanged."
+        text: "Normal flow: Export through OBDentic requires explicit session selection, a sensitive-data warning and a redaction preview before the user confirms the output; the local source audit remains unchanged. File-manager copies are not controlled by this workflow."
       - id: REQ-045.25
         text: "Failure condition the user cancels export → safe stop: No export is created."
       - id: REQ-045.26
-        text: "Normal flow: Deletion and rotation affect whole sessions per the agreed retention policy. An active session is never evicted."
+        text: "Normal flow: Automatic retention deletes only whole completed sessions once 30 days have elapsed since their recorded end. A session without a verified end is not automatically expired. No active session is evicted; manual audit deletion remains separate from vehicle recordings and memos."
       - id: REQ-045.27
         text: "Failure condition storage is full → safe stop: Report storage exhaustion and follow the persistence stop rules; do not silently discard older sessions to make room."
+      - id: REQ-045.28
+        text: "Failure condition no valid local directory was selected, access was revoked, or the destination cannot confirm a durable append → safe stop: Report the destination error; start no unaudited model or tool work, including offline. Do not silently switch locations."
+      - id: REQ-045.29
+        text: "Normal flow: Starting at 80% of the 256 MiB total audit budget, show a storage warning before more work. Count persisted audit bytes in the selected directory, including active and incomplete sessions."
+      - id: REQ-045.30
+        text: "Failure condition an append would exceed 256 MiB total or 32 MiB for one session → safe stop: An append fitting exactly is allowed; the first append exceeding a cap is refused without truncating an event or deleting unexpired history. Apply the persistence stop rules."
+      - id: REQ-045.31
+        text: "Failure condition an encoded JSONL event would exceed 2 MiB → safe stop: Accept an event at the byte limit if the other budgets allow it; refuse a larger event without truncation and follow the persistence stop rules."
+      - id: REQ-045.32
+        text: "Failure condition a session would record more than 10,000 events → safe stop: The 10,000th event can be written; do not begin work that requires an event beyond the cap. Mark an interrupted audit honestly if an end marker cannot be persisted."
+      - id: REQ-045.33
+        text: "Normal flow: On the supported Android reference configuration, durable outbound appends of up to 64 KiB have p95 latency of at most 25 ms, measured from the write request through durability confirmation. This benchmark target never permits dispatch before the write is durable."
 
   - id: REQ-046
     title: Reproduce agent and vehicle-session outcomes offline through the real core
@@ -1333,6 +1345,8 @@ requirements:
         text: "Failure condition a scripted request is raw, unknown or mutating → safe stop: Each receives a typed refusal with exactly zero additional TX."
       - id: REQ-046.23
         text: "Normal flow: Combined acceptance with REQ-045 reconstructs the complete synthetic diagnosis offline, correlating actual scripted attempts, approved and refused tools and source evidence with the transport trace. Neither the foundation nor this acceptance depends on real runtime/model integration."
+      - id: REQ-046.24
+        text: "Normal flow: The synthetic harness suite completes in at most 10 seconds on the macOS CI runner, measured from test start to test end without compilation; do not omit agreed production-path cases or misclassify any of the 35 matrix cases to meet the target."
 
   - id: REQ-047
     title: Keep evidence-backed diagnostic memos private to each local vehicle
@@ -1378,6 +1392,16 @@ requirements:
         text: "Normal flow: A model-authored hypothesis can be saved without per-item confirmation for a verified selected vehicle. It is labeled unverified and attributed to the model; saving it initiates no vehicle read."
       - id: REQ-047.16
         text: "Failure condition the model requests deletion or confirmation of a memo → safe stop: Refuse the operation and leave the memo unchanged; deletion and confirmation remain user-controlled."
+      - id: REQ-047.17
+        text: "Normal flow: The confirmation for deleting a vehicle record states that all its active and archived memos will also be deleted. After confirmation and restart those memos are absent, while another vehicle's memos, recordings and historical audit entries remain unchanged."
+      - id: REQ-047.18
+        text: "Failure condition a vehicle already has 500 active and archived memos combined → safe stop: A create up to the cap is allowed; the next create is refused without deleting or changing an existing memo."
+      - id: REQ-047.19
+        text: "Failure condition a create or update would leave more than 16 KiB of UTF-8 text in one memo → safe stop: Allow a memo exactly at the cap; reject the larger write without truncation or loss of the previous contents."
+      - id: REQ-047.20
+        text: "Failure condition selected memo excerpt text for one model request exceeds 8 KiB UTF-8 → try again: Show that the selection is over budget and allow the user to reduce it. Do not send it as selected or silently alter the approved excerpts."
+      - id: REQ-047.21
+        text: "Failure condition the confirmed vehicle-and-memo deletion cannot be persisted → safe stop: Report that deletion failed and keep the vehicle record and its memos unchanged."
 
   - id: REQ-048
     title: Retrieve local diagnostic evidence with verifiable citations
@@ -1409,6 +1433,16 @@ requirements:
         text: "Failure condition retrieved prose contains instructions posing as policy or vehicle operations → different success: Return it only as source text where relevant; execute zero adapter commands and make zero policy or capability changes."
       - id: REQ-048.9
         text: "Normal flow: The disclosure preview shows only the selected excerpts and source revisions. REQ-045 records the full local retrieval response separately from the exact approved subset actually sent."
+      - id: REQ-048.10
+        text: "Normal flow: The first shipped corpus contains only approved definitions from the pinned Knowledge, in German or English where available. Its source register gives rights for indexing and distribution, language and revision for every included source. External standards and manufacturer documents are excluded pending separate rights clearance."
+      - id: REQ-048.11
+        text: "Normal flow: The first Android search slice distributes at most 16 MiB of source text, uses at most 32 MiB for the resulting index, and adds at most 8 MiB to a like-for-like release APK."
+      - id: REQ-048.12
+        text: "Normal flow: A local answer returns at most 10 ranked hits and at most 4 KiB of UTF-8 quotation text in total; a targeted follow-up also respects the quotation cap."
+      - id: REQ-048.13
+        text: "Normal flow: On the supported Android reference configuration, a local build of the index for the maximum approved source size finishes within 10 seconds without network. It replaces the prior index only after the new index has passed verification against the pin."
+      - id: REQ-048.14
+        text: "Failure condition index construction, pin verification or a source/index limit fails → safe stop: Do not publish a partial or invalid replacement. The prior index remains intact, and a mismatch against the active pin is reported rather than hidden by serving stale hits."
 
   - id: REQ-049
     title: Query a selected recording locally with bounded work and exact source links
@@ -1430,7 +1464,7 @@ requirements:
       - id: REQ-049.3
         text: "Normal flow: A mixed synthetic recording can select DTC and UDS events separately and resolve their original-event references without returning unrelated samples."
       - id: REQ-049.4
-        text: "Normal flow: Repeating the same paginated query on the same selected recording gives the same page contents, order and continuation boundaries with no skips or duplicates across rotation parts."
+        text: "Normal flow: Filter time windows as start-inclusive, end-exclusive. Pages follow original event order across rotation parts, with no skips or duplicates. Opaque continuation cursors apply only to the same recording revision and query; repeated queries return the same page contents and boundaries."
       - id: REQ-049.5
         text: "Failure condition a rotation part is missing → different success: Identify the gap and mark the result partial or not evaluable; do not report a complete aggregate or a healthy diagnosis from it."
       - id: REQ-049.6
@@ -1448,14 +1482,26 @@ requirements:
       - id: REQ-049.12
         text: "Failure condition the user cancels a query in progress → safe stop: End it, identify cancellation and label any returned prefix partial, never a complete aggregate."
       - id: REQ-049.13
-        text: "Failure condition a query would exceed the agreed row budget → safe stop: The boundary test finishes exactly at the row cap; one row beyond it stops with a typed limit and any returned prefix is labeled partial."
+        text: "Failure condition a query would exceed 100,000 input lines in one call → safe stop: The boundary test finishes at the cap; one line beyond it stops with a typed limit and any returned prefix is labeled partial."
       - id: REQ-049.14
-        text: "Failure condition a query would exceed the agreed byte budget → safe stop: The boundary test finishes exactly at the byte cap; one byte beyond it stops with a typed limit and any returned prefix is labeled partial."
+        text: "Failure condition a query would exceed 32 MiB of input in one call → safe stop: The boundary test finishes at the byte cap; one byte beyond it stops with a typed limit and any returned prefix is labeled partial."
       - id: REQ-049.15
-        text: "Failure condition a query would exceed the agreed work budget → safe stop: At the agreed number of measured work units the boundary test can finish; a next unit is not executed and any returned prefix is labeled partial."
+        text: "Failure condition a query would exceed 200,000 operator evaluations in one call → safe stop: The boundary test can finish exactly at the cap; a next evaluation is not performed and any returned prefix is labeled partial."
       - id: REQ-049.16
-        text: "Failure condition a query would exceed the agreed time budget → safe stop: With controlled time the boundary test can finish at the limit but not run past it; return the time limit and mark any prefix partial."
+        text: "Failure condition a query would exceed 1 second of execution in one call → safe stop: With controlled time the boundary test can finish at the cap but not run past it; return the time limit and mark any prefix partial."
       - id: REQ-049.17
-        text: "Failure condition a query would exceed the agreed intermediate-memory budget → safe stop: A boundary fixture completes at the cap; an operation that would go beyond it is not performed and any returned prefix is labeled partial."
+        text: "Failure condition a query would exceed 8 MiB of intermediate memory in one call → safe stop: A boundary fixture completes at the cap; an operation that would go beyond it is not performed and any returned prefix is labeled partial."
       - id: REQ-049.18
         text: "Normal flow: REQ-045 records the query, its local outcome and the exact approved subset actually sent as distinguishable events; no whole recording is sent by default."
+      - id: REQ-049.19
+        text: "Normal flow: The documented jq text subset admits field access, literal comparisons (==, !=, <, <=, >, >=), conjunction with and, map(select(...)), object field projection, length and map(.value) | add / length for the mean. The tool accepts those forms over the documented event schema and rejects other expressions under REQ-049.11."
+      - id: REQ-049.20
+        text: "Normal flow: A result page has at most 100 hits and at most 64 KiB of encoded output. A subsequent page resumes at the next original event, not within a row."
+      - id: REQ-049.21
+        text: "Failure condition a cursor refers to a different query, recording or recording revision → safe stop: Return a typed invalid-cursor outcome and do not continue against different evidence."
+      - id: REQ-049.22
+        text: "Normal flow: An aggregate uses all matching events within the execution budgets, regardless of page size. An empty selection yields count zero and no mean, not a mean of zero."
+      - id: REQ-049.23
+        text: "Normal flow: Recording queries add at most 8 MiB to a like-for-like Android release APK."
+      - id: REQ-049.24
+        text: "Failure condition one projected result cannot fit in the 64 KiB page by itself → try again: Return a typed output limit and allow a narrower projection. Do not silently skip the event or return a cursor that cannot advance."
