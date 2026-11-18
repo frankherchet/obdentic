@@ -264,6 +264,23 @@ final class AccountUiAcceptance {
         Context app = ctx.getApplicationContext();
         File debugSwitch = new File(ctx.getFilesDir(), SignInService.DEBUG_SWITCH);
         debugSwitch.delete();
+        // #350: a failed listener can finish before Android delivers the service's onCreate.
+        Fixture immediate = new Fixture(ctx);
+        try {
+            immediate.config.keepalive = new ChatGptAccount.Keepalive() {
+                @Override public void start() { SignInService.start(app); }
+                @Override public void stop() { SignInService.stop(app); }
+            };
+            immediate.config.opener = (port, timeout, returnLink) -> { throw new java.io.IOException("injected listener failure"); };
+            onMain(inst, () -> {
+                immediate.account.signIn(); immediate.waitIdle();
+                immediate.account.signIn(); immediate.waitIdle();
+                return null;
+            });
+            SystemClock.sleep(1000);
+            require(!SignInService.running && immediate.account.snapshot().message.contains("Port"),
+                "#350 failed sign-in reports the error without crashing or leaving the service running");
+        } finally { immediate.close(); }
         String[] ends = {"cancel", "success", "denied", "timeout"};
         for (String end : ends) {
             Fixture f = new Fixture(ctx);

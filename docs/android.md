@@ -472,7 +472,8 @@ disconnect confirmation, and when a caller (the assistant, #328) asks for an acc
   tags and now refuses a split tag), cleartext traffic stays disabled, and the only use is HTTPS to `auth.openai.com` (discovery, keys,
   token, revocation). While a sign-in waits for the browser a foreground service of type `dataSync` (`SignInService`, notification
   *ChatGPT-Anmeldung läuft*, permission `FOREGROUND_SERVICE_DATA_SYNC`) keeps the process in a network-allowed state; it starts with
-  the tap, stops within 2 s after the attempt ends and never runs otherwise. Debug builds only: a file `debug-no-signin-service` in the
+  the tap, stops within 2 s after the attempt ends and never runs otherwise. If an attempt ends before Android creates the service,
+  its stop is deferred until the service has entered the foreground (#350). Debug builds only: a file `debug-no-signin-service` in the
   app's files directory (`adb shell run-as de.obdentic.app.debug touch files/debug-no-signin-service`) switches it off for the
   measurement of REQ-044.6; whether the service and the callback page's return link stay is decided by the phone measurements
   (REQ-044.6, REQ-044.7), which are part of the real-phone checklist in #330.
