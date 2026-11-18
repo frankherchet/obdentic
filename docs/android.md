@@ -758,6 +758,75 @@ git tag v0.2.0 && git push origin v0.2.0
 If the upload fails (network, quota), re-run the workflow; it uploads the same
 version again. Missing secrets are listed by name in the failing step.
 
+## ADR 0006 coverage matrix (REQ-046.19)
+
+This section classifies the 35 scenarios of the accepted
+[ADR 0006](adr/0006-multi-ecu-uds-sessions.md) simulation. It is a reading of the current code against the prototype
+case source; it adds no test and no production protocol stack, and no result below claims that a new test or any
+future #321 path has run. The cases come from the unmerged spike branch `spike/322-multi-ecu-uds-sim`
+(`spikes/322-multi-ecu-uds/`, test file `spikes/322-multi-ecu-uds/tests/scenarios.rs`), a throwaway reference model on a stateful simulated
+adapter that is not merged and not a diagnostic stack to merge. All data is synthetic.
+
+**Virtual time.** The prototype advances a synthetic virtual clock (milliseconds) instead of sleeping, so keepalive
+gaps, late-frame windows, S3 expiry, backoff (2 s, 4 s, 60 s cool-down) and the maintenance budget are properties of
+the modelled rules. They are not vehicle timing; real S3, gateway and adapter buffering behaviour stays with the
+separate hardware gates [#178](https://github.com/frankherchet/obdentic/issues/178) and #330.
+
+**Classes.**
+- *Production now*: the production path (`ElmSession`, `UdsSessionState`, `MobileCore`) already produces the observable
+  of the case, but only for the single-ECU slot it has today. A "partial" tag names the part that the single slot
+  cannot show; the case as written is not satisfied by it.
+- *Reference model only*: the observable depends on timing and ECU state that only the simulated adapter models
+  (S3 expiry under a blocked read, measured maintenance cost). Production has no counterpart and the case proves no
+  vehicle behaviour; it needs #321 and #178 before any production claim.
+- *Awaits #321*: production lacks the behaviour (several sessions, ledger, stop-all, backoff, NRC table, scheduler) or
+  does the opposite today (any rejected read or transport fault sends `10 01` and ends the one session). "Partial"
+  names the nearest existing production behaviour; it does not meet the case.
+
+Today's single slot is `UdsSessionState` (one target, one responder, ten-minute limit, `3E 80` after 2 s on a poll);
+existing tests are in `src/mobile/uds.rs` (`req_027_*`). Neither the matrix nor #359 changes them.
+
+| # | Prototype test function | Class | Reason |
+| --- | --- | --- | --- |
+| 1 | `two_sessions_interleaved_with_mode01_keep_s3_alive_without_relying_on_reads` | Awaits #321 | Production holds one session; no second session or maintenance of reads. |
+| 2 | `header_switches_are_tracked_and_never_redundant` | Production now (partial) | `ElmSession` tracks `configured_target` and sends `ATSH`/`ATCRA` only on target change; interleaving two held sessions is not possible. |
+| 3 | `multi_frame_response_is_assembled_for_the_requesting_target_only` | Production now (partial) | ISO-TP assembly checks responder header and sequence for the requested target; the second-ECU part needs #321. |
+| 4 | `foreign_responder_through_the_filter_stops_everything_without_further_traffic` | Awaits #321 | Production rejects an unexpected responder but then sends cleanup `10 01`; no stop-all without traffic. |
+| 5 | `stray_frame_without_an_unanswered_request_stops_everything` | Awaits #321 | No ledger of unanswered requests; a stray frame is not classified. |
+| 6 | `late_frame_matching_exactly_one_unanswered_request_is_discarded_without_coverage` | Awaits #321 | Needs the request ledger and late-frame attribution. |
+| 7 | `identical_request_is_not_repeated_while_its_late_answer_could_still_arrive` | Awaits #321 | No late-answer window in scheduling. |
+| 8 | `truncated_multi_frame_response_stops_everything` | Awaits #321 | Truncation is rejected as an error (partial), but cleanup `10 01` follows instead of stop-all. |
+| 9 | `missing_prompt_is_a_transport_failure_and_stops_everything` | Awaits #321 | Exchange error clears the header shadow and ends the session (partial); no transport classification or stop-all. |
+| 10 | `disconnect_marks_every_target_unconfirmed_and_sends_nothing` | Production now (partial) | `on_disconnect` makes the one session indeterminate and `tick` sends nothing; "every target" needs #321. |
+| 11 | `blocked_read_makes_overdue_session_unconfirmed_and_it_is_reverified_not_assumed` | Reference model only | Depends on modelled S3 expiry during a blocked read; re-verification needs #321, real timing #178. |
+| 12 | `nrc_table` | Awaits #321 | The NRC classification table does not exist in production. |
+| 13 | `ordinary_negative_response_to_one_read_marks_only_that_signal` | Awaits #321 | Today one rejected read ends the session (ADR 0003 behaviour). |
+| 14 | `nrc_7f_on_a_session_only_did_is_session_loss_evidence_and_the_session_is_reestablished` | Awaits #321 | No session-loss evidence or re-establishment. |
+| 15 | `nrc_31_after_a_spontaneous_session_end_is_decided_by_the_canary_read` | Awaits #321 | No canary read. |
+| 16 | `nrc_31_on_one_did_of_a_live_session_does_not_end_the_session` | Awaits #321 | Today a rejected read ends the session. |
+| 17 | `definitive_refusal_is_not_retried_and_other_targets_continue` | Production now (partial) | A final NRC on `10 03` leaves the session inactive without retry; "other targets continue" needs #321. |
+| 18 | `transient_refusal_backs_off_2_4_s_then_cools_down_60_s_and_never_gives_up` | Awaits #321 | No backoff or cool-down. |
+| 19 | `repeated_activation_then_immediate_session_loss_is_bounded_by_backoff_and_cooldown` | Awaits #321 | No failure-sequence tracking. |
+| 20 | `successful_default_session_reads_do_not_qualify_and_do_not_reset_the_sequence` | Awaits #321 | No qualifying-read rule. |
+| 21 | `a_qualifying_session_read_resets_the_failure_sequence` | Awaits #321 | No qualifying-read rule. |
+| 22 | `busy_repeat_request_on_activation_is_unconfirmed_cleaned_up_and_only_then_backed_off` | Production now (partial) | NRC `21` on `10 03` is not final: `10 01` cleanup runs first; the backoff afterwards needs #321. |
+| 23 | `busy_repeat_request_on_activation_without_a_positive_return_isolates_only_that_target` | Awaits #321 | Failed cleanup makes the single session indeterminate (partial); no per-target isolation. |
+| 24 | `unanswered_activation_is_cleaned_up_and_an_unconfirmed_return_isolates_only_that_target` | Awaits #321 | Cleanup after an unanswered activation exists (partial); no per-target isolation. |
+| 25 | `unconfirmed_return_over_a_failing_transport_stops_everything_instead` | Awaits #321 | No transport classification or stop-all. |
+| 26 | `keepalive_refusal_releases_the_ecu_and_marks_it_refused` | Awaits #321 | A failed `3E 80` sends `10 01` and ends the session (partial); no refused status. |
+| 27 | `two_unanswered_session_reads_in_a_row_trigger_reverification_by_10_03` | Awaits #321 | Today one failed read ends the session; no re-verification. |
+| 28 | `dpf_raw_request_keeps_priority_while_two_sessions_are_maintained_and_nothing_starves` | Awaits #321 | No scheduler with priorities across two sessions. |
+| 29 | `third_session_is_refused_when_measured_maintenance_cost_exceeds_the_budget` | Reference model only | Modelled adapter cost and budget; real cost and ceiling of 3 stay with #178; needs #321. |
+| 30 | `third_session_is_admitted_when_the_measured_cost_is_low` | Reference model only | Same modelled cost and ceiling; needs #321 and #178. |
+| 31 | `finished_goals_close_only_their_ecu_and_end_of_run_closes_the_rest` | Awaits #321 | `disable` closes the one session (partial); no goal tracking across ECUs. |
+| 32 | `tester_present_is_sent_only_when_a_target_is_due_never_continuously` | Production now (partial) | `tick` sends `3E 80` at most every 2 s for the one target; the several-target bound needs #321. |
+| 33 | `tester_present_goes_to_the_earliest_deadline_first_when_several_are_due` | Awaits #321 | Needs several targets and deadlines. |
+| 34 | `idle_scheduler_waits_for_the_next_deadline_instead_of_polling_the_keepalive` | Awaits #321 | Keepalive is polled once per poll today, not scheduled by deadline. |
+| 35 | `only_the_closed_vocabulary_ever_reaches_the_adapter` | Production now (partial) | Session wire commands are the fixed `10 03`, `10 01`, `3E 80` plus Knowledge DID reads; the multi-ECU vocabulary run needs #321. |
+
+Totals: 7 production now (all partial), 3 reference model only, 25 awaits #321. A "production now" row is not
+vehicle acceptance, and no row is a hardware result.
+
 ## Acceptance
 
 Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals); ids stay in the Debug tab.
