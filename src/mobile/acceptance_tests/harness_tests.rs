@@ -32,25 +32,51 @@ fn read(core: &mut MobileCore<VirtualAdapter>, id: &str) -> Value {
 /// The scripted agent of REQ-046.20: list, read RPM and MAF, scan DTCs; EGR is not advertised.
 struct Run {
     trace: Vec<Trace>,
+    /// Index of the first exchange of the diagnosis itself (after boot, inventory and discovery).
+    diagnosis_from: usize,
     outcomes: Vec<Value>,
     listing: Value,
+    egr_request: Value,
+    egr_tx: usize,
 }
+
+const KNOWLEDGE: &str = "air.charge_limit_overcharge";
 
 fn scenario() -> Run {
     let (mut core, probe) = vt::fixture();
     vt::establish(&mut core);
+    let diagnosis_from = probe.len();
+    assert_eq!(run(&mut core, "assistant.tools", "")["ok"], true);
     assert_eq!(run(&mut core, "assistant.begin", "")["ok"], true);
-    let mut outcomes = Vec::new();
     let listing = call(&mut core, json!({"tool":"signal_list"}));
     let rpm = id_of(&listing, "engine.rpm").expect("RPM is advertised");
     let maf = id_of(&listing, "engine.maf").expect("MAF is advertised");
-    outcomes.push(read(&mut core, &rpm));
+    let knowledge = id_of(&listing, KNOWLEDGE).expect("approved Knowledge signal is listed");
+    let mut outcomes = vec![read(&mut core, &rpm)];
+    // Evidence-driven follow-up: a stored EGR code makes the agent request the airflow and a Knowledge fact.
+    let scan = call(&mut core, json!({"tool":"dtc_scan"}));
+    let egr_finding = scan.to_string().contains("P0401");
+    outcomes.push(scan);
+    assert!(
+        egr_finding,
+        "the synthetic EGR code is the finding that drives the follow-up"
+    );
     outcomes.push(read(&mut core, &maf));
-    outcomes.push(call(&mut core, json!({"tool":"dtc_scan"})));
+    outcomes.push(read(&mut core, &knowledge));
+    // The EGR position itself is not advertised: the scripted agent asks and must get an unknown outcome.
+    let before = probe.len();
+    let egr_request = call(
+        &mut core,
+        json!({"tool":"signal_read","arguments":{"signal":"engine.egr.commanded"}}),
+    );
+    let egr_tx = probe.len() - before;
     Run {
         trace: probe.transactions(),
+        diagnosis_from,
         outcomes,
         listing,
+        egr_request,
+        egr_tx,
     }
 }
 
@@ -88,26 +114,54 @@ fn req_046_1_3_20_the_same_scenario_gives_the_same_trace_and_tool_results() {
     assert_eq!(comparable(&first), comparable(&second));
     assert_eq!(values(&first), values(&second));
 
-    // REQ-046.3: the exact TX order of one scenario and matching RX, responder and tool references.
-    let wires: Vec<&str> = first.trace.iter().map(|t| t.wire.as_str()).collect();
-    eprintln!("{wires:?}");
-    assert!(
-        wires.contains(&"010C\r") && wires.contains(&"0110\r"),
-        "{wires:?}"
-    );
-    assert!(
-        wires.contains(&"03\r") && wires.contains(&"07\r"),
-        "{wires:?}"
-    );
-    assert_eq!(first.outcomes[0]["outcome"], "ok");
+    // REQ-046.3: the exact TX order of the diagnosis and the matching tool references.
+    let wires: Vec<&str> = first.trace[first.diagnosis_from..]
+        .iter()
+        .map(|t| t.wire.as_str())
+        .collect();
+    assert_eq!(wires, EXPECTED_DIAGNOSIS_TX);
     assert_eq!(first.outcomes[0]["value"].as_f64(), Some(1726.0));
     assert_eq!(first.outcomes[0]["provenance"]["responder"], "7E8");
-    assert_eq!(first.outcomes[1]["value"].as_f64(), Some(10.0));
-    assert_eq!(first.outcomes[2]["outcome"], "ok");
-    assert!(first.outcomes[2].to_string().contains("7E8"));
+    assert!(first.outcomes[1].to_string().contains("P0401"));
+    assert_eq!(
+        first.outcomes[1]["stored"]["observations"][0]["responder"],
+        "7E8"
+    );
+    assert_eq!(first.outcomes[2]["value"].as_f64(), Some(10.0));
+    assert_eq!(first.outcomes[3]["outcome"], "ok");
+    // REQ-046.21: the missing EGR fact is a typed unknown outcome, not a value, and costs no traffic.
+    assert_eq!(
+        first.egr_request["outcome"], "refused",
+        "{}",
+        first.egr_request
+    );
+    assert_eq!(first.egr_request["reason"], "unknown_signal");
+    assert!(first.egr_request.get("value").is_none());
+    assert_eq!(first.egr_tx, 0);
     // Virtual time never moves backwards; each exchange ends no earlier than it starts.
     assert!(first.trace.iter().all(|t| t.ended_ms >= t.started_ms));
 }
+
+/// Targeted RPM, the re-initialization before a functional scan, stored and pending DTCs, then the targeted MAF
+/// and Knowledge reads.
+const EXPECTED_DIAGNOSIS_TX: [&str; 16] = [
+    "ATSH 7E0\r",
+    "ATCRA 7E8\r",
+    "010C\r",
+    "ATZ\r",
+    "ATE0\r",
+    "ATL0\r",
+    "ATS1\r",
+    "ATH1\r",
+    "ATSP0\r",
+    "0100\r",
+    "03\r",
+    "07\r",
+    "ATSH 7E0\r",
+    "ATCRA 7E8\r",
+    "0110\r",
+    "221356\r",
+];
 
 #[test]
 // REQ-046.2, REQ-046.3
@@ -131,25 +185,33 @@ fn req_046_4_an_unadvertised_pid_is_unsupported_and_sends_no_value() {
     let (mut core, probe) = vt::fixture();
     vt::establish(&mut core);
     let listing = call(&mut core, json!({"tool":"signal_list"}));
-    assert!(id_of(&listing, "engine.speed").is_none());
+    assert!(id_of(&listing, "vehicle.speed").is_none());
     let mark = probe.len();
-    let result = run(&mut core, "read", "engine.speed");
+    let result = run(&mut core, "read", "vehicle.speed");
     assert_eq!(result["ok"], false, "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not advertise support"),
+        "{result}"
+    );
     assert!(result.get("value").is_none());
-    assert!(probe.wires_since(mark).iter().all(|wire| wire != "010D\r"));
+    assert_eq!(probe.len(), mark, "unsupported means no traffic");
 }
 
 #[test]
 // REQ-046.21
 fn req_046_21_a_fact_the_vehicle_does_not_advertise_stays_unknown() {
-    let run_result = scenario();
+    let result = scenario();
     for semantic in ["engine.egr.commanded", "engine.egr.error"] {
         assert!(
-            id_of(&run_result.listing, semantic).is_none(),
+            id_of(&result.listing, semantic).is_none(),
             "{semantic} must not be listed"
         );
     }
-    assert!(run_result.trace.iter().all(|t| t.wire != "012C\r"));
+    assert_eq!(result.egr_request["outcome"], "refused");
+    assert!(result.trace.iter().all(|t| t.wire != "012C\r"));
 }
 
 #[test]

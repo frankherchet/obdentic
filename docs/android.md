@@ -764,7 +764,7 @@ This section classifies the 35 scenarios of the accepted
 [ADR 0006](adr/0006-multi-ecu-uds-sessions.md) simulation. It is a reading of the current code against the prototype
 case source; it adds no test and no production protocol stack, and no result below claims that a new test or any
 future #321 path has run. The cases come from the unmerged spike branch `spike/322-multi-ecu-uds-sim`
-(`spikes/322-multi-ecu-uds/`, test file `adr0006-scenarios.rs`), a throwaway reference model on a stateful simulated
+(`spikes/322-multi-ecu-uds/`, test file `spikes/322-multi-ecu-uds/tests/scenarios.rs`), a throwaway reference model on a stateful simulated
 adapter that is not merged and not a diagnostic stack to merge. All data is synthetic.
 
 **Virtual time.** The prototype advances a synthetic virtual clock (milliseconds) instead of sleeping, so keepalive
