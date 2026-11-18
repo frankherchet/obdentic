@@ -199,6 +199,7 @@ An issue may be closed when:
 - [ ] the PR names the issue and criteria and is merged
 - [ ] relevant docs, architecture references and ADRs are updated where behavior or structure changed
 - [ ] build and applicable Android/JNI/Swift checks from Repository pass; CI is green
+- [ ] changes to Android foreground services have automated lifecycle coverage for immediate failure or cancellation before foreground activation and for a prompt retry, where applicable (#350)
 - [ ] the merge is visible on `origin/main`; close the implemented issue immediately after successful merge
 - [ ] transport/replay tests cover affected observable behavior; read-only/capability invariants are preserved
 - [ ] staged changes have been inspected for private captures, VINs, ECU/device identifiers and authentication material; none are published
