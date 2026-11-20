@@ -29,10 +29,10 @@ final class ThroughputAcceptance {
             waitFor(() -> service.snapshot().optString("mode").equals("demo") && service.snapshot().optString("phase").equals("ready") && !service.snapshot().optBoolean("busy"), "demo ready");
             String demoReason = ObdService.throughputBlocker(service.snapshot());
             require(demoReason != null && demoReason.contains("Demo"), "REQ-022.1 demo: unavailable with a reason: " + demoReason);
-            int wire = service.snapshot().optJSONArray("debug").length(); long seq = service.snapshot().optLong("messageSeq");
+            long wire = service.wireEventCount(); long seq = service.snapshot().optLong("messageSeq");
             service.runJob(ObdService.THROUGHPUT);
             require(service.snapshot().optLong("messageSeq") > seq && service.snapshot().optString("message").contains("Demo"), "REQ-022.1 demo: the refusal is shown: " + service.snapshot().optString("message"));
-            require(service.snapshot().optJSONArray("debug").length() == wire && service.snapshot().optString("recording").isEmpty() && service.snapshot().optJSONObject("throughput").length() == 0, "REQ-022.1 demo: no job, no traffic, no recording");
+            require(service.wireEventCount() == wire && service.snapshot().optString("recording").isEmpty() && service.snapshot().optJSONObject("throughput").length() == 0, "REQ-022.1 demo: no job, no traffic, no recording");
             require(ui.text("Diagnose").contains(demoReason) && Boolean.FALSE.equals(ui.enabled(BUTTON, false)), "REQ-022.1 demo: Diagnose shows the reason and a disabled button");
 
             // live and ready: available, runs, recorded

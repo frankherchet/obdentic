@@ -5,8 +5,6 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.ActivityNotFoundException;
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -97,16 +95,25 @@ public class MainActivity extends Activity {
     private JSONObject state=new JSONObject();
     private LinearLayout body, nav;
     private ScrollView scroll;
-    private TextView badge, status, udsIndicator, udsRemaining;
+    private TextView pageTitle, status, udsIndicator, udsRemaining;
+    private Button back, modeButton;
     private TextView smartSummary, smartMissing, smartTriggers, smartChanges;
     private String lastSmartSet="";
     public volatile Dialog activeSignalSelector;
     private Button chip;
-    private TextView debugLog;
     /** The account dialogs, for the phone acceptance. */
     public volatile Dialog firstUseDialog, disconnectDialog;
     private AlertDialog networkSettingsDialog;
-    private int tab=0;
+    /** Three work areas in the bottom navigation; the adapter, vehicle and account views are context targets opened from the header and return to the last work area. */
+    enum Screen { LIVE, DIAGNOSE, AUFNAHMEN, ADAPTER, FAHRZEUGE, KONTO;
+        boolean main(){return this==LIVE||this==DIAGNOSE||this==AUFNAHMEN;}
+        /** A missing, old or unknown saved name opens Live. */
+        static Screen parse(String name){if(name!=null)for(Screen s:values())if(s.name().equals(name))return s;return LIVE;}
+    }
+    private Screen screen=Screen.LIVE, returnTo=Screen.LIVE;
+    /** Collapsed sections, kept across refresh and rotation; opening one starts nothing. */
+    private boolean moreChecks, recordingSettings;
+    private final java.util.HashSet<String> fileActions=new java.util.HashSet<>();
     private static final int SHOWN_RECORDS=30;
     private String shownRecords(){JSONArray r=array("records"),shown=new JSONArray();for(int i=0;i<Math.min(r.length(),SHOWN_RECORDS);i++)shown.put(r.opt(i));return shown.toString();}
     private String structure="";
@@ -118,20 +125,25 @@ public class MainActivity extends Activity {
     @Override public void onCreate(Bundle saved){AppLog.init(this);
         setTheme(android.R.style.Theme_Material_NoActionBar);
         super.onCreate(saved);
-        if(saved!=null){tab=saved.getInt("tab",0);pendingExport=saved.getString("pendingExport","");}
+        if(saved!=null){screen=Screen.parse(saved.getString("screen"));Screen r=Screen.parse(saved.getString("returnTo"));returnTo=r.main()?r:Screen.LIVE;moreChecks=saved.getBoolean("moreChecks");recordingSettings=saved.getBoolean("recordingSettings");ArrayList<String> open=saved.getStringArrayList("fileActions");if(open!=null)fileActions.addAll(open);pendingExport=saved.getString("pendingExport","");}
         launchDemo="demo".equals(getIntent().getStringExtra("mode"));
         getWindow().setStatusBarColor(BG);getWindow().setNavigationBarColor(BG);
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(BG);
         root.setOnApplyWindowInsetsListener((v,insets)->{v.setPadding(insets.getSystemWindowInsetLeft(),insets.getSystemWindowInsetTop(),insets.getSystemWindowInsetRight(),insets.getSystemWindowInsetBottom());return insets;});
         setContentView(root);
-        LinearLayout heading=row();heading.setPadding(dp(20),dp(12),dp(20),dp(6));
-        TextView name=text("OBDentic",27,TEXT);name.setTypeface(null,Typeface.BOLD);heading.addView(name,new LinearLayout.LayoutParams(0,-2,1));
-        udsIndicator=text("UDS erweiterte Sitzung aktiv",11,ACCENT);udsIndicator.setGravity(Gravity.CENTER);udsIndicator.setMaxWidth(dp(128));udsIndicator.setMaxLines(3);udsIndicator.setPadding(dp(7),dp(6),dp(7),dp(6));udsIndicator.setBackground(surface(0xff203f3a,10));udsIndicator.setVisibility(View.GONE);heading.addView(udsIndicator);
-        badge=text("STARTET",12,ACCENT);badge.setTypeface(null,Typeface.BOLD);badge.setGravity(Gravity.CENTER);badge.setMaxLines(2);badge.setMaxWidth(dp(220));badge.setPadding(dp(12),dp(8),dp(12),dp(8));badge.setBackground(surface(0xff203f3a,10));heading.addView(badge);root.addView(heading);
-        chip=button("Kein Fahrzeug gewählt",()->{tab=5;structure="";scroll.scrollTo(0,0);buildNav();refresh();});chip.setSingleLine(true);chip.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        LinearLayout.LayoutParams chipParams=new LinearLayout.LayoutParams(-1,-2);chipParams.setMargins(dp(20),0,dp(20),dp(2));root.addView(chip,chipParams);
-        status=text("Diagnose wird vorbereitet …",14,MUTED);status.setMaxLines(3);status.setEllipsize(android.text.TextUtils.TruncateAt.END);status.setPadding(dp(20),dp(2),dp(20),dp(12));root.addView(status);
-        scroll=new ScrollView(this);scroll.setFillViewport(true);body=new LinearLayout(this);body.setOrientation(LinearLayout.VERTICAL);body.setPadding(dp(16),dp(4),dp(16),dp(20));scroll.addView(body);root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+        LinearLayout heading=row();heading.setPadding(dp(12),dp(6),dp(16),dp(2));
+        back=button("Zurück",this::goBack);back.setVisibility(View.GONE);heading.addView(back,new LinearLayout.LayoutParams(-2,-2));
+        pageTitle=text("Live",20,TEXT);pageTitle.setTypeface(null,Typeface.BOLD);pageTitle.setPadding(dp(8),0,dp(8),0);if(Build.VERSION.SDK_INT>=28)pageTitle.setAccessibilityHeading(true);heading.addView(pageTitle,new LinearLayout.LayoutParams(0,-2,1));
+        udsIndicator=text("UDS erweiterte Sitzung aktiv",11,ACCENT);udsIndicator.setGravity(Gravity.CENTER);udsIndicator.setMaxWidth(dp(150));udsIndicator.setPadding(dp(7),dp(6),dp(7),dp(6));udsIndicator.setBackground(surface(0xff203f3a,10));udsIndicator.setVisibility(View.GONE);heading.addView(udsIndicator);
+        root.addView(heading);
+        // the context bar: connection/mode opens the adapter view, the vehicle name the vehicle list; stacked when the text would not fit side by side
+        LinearLayout context=flow();context.setPadding(dp(16),0,dp(16),dp(2));
+        modeButton=button("STARTET",()->show(Screen.ADAPTER));modeButton.setTag("context-adapter");modeButton.setTypeface(null,Typeface.BOLD);modeButton.setTextSize(13);
+        context.addView(modeButton,flowParams(context));
+        chip=button("Kein Fahrzeug gewählt",()->show(Screen.FAHRZEUGE));chip.setTag("context-vehicle");chip.setTextSize(13);
+        context.addView(chip,flowParams(context));root.addView(context);
+        status=text("",13,MUTED);status.setMaxLines(4);status.setEllipsize(android.text.TextUtils.TruncateAt.END);status.setPadding(dp(20),dp(2),dp(20),dp(4));status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);status.setVisibility(View.GONE);root.addView(status);
+        scroll=new ScrollView(this);scroll.setFillViewport(true);body=new LinearLayout(this);body.setOrientation(LinearLayout.VERTICAL);body.setPadding(dp(16),dp(0),dp(16),dp(20));scroll.addView(body);root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
         nav=row();nav.setPadding(dp(4),dp(6),dp(4),dp(6));root.addView(nav);buildNav();
         // Starting from the visible Activity is allowed. The service promotes itself
         // once a real Bluetooth connection has the required runtime permissions.
@@ -141,7 +153,27 @@ public class MainActivity extends Activity {
     @Override protected void onStop(){getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);super.onStop();}
     @Override protected void onResume(){super.onResume();resumed=this;handler.post(poll);if(service()!=null)service().resumeIfBlocked();}
     @Override protected void onPause(){handler.removeCallbacks(poll);if(resumed==this)resumed=null;if(firstUseDialog!=null)firstUseDialog.dismiss();if(networkSettingsDialog!=null)networkSettingsDialog.dismiss();super.onPause();}
-    @Override protected void onSaveInstanceState(Bundle out){out.putInt("tab",tab);out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
+    @Override protected void onSaveInstanceState(Bundle out){out.putString("screen",screen.name());out.putString("returnTo",returnTo.name());out.putBoolean("moreChecks",moreChecks);out.putBoolean("recordingSettings",recordingSettings);out.putStringArrayList("fileActions",new ArrayList<>(fileActions));out.putString("pendingExport",pendingExport);super.onSaveInstanceState(out);}
+    private android.window.OnBackInvokedCallback backToWorkArea;
+    /** Back on a context target returns to its work area; on a work area the system handles back as before. Registered only while needed. */
+    private void syncBack(){
+        if(Build.VERSION.SDK_INT<33)return;
+        boolean want=!screen.main();if(want==(backToWorkArea!=null))return;
+        if(want){backToWorkArea=this::goBack;getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,backToWorkArea);}
+        else{getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backToWorkArea);backToWorkArea=null;}
+    }
+    /** Before API 33 the back key still arrives as a key event. */
+    @Override public boolean dispatchKeyEvent(android.view.KeyEvent e){
+        if(Build.VERSION.SDK_INT<33&&e.getKeyCode()==android.view.KeyEvent.KEYCODE_BACK&&!screen.main()){if(e.getAction()==android.view.KeyEvent.ACTION_UP)goBack();return true;}
+        return super.dispatchKeyEvent(e);
+    }
+    /** The one way to change the view. A work area replaces the view directly; a context target remembers the work area it was opened from. Never starts a search or a job. */
+    private void show(Screen next){if(!next.main()&&screen.main())returnTo=screen;screen=next;structure="";scroll.scrollTo(0,0);buildNav();refresh();}
+    private void goBack(){show(returnTo);}
+    /** Side by side when the labels fit; below each other on narrow displays or with large text, so nothing is cut off. */
+    private boolean narrow(){android.content.res.Configuration c=getResources().getConfiguration();return c.screenWidthDp/Math.max(1f,c.fontScale)<360;}
+    private LinearLayout flow(){LinearLayout l=new LinearLayout(this);l.setOrientation(narrow()?LinearLayout.VERTICAL:LinearLayout.HORIZONTAL);l.setGravity(Gravity.CENTER_VERTICAL);return l;}
+    private LinearLayout.LayoutParams flowParams(LinearLayout parent){boolean across=parent.getOrientation()==LinearLayout.HORIZONTAL;LinearLayout.LayoutParams p=across?new LinearLayout.LayoutParams(0,-2,1):new LinearLayout.LayoutParams(-1,-2);if(across)p.setMargins(parent.getChildCount()>0?dp(3):0,dp(3),0,dp(3));else p.setMargins(0,dp(3),0,dp(3));return p;}
     private ObdService service(){return ObdService.current;}
     private void act(Runnable action){try{if(service()!=null)action.run();else toast("Dienst startet. Bitte kurz warten.");}catch(Exception e){toast(e.getMessage()==null?"Aktion fehlgeschlagen":e.getMessage());}refresh();}
     /** REQ-021.1/.4: starts the pending state, then the service call; a second tap while pending starts nothing. */
@@ -154,9 +186,12 @@ public class MainActivity extends Activity {
     }
     /** REQ-021.1/.5: while pending the button is disabled, shows the pending text (also as content description) and a progress indicator. */
     private Button actionButton(LinearLayout parent,PendingActions.Spec spec,String suffix,String idle,boolean enabled,Runnable onTap){
+        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,dp(5),0,dp(3));
+        return actionButton(parent,p,spec,suffix,idle,enabled,onTap);
+    }
+    private Button actionButton(LinearLayout parent,LinearLayout.LayoutParams p,PendingActions.Spec spec,String suffix,String idle,boolean enabled,Runnable onTap){
         boolean pend=service()!=null&&service().pending.isPending(spec.key+suffix);
         Button b=button(pend?spec.pending:idle,onTap);b.setEnabled(enabled&&!pend);
-        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,dp(5),0,dp(3));
         if(!pend){parent.addView(b,p);return b;}
         b.setContentDescription(spec.pending);
         LinearLayout r=row();ProgressBar bar=new ProgressBar(this,null,android.R.attr.progressBarStyleSmall);bar.setIndeterminate(true);bar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
@@ -173,25 +208,22 @@ public class MainActivity extends Activity {
         JSONObject chosen=selectedVehicle();String chipName=chosen==null?"Kein Fahrzeug gewählt":chosen.optString("name");
         chip.setText(chipName);chip.setContentDescription("Gewähltes Fahrzeug: "+(chosen==null?"keines":chipName));
         String mode=state.optString("mode","live"), phase=state.optString("phase","idle");
-        String replayBadge="REPLAY · "+(state.optString("replaySourceMode").equals("demo")?"DEMO":"DATEI");
-        if(mode.equals("replay")&&state.optBoolean("replayPartial"))replayBadge+="\nTEILAUFNAHME";
-        badge.setText(mode.equals("demo")?"DEMO · SIMULIERT":mode.equals("replay")?replayBadge:phase.equals("ready")?"LIVE · ADAPTER":"LIVE · GETRENNT");
-        int tint=mode.equals("live")?ACCENT:0xffffca75;badge.setTextColor(tint);
-        boolean extended=udsActive(state);udsIndicator.setText("UDS erweiterte Sitzung aktiv");udsIndicator.setVisibility(extended?View.VISIBLE:View.GONE);udsIndicator.setContentDescription(extended?"UDS erweiterte Sitzung aktiv":"UDS Standardsitzung");
+        String modeText=modeText(state);modeButton.setText(modeText);modeButton.setTextColor(mode.equals("live")?ACCENT:0xffffca75);modeButton.setContentDescription("Verbindung: "+modeText.replace('\n',' ')+". Adapter öffnen");
+        // the connection state is in the context bar; this line only carries a running job and the service's last feedback or error
         String message=pending.notice(seq);if(message.isEmpty())message=state.optString("message","");
-        status.setText(phaseName(phase)+(state.optBoolean("busy")?" · Auftrag läuft":"")+(message.isEmpty()?"":"\n"+message));
+        String line=(state.optBoolean("busy")?"Auftrag läuft"+(message.isEmpty()?"":" · "):"")+message;
+        status.setText(line);status.setVisibility(line.isEmpty()?View.GONE:View.VISIBLE);
         status.setTextColor(phase.equals("error")?0xffffa79c:MUTED);
         if(!historyMode.equals(mode)){historyMode=mode;histories.clear();lastSamples.clear();}
         collectHistory();
-        String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+state.optString("autoRecording")+state.optBoolean("autoRecord")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
-        if(tab==0)key+="|"+smartStructureKey()+"|"+state.opt("component")+"|"+gapStructureKey();
-        if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
-        if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
-        if(tab==2)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+state.optString("recording")+"|"+state.optString("replayFile");
-        if(tab==3)key+="|"+(array("debug").length()==0);
-        if(tab==4)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter");
-        if(tab==4||tab==6)key+="|"+ChatGptAccount.get(this).snapshot().version;
-        if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->{if(debugLog!=null)scroll.fullScroll(View.FOCUS_DOWN);else scroll.scrollTo(0,y);});}
+        String key=pending.signature()+"|"+screen+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+state.optString("autoRecording")+state.optBoolean("autoRecord")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
+        if(screen==Screen.LIVE)key+="|"+smartStructureKey()+"|"+state.opt("component")+"|"+gapStructureKey()+"|"+(array("values").length()>0);
+        if(screen==Screen.DIAGNOSE||screen==Screen.AUFNAHMEN||screen==Screen.ADAPTER)key+="|"+state.optBoolean("busy");
+        if(screen==Screen.DIAGNOSE)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
+        if(screen==Screen.AUFNAHMEN)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+state.optString("replayFile");
+        if(screen==Screen.ADAPTER)key+="|"+array("devices").toString()+"|"+state.optBoolean("autoConnect")+"|"+state.optBoolean("autoPending")+"|"+state.optString("knownAdapter")+"|"+state.optBoolean("autoDtc",true);
+        if(screen==Screen.ADAPTER||screen==Screen.KONTO)key+="|"+ChatGptAccount.get(this).snapshot().version;
+        if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->scroll.scrollTo(0,y));}
         updateValues();
         updateUdsStatus();
         updateSmartStatus();
@@ -199,9 +231,14 @@ public class MainActivity extends Activity {
         announceGap();
         accountDialog();
         showNetworkSettingsPrompt();
-        if(debugLog!=null){String content=debugText();if(!content.contentEquals(debugLog.getText())){debugLog.setText(content);scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));}}
     }
-    private String phaseName(String p){switch(p){case "ready":return "Verbunden · bereit";case "scanning":return "Adapter werden gesucht …";case "connecting":return "Verbindung wird aufgebaut …";case "disconnected":return "Getrennt";case "error":return "Verbindungsfehler";case "replay":return "Gespeicherte Sitzung";default:return "Bereit zum Verbinden";}}
+    /** The connection or data source in words: live disconnected or with adapter, simulated demo, replay with its source and a partial file. */
+    public static String modeText(JSONObject state){
+        String mode=state.optString("mode","live"),phase=state.optString("phase","idle");
+        if(mode.equals("demo"))return phase.equals("ready")?"DEMO · SIMULIERT":phase.equals("connecting")?"DEMO · STARTET …":"DEMO · BEENDET";
+        if(mode.equals("replay"))return "REPLAY · "+(state.optString("replaySourceMode").equals("demo")?"DEMO":"DATEI")+(state.optBoolean("replayPartial")?" · TEILAUFNAHME":"");
+        switch(phase){case "ready":return "LIVE · ADAPTER";case "scanning":return "LIVE · SUCHE …";case "connecting":return "LIVE · VERBINDET …";default:return state.optBoolean("autoPending")?"LIVE · GETRENNT · AUTOMATISCHER VERSUCH":"LIVE · GETRENNT";}
+    }
     private String udsStructureKey(){JSONObject uds=state.optJSONObject("uds");return uds==null?"":uds.optString("state")+"|"+uds.optBoolean("active")+"|"+uds.optString("error")+"|"+uds.optString("target",uds.optString("target_id"));}
     private void updateUdsStatus(){if(udsIndicator==null)return;boolean active=udsActive(state);udsIndicator.setText("UDS erweiterte Sitzung aktiv");udsIndicator.setVisibility(active?View.VISIBLE:View.GONE);udsIndicator.setContentDescription(active?"UDS erweiterte Sitzung aktiv":"UDS Standardsitzung");if(udsRemaining!=null)udsRemaining.setText(udsStatusText());}
     private String udsStatusText(){JSONObject uds=state.optJSONObject("uds");if(udsActive(state)){long seconds=uds==null?0:uds.optLong("remaining_s",uds.optLong("remaining_ms")/1000);String target=uds==null?"":uds.optString("target",uds.optString("target_id"));return "UDS erweiterte Sitzung aktiv"+(target.isEmpty()?"":" · "+target)+(seconds>0?" · noch etwa "+seconds+" s":"");}String error=uds==null?"":uds.optString("error");if(error.isEmpty()&&uds!=null&&"indeterminate".equals(uds.optString("state")))error="Sitzungsstatus unklar";return error.isEmpty()?udsEnableBlocker():"Erweiterte Sitzung nicht aktiv · "+error;}
@@ -209,11 +246,20 @@ public class MainActivity extends Activity {
     private boolean identifiedEngineResponded(){JSONObject result=state.optJSONObject("ecuDiscovery"),record=selectedVehicle();if((result==null||result.length()==0)&&record!=null)result=record.optJSONObject("ecu_discovery");JSONArray targets=result==null?null:result.optJSONArray("targets");for(int i=0;targets!=null&&i<targets.length();i++){JSONObject target=targets.optJSONObject(i);if(target==null||!"present".equals(target.optString("status")))continue;String role=target.optString("role",target.optString("logical_role"));boolean engine=role.toLowerCase(java.util.Locale.ROOT).contains("engine")||role.toLowerCase(java.util.Locale.ROOT).contains("motor"),identified=false;JSONArray identity=target.optJSONArray("identity");if(identity==null)identity=target.optJSONArray("identification");for(int j=0;identity!=null&&j<identity.length();j++){JSONObject item=identity.optJSONObject(j);if(item==null)continue;String semantic=item.optString("semantic"),value=item.optString("value");if(semantic.contains("logical_role")&&(value.toLowerCase(java.util.Locale.ROOT).contains("engine")||value.toLowerCase(java.util.Locale.ROOT).contains("motor")))engine=true;if(!value.isEmpty()||positiveUdsResponse(item.opt("response")))identified=true;}if(engine&&identified)return true;}return false;}
     private static boolean positiveUdsResponse(Object response){if(response instanceof JSONArray){JSONArray bytes=(JSONArray)response;return bytes.length()>0&&bytes.optInt(0,-1)==0x62;}if(response instanceof String)return ((String)response).trim().toLowerCase(java.util.Locale.ROOT).startsWith("62");return false;}
     private boolean udsCandidatesExpected(){if(state.optInt("udsCandidates",0)>0)return true;JSONArray candidates=state.optJSONArray("udsCandidates");if(candidates!=null&&candidates.length()>0)return true;for(int i=0;i<array("signals").length();i++){JSONObject signal=array("signals").optJSONObject(i);if(signal==null)continue;String protocol=signalField(signal,"protocol").toLowerCase(java.util.Locale.ROOT),session=signalField(signal,"session_requirement").toLowerCase(java.util.Locale.ROOT);if(protocol.equals("uds")||signal.optBoolean("session_required")||session.contains("extended")||session.contains("required"))return true;}return false;}
-    private void buildNav(){nav.removeAllViews();nav.setWeightSum(5);String[] titles={"Live","Diagnose","Aufnahmen","Debug","Adapter"};for(int i=0;i<titles.length;i++){final int next=i;Button b=button(titles[i],()->{tab=next;structure="";scroll.scrollTo(0,0);buildNav();refresh();});b.setTextSize(12);b.setMinWidth(0);b.setMinimumWidth(0);b.setPadding(dp(2),dp(4),dp(2),dp(4));b.setTextColor(tab==i?BG:MUTED);b.setBackground(surface(tab==i?ACCENT:CARD,12));b.setBackgroundTintList(null);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(48),1);p.setMargins(dp(2),0,dp(2),0);nav.addView(b,p);}}
+    private void buildNav(){
+        nav.removeAllViews();Screen[] areas={Screen.LIVE,Screen.DIAGNOSE,Screen.AUFNAHMEN};String[] titles={"Live","Diagnose","Aufnahmen"};
+        for(int i=0;i<areas.length;i++){final Screen next=areas[i];boolean selected=screen==next;
+            Button b=button(titles[i],()->show(next));b.setTextSize(13);b.setMinWidth(0);b.setMinimumWidth(0);b.setPadding(dp(2),dp(4),dp(2),dp(4));b.setTextColor(selected?BG:MUTED);b.setBackground(surface(selected?ACCENT:CARD,12));b.setBackgroundTintList(null);b.setSelected(selected);
+            if(Build.VERSION.SDK_INT>=30)b.setStateDescription(selected?"ausgewählt":"");
+            LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,-2,1);p.setMargins(dp(2),0,dp(2),0);nav.addView(b,p);}
+        boolean context=!screen.main();back.setVisibility(context?View.VISIBLE:View.GONE);
+        if(context)back.setContentDescription("Zurück zu "+titles[java.util.Arrays.asList(areas).indexOf(returnTo)]);
+        syncBack();
+    }
     /** REQ-042.1, REQ-042.10, REQ-042.12: the optional ChatGPT account section. Never touches the vehicle service. */
     private void accountTab(){
         ChatGptAccount account=ChatGptAccount.get(this);ChatGptAccount.Snapshot s=account.snapshot();
-        title("ChatGPT-Konto","Optional · die App funktioniert auch ohne Konto");
+        title("ChatGPT-Konto");
         LinearLayout c=card();
         boolean connected=s.status==ChatGptAccount.Status.CONNECTED||s.status==ChatGptAccount.Status.UNREACHABLE||s.status==ChatGptAccount.Status.PLAN_MISSING;
         boolean signingIn=s.phase==ChatGptAccount.Phase.WAITING||s.phase==ChatGptAccount.Phase.EXCHANGING;
@@ -256,7 +302,7 @@ public class MainActivity extends Activity {
     }
     /** REQ-042.13: only a denied sign-in socket offers the app's Android network settings. */
     private void showNetworkSettingsPrompt() {
-        if (tab != 6 || resumed != this || networkSettingsDialog != null) return;
+        if (screen != Screen.KONTO || resumed != this || networkSettingsDialog != null) return;
         ChatGptAccount account = ChatGptAccount.get(this);
         if (!account.networkSettingsPromptDue()) return;
         networkSettingsDialog = new AlertDialog.Builder(this).setTitle("Netzwerkzugriff für OBDentic erlauben")
@@ -284,22 +330,35 @@ public class MainActivity extends Activity {
             }
         }
     }
-    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;udsRemaining=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;case 6:accountTab();break;default:connection();}}
+    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();udsRemaining=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;
+        switch(screen){case LIVE:live();break;case DIAGNOSE:diagnose();break;case AUFNAHMEN:recordings();break;case ADAPTER:connection();break;case FAHRZEUGE:vehicles();break;default:accountTab();}}
     private void live(){
-        title("Live-Messwerte","Werte und Verlauf auf einen Blick");
-        addButton(body,"Messwerte auswählen",this::chooseSignals).setEnabled(state.optString("recording").isEmpty()&&!(smartActive(state)&&!state.optString("mode","live").equals("replay")));
+        title("Live");
+        String mode=state.optString("mode","live");boolean replay=mode.equals("replay"),ready=state.optString("phase").equals("ready");
         JSONArray selected=array("selected");
         boolean recordingNow=!state.optString("recording").isEmpty();
-        boolean canRecordSelection=!state.optString("mode","live").equals("replay")&&state.optString("phase").equals("ready")&&!state.optBoolean("busy")&&!recordingNow&&selected.length()>0&&smartRecordingBlocker(state)==null;
-        // Keep stopping an active recording immediately reachable; inactive setup belongs below the measurements.
-        if(recordingNow)actionButton(body,REC_STOP,"","Aufzeichnung stoppen",true,()->perform(REC_STOP,"",()->service().stopRecording()));
-        if(!state.optString("recording").isEmpty())note(body,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);
+        if(!replay&&!ready){
+            // without a connection: one start surface, no locked recording actions and no old values shown as current
+            LinearLayout c=card();note(c,"VERBINDUNG STARTEN",ACCENT);
+            note(c,"Verbinde deinen OBD-Adapter, um Messwerte zu lesen. Ohne Fahrzeug zeigt die Demo simulierte Werte.",MUTED);
+            primary(addButton(c,"Adapter verbinden",()->show(Screen.ADAPTER)));
+            addButton(c,"Demo starten",()->act(()->service().setDemo()));
+            if(recordingNow){actionButton(c,REC_STOP,"","Aufzeichnung stoppen",true,()->perform(REC_STOP,"",()->service().stopRecording()));smallNote(c,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);}
+            return;
+        }
+        boolean canRecordSelection=!replay&&ready&&!state.optBoolean("busy")&&!recordingNow&&selected.length()>0&&smartRecordingBlocker(state)==null;
         gapCard();
+        // the selection and recording bar above the tiles: start and stop without changing the view
+        LinearLayout bar=flow();LinearLayout.LayoutParams barParams=new LinearLayout.LayoutParams(-1,-2);barParams.setMargins(0,dp(2),0,0);body.addView(bar,barParams);
+        Button choose=button("Messwerte auswählen",this::chooseSignals);choose.setEnabled(!recordingNow&&!(smartActive(state)&&!replay));bar.addView(choose,flowParams(bar));
+        if(recordingNow)actionButton(bar,flowParams(bar),REC_STOP,"","Aufzeichnung stoppen",true,()->perform(REC_STOP,"",()->service().stopRecording()));
+        else if(!replay)primary(actionButton(bar,flowParams(bar),REC_START,"","Auswahl aufzeichnen",canRecordSelection,()->perform(REC_START,"",()->service().startRecording("live-selection"))));
+        if(recordingNow)smallNote(body,"● Aufzeichnung läuft · "+state.optString("recording"),ACCENT);
         JSONArray values=array("values");
         LinkedHashMap<String,JSONObject> shown=new LinkedHashMap<>();
         for(int i=0;i<selected.length();i++){String s=selected.optString(i);shown.put(s,signal(s));}
         for(int i=0;i<values.length();i++){JSONObject v=values.optJSONObject(i);if(v!=null&&selected.length()==0)shown.put(v.optString("semantic"),v);}
-        if(shown.isEmpty())empty("Noch keine Messwerte","Wähle Messwerte aus und verbinde deinen Adapter. Mit „Demo starten“ unter Adapter kannst du die Oberfläche ohne Auto testen.");
+        if(shown.isEmpty())empty("Noch keine Messwerte",replay?"Diese Aufnahme enthält keine Messwerte.":"Wähle mit „Messwerte auswählen“, was angezeigt und gelesen wird.");
         int columns=getResources().getConfiguration().orientation==android.content.res.Configuration.ORIENTATION_LANDSCAPE?3:2,col=0;LinearLayout row=null;
         for(Map.Entry<String,JSONObject> entry:shown.entrySet()){
             String id=entry.getKey();JSONObject s=entry.getValue();
@@ -317,12 +376,10 @@ public class MainActivity extends Activity {
             col=(col+1)%columns;
         }
         while(col!=0&&col<columns){row.addView(new View(this),new LinearLayout.LayoutParams(0,1,1));col++;}
-        if(!recordingNow)actionButton(body,REC_START,"","Gewählte Messwerte aufzeichnen",canRecordSelection,()->perform(REC_START,"",()->service().startRecording("live-selection")));
         // below the tiles: the first screen keeps its tile density (#239)
         smartCard();
         if(!recordingNow&&smartRecordingBlocker(state)!=null)note(body,smartRecordingBlocker(state),MUTED);
         componentCard();
-        JSONObject vehicle=state.optJSONObject("vehicle");if(vehicle!=null&&vehicle.length()>0){LinearLayout c=card();note(c,"FAHRZEUG",ACCENT);note(c,vehicle.optString("vin","Fahrzeug erfasst"),TEXT);JSONArray responders=vehicle.optJSONArray("responders");if(responders!=null)note(c,responders.length()+" Responder · Details unter Diagnose",MUTED);}
     }
     /** REQ-037: the headline when live reads (or the recorded ones) show no current value. Observation only; the cause is never named. */
     public static String gapText(JSONObject state){JSONObject gap=state.optJSONObject("gap");return gap!=null&&gap.optBoolean("active")?MeasurementGap.TEXT:"";}
@@ -507,23 +564,54 @@ public class MainActivity extends Activity {
             Object session=entry.opt("session");smallNote(c,semanticLabel(entry.optString("semantic"),array("signals"))+(Boolean.TRUE.equals(session)?" · erweiterte Sitzung":"")+(entry.optString("detail").isEmpty()?"":" · "+entry.optString("detail")),MUTED);}
     }
     private void diagnose(){
-        title("Diagnose","Lesende Aufträge · Ergebnisse bleiben lokal");
-        LinearLayout c=card();note(c,"FAHRZEUG & FEHLERSPEICHER",ACCENT);
-        job(c,"Fahrzeug und Steuergeräte erfassen","inventory");job(c,"Fehlercodes lesen","dtc.scan");
-        throughputCard();
-        ecuDiscoveryCard();availabilityCard();
-        knowledgeLearningCard();
-        udsSessionCard();
-
-        JSONObject vehicle=state.optJSONObject("vehicle");
-        if(vehicle!=null&&vehicle.length()>0)showInventory(vehicle);
-        JSONObject dtcs=state.optJSONObject("diagnostics");
-        if(dtcs!=null&&dtcs.length()>0)showDtcs(dtcs);
+        title("Diagnose");
         JSONObject result=state.optJSONObject("jobResult");
-        if(result!=null&&result.length()>0&&!result.optBoolean("ok",true)&&!result.optString("error").isEmpty()){
-            LinearLayout error=card();note(error,"AUFTRAG NICHT ABGESCHLOSSEN",0xffffa79c);note(error,result.optString("error"),TEXT);
-        }
-        if((vehicle==null||vehicle.length()==0)&&(dtcs==null||dtcs.length()==0)&&(result==null||result.length()==0))empty("Bereit für den ersten Auftrag","Verbinde den Adapter oder starte die Demo. Rohdaten und Antworten findest du unter Debug.");
+        boolean failed=result!=null&&result.length()>0&&!result.optBoolean("ok",true)&&!result.optString("error").isEmpty();
+        if(failed)jobFailureCard(result); // the last error stays above everything, never inside the collapsed checks
+        String blocked=jobBlocker(),lastFailed=failed?result.optString("action"):"";
+        LinearLayout c=card();note(c,"FEHLERCODES",ACCENT);
+        primary(job(c,"Fehlercodes lesen","dtc.scan"));
+        if(blocked!=null)smallNote(c,blocked,MUTED);
+        JSONObject dtcs=state.optJSONObject("diagnostics");boolean dtcsShown=dtcs!=null&&dtcs.length()>0;
+        if(!dtcsShown)smallNote(c,lastFailed.equals("dtc.scan")?"Beim letzten Versuch nicht gelesen · keine aktuellen Fehlercodes bekannt":"Noch nicht gelesen · liest gespeicherte und anstehende Codes je Steuergerät, löscht nichts",MUTED);
+        if(dtcsShown)showDtcs(dtcs);
+        LinearLayout v=card();note(v,"FAHRZEUG UND STEUERGERÄTE",ACCENT);
+        primary(job(v,"Fahrzeug und Steuergeräte erfassen","inventory"));
+        JSONObject vehicle=state.optJSONObject("vehicle");boolean inventoryShown=vehicle!=null&&vehicle.length()>0;
+        if(!inventoryShown)smallNote(v,lastFailed.equals("inventory")?"Beim letzten Versuch nicht erfasst":"Noch nicht erfasst · liest FIN und antwortende Steuergeräte",MUTED);
+        if(inventoryShown)showInventory(vehicle);
+        boolean extended=udsActive(state);
+        if(extended)udsSessionCard(); // the way back to the standard session stays reachable without opening the checks
+        Button more=addButton(body,moreChecks?"Weitere Prüfungen ausblenden":"Weitere Prüfungen anzeigen",()->{moreChecks=!moreChecks;structure="";refresh();});
+        more.setTag("more-checks");
+        if(!moreChecks){smallNote(body,"Steuergeräteerkennung, Verfügbarkeit, Knowledge-Prüfung, Adapter-Leistung"+(extended?"":", erweiterte Sitzung"),MUTED);return;}
+        ecuDiscoveryCard();availabilityCard();knowledgeLearningCard();throughputCard();
+        if(!extended)udsSessionCard();
+    }
+    /** Why no diagnostic job can start now, or null. */
+    private String jobBlocker(){String mode=state.optString("mode","live");if(mode.equals("replay"))return "In der Wiedergabe wird nichts an ein Fahrzeug gesendet";if(state.optBoolean("busy"))return "Ein Auftrag läuft";if(!canRun())return "Erst einen Adapter verbinden oder die Demo starten";return null;}
+    /** A failed job: what was not determined, whether an earlier result still applies, and the recording that holds its traffic only when one exists. */
+    private void jobFailureCard(JSONObject result){
+        String action=result.optString("action");
+        LinearLayout c=card();note(c,jobFailureTitle(action),0xffffa79c);note(c,result.optString("error"),TEXT);
+        smallNote(c,jobFailureScope(action),MUTED);
+        String file=failureRecordingNote(result,state);if(!file.isEmpty())smallNote(c,file,MUTED);
+    }
+    /** Points to the offline evaluation only when the recording that holds the failed job's traffic actually exists; "" otherwise. */
+    public static String failureRecordingNote(JSONObject result,JSONObject state){
+        String file=result.optString("recording");if(file.isEmpty())return "";
+        boolean exists=file.equals(state.optString("recording"))||file.equals(state.optString("autoRecording"));
+        JSONArray r=state.optJSONArray("records");for(int i=0;!exists&&r!=null&&i<r.length();i++){JSONObject o=r.optJSONObject(i);exists=o!=null&&file.equals(o.optString("name"));}
+        return exists?"Anfragen und Antworten stehen in der Aufnahme „"+file+"“ zur Offline-Auswertung.":"";
+    }
+    public static String jobFailureTitle(String action){
+        switch(action){case "dtc.scan":return "FEHLERCODES NICHT GELESEN";case "inventory":return "FAHRZEUG NICHT ERFASST";case "ecu.discover":return "STEUERGERÄTE NICHT ERKANNT";case ObdService.AVAILABILITY:return "VERFÜGBARKEIT NICHT GEPRÜFT";case "knowledge.learn":return "KNOWLEDGE-PRÜFUNG NICHT ABGESCHLOSSEN";case ObdService.THROUGHPUT:return "ADAPTER-LEISTUNG NICHT GEMESSEN";case "uds.enable":return "ERWEITERTE SITZUNG NICHT AKTIVIERT";case "uds.disable":return "STANDARD-SITZUNG NICHT BESTÄTIGT";default:return action.startsWith("read:")?"MESSWERT NICHT GELESEN":"AUFTRAG NICHT ABGESCHLOSSEN";}
+    }
+    /** Fault codes and inventory are replaced by each run, so a failure leaves none shown as current; the other checks keep their last successful result. */
+    public static String jobFailureScope(String action){
+        switch(action){case "dtc.scan":case "inventory":return "Es wurde kein neues Ergebnis ermittelt. Ein früheres Ergebnis wird nicht als aktuell angezeigt.";
+            case "ecu.discover":case ObdService.AVAILABILITY:case "knowledge.learn":case ObdService.THROUGHPUT:return "Es wurde kein neues Ergebnis ermittelt. Ein zuvor erfolgreich ermitteltes Ergebnis bleibt unverändert und gilt weiter.";
+            default:return "Es wurde kein neues Ergebnis ermittelt.";}
     }
     /** REQ-022.1/.6: the button (live and ready only, otherwise the reason) and the summary of the last or replayed measurement. */
     private void throughputCard(){
@@ -633,51 +721,75 @@ public class MainActivity extends Activity {
         if(pending!=null)showDtcSection("ANSTEHENDE FEHLERCODES","Keine anstehenden Fehlercodes",pending); // REQ-034.2: Mode 07
     }
     private void showDtcSection(String heading,String none,JSONObject dtcs){
-        LinearLayout c=card();note(c,heading,ACCENT);JSONArray observations=dtcs.optJSONArray("observations");
-        if(dtcs.has("error"))note(c,"Fehler: "+dtcs.optString("error"),0xffffa79c);
-        if(observations==null||observations.length()==0)note(c,"Keine Steuergeräte-Antworten",MUTED);
+        LinearLayout c=card();note(c,heading,ACCENT);
+        for(String[] line:dtcLines(dtcs,none))note(c,line[0],line[1].equals("error")?0xffffa79c:line[1].equals("muted")?MUTED:TEXT);
+    }
+    /**
+     * The lines of one fault-code section as {text, "error"|"text"|"muted"}. "{@code none}" (no codes) only for a responder that answered
+     * without codes; a timeout, a missing answer or an error is never shown as "no fault codes".
+     */
+    public static java.util.List<String[]> dtcLines(JSONObject dtcs,String none){
+        ArrayList<String[]> lines=new ArrayList<>();JSONArray observations=dtcs.optJSONArray("observations");
+        if(dtcs.has("error"))lines.add(new String[]{"Fehler: "+dtcs.optString("error"),"error"});
+        if(observations==null||observations.length()==0)lines.add(new String[]{"Keine Steuergeräte-Antworten","muted"});
         else for(int i=0;i<observations.length();i++){JSONObject item=observations.optJSONObject(i);if(item==null)continue;String responder=displayResponder(item.optString("responder",""));String error=item.optString("error","");JSONArray codes=item.optJSONArray("codes");
-            if(!error.isEmpty())note(c,responder+" · Fehler: "+error,0xffffa79c);
-            else if(item.optBoolean("no_dtcs")||(codes!=null&&codes.length()==0))note(c,responder+" · "+none,TEXT);
-            else if(codes!=null){StringBuilder values=new StringBuilder();for(int j=0;j<codes.length();j++){if(j>0)values.append(", ");values.append(codes.optString(j));}note(c,responder+" · "+values,TEXT);}
-            else note(c,responder+" · Keine auswertbaren Codes",MUTED);
+            if(!error.isEmpty())lines.add(new String[]{responder+" · Fehler: "+error,"error"});
+            else if(item.optBoolean("no_dtcs")||(codes!=null&&codes.length()==0))lines.add(new String[]{responder+" · "+none,"text"});
+            else if(codes!=null){StringBuilder values=new StringBuilder();for(int j=0;j<codes.length();j++){if(j>0)values.append(", ");values.append(codes.optString(j));}lines.add(new String[]{responder+" · "+values,"text"});}
+            else lines.add(new String[]{responder+" · Keine auswertbaren Codes","muted"});
         }
-        JSONArray errors=dtcs.optJSONArray("errors");if(errors!=null)for(int i=0;i<errors.length();i++){JSONObject item=errors.optJSONObject(i);if(item!=null)note(c,displayResponder(item.optString("responder",""))+" · "+item.optString("error","Antwortfehler"),0xffffa79c);}
+        JSONArray errors=dtcs.optJSONArray("errors");if(errors!=null)for(int i=0;i<errors.length();i++){JSONObject item=errors.optJSONObject(i);if(item!=null)lines.add(new String[]{displayResponder(item.optString("responder",""))+" · "+item.optString("error","Antwortfehler"),"error"});}
+        return lines;
     }
-    private String displayResponder(String responder){return responder.isEmpty()?"Unbekannter Responder":responder;}
-    private void job(LinearLayout parent,String label,String action){PendingActions.Spec spec=jobSpec(label);actionButton(parent,spec,":"+action,label,canRun(),()->perform(spec,":"+action,()->service().runJob(action)));}
+    private static String displayResponder(String responder){return responder.isEmpty()?"Unbekannter Responder":responder;}
+    private Button job(LinearLayout parent,String label,String action){PendingActions.Spec spec=jobSpec(label);return actionButton(parent,spec,":"+action,label,canRun(),()->perform(spec,":"+action,()->service().runJob(action)));}
     private boolean canRun(){String mode=state.optString("mode");return !state.optBoolean("busy")&&!mode.equals("replay")&&(mode.equals("demo")||state.optString("phase").equals("ready"));}
+    /** A library: running recording, export folder and one-tap export first, then the newest files; settings stay collapsed below the export head. */
     private void recordings(){
-        title("Aufnahmen","Lokal sichern · später ohne Auto untersuchen");
-        if(!state.optString("recording").isEmpty())note(body,"● "+state.optString("recording"),ACCENT);
-        note(body,"Aufzeichnungen enthalten möglicherweise Fahrzeugkennungen. Export erfolgt nur auf deine ausdrückliche Auswahl.",MUTED); // REQ-025.7: no recording profiles; Live records the selection
-        autoRecordCard();
-        exportCard();
-        JSONArray records=array("records");if(records.length()==0)empty("Noch keine Aufnahmen","Starte eine Aufzeichnung im Live- oder Demomodus. Die Dateien bleiben auf diesem Handy.");
+        title("Aufnahmen");
+        String folder=RecordingExporter.folder(this),active=activeRecordingName();
+        LinearLayout head=card();
+        if(!active.isEmpty())note(head,"● Aufzeichnung läuft · "+active,ACCENT);
+        note(head,folder.isEmpty()?"Kein Export-Ordner gewählt":"Export-Ordner: "+folderName(folder),folder.isEmpty()?MUTED:TEXT);
+        if(folder.isEmpty())primary(addButton(head,"Export-Ordner wählen …",this::chooseFolder));
+        else primary(actionButton(head,EXPORT_ALL,"","Alle exportieren",true,()->perform(EXPORT_ALL,"",()->service().exportAll())));
+        smallNote(head,"Aufnahmen können FIN, Steuergerätekennungen und km-Stand enthalten. Sie verlassen das Handy nur durch deinen Export.",MUTED);
+        addButton(body,recordingSettings?"Aufnahme- und Exporteinstellungen ausblenden":"Aufnahme- und Exporteinstellungen anzeigen",()->{recordingSettings=!recordingSettings;structure="";refresh();}).setTag("recording-settings");
+        if(recordingSettings){autoRecordCard();exportCard();}
+        JSONArray records=array("records");
+        if(records.length()==0){LinearLayout e=card();note(e,"Noch keine Aufnahmen",TEXT);note(e,"Aufnahmen startest du unter Live. Die Dateien bleiben auf diesem Handy.",MUTED);addButton(e,"Zu Live",()->show(Screen.LIVE));return;}
         // REQ-028.13: only the newest ones; thousands of cards froze the main thread
-        if(records.length()>SHOWN_RECORDS)note(card(),(records.length()-SHOWN_RECORDS)+" ältere Aufnahmen nicht angezeigt – Export und Teilen erfassen alle.",MUTED);
-        for(int i=0;i<Math.min(records.length(),SHOWN_RECORDS);i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");LinearLayout item=card();note(item,name,TEXT);note(item,record.optLong("bytes")+" Bytes",MUTED);addButton(item,"Als Replay öffnen",()->act(()->{service().openRecording(name);tab=0;buildNav();structure="";}));addButton(item,"Datei exportieren …",()->export(name));Button delete=addButton(item,"Aufnahme löschen …",()->confirmDeleteRecording(name));delete.setEnabled(!name.equals(state.optString("recording"))&&!name.equals(state.optString("replayFile")));}
+        if(records.length()>SHOWN_RECORDS)smallNote(body,(records.length()-SHOWN_RECORDS)+" ältere Aufnahmen nicht angezeigt – Export und Teilen erfassen alle.",MUTED);
+        for(int i=0;i<Math.min(records.length(),SHOWN_RECORDS);i++){JSONObject record=records.optJSONObject(i);if(record==null)continue;String name=record.optString("name");
+            boolean running=name.equals(active),replayed=name.equals(state.optString("replayFile"));
+            LinearLayout item=card();note(item,name,TEXT);smallNote(item,sizeText(record.optLong("bytes"))+(running?" · Aufzeichnung läuft":replayed?" · als Replay geöffnet":""),running?ACCENT:MUTED);
+            LinearLayout actions=flow();item.addView(actions,new LinearLayout.LayoutParams(-1,-2));
+            Button open=button("Als Replay öffnen",()->{act(()->service().openRecording(name));show(Screen.LIVE);});actions.addView(open,flowParams(actions));
+            boolean expanded=fileActions.contains(name);
+            Button more=button(expanded?"Weniger":"Weitere Aktionen",()->{if(!fileActions.remove(name))fileActions.add(name);structure="";refresh();});more.setContentDescription((expanded?"Weitere Aktionen ausblenden: ":"Weitere Aktionen: ")+name);actions.addView(more,flowParams(actions));
+            if(!expanded)continue;
+            addButton(item,"Datei exportieren …",()->export(name));
+            addButton(item,"Aufnahme löschen …",()->confirmDeleteRecording(name)).setEnabled(!running&&!replayed);
+        }
     }
+    static String sizeText(long bytes){if(bytes<1024)return bytes+" Bytes";java.text.NumberFormat f=java.text.NumberFormat.getNumberInstance(java.util.Locale.GERMANY);f.setMaximumFractionDigits(1);return bytes<1024L*1024?f.format(bytes/1024.0)+" KB":f.format(bytes/(1024.0*1024))+" MB";}
     /** REQ-028: always-on session recording switch and delete-all. */
     private void autoRecordCard(){
         boolean on=state.optBoolean("autoRecord",true);
         LinearLayout c=card();note(c,"DAUER-AUFZEICHNUNG",ACCENT);
         note(c,"Jede Live-Verbindung wird ab dem Verbindungsaufbau zum Adapter automatisch aufgezeichnet (…-auto.jsonl, alle 30 min oder 10 MB neue Datei). Die App löscht nichts selbst.",MUTED);
-        if(!state.optString("autoRecording").isEmpty())note(c,"● "+state.optString("autoRecording"),ACCENT);
         actionButton(c,AUTO_RECORD,"","Dauer-Aufzeichnung: "+(on?"an":"aus"),true,()->perform(AUTO_RECORD,"",()->service().setAutoRecord(!on)));
         actionButton(c,EXPORT_NOW,"","Jetzt exportieren",true,()->perform(EXPORT_NOW,"",()->service().exportCurrent())); // REQ-028.11
         actionButton(c,AUTO_RECORD_DELETE,"","Automatische Aufnahmen löschen …",true,()->new AlertDialog.Builder(this).setTitle("Automatische Aufnahmen löschen?").setMessage("Alle abgeschlossenen automatischen Aufnahmen werden dauerhaft gelöscht. Benannte Aufnahmen und exportierte Kopien bleiben.").setPositiveButton("Löschen",(d,w)->perform(AUTO_RECORD_DELETE,"",()->service().deleteAutoRecordings())).setNegativeButton("Abbrechen",null).show());
     }
-    /** REQ-018: export folder, one-tap and automatic export, share sheet. */
+    /** REQ-018: the export actions besides "Alle exportieren": folder, automatic export, share sheet. */
     private void exportCard(){
-        String folder=RecordingExporter.folder(this);boolean auto=RecordingExporter.auto(this);
+        boolean auto=RecordingExporter.auto(this);
         LinearLayout c=card();note(c,"EXPORT",ACCENT);
-        note(c,folder.isEmpty()?"Kein Export-Ordner gewählt":"Export-Ordner: "+folderName(folder),folder.isEmpty()?MUTED:TEXT);
         addButton(c,"Export-Ordner wählen …",this::chooseFolder);
-        actionButton(c,EXPORT_ALL,"","Alle exportieren",!folder.isEmpty(),()->perform(EXPORT_ALL,"",()->service().exportAll()));
         actionButton(c,AUTO_EXPORT,"","Automatischer Export: "+(auto?"an":"aus"),true,()->{if(!auto&&RecordingExporter.folder(this).isEmpty()){toast("Zuerst Export-Ordner wählen");return;}perform(AUTO_EXPORT,"",()->RecordingExporter.setAuto(this,!auto));});
         addButton(c,"Aufnahmen teilen …",this::shareAll);
-        smallNote(c,"Empfohlen: Download/OBDentic. Exportierte Aufnahmen können FIN, Steuergerätekennungen und km-Stand enthalten; nur abgeschlossene Aufnahmen werden kopiert, Originale bleiben auf dem Handy.",MUTED);
+        smallNote(c,"Empfohlen: Download/OBDentic. Nur abgeschlossene Aufnahmen werden kopiert, Originale bleiben auf dem Handy.",MUTED);
     }
     private static String folderName(String tree){try{return Uri.decode(android.provider.DocumentsContract.getTreeDocumentId(Uri.parse(tree)));}catch(RuntimeException e){return tree;}}
     private void chooseFolder(){
@@ -701,7 +813,7 @@ public class MainActivity extends Activity {
     private String date(long millis){return formatDate(millis);}
     private static String km(double value){java.text.NumberFormat f=java.text.NumberFormat.getNumberInstance(java.util.Locale.GERMANY);f.setMaximumFractionDigits(1);return f.format(value)+" km";}
     private void vehicles(){
-        title("Fahrzeuge","Lokal gespeichert · nur auf diesem Handy");
+        title("Fahrzeuge");smallNote(body,"Lokal gespeichert · nur auf diesem Handy",MUTED);
         JSONObject store=vehicleStore();
         if(store.optBoolean("unreadable")){LinearLayout e=card();note(e,"FAHRZEUGSPEICHER NICHT LESBAR",0xffffa79c);note(e,"Die gespeicherten Fahrzeuge konnten nicht gelesen werden. Verbindungen funktionieren weiter. Die Datei wird nicht überschrieben, solange du den Speicher nicht selbst zurücksetzt.",MUTED);addButton(e,"Fahrzeugspeicher zurücksetzen …",this::confirmResetVehicles);return;}
         JSONArray rows=store.optJSONArray("vehicles");
@@ -732,7 +844,7 @@ public class MainActivity extends Activity {
         m.append("\nMotorsteuergerät gezielt geprüft: ").append(row.optBoolean("engine_target_validated")?"ja":"nein");
         JSONObject odometer=row.optJSONObject("odometer"),failure=row.optJSONObject("odometer_error"),decrease=row.optJSONObject("odometer_decrease");
         m.append("\nkm-Stand: ").append(odometer==null?"nicht verfügbar":km(odometer.optDouble("km"))+" (Quelle: "+odometer.optString("source")+", gelesen "+formatDate(odometer.optLong("read_at"))+")");
-        if(failure!=null)m.append("\nLetzter Leseversuch fehlgeschlagen: ").append(failure.optString("error")).append(" (").append(formatDate(failure.optLong("at"))).append(")");
+        if(failure!=null)m.append("\nLetzter Leseversuch fehlgeschlagen: ").append(failure.optString("error")).append(" (").append(formatDate(failure.optLong("at"))).append(")").append(odometer==null?" · kein km-Stand ermittelt":" · der gespeicherte km-Stand gilt weiter");
         if(decrease!=null)m.append("\nNiedriger als zuvor gelesen: ").append(km(decrease.optDouble("previous_km"))).append(" am ").append(formatDate(decrease.optLong("previous_at")));
         m.append("\nErste Verbindung: ").append(formatDate(row.optLong("first_connected"))).append("\nLetzte Verbindung: ").append(formatDate(row.optLong("last_connected")));
         return m.toString();
@@ -744,29 +856,24 @@ public class MainActivity extends Activity {
     private void confirmDeleteVehicle(String vin,String name){new AlertDialog.Builder(this).setTitle("Fahrzeug endgültig löschen?").setMessage(name+"\n\nDer Eintrag wird dauerhaft aus dem internen Speicher gelöscht. Aufnahmen bleiben erhalten.").setPositiveButton("Endgültig löschen",(d,w)->perform(VEHICLE_DELETE,":"+vin,()->service().deleteVehicle(vin))).setNegativeButton("Abbrechen",null).show();}
     private void confirmResetVehicles(){new AlertDialog.Builder(this).setTitle("Fahrzeugspeicher zurücksetzen?").setMessage("Alle gespeicherten Fahrzeuge werden dauerhaft gelöscht und der Speicher wird neu angelegt. Aufnahmen bleiben erhalten.").setPositiveButton("Zurücksetzen",(d,w)->act(()->service().resetVehicleStore())).setNegativeButton("Abbrechen",null).show();}
     private void confirmDeleteRecording(String name){new AlertDialog.Builder(this).setTitle("Aufnahme endgültig löschen?").setMessage("Diese Datei wird dauerhaft aus dem internen Speicher gelöscht. Exportierte Kopien bleiben bestehen.\n\n"+name).setPositiveButton("Endgültig löschen",(dialog,which)->act(()->service().deleteRecording(name))).setNegativeButton("Abbrechen",null).show();}
-    /** One full-height window; the page itself scrolls and always follows the newest line (bottom). */
-    private void debug(){
-        addButton(body,"Debug-Daten lokal kopieren",()->{ClipboardManager cm=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);cm.setPrimaryClip(ClipData.newPlainText("OBDentic Debug",debugText()));toast("In die lokale Zwischenablage kopiert");});
-        note(body,"Kann VIN, Steuergerätekennungen und weitere Fahrzeugdaten enthalten. Nur gezielt teilen.",MUTED);
-        if(array("debug").length()==0)empty("Noch kein Datenverkehr","Verbinden oder einen Diagnoseauftrag starten. Hier erscheinen gesendete Befehle, Antworten und Dienstmeldungen.");
-        else{debugLog=text(debugText(),12,TEXT);debugLog.setTypeface(Typeface.MONOSPACE);debugLog.setTextIsSelectable(true);debugLog.setMinHeight(scroll.getHeight());body.addView(debugLog);}
-    }
-    private String debugText(){StringBuilder s=new StringBuilder();JSONArray logs=array("debug");for(int i=0;i<logs.length();i++){JSONObject j=logs.optJSONObject(i);if(j==null){s.append(logs.optString(i)).append('\n');continue;}s.append(j.optString("at")).append("  ").append(j.optString("direction")).append("  ").append(j.optString("text")).append('\n');}return s.toString();}
+    /** Search results directly under the search, then the automatic options; disconnecting or stopping an automatic attempt stays reachable without opening anything. */
     private void connection(){
-        title("Adapter","Carly-Adapter suchen und gezielt verbinden");
-        LinearLayout c=card();actionButton(c,SCAN,"","Adapter suchen",true,this::requestScan);actionButton(c,DISCONNECT,"","Verbindung trennen",!state.optString("phase").equals("idle"),()->perform(DISCONNECT,"",()->service().disconnect()));
+        title("Adapter");
+        LinearLayout c=card();note(c,"ADAPTER SUCHEN",ACCENT);
+        primary(actionButton(c,SCAN,"","Adapter suchen",true,this::requestScan));
+        if(state.optBoolean("autoPending")||service().pending.isPending(AUTO_STOP.key))actionButton(c,AUTO_STOP,"","Automatische Verbindung stoppen",true,()->perform(AUTO_STOP,"",()->service().stopAutoConnect()));
+        if(!state.optString("phase").equals("idle")||service().pending.isPending(DISCONNECT.key))actionButton(c,DISCONNECT,"","Verbindung trennen",true,()->perform(DISCONNECT,"",()->service().disconnect()));
+        JSONArray devices=array("devices");if(devices.length()==0)smallNote(c,"Noch keine Adapter gefunden. Adapter mit Strom versorgen, Bluetooth einschalten und Suche starten.",MUTED);
+        for(int i=0;i<devices.length();i++){JSONObject d=devices.optJSONObject(i);if(d==null)continue;String address=d.optString("address"),name=d.optString("name","Bluetooth-Gerät");LinearLayout device=card();note(device,name,TEXT);note(device,address+" · "+d.optInt("rssi")+" dBm",MUTED);actionButton(device,CONNECT,":"+address,"Verbinden",!state.optBoolean("busy"),()->perform(CONNECT,":"+address,()->service().connect(address)));}
         boolean autoOn=state.optBoolean("autoConnect",true);String known=state.optString("knownAdapter");
         LinearLayout auto=card();note(auto,"AUTOMATISCH VERBINDEN",ACCENT);
         note(auto,known.isEmpty()?"Noch kein Adapter bekannt · wird nach der ersten erfolgreichen Verbindung gemerkt":"Bekannter Adapter: "+known+" · Verbindung beim Start und nach Abbruch, Pausen 2, 5, 10 s, dann alle 30 s",known.isEmpty()?MUTED:TEXT);
         actionButton(auto,AUTO_CONNECT,"","Automatisch verbinden: "+(autoOn?"an":"aus"),true,()->perform(AUTO_CONNECT,"",()->service().setAutoConnect(!autoOn)));
         boolean dtcOn=state.optBoolean("autoDtc",true);
         actionButton(auto,AUTO_DTC,"","Fehlerspeicher beim Verbinden lesen: "+(dtcOn?"an":"aus"),true,()->perform(AUTO_DTC,"",()->service().setAutoDtc(!dtcOn)));
-        if(state.optBoolean("autoPending")||service().pending.isPending(AUTO_STOP.key))actionButton(auto,AUTO_STOP,"","Automatische Verbindung stoppen",true,()->perform(AUTO_STOP,"",()->service().stopAutoConnect()));
-        JSONArray devices=array("devices");if(devices.length()==0)note(c,"Noch keine Adapter gefunden. Adapter mit Strom versorgen, Bluetooth einschalten und Suche starten.",MUTED);
-        for(int i=0;i<devices.length();i++){JSONObject d=devices.optJSONObject(i);if(d==null)continue;String address=d.optString("address"),name=d.optString("name","Bluetooth-Gerät");LinearLayout device=card();note(device,name,TEXT);note(device,address+" · "+d.optInt("rssi")+" dBm",MUTED);actionButton(device,CONNECT,":"+address,"Verbinden",!state.optBoolean("busy"),()->perform(CONNECT,":"+address,()->service().connect(address)));}
-        LinearLayout demo=card();note(demo,"OHNE FAHRZEUG TESTEN",ACCENT);note(demo,"Die Demo liefert simulierte Messwerte und Diagnoseantworten. Aufnahmen und Export lassen sich damit am Schreibtisch prüfen.",MUTED);addButton(demo,"Demo starten",()->act(()->{service().setDemo();tab=0;structure="";buildNav();}));
+        LinearLayout demo=card();note(demo,"OHNE FAHRZEUG TESTEN",ACCENT);note(demo,"Die Demo liefert simulierte Messwerte und Diagnoseantworten. Aufnahmen und Export lassen sich damit am Schreibtisch prüfen.",MUTED);addButton(demo,"Demo starten",()->{act(()->service().setDemo());show(Screen.LIVE);});
         LinearLayout account=card();note(account,"CHATGPT-KONTO (OPTIONAL)",ACCENT);note(account,ChatGptAccount.get(this).snapshot().status.label,MUTED);
-        addButton(account,"Konto öffnen",()->{tab=6;structure="";scroll.scrollTo(0,0);buildNav();refresh();});
+        addButton(account,"Konto öffnen",()->show(Screen.KONTO));
     }
     private void requestScan(){ArrayList<String> missing=new ArrayList<>();if(Build.VERSION.SDK_INT>=31){missing.add(Manifest.permission.BLUETOOTH_SCAN);missing.add(Manifest.permission.BLUETOOTH_CONNECT);}else missing.add(Manifest.permission.ACCESS_FINE_LOCATION);if(Build.VERSION.SDK_INT>=33)missing.add(Manifest.permission.POST_NOTIFICATIONS);missing.removeIf(p->checkSelfPermission(p)==PackageManager.PERMISSION_GRANTED);if(!missing.isEmpty()){scanAfterPermission=true;requestPermissions(missing.toArray(new String[0]),7);}else perform(SCAN,"",()->service().scan());}
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==7&&scanAfterPermission){scanAfterPermission=false;boolean allowed=true;for(int i=0;i<permissions.length;i++)if(!permissions[i].equals(Manifest.permission.POST_NOTIFICATIONS)&&results[i]!=PackageManager.PERMISSION_GRANTED)allowed=false;if(allowed)perform(SCAN,"",()->service().scan());else new AlertDialog.Builder(this).setTitle("Bluetooth-Berechtigung fehlt").setMessage("Erlaube Geräte in der Nähe in den Android-App-Einstellungen, um den Adapter zu suchen und zu verbinden.").setPositiveButton("Einstellungen",(d,w)->startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())))).setNegativeButton("Schließen",null).show();}}
@@ -943,7 +1050,10 @@ public class MainActivity extends Activity {
     private String signalLabel(String id,JSONObject signal){return SignalNames.shortName(signal.optString("meaning",id),signal.optString("title",""));}
     private JSONArray array(String key){JSONArray a=state.optJSONArray(key);return a==null?new JSONArray():a;}
     private boolean contains(JSONArray a,String s){for(int i=0;i<a.length();i++)if(s.equals(a.optString(i)))return true;return false;}
-    private void title(String title,String subtitle){TextView t=text(title,25,TEXT);t.setTypeface(null,Typeface.BOLD);body.addView(t);note(body,subtitle,MUTED);}
+    /** The current page's title lives in the header, not in the scrolling body. */
+    private void title(String title){pageTitle.setText(title);setTitle(title);}
+    /** The one accent action of a section; secondary actions keep the plain button. */
+    private Button primary(Button b){b.setTextColor(new android.content.res.ColorStateList(new int[][]{new int[]{-android.R.attr.state_enabled},new int[]{}},new int[]{0xff78899c,BG}));b.setBackgroundTintList(new android.content.res.ColorStateList(new int[][]{new int[]{-android.R.attr.state_enabled},new int[]{}},new int[]{0xff1d2938,ACCENT}));b.setTypeface(null,Typeface.BOLD);return b;}
     private void empty(String title,String detail){LinearLayout c=card();note(c,title,TEXT);note(c,detail,MUTED);}
     private LinearLayout card(){LinearLayout c=new LinearLayout(this);c.setOrientation(LinearLayout.VERTICAL);c.setPadding(dp(16),dp(14),dp(16),dp(14));c.setBackground(surface(CARD,20));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,dp(12),0,0);body.addView(c,p);return c;}
     private LinearLayout row(){LinearLayout r=new LinearLayout(this);r.setOrientation(LinearLayout.HORIZONTAL);r.setGravity(Gravity.CENTER_VERTICAL);return r;}

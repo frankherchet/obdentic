@@ -26,7 +26,7 @@ public final class UdsAcceptance {
     public interface OnMain { <T> T call(java.util.concurrent.Callable<T> call) throws Exception; }
 
     public static void verifyDemoGate(OnMain main, Activity activity, ObdService service) throws Exception {
-        main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Diagnose").performClick(); return null; });
+        main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Diagnose").performClick(); UiNav.openMoreChecks(activity); return null; });
         Button enable = main.call(() -> requireButton(activity.getWindow().getDecorView(), "Erweiterte Sitzung aktivieren"));
         require(!enable.isEnabled(), "REQ-027.1 extended session is disabled in demo");
         require(main.call(() -> hasText(activity.getWindow().getDecorView(), "Nur im Livebetrieb verfügbar")), "REQ-027.1 disabled reason is visible");
@@ -66,7 +66,7 @@ public final class UdsAcceptance {
                 && service.snapshot().optInt("udsCandidates") > 0, "Knowledge engine target identified");
             require(fake[0].commands.contains("7E0:22F187"), "REQ-027.1 discovery probes the identified engine target with F187");
 
-            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Diagnose").performClick(); return null; });
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Diagnose").performClick(); UiNav.openMoreChecks(activity); return null; });
             waitFor(() -> main.call(() -> {
                 Button enable = findButtonOrNull(activity.getWindow().getDecorView(), "Erweiterte Sitzung aktivieren");
                 return enable != null && enable.isEnabled();
@@ -124,11 +124,12 @@ public final class UdsAcceptance {
             require(service.snapshot().optJSONObject("uds").optBoolean("active"), "REQ-027.6 the extended session stays active while standard PIDs are polled");
             waitFor(() -> main.call(() -> hasText(activity.getWindow().getDecorView(), "OBD2")), "REQ-027.6 the standard tile is labelled OBD2 next to the UDS tile");
             require(!main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "pausiert")), "REQ-027.6 no tile claims that OBD2 is paused");
-            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Diagnose").performClick(); return null; });
-            // The persistent header is one text; the Diagnose card adds its own status line and its note and button, which exist only there
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Diagnose").performClick(); UiNav.closeMoreChecks(activity); return null; });
+            // The persistent header is one text; the Diagnose card adds its own status line and its note and button, which exist only there.
+            // With "Weitere Prüfungen" closed the active session's card stays visible, so the way back is never hidden.
             waitFor(() -> main.call(() -> countTextStarting(activity.getWindow().getDecorView(), "UDS erweiterte Sitzung aktiv") >= 2
                 && hasTextContaining(activity.getWindow().getDecorView(), "Modus 01")
-                && findButtonOrNull(activity.getWindow().getDecorView(), "Standard-Sitzung wiederherstellen") != null), "REQ-027.6 the Diagnose session card shows its own status, Mode 01 note and switch-off button");
+                && findButtonOrNull(activity.getWindow().getDecorView(), "Standard-Sitzung wiederherstellen") != null), "REQ-027.6/REQ-055.4 with the special checks closed the active session card shows its own status, Mode 01 note and switch-off button");
             require(!main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "pausiert")), "REQ-027.6 Diagnose does not claim that OBD2 is paused");
             main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Live").performClick(); return null; });
 

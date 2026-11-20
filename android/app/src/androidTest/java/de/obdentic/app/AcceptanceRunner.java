@@ -97,7 +97,10 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Live RPM/coolant readings and changing observation selection");
             activity = PendingFeedbackAcceptance.run(this, activity, service); // recreates the Activity (REQ-021.6)
             RecordingListAcceptance.run(this, service);
-            passed("Recordings tab with 3000 extra recordings (REQ-028.13): opens fast, lists the newest 30, states how many older ones are not shown, snapshots stay fast; debug tab is one full-height window that follows the newest line (REQ-033.1)");
+            passed("Recordings tab with 3000 extra recordings (REQ-028.13): opens fast, lists the newest 30, states how many older ones are not shown, snapshots stay fast; export folder and one-tap export directly visible, settings closed, the first file without scrolling");
+            UiStructureAcceptance.run(this, service, this::shoot);
+            activity = LiveGridAcceptance.front(this::onMain, 15000); // recreated by the checks
+            passed("Task-oriented UI: bottom navigation Live/Diagnose/Aufnahmen only, adapter and vehicles from the labelled header, back and Android back return to the work area, 'Adapter verbinden' opens the adapter view without a search, 'Demo starten' stays on Live with the simulation named, Diagnose shows fault codes and vehicle before the closed special checks, opening/recreating/returning starts no job and sends nothing, no raw traffic or debug action, empty/timeout/successful fault-code answers distinguished, a failure names a recording only when it exists, large text stacks the header without cutting it, landscape keeps the work area");
             passed("Pending feedback (REQ-021): disabled pending button with text, indicator and content description, tap while pending ignored, state survives tab switch and Activity recreation, ends on the observed target state, time-limit message and usable button, announcements, real recording start and stop");
             AccountAcceptance.run(getTargetContext());
             passed("ChatGPT account engine (#327, REQ-042 to REQ-044) against a fake authorization server and fake browser: authorization request, loopback listener, callback checks, code exchange, ID-token validation, plan-scope-missing state, status, one-time dialog, one account, no browser/port, Keystore-encrypted record, unreadable record, access token and refresh rotation (serialized, earliest_refresh_at, terminal and temporary errors, invalid_client), revocation with retries, races with disconnect, no requests without an account, minimal requests, no path to the vehicle session, log masking");
@@ -114,8 +117,8 @@ public final class AcceptanceRunner extends Instrumentation {
             job("dtc.scan");
             require(service.snapshot().getJSONObject("diagnostics").toString().contains("P0133"), "Responder-scoped DTC decoding");
             capture(activity,"Diagnose","acceptance-diagnose.png");
-            capture(activity,"Debug","acceptance-debug.png");
-            capture(activity,"Adapter","acceptance-connection.png");
+            runOnMainSync(() -> UiNav.openAdapter(activity)); waitForIdleSync(); shoot(activity,"acceptance-connection.png"); // the labelled connection header
+            runOnMainSync(() -> { Button back=findButton(activity.getWindow().getDecorView(),"Zurück"); require(back!=null,"back from the adapter view"); back.performClick(); });
             passed("Inventory and stored-DTC jobs");
 
             service.startRecording("engine-drive");
@@ -124,6 +127,7 @@ public final class AcceptanceRunner extends Instrumentation {
             File file = new File(new File(getTargetContext().getFilesDir(), "recordings"), filename);
             waitFor(() -> file.length() > 500, "recording evidence");
             deleteRecording(filename,"Aufzeichnung vor dem Löschen stoppen");
+            require(!UiStructureAcceptance.deleteEnabled(this,filename),"REQ-055.5 the running recording cannot be deleted from its file actions");
             require(file.isFile()&&filename.equals(service.snapshot().optString("recording")),"Active recording cannot be deleted");
             deleteRecording("../outside.jsonl","Ungültiger Aufnahmepfad");
             deleteRecording("bad/name.jsonl","Ungültiger Aufnahmepfad");
@@ -174,11 +178,15 @@ public final class AcceptanceRunner extends Instrumentation {
 
             service.disconnect();
             require("disconnected".equals(service.snapshot().optString("phase")),"Disconnect state");
+            long wireBefore=service.wireEventCount();
             service.openRecording(filename);
             waitFor(() -> "replay".equals(service.snapshot().optString("mode")) && !service.snapshot().optBoolean("busy"), "offline replay");
             require(service.snapshot().getJSONArray("values").length()>0,"Replay restores readings");
             require("Volkswagen".equals(service.snapshot().getJSONObject("vehicle").getJSONObject("vin_identity").optString("make_hint")),"Offline replay derives manufacturer locally");
+            UiStructureAcceptance.replay(this,service,wireBefore);
             deleteRecording(filename,"Im Replay geöffnete Aufzeichnung kann nicht gelöscht werden");
+            require(!UiStructureAcceptance.deleteEnabled(this,filename),"REQ-055.5 the loaded replay cannot be deleted from its file actions");
+            activity = LiveGridAcceptance.front(this::onMain, 15000); // brought back to the front for the replay checks
             require(file.isFile()&&filename.equals(service.snapshot().optString("replayFile")),"Loaded replay cannot be deleted");
             passed("Disconnect and offline replay without a live connection");
 
@@ -233,7 +241,7 @@ public final class AcceptanceRunner extends Instrumentation {
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
                 public String text(String tab) throws Exception { return tabText(activity,tab); }
                 public Boolean enabled(String label,boolean expected) throws Exception { 
-                    Boolean now=null; for(int i=0;i<50;i++) { now=onMain(() -> { findButton(activity.getWindow().getDecorView(),"Diagnose").performClick(); /* re-renders from the current state: the paused Activity does not poll */ Button b=findButton(activity.getWindow().getDecorView(),label); return b==null?null:b.isEnabled(); }); if(now!=null&&now==expected) break; SystemClock.sleep(100); }
+                    Boolean now=null; for(int i=0;i<50;i++) { now=onMain(() -> { findButton(activity.getWindow().getDecorView(),"Diagnose").performClick(); /* re-renders from the current state: the paused Activity does not poll */ UiNav.openMoreChecks(activity); Button b=findButton(activity.getWindow().getDecorView(),label); return b==null?null:b.isEnabled(); }); if(now!=null&&now==expected) break; SystemClock.sleep(100); }
                     return now; }
             });
             passed("Adapter throughput job (REQ-022): unavailable with a reason in demo, not connected and replay without any traffic; live and ready runs the closed job against the simulated adapter (6 PIDs x 10 reads with median/p90/reads per second, multi-PID with 2, 3 and 6 PIDs decoded per PID: full, full, rejected), own complete recording with every TX/RX and the result, summary card in Diagnose, replay re-derives the same summary (real multi-PID answers of a vehicle remain for #178)");
@@ -251,7 +259,7 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Known vehicles: per-record signal selection restored without adapter traffic, stored support labelled with its date and never used for discovery, default selection");
             runOnMainSync(service::setDemo);
             waitFor(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"),"restore demo for UI review");
-            for(String name:new String[]{"acceptance-live.png","acceptance-diagnose.png","acceptance-debug.png","acceptance-connection.png","acceptance-recordings.png","acceptance-vehicles.png","demo-recording.jsonl"}) emitArtifact(name);
+            for(String name:new String[]{"acceptance-start.png","acceptance-live.png","acceptance-diagnose.png","acceptance-connection.png","acceptance-recordings.png","acceptance-vehicles.png","acceptance-largefont.png","demo-recording.jsonl"}) emitArtifact(name);
             result.putString("stream", report + "\nDESK ACCEPTANCE PASSED\nReal Carly/vehicle acceptance remains separate.\n");
             RecordingExporter.setAuto(getTargetContext(), userAutoExport); restoreAdapterPrefs(adapterPrefs, userAdapter);
             finish(Activity.RESULT_OK,result);
@@ -367,7 +375,7 @@ public final class AcceptanceRunner extends Instrumentation {
     }
     /** REQ-013.5: the selected vehicle's name is visible on every tab; the chip opens the vehicle list with a masked VIN. */
     private void showVehicles(Activity activity,String name,String listText) throws Exception {
-        for(String tab:new String[]{"Live","Diagnose","Aufnahmen","Debug","Adapter"}) {
+        for(String tab:new String[]{"Live","Diagnose","Aufnahmen"}) {
             runOnMainSync(() -> { Button button=findButton(activity.getWindow().getDecorView(),tab); require(button!=null,"Navigation tab "+tab); button.performClick(); });
             require(onMain(() -> hasText(activity.getWindow().getDecorView(),name,true)),"REQ-013.5 header shows the vehicle name on tab "+tab);
         }
@@ -399,7 +407,7 @@ public final class AcceptanceRunner extends Instrumentation {
     }
     /** REQ-022: opens {@code tab}, waits for the 500 ms refresh and returns all visible texts. */
     private String tabText(Activity activity,String tab) throws Exception {
-        runOnMainSync(() -> { Button button=findButton(activity.getWindow().getDecorView(),tab); require(button!=null,"Navigation tab "+tab); button.performClick(); });
+        runOnMainSync(() -> { Button button=findButton(activity.getWindow().getDecorView(),tab); require(button!=null,"Navigation tab "+tab); button.performClick(); if(tab.equals("Diagnose")) UiNav.openMoreChecks(activity); });
         SystemClock.sleep(1500);
         return onMain(() -> { StringBuilder all=new StringBuilder(); collectText(activity.getWindow().getDecorView(),all); return all.toString(); });
     }

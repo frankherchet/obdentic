@@ -171,6 +171,8 @@ final class VehicleRecordsAcceptance {
         require(record(odo, VIN_A).getJSONObject("odometer").toString().equals(stored.toString()), "REQ-015.3 failure keeps stored value and date");
         JSONObject failure = record(odo, VIN_A).getJSONObject("odometer_error");
         require(failure.getString("error").equals("NO DATA") && failure.getLong("at") == 6000, "REQ-015.3 failure and its date are recorded: " + failure);
+        String failedDetails = MainActivity.vehicleDetails(record(odo, VIN_A));
+        require(failedDetails.contains("Letzter Leseversuch fehlgeschlagen: NO DATA") && failedDetails.contains("der gespeicherte km-Stand gilt weiter"), "REQ-015.3 the details show the failure and that the stored value still applies: " + failedDetails);
         require(odo.odometer(VIN_A, 100000.0, 7000) == null, "REQ-015.4 lower value stored");
         JSONObject lower = record(odo, VIN_A);
         require(lower.getJSONObject("odometer").getDouble("km") == 100000.0 && lower.getJSONObject("odometer").getLong("read_at") == 7000, "REQ-015.4 lower value replaces the stored one");
@@ -223,7 +225,7 @@ final class VehicleRecordsAcceptance {
         String before = own.snapshot().toString(), previous = own.snapshot().optString("selected");
         JSONArray selectedBefore = new JSONArray(service.snapshot().getJSONArray("selected").toString());
         String signalsBefore = service.snapshot().getJSONArray("signals").toString();
-        int traffic = service.snapshot().getJSONArray("debug").length();
+        long traffic = service.wireEventCount();
         long seen = System.currentTimeMillis();
         for (String vin : new String[]{VIN_SEL_B, VIN_SEL_A}) { // A last, so A is selected
             JSONObject inventory = new JSONObject().put("vin", vin).put("vin_identity", new JSONObject().put("status", "unidentified")).put("responders", new JSONArray().put("7E0"))
@@ -246,7 +248,7 @@ final class VehicleRecordsAcceptance {
             require(service.snapshot().getJSONArray("selected").toString().equals(coolant.toString()), "REQ-014.1 selecting the other record restores its selection");
             service.setSignals(new JSONArray().put("no.such.signal"));
             require(own.selection(VIN_SEL_B).length() == 0, "REQ-014.1 unknown semantics are filtered before storing");
-            require(service.snapshot().getJSONArray("debug").length() == traffic, "REQ-014.1 selecting and restoring sends no adapter traffic");
+            require(service.wireEventCount() == traffic, "REQ-014.1 selecting and restoring sends no adapter traffic");
             require(service.snapshot().getJSONArray("signals").toString().equals(signalsBefore), "REQ-014.3 stored support is never copied into the current session's signal status");
             require(new VehicleStore(new File(service.getFilesDir(), "vehicles.json")).selection(VIN_SEL_A).toString().equals(rpmSpeed.toString()), "REQ-014.1 the service's selection is on disk");
 

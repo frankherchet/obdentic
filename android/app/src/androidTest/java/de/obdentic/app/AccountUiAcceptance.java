@@ -104,8 +104,8 @@ final class AccountUiAcceptance {
     }
 
     private static void openAccountSection(Instrumentation inst, Activity a) throws Exception {
-        click(inst, a, "Adapter");
-        click(inst, a, "Konto öffnen"); // REQ-042.1: two taps from the main navigation
+        onMain(inst, () -> { UiNav.openAdapter(a); return null; }); // the labelled connection header
+        click(inst, a, "Konto öffnen"); // REQ-042.1: two taps from the main view
         waitText(inst, a, "ChatGPT-Konto", true, "account section");
     }
 
@@ -119,6 +119,8 @@ final class AccountUiAcceptance {
     }
 
     private static void returnFromSettings(UiAutomation ui, MainActivity activity) throws Exception {
+        // the back key must reach Settings, not the app's still-focused window during the transition
+        waitUntil(() -> { AccessibilityNodeInfo root = ui.getRootInActiveWindow(); return root != null && !activity.getPackageName().contentEquals(root.getPackageName()); }, 8000, "#352 settings in front");
         try (android.os.ParcelFileDescriptor ignored = ui.executeShellCommand("input keyevent 4")) {
             waitUntil(() -> MainActivity.resumed == activity, 8000, "#352 return from settings");
         }
