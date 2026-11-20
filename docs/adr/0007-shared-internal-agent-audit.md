@@ -56,3 +56,31 @@ The tentative reference for a later experiment is the existing documented Mi 9T 
 - Inject short writes, full storage, permission loss, file-sync and directory-sync failure, process termination at create/write/sync/ack/dispatch boundaries, and separately controlled abrupt system/storage interruption on a disposable reference device or a fault-injection setup with a defined persistence oracle. Capture independent pre-interruption sequence/ack markers and post-recovery bytes/name and inspect torn lines, missing end markers and uncertain dispatch. Test failures before acknowledgement separately from loss after acknowledgement; graceful reboot and app force-stop are not power-loss proof. If an abrupt interruption or trustworthy oracle is unavailable, its durability verdict remains inconclusive.
 - Synthetic boundary matrix: completed session at just before/exactly/after 30 days; active and missing verified end never auto-expire; warning before further work at 80% of 256 MiB including incomplete and active bytes; exact and one-byte-over 256 MiB total, 32 MiB session, and 2 MiB encoded event; 10,000th and attempted 10,001st event. Check no truncation, unauthorized eviction, or unaudited dispatch. Include full-storage and interrupted-end-marker inspection.
 - Predeclare the latency method before sampling: monotonic clock from each append request through the **actual proven** durability confirmation, including any file/directory synchronization required by that case; use synthetic complete outbound JSONL records of sizes through 64 KiB. Record device/build, filesystem, free space, thermal/power state, workload, sample count, every raw duration and failure; report nearest-rank p95 separately for cold (fresh process and newly established file where applicable) and warm (repeated appends), without dropping failed or slow writes. A proposed minimum is 100 successful samples per stratum, with failures separately counted as failures rather than silently discarded; this sample size does not prove tail behavior or authorize changing the approved 25 ms target. Define cold-cache control and repetitions before running; if cold storage state cannot be established label it process-cold, not storage-cold. Exceeding 25 ms in an applicable measured stratum refutes the target; missing a proven acknowledgement, representative coverage or sufficient samples is inconclusive, not PASS.
+
+## Synthetic phone follow-up — #363
+
+The preceding verdict is from the paper pass. The owner subsequently authorized one synthetic session on a Mi 9T with LineageOS Android 16, using the system ExternalStorageProvider and a directory selected with the system picker on primary emulated storage. No vehicle, account, model or private payload was used. The prototype and raw samples remain local.
+
+### Observations
+
+- The file descriptor resolved to the primary emulated FUSE volume. The app could not query the provider's root flags. Opening a directory descriptor and calling `fsync` returned successfully; this did not test persistence of a newly created file name. The underlying `/data` filesystem was f2fs with `fsync_mode=nobarrier`.
+- The local prototype's `warm.sh`, `cold.sh` and `stats.py` measured from the write request to the prototype's synchronization acknowledgement. The invalid cold run timed JSON encoding as well; it was excluded and repeated with records encoded before timing. Cold means fresh process, not proven cold storage.
+
+| Write path | Samples per size | p95 ms, 1 KiB | 4 KiB | 16 KiB | 64 KiB |
+|---|---:|---:|---:|---:|---:|
+| Warm, descriptor held | 200 | 2.35 | 1.66 | 2.08 | 3.00 |
+| Warm, reopened | 200 | 15.69 | 16.45 | 15.43 | 15.84 |
+| Warm, with destination guard | 200 | 13.93 | 14.29 | 13.90 | 16.60 |
+| Process-cold, existing file | 100 | 59.23 | 58.26 | 60.13 | 57.84 |
+| Process-cold, new file | 100 | 112.72 | 113.32 | 112.79 | 113.92 |
+
+- `fail.py kill`: 20 process kills at each of four boundaries (after create, write, sync or acknowledgement). No acknowledged record was lost or torn, and the captured traces showed no dispatch without acknowledgement.
+- `fail.py force`: 7 of 20 planned force-stop runs completed. Actual stops were around 25 seconds, not the planned 0.3–3 seconds. No acknowledged record was lost or torn. One dispatch log had no matching acknowledgement in the capture. Log loss is a hypothesis; the trace cannot settle that case.
+- Invalid destinations were refused in synthetic validation. Grant revocation, directory move/deletion, injected storage failures, retention/size boundaries and power loss were not tested.
+
+### Updated verdict
+
+- **Latency target not met on this candidate:** every process-cold sample exceeded 25 ms even when timed only to the prototype synchronization acknowledgement. Warm results are not evidence of storage durability.
+- **Durable-before-dispatch remains inconclusive:** process death leaves the page cache intact. Successful file and directory sync calls plus these process-death observations do not establish power-loss survival. The incomplete force-stop evidence and untested failure/retention cases are not passes.
+
+Keep ADR 0007 proposed and #355 blocked. Keep cold starts within REQ-045.33 and require proven durability before dispatch; neither threshold, storage location nor failure behavior is changed here.
