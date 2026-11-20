@@ -194,6 +194,7 @@ An issue may move to `status:ready` when:
 ### Definition of Done
 An issue may be closed when:
 - [ ] every criterion has at least one passing test that names its ID
+- [ ] a criterion that names an exact sequence (command order, event order, transmitted bytes) is tested with an equality assertion on the full sequence, not `contains`; the independent review checks this
 - [ ] the full test suite passes: `cargo +1.98.0 test --locked`, using the host PATH prefix in Repository
 - [ ] lint/format passes: `cargo +1.98.0 fmt --all -- --check` and `cargo +1.98.0 clippy --all-targets --locked -- -D warnings`, using the host PATH prefix in Repository
 - [ ] the PR names the issue and criteria and is merged
