@@ -20,7 +20,7 @@ import java.util.concurrent.FutureTask;
  */
 final class PendingFeedbackAcceptance {
     private static final PendingActions.Spec NEVER = new PendingActions.Spec("rec.start","Aufzeichnung starten","Aufzeichnung wird gestartet …",60000,(n,b)->false);
-    private static final String START = "Gewählte Messwerte aufzeichnen", START_PENDING = "Aufzeichnung wird gestartet …", STOP = "Aufzeichnung stoppen", STOP_PENDING = "Aufzeichnung wird gestoppt …";
+    private static final String START = "Auswahl aufzeichnen", START_PENDING = "Aufzeichnung wird gestartet …", STOP = "Aufzeichnung stoppen", STOP_PENDING = "Aufzeichnung wird gestoppt …";
 
     /** Demo service ready and idle, the Activity in front. Returns the Activity that is current afterwards (REQ-021.6 recreates it). */
     static Activity run(Instrumentation inst, Activity activity, ObdService service) throws Exception {
@@ -61,7 +61,7 @@ final class PendingFeedbackAcceptance {
         pending.start(new PendingActions.Spec("rec.start","Aufzeichnung starten","Aufzeichnung wird gestartet …",1500,(n,b2)->false),"",service.snapshot(),SystemClock.elapsedRealtime());
         awaitAnnouncement(inst, current, "Keine Rückmeldung · Aufzeichnung starten", "REQ-021.5 expiry announced"); // before anything else can replace it
         awaitButton(inst, START);
-        require(onMain(inst,() -> hasText(current.getWindow().getDecorView(),"Keine Rückmeldung · Aufzeichnung starten")), "REQ-021.3 time limit message in the status line");
+        require(onMain(inst,() -> hasText(current.getWindow().getDecorView(),"Keine Rückmeldung · Aufzeichnung starten")), "REQ-021.3/REQ-055.2 time limit message in the status line");
         require(pending.signature().equals("[]"), "REQ-021.3 pending cleared on expiry");
         Button usable = awaitButton(inst, START);
         require(onMain(inst,() -> usable.isEnabled()), "REQ-021.3 button usable again after expiry");

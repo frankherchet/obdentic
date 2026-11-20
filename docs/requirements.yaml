@@ -294,7 +294,7 @@ requirements:
       - id: REQ-015.2
         text: When PID 0xA6 is not advertised, no odometer request is sent, and the record shows its last stored value with that value's date, or "km-Stand nicht verfügbar" when none exists.
       - id: REQ-015.3
-        text: When the odometer read fails with NO DATA, a negative response, a timeout or a malformed payload, the stored value and date remain unchanged, the record's details show the failure, and the raw TX/RX remains visible under Debug.
+        text: When the odometer read fails with NO DATA, a negative response, a timeout or a malformed payload, the stored value and date remain unchanged, the record's details show the failure and whether the stored value still applies, and the raw TX/RX is kept only in a running recording for offline analysis, never shown in the app.
       - id: REQ-015.4
         text: When a newly read odometer value is lower than the stored one, the new value is stored and the record's details show that it is lower than the previous value, naming that value and its date, without correcting either value.
 
@@ -754,10 +754,12 @@ requirements:
     title: Read the live debug log without scrolling by hand
     type: functional
     priority: should
-    status: accepted
+    status: obsolete
     source: "Conversation 2026-10-30, request by @frankherchet"
     description: >
       While testing in the vehicle the user watches the TX/RX log and wants the newest lines in view.
+      Obsolete by decision of @frankherchet (Android UI cleanup): the app has no debug view; raw TX/RX
+      exists only in private recordings for offline analysis.
     acceptance:
       - id: REQ-033.1
         text: The debug tab shows the session's TX/RX log as one window at least as tall as the visible screen, without a card or title around it, and after every new line it scrolls so the newest line (bottom) is visible.
@@ -1147,7 +1149,7 @@ requirements:
       - id: REQ-043.1
         text: "The credential record (issued client id, access, refresh and ID token, expiry, granted scopes, account e-mail and subject) exists only as an app-private file encrypted with an AES-256-GCM key held in the Android Keystore, with a fresh IV for each write and written atomically (temporary file, sync, rename), so a failed write leaves the previous record or none. It is excluded from backup and device transfer and is readable again after the app process is killed and after a restart of the phone."
       - id: REQ-043.2
-        text: "No token, authorization code, PKCE verifier, state, nonce, authorization URL, Authorization header, e-mail address or account subject appears in the app log, Logcat, the Debug tab, a recording, an exported or shared file or a notification. Account events in the log use only an event name, an HTTP status and an error code from a fixed vocabulary, and the log masking (REQ-029.4) also replaces text shaped like a JWT or a 'Bearer' value with a placeholder."
+        text: "No token, authorization code, PKCE verifier, state, nonce, authorization URL, Authorization header, e-mail address or account subject appears in the app log, Logcat, a recording, an exported or shared file or a notification. Account events in the log use only an event name, an HTTP status and an error code from a fixed vocabulary, and the log masking (REQ-029.4) also replaces text shaped like a JWT or a 'Bearer' value with a placeholder."
       - id: REQ-043.3
         text: "A record that cannot be read (corrupt file, unknown format, Keystore key missing or invalidated) is deleted together with its key, the section shows 'Nicht verbunden' with the hint to connect again, and no other function of the app is affected and the app does not crash."
       - id: REQ-043.4
@@ -1633,3 +1635,31 @@ requirements:
         text: "Failure condition mic permission is denied or the on-device recognizer, selected language or local TTS voice is unavailable → different success: Explain the unavailable option and preserve typing/readable text; do not fall back to a network speech service."
       - id: REQ-054.4
         text: "Failure condition the user cancels voice, the app leaves the foreground or the live stationary check fails → safe stop: Stop the affected recognition/playback and do not send a late transcript, prompt for attention, or auto-resume. Voice never starts its own adapter traffic."
+
+  - id: REQ-055
+    title: Organize the Android app by user tasks instead of subsystems
+    type: functional
+    priority: should
+    status: accepted
+    source: "Conversation 2026-11-20: Android UI cleanup plan, decision by @frankherchet"
+    description: >
+      The app shows three work areas (Live, Diagnose, Aufnahmen); the adapter and the vehicle list are
+      context targets in the header. There is no debug view: raw TX/RX stays in private recordings for
+      offline analysis. Recording, replay, desktop evaluation and the transport contract are unchanged.
+    acceptance:
+      - id: REQ-055.1
+        text: "Normal flow: The bottom navigation holds exactly Live, Diagnose and Aufnahmen and the app starts in Live. From every work area one tap on the labelled connection/mode button opens the adapter view and one tap on the vehicle name opens the vehicle list; 'Zurück' and Android back return to the work area they were opened from, a main tab switches directly. The view, its return target and opened sections survive rotation; a missing, old or unknown saved view opens Live."
+      - id: REQ-055.2
+        text: "Normal flow: The header names in text live disconnected, live with adapter, demo simulated, replay with its source, a partial recording and an active extended session; a running job, an error or a missing response stays readable in the status line without repeating the connection state."
+      - id: REQ-055.3
+        text: "Normal flow: Without a connection Live shows one start surface: 'Adapter verbinden' opens the adapter view without a search and 'Demo starten' starts the simulation on Live; no locked recording or selection actions are shown. With a connection, demo or replay the selection/recording bar and the tiles lead, and eight demo signals fit the first portrait viewport of the reference emulator."
+      - id: REQ-055.4
+        text: "Normal flow: Diagnose shows 'Fehlercodes lesen' with stored and pending codes per responder, then 'Fahrzeug und Steuergeräte erfassen', before the closed 'Weitere Prüfungen'; an active extended session's card and its return action stay above them. An empty answer, an error or timeout and a successful answer are shown differently, and a timeout or missing answer is never shown as 'no fault codes'."
+      - id: REQ-055.5
+        text: "Normal flow: Aufnahmen shows the running recording, the export folder and 'Alle exportieren' first, then the newest 30 files with 'Als Replay öffnen'; each file's 'Weitere Aktionen' holds its export and confirmed delete, the running file and the loaded replay cannot be deleted, recording and export settings are closed, and an empty list offers 'Zu Live'."
+      - id: REQ-055.6
+        text: "Failure condition the user changes views, opens a section or rotates the phone → safe stop: Nothing starts a search, a diagnostic job or adapter traffic."
+      - id: REQ-055.7
+        text: "Failure condition raw traffic or a failed job is to be explained → different success: No view shows raw TX/RX, a log window or a debug copy action; a failed job names what was not determined and whether an earlier result still applies, and points to a recording for offline analysis only when that recording exists."
+      - id: REQ-055.8
+        text: "Failure condition large system text or a narrow display → different success: Header elements stack instead of cutting text, interactive targets are at least 48 dp, and mode, vehicle, the selected tab and action names stay distinguishable to accessibility services."

@@ -134,7 +134,7 @@ public final class SignalSelectorAcceptance {
 
             service.setSignals(original);
             require(original.length() > 0, "REQ-024 selected-signal recording has a selection");
-            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Gewählte Messwerte aufzeichnen").performClick(); return null; });
+            main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Auswahl aufzeichnen").performClick(); return null; });
             waitFor(() -> !service.snapshot().optString("recording").isEmpty(), "synthetic recording starts for selector lock");
             require(original.toString().equals(service.snapshot().optJSONArray("selected").toString()),
                 "REQ-024 selected-signal recording preserves the current selection");
@@ -153,7 +153,7 @@ public final class SignalSelectorAcceptance {
             waitFor(() -> service.snapshot().optString("recording").isEmpty(), "REQ-025.7 the Live button stopped the recording");
             service.deleteRecording(recorded);
             main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Aufnahmen").performClick(); return null; });
-            waitFor(() -> main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "DAUER-AUFZEICHNUNG")), "recordings tab");
+            waitFor(() -> main.call(() -> hasTextContaining(activity.getWindow().getDecorView(), "Aufnahme- und Exporteinstellungen")), "recordings tab");
             require(main.call(() -> !hasTextContaining(activity.getWindow().getDecorView(), "AUFNAHMEPROFIL") && findButton(activity.getWindow().getDecorView(), "Aufzeichnung starten") == null), "REQ-025.7 no recording profile on the recordings tab");
             main.call(() -> { requireButton(activity.getWindow().getDecorView(), "Live").performClick(); return null; });
 

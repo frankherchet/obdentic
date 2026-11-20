@@ -18,8 +18,20 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 - The engine baseline, drive and OBD expansion profiles of the catalog, offered as built-in
   presets ("Vorlage · Motor-Grundwerte", "Fahrt", "OBD-Zusatzwerte", "Weitere OBD-Werte") under
   Live → Messwerte auswählen → Preset anwenden (REQ-025.6); unsupported signals are skipped.
-  There is no recording-profile chooser: "Gewählte Messwerte aufzeichnen" below the Live tiles starts a
-  recording of the selection; while recording, "Aufzeichnung stoppen" stays above the tiles (REQ-025.7).
+  There is no recording-profile chooser: "Auswahl aufzeichnen" in the bar above the Live tiles starts a
+  recording of the selection; while recording, "Aufzeichnung stoppen" takes its place (REQ-025.7).
+- Task-oriented navigation: the bottom bar holds only **Live**, **Diagnose** and **Aufnahmen**; the app
+  opens in Live. The header shows the page title and a context bar: the labelled connection/mode button
+  (LIVE · GETRENNT / LIVE · ADAPTER / DEMO · SIMULIERT / REPLAY · DEMO|DATEI [· TEILAUFNAHME]) opens the
+  adapter view, the vehicle name the vehicle list. "Zurück" and Android back return to the last work area;
+  the view and the open sections survive rotation. Changing the view never starts a search or a job.
+  Without a connection Live shows one start surface ("Adapter verbinden" opens the adapter view without a
+  search, "Demo starten" starts the simulation). Diagnose leads with "Fehlercodes lesen" and "Fahrzeug und
+  Steuergeräte erfassen"; the special checks sit under the closed "Weitere Prüfungen" (an active extended
+  session's card stays above it). Aufnahmen is a library: running recording, export folder and
+  "Alle exportieren" first, then the newest files with "Als Replay öffnen" and per-file "Weitere Aktionen";
+  recording and export settings are collapsed. There is no debug view: raw TX/RX exists only in private
+  recordings for offline analysis (REQ-033 is obsolete).
 - Five OBDentic component presets ("dpf", "egr", "cooling", "turbo", "rail", German names) in the same
   "Preset anwenden" list (REQ-035) and the user-started smart analysis (REQ-036), see below.
 - Private recording, foreground connected-device service, screen-off operation,
@@ -122,7 +134,7 @@ attempt at once and the pauses start again at 2 seconds (REQ-020.10); the status
 foreground service stays up while waiting, so retries also run with the screen off. A manual
 "Verbindung trennen", the "Automatische Verbindung stoppen" button, starting the demo or opening
 a replay ends the attempts; none follow until the user connects or the app is started again.
-"Automatisch verbinden" on the Adapter tab (default on, persisted) switches the feature.
+"Automatisch verbinden" in the adapter view (default on, persisted) switches the feature.
 With Bluetooth off or a permission missing no attempt is made, the status line says why, and
 attempts resume when Bluetooth turns on (or when the app returns to the foreground).
 
@@ -131,7 +143,7 @@ connection (also after an automatic reconnect), once the automatic ECU identific
 availability jobs are done, the app runs the existing read-only `dtc.scan` once: stored (Mode 03)
 and pending (Mode 07) codes per responder, or "keine Fehler"; a negative response, NO DATA or
 timeout stays an explicit result and never ends the connection. Its TX/RX goes into the running
-automatic recording and replay shows both lists without traffic. Switch on the Adapter tab
+automatic recording and replay shows both lists without traffic. Switch in the adapter view
 (default on, persisted). Demo and replay never scan; nothing is ever cleared (no Mode 04).
 
 After an automatic connection only the existing initialization and inventory run, with the normal
@@ -528,8 +540,8 @@ can select a different compatible NDK installation. The build adds no Java/Kotli
 runtime dependencies beyond Android itself. APKs, JNI binaries, local SDK paths
 and Gradle caches remain untracked. The native crate has its own lockfile.
 
-Start OBDentic, open **Adapter**, and choose **Demo starten** for desk testing,
-or **Adapter suchen** for the real Carly. Android requests Nearby devices and
+Start OBDentic and choose **Demo starten** on Live for desk testing, or **Adapter verbinden** →
+**Adapter suchen** for the real Carly. Android requests Nearby devices and
 notification permissions as needed. No USB connection to the Mac is required for
 live use. A connected session remains owned by the service when switching tabs,
 recreating the Activity or locking the screen. Reopening after process death
@@ -829,9 +841,10 @@ vehicle acceptance, and no row is a hardware result.
 
 ## Acceptance
 
-Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals); ids stay in the Debug tab.
+Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals).
 
-The Debug tab is one full-height TX/RX window that scrolls to the newest line after every update (REQ-033.1).
+No view shows raw TX/RX, a log window or a debug copy action; recordings keep timestamped `wire` events for the offline evaluation.
+`ObdService.wireEventCount()` counts live and demo wire events (never file reads), so no-traffic checks compare it before and after.
 
 Build and install the instrumentation APK, then run it with the phone unlocked:
 
