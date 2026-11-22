@@ -117,7 +117,7 @@ Every xp-* skill ends with a hand-over in this form:
 - Remote: `frankherchet/obdentic`
 - Default branch: `main`
 - GitHub access: `gh` CLI; if unavailable, use the host's GitHub MCP tools.
-- CI: `.github/workflows/ci.yml` on every push and PR: one job `check` on macOS that always runs, so no PR carries a skipped check. It verifies the Knowledge pin, formatting, tests, Clippy and build. Documentation-only changes (`*.md`, `docs/`, `.memento/`) skip only those Rust steps; failing change detection fails the job and any unknown result runs the Rust steps. The logic is in `tools/ci-gate.sh`, tested by `tools/test-ci-gate.sh`.
+- CI: `.github/workflows/ci.yml` on every push and PR: one job `check` on macOS that always runs, so no PR carries a skipped check. It always validates `docs/requirements.yaml`, then verifies the Knowledge pin, formatting, tests, Clippy and build. Documentation-only changes (`*.md`, `docs/`, `.memento/`) skip only those Rust steps; failing change detection fails the job and any unknown result runs the Rust steps. The logic is in `tools/ci-gate.sh`, tested by `tools/test-ci-gate.sh`.
 - Build and test feedback target: under 10 minutes. On 2026-10-23, the full 466-test suite passed in 2.57 seconds with a warm build cache in an isolated checkout using the locked Knowledge revision. This is not a cold-build timing.
 - **Fix the default branch first:** while it is red, repairing it is the only next issue. A local dirty Knowledge submodule is not itself evidence that `main` is red: compare against `knowledge.lock`, preserve local changes, and verify the locked revision in isolation when needed.
 
@@ -210,7 +210,7 @@ An issue may be closed when:
 Software issues may close after the agreed software checks and merge while their separately tracked hardware acceptance stays open. Hardware-acceptance issues themselves require real vehicle evidence. Keep milestones open until all required issues and hardware acceptance are complete; only a human closes a milestone.
 
 ### Requirements
-- File: `docs/requirements.yaml`, validated by `docs/requirements.schema.json`.
+- File: `docs/requirements.yaml`, validated against `docs/requirements.schema.json` and for unique, correctly prefixed IDs by `uv run --script tools/check-requirements.py` from the repository root (pinned libraries; tested by `tools/test-check-requirements.sh`). Run it after every change to the file.
 - IDs: `REQ-NNN` for requirements, `REQ-NNN.N` for criteria. IDs are never reused; retired requirements are marked `obsolete`.
 - Imported product-contract requirements start as `draft`; import is not acceptance or a claim of implementation/hardware validation. Existing issues are mapped during refinement. `.requirements/*.md` remain historical sources; resolve conflicts against `docs/project-goals.md` rather than silently importing obsolete scope.
 - Requirements and criteria an agent adds start as `draft`; only `frankherchet` sets them to `accepted`.
