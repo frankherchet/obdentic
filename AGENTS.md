@@ -191,6 +191,8 @@ An issue may move to `status:ready` when:
 - [ ] affected read-only/capability boundaries and raw-evidence/replay behavior are explicit
 - [ ] vehicle-specific evidence stays private; any required hardware acceptance is identified as a separate gate with explicit vehicle availability
 
+A plan approved in conversation is a refinement only once it is posted to its issue as a refinement block (`Ready: yes`) and the Definition of Ready is checked, before the first commit; an issue created at ship time does not satisfy this.
+
 ### Definition of Done
 An issue may be closed when:
 - [ ] every criterion has at least one passing test that names its ID
@@ -211,6 +213,7 @@ Software issues may close after the agreed software checks and merge while their
 - File: `docs/requirements.yaml`, validated by `docs/requirements.schema.json`.
 - IDs: `REQ-NNN` for requirements, `REQ-NNN.N` for criteria. IDs are never reused; retired requirements are marked `obsolete`.
 - Imported product-contract requirements start as `draft`; import is not acceptance or a claim of implementation/hardware validation. Existing issues are mapped during refinement. `.requirements/*.md` remain historical sources; resolve conflicts against `docs/project-goals.md` rather than silently importing obsolete scope.
+- Requirements and criteria an agent adds start as `draft`; only `frankherchet` sets them to `accepted`.
 - The file says *what* is required, never *how far* it is: issues link to criteria with their `Requirements:` line, tests with the criterion ID in their name or in a comment next to them.
 
 ### Architecture
