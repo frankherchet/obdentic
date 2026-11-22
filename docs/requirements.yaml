@@ -1663,3 +1663,25 @@ requirements:
         text: "Failure condition raw traffic or a failed job is to be explained → different success: No view shows raw TX/RX, a log window or a debug copy action; a failed job names what was not determined and whether an earlier result still applies, and points to a recording for offline analysis only when that recording exists."
       - id: REQ-055.8
         text: "Failure condition large system text or a narrow display → different success: Header elements stack instead of cutting text, interactive targets are at least 48 dp, and mode, vehicle, the selected tab and action names stay distinguishable to accessibility services."
+
+  - id: REQ-056
+    title: Reject an invalid requirements file in CI
+    type: constraint
+    priority: should
+    status: accepted
+    source: "Retro of the Android UI cleanup; refinement with @frankherchet"
+    description: >
+      Skills, issues and tests rely on unique, well-formed requirement and criterion IDs. The file is
+      checked against its schema, used as shipped by the xp workflow, and for ID consistency, which
+      the schema cannot express.
+    acceptance:
+      - id: REQ-056.1
+        text: "Normal flow: The CI job 'check' validates docs/requirements.yaml against docs/requirements.schema.json on every pull request and every push to the default branch, including changes that touch only documentation or requirements; a valid file passes and the check adds at most 60 s to the job."
+      - id: REQ-056.2
+        text: "Failure condition the file is not valid YAML or violates the schema → safe stop: The job fails, and its output names the location (line, or JSON path of the element) and the violated rule."
+      - id: REQ-056.3
+        text: "Failure condition a requirement or criterion ID occurs more than once, a criterion ID does not start with its requirement's ID followed by '.', or depends_on names a requirement that does not exist → safe stop: The job fails, and its output names each offending ID."
+      - id: REQ-056.4
+        text: "Failure condition the validator cannot be installed or run → try again: The job fails instead of passing or skipping the check, and re-running the job repeats the installation."
+      - id: REQ-056.5
+        text: "Normal flow: The same check runs locally with one documented command from the repository root and gives the same verdict as CI; validator, its libraries and the CI action that provides it are pinned to exact versions."

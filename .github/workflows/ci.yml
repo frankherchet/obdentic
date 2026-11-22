@@ -29,6 +29,14 @@ jobs:
           fetch-depth: 0
       - name: Test CI gate script
         run: tools/test-ci-gate.sh
+      # REQ-056: the requirements file is checked on every run, also when the Rust steps skip.
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.9.8"
+      - name: Test requirements check
+        run: tools/test-check-requirements.sh
+      - name: Validate requirements
+        run: uv run --script tools/check-requirements.py
       - name: Detect code changes
         id: diff
         env:
