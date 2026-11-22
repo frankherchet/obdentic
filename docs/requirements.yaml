@@ -1640,7 +1640,7 @@ requirements:
     title: Organize the Android app by user tasks instead of subsystems
     type: functional
     priority: should
-    status: accepted
+    status: draft
     source: "Conversation 2026-11-20: Android UI cleanup plan, decision by @frankherchet"
     description: >
       The app shows three work areas (Live, Diagnose, Aufnahmen); the adapter and the vehicle list are
