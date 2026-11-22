@@ -30,6 +30,7 @@ expect_reject() {
   printf '%s' "$yaml" > "$tmp/case.yaml"
   run "$tmp/case.yaml"
   [ "$code" -ne 0 ] || fail "$id $name: accepted, want rejected"
+  case "$out" in *Traceback*) fail "$id $name: crashed instead of naming the problem: $out" ;; esac
   for part in "$@"; do
     case "$out" in *"$part"*) ;; *) fail "$id $name: output lacks '$part': $out" ;; esac
   done
@@ -68,7 +69,21 @@ expect_reject REQ-056.2 "invalid YAML" 'version: 1
 requirements:
   - id: REQ-001
     title: [unclosed
-' "line"
+' "invalid YAML" "line 5, column"
+expect_reject REQ-056.2 "duplicate top-level key" "$valid
+requirements: []
+" "duplicate key 'requirements'" "line 21" # $valid ends with a newline: a blank line 20, the duplicate on 21
+expect_reject REQ-056.2 "duplicate nested key" "${valid/    status: accepted/    status: accepted
+    status: draft}" "duplicate key 'status'" "line 8"
+expect_reject REQ-056.2 "acceptance not a list" "${valid/    acceptance:
+      - id: REQ-001.1
+        text: works/    acceptance: 5}" '$.requirements[0].acceptance' "type"
+expect_reject REQ-056.2 "depends_on not a list" "${valid/depends_on: \[REQ-001\]/depends_on: 5}" '$.requirements[1].depends_on' "type"
+expect_reject REQ-056.2 "id not a string" "${valid/id: REQ-002
+/id: [x]
+}" '$.requirements[1].id' "type"
+expect_reject REQ-056.2 "depends_on a string" "${valid/depends_on: \[REQ-001\]/depends_on: REQ-001}" '$.requirements[1].depends_on' "type"
+case "$out" in *"depends_on names"*) fail "REQ-056.2 depends_on as a string is read character by character: $out" ;; esac
 expect_reject REQ-056.2 "unknown status" "${valid/status: draft/status: done}" '$.requirements[1].status' "enum"
 expect_reject REQ-056.2 "unknown key" "${valid/    title: First/    title: First
     owner: me}" '$.requirements[0]' "additionalProperties"
@@ -76,10 +91,11 @@ expect_reject REQ-056.2 "missing text" "${valid/        text: works
 /}" '$.requirements[0].acceptance[0]' "required"
 expect_reject REQ-056.2 "bad id pattern" "${valid/id: REQ-001.1/id: REQ-1.1}" '$.requirements[0].acceptance[0].id' "pattern"
 
-# REQ-056.3: ID consistency the schema cannot express, each offending ID named
-expect_reject REQ-056.3 "duplicate requirement" "${valid/id: REQ-002
-/id: REQ-001
-}" "REQ-001"
+# REQ-056.3: ID consistency the schema cannot express, each offending ID named (the duplicate's criterion moves along, so only the duplicate is wrong)
+printf '%s' "${valid/id: REQ-002.1/id: REQ-001.2}" | sed 's/id: REQ-002$/id: REQ-001/' > "$tmp/dup.yaml"
+run "$tmp/dup.yaml"
+[ "$code" -ne 0 ] || fail "REQ-056.3 duplicate requirement accepted"
+[ "$out" = "$tmp/dup.yaml: REQ-001: requirement ID occurs more than once" ] || fail "REQ-056.3 duplicate requirement: want exactly the duplicate named, got: $out"
 expect_reject REQ-056.3 "duplicate criterion" "${valid/id: REQ-002.1/id: REQ-002.1
         text: twice
       - id: REQ-002.1}" "REQ-002.1"
