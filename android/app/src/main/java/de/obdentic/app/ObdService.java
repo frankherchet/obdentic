@@ -393,8 +393,16 @@ public final class ObdService extends Service {
         if(error==null && noRecording && !smartOn) restoreSelection(vin); // REQ-014.1; a running smart analysis keeps its own selection
         coverageStoredRefresh(); return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
     public void renameVehicle(String vin,String name) { vehicleAction(() -> { String error=vehicles.rename(vin,name); return error==null?"Fahrzeug umbenannt: "+vehicles.name(vin):error; }); }
-    public void deleteVehicle(String vin) { vehicleAction(() -> { String name=vehicles.name(vin), error=vehicles.delete(vin); coverageStoredRefresh(); return error==null?"Fahrzeug gelöscht: "+name:error; }); }
-    public void resetVehicleStore() { vehicleAction(() -> { String error=vehicles.reset(); return error==null?"Fahrzeugspeicher zurückgesetzt":error; }); }
+    public void deleteVehicle(String vin) { vehicleAction(() -> { String name=vehicles.name(vin), error=vehicles.delete(vin); if(error==null && vin.equals(coverageVin)) coverageDetach(); coverageStoredRefresh(); return error==null?"Fahrzeug gelöscht: "+name:error; }); }
+    public void resetVehicleStore() { vehicleAction(() -> { String error=vehicles.reset(); if(error==null) coverageDetach(); return error==null?"Fahrzeugspeicher zurückgesetzt":error; }); }
+    /** Worker. The record the run credited is gone (REQ-038.6): the core drops its vehicle ledger, nothing is stored for it, the card shows the run only. */
+    private void coverageDetach() {
+        if(coverageVin.isEmpty()) return;
+        coverageVin=""; coverageSaveFailed=false; coverageSaveError="";
+        if(!coverageLedgerOn) return;
+        coverageCore("coverage.live.detach_vehicle",new JSONObject());
+        publishCoverage(coverageCore("coverage.live.snapshot",new JSONObject()));
+    }
     private void vehicleAction(java.util.function.Supplier<String> action) { if(!worker.isShutdown()) worker.execute(() -> message(action.get())); }
     private void applySupport(JSONObject support) {
         JSONArray statuses = support.optJSONArray("signals"); if(statuses == null) return;

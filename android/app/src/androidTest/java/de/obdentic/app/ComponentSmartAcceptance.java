@@ -110,10 +110,20 @@ final class ComponentSmartAcceptance {
             waitFor(() -> "demo".equals(service.snapshot().optString("mode")) && "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"), "demo after replay");
             require(service.snapshot().isNull("coverage"), "REQ-038.9 demo cannot inherit replay coverage");
             // REQ-038.6 / REQ-013.9: deleting the record deletes its ledger; recordings stay
-            Set<String> recordingsBefore = names(dir);
             require(service.vehicles.hasCoverageEntry(vin), "test setup: the record carries its ledger before it is deleted");
+            // (#340 review) the record is deleted while a run credits it: nothing of it is shown or written afterwards
+            service.setAutoConnect(false); reconnect(service, link, false);
+            service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started before the vehicle is deleted");
+            waitFor(() -> { JSONObject live = liveCoverage(service); return live != null && live.optBoolean("vehicle_attached") && entryCount(live.optJSONObject("run")) > 0; }, "the run credits the vehicle before it is deleted");
+            Set<String> recordingsBefore = names(dir);
             service.deleteVehicle(vin);
             waitFor(() -> !service.vehicles.hasCoverageEntry(vin) && service.vehicles.coverageLedger(vin) == null, "REQ-038.6 the vehicle ledger is deleted with its record");
+            waitFor(() -> { JSONObject live = liveCoverage(service); return live != null && !live.optBoolean("vehicle_attached"); }, "REQ-038.6 the run no longer credits the deleted vehicle");
+            require(!MainActivity.coverageText(service.snapshot()).contains("Fahrzeug gesamt"), "REQ-038.6 no vehicle totals for a deleted vehicle: " + MainActivity.coverageText(service.snapshot()));
+            SystemClock.sleep(1500); stopSmart(service);
+            waitFor(() -> !service.snapshot().optBoolean("busy"), "idle after the run");
+            require(!service.snapshot().optString("message").contains("Fahrzeug-Abdeckung nicht gespeichert") && !service.snapshot().toString().contains("Fahrzeug nicht gefunden"), "REQ-038.6 no false write failure: " + service.snapshot().optString("message"));
+            require(!service.vehicles.hasCoverageEntry(vin) && service.vehicles.coverageLedger(vin) == null, "REQ-038.6 no ledger is written for the deleted vehicle");
             require(names(dir).equals(recordingsBefore), "REQ-038.6 deleting the record leaves the recordings unchanged");
         } finally {
             service.rotateAfterSmart = ""; service.rotateMs = 30L * 60 * 1000;
