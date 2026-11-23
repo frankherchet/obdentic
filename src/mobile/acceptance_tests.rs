@@ -1598,3 +1598,6 @@ fn req_023_7_8_live_knowledge_read_and_replay_use_the_decisive_response() {
 }
 
 mod assistant_tests;
+
+mod harness_tests;
+mod harness_transport;

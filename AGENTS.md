@@ -117,7 +117,7 @@ Every xp-* skill ends with a hand-over in this form:
 - Remote: `frankherchet/obdentic`
 - Default branch: `main`
 - GitHub access: `gh` CLI; if unavailable, use the host's GitHub MCP tools.
-- CI: `.github/workflows/ci.yml` on every push and PR: one job `check` on macOS that always runs, so no PR carries a skipped check. It verifies the Knowledge pin, formatting, tests, Clippy and build. Documentation-only changes (`*.md`, `docs/`, `.memento/`) skip only those Rust steps; failing change detection fails the job and any unknown result runs the Rust steps. The logic is in `tools/ci-gate.sh`, tested by `tools/test-ci-gate.sh`.
+- CI: `.github/workflows/ci.yml` on every push and PR: one job `check` on macOS that always runs, so no PR carries a skipped check. It always validates `docs/requirements.yaml`, then verifies the Knowledge pin, formatting, tests, Clippy and build. Documentation-only changes (`*.md`, `docs/`, `.memento/`) skip only those Rust steps; failing change detection fails the job and any unknown result runs the Rust steps. The logic is in `tools/ci-gate.sh`, tested by `tools/test-ci-gate.sh`.
 - Build and test feedback target: under 10 minutes. On 2026-10-23, the full 466-test suite passed in 2.57 seconds with a warm build cache in an isolated checkout using the locked Knowledge revision. This is not a cold-build timing.
 - **Fix the default branch first:** while it is red, repairing it is the only next issue. A local dirty Knowledge submodule is not itself evidence that `main` is red: compare against `knowledge.lock`, preserve local changes, and verify the locked revision in isolation when needed.
 
@@ -191,9 +191,12 @@ An issue may move to `status:ready` when:
 - [ ] affected read-only/capability boundaries and raw-evidence/replay behavior are explicit
 - [ ] vehicle-specific evidence stays private; any required hardware acceptance is identified as a separate gate with explicit vehicle availability
 
+A plan approved in conversation is a refinement only once it is posted to its issue as a refinement block (`Ready: yes`) and the Definition of Ready is checked, before the first commit; an issue created at ship time does not satisfy this.
+
 ### Definition of Done
 An issue may be closed when:
 - [ ] every criterion has at least one passing test that names its ID
+- [ ] a criterion that names an exact sequence (command order, event order, transmitted bytes) is tested with an equality assertion on the full sequence, not `contains`; the independent review checks this
 - [ ] the full test suite passes: `cargo +1.98.0 test --locked`, using the host PATH prefix in Repository
 - [ ] lint/format passes: `cargo +1.98.0 fmt --all -- --check` and `cargo +1.98.0 clippy --all-targets --locked -- -D warnings`, using the host PATH prefix in Repository
 - [ ] the PR names the issue and criteria and is merged
@@ -207,9 +210,10 @@ An issue may be closed when:
 Software issues may close after the agreed software checks and merge while their separately tracked hardware acceptance stays open. Hardware-acceptance issues themselves require real vehicle evidence. Keep milestones open until all required issues and hardware acceptance are complete; only a human closes a milestone.
 
 ### Requirements
-- File: `docs/requirements.yaml`, validated by `docs/requirements.schema.json`.
+- File: `docs/requirements.yaml`, validated against `docs/requirements.schema.json` and for unique, correctly prefixed IDs by `uv run --script tools/check-requirements.py` from the repository root (pinned libraries; tested by `tools/test-check-requirements.sh`). Run it after every change to the file.
 - IDs: `REQ-NNN` for requirements, `REQ-NNN.N` for criteria. IDs are never reused; retired requirements are marked `obsolete`.
 - Imported product-contract requirements start as `draft`; import is not acceptance or a claim of implementation/hardware validation. Existing issues are mapped during refinement. `.requirements/*.md` remain historical sources; resolve conflicts against `docs/project-goals.md` rather than silently importing obsolete scope.
+- Requirements and criteria an agent adds start as `draft`; only `frankherchet` sets them to `accepted`.
 - The file says *what* is required, never *how far* it is: issues link to criteria with their `Requirements:` line, tests with the criterion ID in their name or in a comment next to them.
 
 ### Architecture

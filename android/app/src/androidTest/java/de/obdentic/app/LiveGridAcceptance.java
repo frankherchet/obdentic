@@ -90,7 +90,7 @@ final class LiveGridAcceptance {
             }
             Thread.sleep(300);
         }
-        require(last.isEmpty() && shown != null, "#239 " + last);
+        require(last.isEmpty() && shown != null, "#239/REQ-055.3 " + last);
         final Activity verified = shown;
         String first = main.call(() -> ranges(verified.getWindow().getDecorView()));
         Thread.sleep(2500);

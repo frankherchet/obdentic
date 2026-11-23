@@ -33,14 +33,14 @@ final class RecordingListAcceptance {
             require(note[0], "REQ-028.13 the number of older recordings is shown");
             long snap = SystemClock.elapsedRealtime(); for (int i = 0; i < 10; i++) service.snapshot();
             require(SystemClock.elapsedRealtime() - snap < 1000, "REQ-028.13 ten state snapshots stay fast: " + (SystemClock.elapsedRealtime() - snap) + " ms");
-            // REQ-033.1: the debug tab is one full-height window that follows the newest line
-            inst.runOnMainSync(() -> { Button b = find(a.getWindow().getDecorView(), "Debug"); require(b != null, "debug tab"); b.performClick(); });
-            SystemClock.sleep(1500);
-            boolean[] bottom = {false}; String[] why = {""};
-            inst.runOnMainSync(() -> { android.widget.ScrollView sv = scrollView(a.getWindow().getDecorView()); View child = sv.getChildAt(0);
-                TextView log = monospace(sv); bottom[0] = log != null && log.getHeight() >= sv.getHeight() - 400 && sv.getScrollY() + sv.getHeight() >= child.getHeight() - 4;
-                why[0] = "log=" + (log == null ? "none" : log.getHeight()) + " view=" + sv.getHeight() + " y=" + sv.getScrollY() + " content=" + child.getHeight(); });
-            require(bottom[0], "REQ-033.1 the debug window fills the screen and shows the newest line: " + why[0]);
+            // the library head: folder and one-tap export directly visible, settings closed, the first file reachable without scrolling past them
+            inst.waitForIdleSync(); boolean[] head = {false}; String[] why = {""};
+            inst.runOnMainSync(() -> { View root = a.getWindow().getDecorView(); android.widget.ScrollView sv = scrollView(root);
+                boolean folder = text(root, "Export-Ordner"), export = find(root, "Alle exportieren") != null || find(root, "Export-Ordner wählen …") != null, closed = !text(root, "DAUER-AUFZEICHNUNG") && find(root, "Aufnahme- und Exporteinstellungen anzeigen") != null;
+                Button first = find(root, "Als Replay öffnen"); int[] s = new int[2], f = new int[2]; sv.getLocationOnScreen(s); if (first != null) first.getLocationOnScreen(f);
+                boolean reachable = first != null && f[1] + first.getHeight() <= s[1] + sv.getHeight();
+                head[0] = folder && export && closed && reachable; why[0] = "folder=" + folder + " export=" + export + " settingsClosed=" + closed + " firstFileInView=" + reachable; });
+            require(head[0], "REQ-055.5 recordings library head: " + why[0]);
             inst.runOnMainSync(() -> { Button b = find(a.getWindow().getDecorView(), "Live"); if (b != null) b.performClick(); });
         } finally { for (File f : dummies) f.delete(); }
     }
@@ -52,11 +52,6 @@ final class RecordingListAcceptance {
     private static android.widget.ScrollView scrollView(View v) {
         if (v instanceof android.widget.ScrollView) return (android.widget.ScrollView) v;
         if (v instanceof ViewGroup) { ViewGroup g = (ViewGroup) v; for (int i = 0; i < g.getChildCount(); i++) { android.widget.ScrollView f = scrollView(g.getChildAt(i)); if (f != null) return f; } }
-        return null;
-    }
-    private static TextView monospace(View v) {
-        if (v instanceof TextView && !(v instanceof Button) && ((TextView) v).getTypeface() == android.graphics.Typeface.MONOSPACE) return (TextView) v;
-        if (v instanceof ViewGroup) { ViewGroup g = (ViewGroup) v; for (int i = 0; i < g.getChildCount(); i++) { TextView f = monospace(g.getChildAt(i)); if (f != null) return f; } }
         return null;
     }
     private static int count(View v, String t) {

@@ -294,7 +294,7 @@ requirements:
       - id: REQ-015.2
         text: When PID 0xA6 is not advertised, no odometer request is sent, and the record shows its last stored value with that value's date, or "km-Stand nicht verfügbar" when none exists.
       - id: REQ-015.3
-        text: When the odometer read fails with NO DATA, a negative response, a timeout or a malformed payload, the stored value and date remain unchanged, the record's details show the failure, and the raw TX/RX remains visible under Debug.
+        text: When the odometer read fails with NO DATA, a negative response, a timeout or a malformed payload, the stored value and date remain unchanged, the record's details show the failure and whether the stored value still applies, and the raw TX/RX is kept only in a running recording for offline analysis, never shown in the app.
       - id: REQ-015.4
         text: When a newly read odometer value is lower than the stored one, the new value is stored and the record's details show that it is lower than the previous value, naming that value and its date, without correcting either value.
 
@@ -379,7 +379,7 @@ requirements:
       - id: REQ-018.7
         text: Every exported file is byte-identical to its internal recording, and export never deletes, moves or modifies an internal recording.
       - id: REQ-018.8
-        text: Recording export needs and adds no permission of its own and never uses the network; no storage permission is added. Since REQ-044.3 the only permissions beyond the export release are INTERNET and the dataSync foreground-service permission of the optional ChatGPT account.
+        text: Recording export needs and adds no permission of its own and never uses the network; no storage permission is added. The separate account and optional microphone permissions under REQ-044.3 and REQ-054.1 are not used by export.
       - id: REQ-018.9
         text: Exporting never runs on the thread that talks to the adapter; while an export copies files, live polling, connection handling and jobs continue without waiting for it.
 
@@ -754,10 +754,12 @@ requirements:
     title: Read the live debug log without scrolling by hand
     type: functional
     priority: should
-    status: accepted
+    status: obsolete
     source: "Conversation 2026-10-30, request by @frankherchet"
     description: >
       While testing in the vehicle the user watches the TX/RX log and wants the newest lines in view.
+      Obsolete by decision of @frankherchet (Android UI cleanup): the app has no debug view; raw TX/RX
+      exists only in private recordings for offline analysis.
     acceptance:
       - id: REQ-033.1
         text: The debug tab shows the session's TX/RX log as one window at least as tall as the visible screen, without a card or title around it, and after every new line it scrolls so the newest line (bottom) is visible.
@@ -1130,7 +1132,7 @@ requirements:
       - id: REQ-042.12
         text: "Exactly one account is supported: while one is connected with the plan permission 'Continue with ChatGPT' is not offered and a second attempt cannot start; in the inactive state of REQ-042.9 it offers only the re-authorization of that sign-in. A second tap during an attempt is ignored, and both buttons show immediate pending feedback (REQ-021). Using another account requires disconnecting first."
       - id: REQ-042.13
-        text: "Without an installed browser, or when no loopback port can be bound, the attempt stops before anything is opened, says why, closes any listener and stores nothing."
+        text: "Without an installed browser, or when the local listener cannot start, the attempt stops before the browser opens, says why, closes any listener and stores no credentials. If the operating system explicitly denies the socket, the account screen offers to open the app's network settings, falling back to its app info when necessary, or to cancel. The settings only open on confirmation. The user must tap sign-in again after returning. Port conflicts, other I/O errors and offline errors do not offer this dialog."
 
   - id: REQ-043
     title: Protect, refresh and remove the ChatGPT credentials
@@ -1147,7 +1149,7 @@ requirements:
       - id: REQ-043.1
         text: "The credential record (issued client id, access, refresh and ID token, expiry, granted scopes, account e-mail and subject) exists only as an app-private file encrypted with an AES-256-GCM key held in the Android Keystore, with a fresh IV for each write and written atomically (temporary file, sync, rename), so a failed write leaves the previous record or none. It is excluded from backup and device transfer and is readable again after the app process is killed and after a restart of the phone."
       - id: REQ-043.2
-        text: "No token, authorization code, PKCE verifier, state, nonce, authorization URL, Authorization header, e-mail address or account subject appears in the app log, Logcat, the Debug tab, a recording, an exported or shared file or a notification. Account events in the log use only an event name, an HTTP status and an error code from a fixed vocabulary, and the log masking (REQ-029.4) also replaces text shaped like a JWT or a 'Bearer' value with a placeholder."
+        text: "No token, authorization code, PKCE verifier, state, nonce, authorization URL, Authorization header, e-mail address or account subject appears in the app log, Logcat, a recording, an exported or shared file or a notification. Account events in the log use only an event name, an HTTP status and an error code from a fixed vocabulary, and the log masking (REQ-029.4) also replaces text shaped like a JWT or a 'Bearer' value with a placeholder."
       - id: REQ-043.3
         text: "A record that cannot be read (corrupt file, unknown format, Keystore key missing or invalidated) is deleted together with its key, the section shows 'Nicht verbunden' with the hint to connect again, and no other function of the app is affected and the app does not crash."
       - id: REQ-043.4
@@ -1189,11 +1191,11 @@ requirements:
       concluded from simulated runs.
     acceptance:
       - id: REQ-044.1
-        text: "With no account, and also with every network request failing or the phone in airplane mode, connecting, live measurement, recording, replay, export, diagnostics and every other existing function behave as before. The app makes no network request at start or while any tab is open; requests happen only after 'Continue with ChatGPT', after the disconnect confirmation, and when a caller asks for an access token while an account is connected. No error dialog, notification or service appears because of a missing account or network."
+        text: "With no account, and also with every network request failing or the phone in airplane mode, connecting, live measurement, recording, replay, export, diagnostics and every other existing local function behave as before. Starting the app or opening a tab does not initiate network traffic. Account requests happen only after 'Continue with ChatGPT', after disconnect confirmation, or when a caller explicitly needs an access token for an approved request while an account is connected. Assistant inference separately requires REQ-050.2 and REQ-050.4. No error dialog, notification or service appears solely because an account or network is missing."
       - id: REQ-044.2
         text: "Every request made for the account goes over HTTPS to auth.openai.com and sends only the fields named in REQ-042.2, REQ-042.7, REQ-043.4 and REQ-043.10 plus the ID-token key fetch; endpoints taken from the discovery document are used only when they are HTTPS on the same host. A test that records all requests finds no VIN, ECU or adapter identifier, recording content, device address or other device identifier besides the random host id and the app name. Redirects are not followed."
       - id: REQ-044.3
-        text: "The release manifest declares INTERNET as one single-line tag '<uses-permission android:name=\"android.permission.INTERNET\" />' so tools/verify-release-apk.sh accepts the built release APK, and adds no other permission besides the one in REQ-044.5. cleartext traffic stays disabled, no Gradle dependency is added, and the permission assertion of the acceptance run (REQ-018.8) allows INTERNET and still rejects storage permissions."
+        text: "The release manifest declares INTERNET as one single-line tag '<uses-permission android:name=\"android.permission.INTERNET\" />' so tools/verify-release-apk.sh accepts the built release APK. The account feature requires no other permission besides the one in REQ-044.5; optional local dictation alone may add RECORD_AUDIO under REQ-054.1. Cleartext traffic stays disabled, the account feature adds no Gradle dependency, and the recording export check (REQ-018.8) still rejects storage permissions."
       - id: REQ-044.4
         text: "Connecting, refreshing or disconnecting an account changes no vehicle capability: the process capability, the list of diagnostic jobs and the assistant tool interface (REQ-041.1) are identical with and without a connected account, the account code has no path to the session owner or the adapter transport, and it sends no vehicle traffic."
       - id: REQ-044.5
@@ -1205,4 +1207,481 @@ requirements:
       - id: REQ-044.8
         text: "A phone checklist in the AI acceptance issue covers, without vehicle or adapter traffic and with only sign-in data leaving the phone: first connection with consent and the one-time dialog, the indicator and 'Manage usage' opening ChatGPT usage settings, still connected after force-stop and relaunch, disconnect then connect again with the saved client id, disconnect in airplane mode with the unconfirmed-revocation message, and the measurements of REQ-044.6 and REQ-044.7. Its results are recorded as sanitized pass or fail without tokens, e-mail, subject or client id, and no simulated check counts as phone evidence."
       - id: REQ-044.9
-        text: "docs/project-goals.md section 7 gains a subsection 'Cloud inference and accounts' with the text: 'Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.' docs/android.md describes the account feature, the INTERNET permission and its sole use, the sign-in service as decided by REQ-044.6, and no longer says the app has no internet permission."
+        text: "docs/project-goals.md section 7 gains a subsection 'Cloud inference and accounts' with the text: 'Cloud inference and account use are optional and require explicit user consent. Local diagnostics, recording and replay remain usable without an account or network. Before sending diagnostic facts, show what will leave the device and minimize it; never send raw recordings or vehicle and device identifiers by default. Network access or AI output cannot elevate vehicle capabilities.' docs/android.md describes the account use of INTERNET and the sign-in service as decided by REQ-044.6. When inference ships, document its distinct opt-in use under REQ-050.2 and REQ-050.4."
+
+  - id: REQ-045
+    title: Reconstruct a complete diagnostic agent run from its local audit
+    type: functional
+    priority: must
+    status: accepted
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-041, REQ-043, REQ-044]
+    description: >
+      The user can inspect actual model exchanges and tool activity without
+      reopening a connection, account or model. A versioned JSONL audit is
+      distinct from the vehicle recording and remains honest after interruption.
+    acceptance:
+      - id: REQ-045.1
+        text: "Normal flow: A synthetic diagnosis with two turns, one retry and multiple tool calls reconstructs chronologically from versioned JSONL alone. The start records runtime, build and model versions, Knowledge pin, opaque vehicle reference, configuration and budgets; a monotone sequence, wall and monotonic times, and applicable session_id, turn_id, request_id and tool_call_id correlate events without conflating attempts."
+      - id: REQ-045.2
+        text: "Normal flow: At the client send boundary, the reconstructed request JSON equals the actual JSON by value, preserving array order and exact string contents in instructions, all messages, tools and schemas, options and the selected memo, Knowledge and recording-query excerpts. A pre-send preview is not evidence of dispatch; HTTP framing and authentication metadata are not part of the audit."
+      - id: REQ-045.3
+        text: "Normal flow: Reconstruct all received response items and streaming deltas in order, the original tool argument strings, and the final content, refusal, finish or incomplete status and usage when supplied; missing items or usage are not fabricated."
+      - id: REQ-045.4
+        text: "Normal flow: For an allowed call, the trace identifies the proposal and exact arguments, policy result and reason, effective operation, execution start and end, result and evidence reference."
+      - id: REQ-045.5
+        text: "Failure condition policy denies a proposed tool → safe stop: Record the original arguments, denial and reason, but no execution start or end; no tool work occurs."
+      - id: REQ-045.6
+        text: "Failure condition an allowed tool fails during execution → safe stop: Record its start, terminal error and available evidence, not a successful outcome."
+      - id: REQ-045.7
+        text: "Normal flow: A memo read and mutation, a Knowledge lookup and a recording query use the same tool lifecycle audit. For each, the complete local outcome is distinguishable from the exact subset sent externally."
+      - id: REQ-045.8
+        text: "Failure condition the user denies initial or renewed disclosure → safe stop: Record the decision. For initial denial make zero external requests for this diagnosis. For later denial retain the previously approved exchanges in the audit, never dispatch the denied request, and send nothing further for that diagnosis."
+      - id: REQ-045.9
+        text: "Normal flow: Inspecting audit events triggers no tools, model calls or vehicle access."
+      - id: REQ-045.10
+        text: "Failure condition an outbound audit entry cannot be persisted before dispatch → safe stop: Do not dispatch the request or tool, including offline tools."
+      - id: REQ-045.11
+        text: "Failure condition audit persistence fails during a request or tool → safe stop: Cancel in-flight work where possible; start no subsequent call or automatic retry. Do not report the audit or diagnosis as complete because an error record could not be written."
+      - id: REQ-045.12
+        text: "Failure condition no durable end marker, a sequence gap, a torn line or an open attempt → safe stop: For each case the offline inspector shows the last evidenced action and marks the affected run incomplete or unknown; an unconfirmed dispatch is not presented as sent or as not sent."
+      - id: REQ-045.13
+        text: "Failure condition a request times out → safe stop: The trace preserves received events and shows timeout, not success."
+      - id: REQ-045.14
+        text: "Failure condition the model network request fails → safe stop: The trace shows the network failure for the affected attempt and the evidence already received; any permitted later retry has a distinct request identity."
+      - id: REQ-045.15
+        text: "Failure condition a usage limit ends the request → safe stop: The trace shows the limit outcome and only usage supplied by the provider."
+      - id: REQ-045.16
+        text: "Failure condition the user cancels → safe stop: Retain the recorded trace and cancellation outcome; start no further work for that diagnosis."
+      - id: REQ-045.17
+        text: "Failure condition the vehicle session disconnects during diagnosis → safe stop: Retain the available trace with the disconnect outcome; do not infer the pending tool result."
+      - id: REQ-045.18
+        text: "Failure condition the app process terminates mid-stream → safe stop: The inspector shows the persisted prefix and an incomplete or unknown outcome; it does not invent a terminal response."
+      - id: REQ-045.19
+        text: "Normal flow: Offline inspection of a synthetic session shows the actual transcript, calls and status. It separately identifies whether the audit is complete and whether the diagnosis succeeded. Links identify exact source evidence in the separate recording; neither side is sampled or truncated to make the audit appear complete, and whole recordings are not embedded."
+      - id: REQ-045.20
+        text: "Failure condition a linked recording is missing → different success: The transcript remains readable and shows the source reference as unresolved."
+      - id: REQ-045.21
+        text: "Normal flow: Synthetic secret markers injected into authorization or account metadata are absent from the private JSONL, export and error output."
+      - id: REQ-045.22
+        text: "Failure condition an outgoing diagnostic payload contains disallowed secret material → safe stop: Reject it before sending without logging the forbidden material. Never alter the private record of a payload that was actually sent to make it appear compliant."
+      - id: REQ-045.23
+        text: "Normal flow: Before the first audited session, the user explicitly selects a directory on shared internal device storage. The app warns that full unencrypted JSONL files will be visible in the file manager and can be copied or backed up outside OBDentic without its export preview. The app itself does not upload or back up the audit or select a remote provider. The model cannot select or change the directory."
+      - id: REQ-045.24
+        text: "Normal flow: Export through OBDentic requires explicit session selection, a sensitive-data warning and a redaction preview before the user confirms the output; the local source audit remains unchanged. File-manager copies are not controlled by this workflow."
+      - id: REQ-045.25
+        text: "Failure condition the user cancels export → safe stop: No export is created."
+      - id: REQ-045.26
+        text: "Normal flow: Automatic retention deletes only whole completed sessions once 30 days have elapsed since their recorded end. A session without a verified end is not automatically expired. No active session is evicted; manual audit deletion remains separate from vehicle recordings and memos."
+      - id: REQ-045.27
+        text: "Failure condition storage is full → safe stop: Report storage exhaustion and follow the persistence stop rules; do not silently discard older sessions to make room."
+      - id: REQ-045.28
+        text: "Failure condition no valid local directory was selected, access was revoked, or the destination cannot confirm a durable append → safe stop: Report the destination error; start no unaudited model or tool work, including offline. Do not silently switch locations."
+      - id: REQ-045.29
+        text: "Normal flow: Starting at 80% of the 256 MiB total audit budget, show a storage warning before more work. Count persisted audit bytes in the selected directory, including active and incomplete sessions."
+      - id: REQ-045.30
+        text: "Failure condition an append would exceed 256 MiB total or 32 MiB for one session → safe stop: An append fitting exactly is allowed; the first append exceeding a cap is refused without truncating an event or deleting unexpired history. Apply the persistence stop rules."
+      - id: REQ-045.31
+        text: "Failure condition an encoded JSONL event would exceed 2 MiB → safe stop: Accept an event at the byte limit if the other budgets allow it; refuse a larger event without truncation and follow the persistence stop rules."
+      - id: REQ-045.32
+        text: "Failure condition a session would record more than 10,000 events → safe stop: The 10,000th event can be written; do not begin work that requires an event beyond the cap. Mark an interrupted audit honestly if an end marker cannot be persisted."
+      - id: REQ-045.33
+        text: "Normal flow: On the supported Android reference configuration, durable outbound appends of up to 64 KiB have p95 latency of at most 25 ms, measured from the write request through durability confirmation. This benchmark target never permits dispatch before the write is durable."
+
+  - id: REQ-046
+    title: Reproduce agent and vehicle-session outcomes offline through the real core
+    type: functional
+    priority: must
+    status: accepted
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; ADR 0006"
+    depends_on: [REQ-041]
+    description: >
+      Maintainers can run reviewable synthetic Rust scenarios through the production
+      adapter exchange seam, session, mobile core and assistant policy. The
+      harness is not vehicle acceptance. Only the combined audit acceptance
+      depends on REQ-045; the harness foundation is independently testable.
+    acceptance:
+      - id: REQ-046.1
+        text: "Normal flow: Running the same versioned synthetic scenario twice through the existing ElmExchange/ScriptedExchange seam (and the mobile acceptance fakes where applicable) with the real ElmSession, MobileCore and assistant policy yields the same TX order, RX attribution, virtual timestamps and tool outcomes. Scenarios use virtual time, with no sleeps, BLE, account, cloud or private recording."
+      - id: REQ-046.2
+        text: "Normal flow: Across the scripted runs at most one adapter request is outstanding, including during a pending reply, timeout and reconnect."
+      - id: REQ-046.3
+        text: "Normal flow: Inventory, signal listing, a supported Mode 01 PID, an approved Knowledge read and a DTC scan produce the exact expected TX sequence and matching RX, responder and tool references. Local listing itself adds no TX."
+      - id: REQ-046.4
+        text: "Failure condition a Mode 01 PID is unsupported → different success: Report unsupported with the exact expected traffic for the fixture and no fabricated value."
+      - id: REQ-046.5
+        text: "Normal flow: Varying routing/filter selectors, adapter reset and prompt behavior, single or multi-frame replies and modeled ECU session state changes the observed response accordingly; order alone cannot select the next reply."
+      - id: REQ-046.6
+        text: "Failure condition a targeted Knowledge read receives NRC 0x21 (busy) → different success: The scenario records it as intermediate, uses only a decisive reply from that exchange, and reports missing evidence with the busy response if none arrives. Check exact TX; no unbounded retry."
+      - id: REQ-046.7
+        text: "Failure condition a targeted Knowledge read receives NRC 0x78 (pending) → different success: A decisive reply within the allowed exchange determines the result; a pending-only expiry yields no value. Check exact TX and the virtual deadline."
+      - id: REQ-046.8
+        text: "Failure condition the target replies NRC 0x31 (out of range) → safe stop: Show the negative response as decisive, with no decoded value; do not continue the read as though it were pending. Check exact TX."
+      - id: REQ-046.9
+        text: "Failure condition the requested ECU returns a reply for a different operation → safe stop: The reply does not supply a value or evidence for the requested operation; the trace retains the actual reply and outcome."
+      - id: REQ-046.10
+        text: "Failure condition one valid response is duplicated → back on track: Do not count the duplicate as another completed request or an independent measurement; show the actual RX and exact TX."
+      - id: REQ-046.11
+        text: "Failure condition a non-target ECU supplies the only response → safe stop: Show missing target evidence and its actual source, never a value attributed to the requested ECU."
+      - id: REQ-046.12
+        text: "Failure condition a response arrives after its exchange expired → safe stop: Keep the timeout; do not use the late reply to satisfy that or a subsequent request."
+      - id: REQ-046.13
+        text: "Failure condition a valid reply arrives in fragments → back on track: Attribute only the complete valid reply; incomplete fragments alone never produce a value."
+      - id: REQ-046.14
+        text: "Failure condition a frame is malformed → safe stop: The named scenario exposes malformed or missing evidence, the actual RX and exact TX, without a fabricated value or zero-as-healthy."
+      - id: REQ-046.15
+        text: "Failure condition the adapter prompt is missing → safe stop: Show bounded timeout and exact TX; no new adapter exchange starts on assumed readiness."
+      - id: REQ-046.16
+        text: "Failure condition adapter routing is unconfirmed → safe stop: Do not continue diagnosis with an assumed target; the exact trace identifies the stop and any existing bounded cleanup."
+      - id: REQ-046.17
+        text: "Failure condition returning to the expected session fails → safe stop: Do not continue diagnosis with assumed session state; the exact trace identifies the stop and any existing bounded cleanup."
+      - id: REQ-046.18
+        text: "Failure condition the adapter disconnects during a pending request → safe stop: Report disconnect for that request. Reconnecting cannot fulfill it with a late response; a new request requires newly established state."
+      - id: REQ-046.19
+        text: "Normal flow: Classify every one of the 35 accepted ADR 0006 scenarios as production-path now, reference-model only or awaiting multi-ECU production support; use the virtual clock for keepalive, response attribution and expiry. Reference-model/future scenarios never count as passing production or hardware acceptance."
+      - id: REQ-046.20
+        text: "Normal flow: A scripted model calling assistant.tools, assistant.begin and assistant.tool investigates synthetic EGR/MAF evidence and requests an allowed follow-up."
+      - id: REQ-046.21
+        text: "Failure condition the EGR/MAF scenario lacks a fact needed for the diagnosis → different success: The scripted result gives an unknown outcome for that fact instead of a confident diagnosis."
+      - id: REQ-046.22
+        text: "Failure condition a scripted request is raw, unknown or mutating → safe stop: Each receives a typed refusal with exactly zero additional TX."
+      - id: REQ-046.23
+        text: "Normal flow: Combined acceptance with REQ-045 reconstructs the complete synthetic diagnosis offline, correlating actual scripted attempts, approved and refused tools and source evidence with the transport trace. Neither the foundation nor this acceptance depends on real runtime/model integration."
+      - id: REQ-046.24
+        text: "Normal flow: The synthetic harness suite completes in at most 10 seconds on the macOS CI runner, measured from test start to test end without compilation; do not omit agreed production-path cases or misclassify any of the 35 matrix cases to meet the target."
+
+  - id: REQ-047
+    title: Keep evidence-backed diagnostic memos private to each local vehicle
+    type: functional
+    priority: should
+    status: accepted
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-013, REQ-045]
+    description: >
+      A user can preserve diagnostic history without letting model conjecture
+      become evidence or altering reviewed Vehicle Knowledge. Local ownership
+      follows the private vehicle record, not an account, replay or model.
+    acceptance:
+      - id: REQ-047.1
+        text: "Normal flow: With two synthetic private vehicle records selected in turn, creating and searching a memo shows it only on the selected vehicle, including after offline restart and after ChatGPT account disconnect."
+      - id: REQ-047.2
+        text: "Normal flow: Updating a memo preserves its source, author, creation and update times, Knowledge pin, status, contradictions and predecessor; the other vehicle's record stays unchanged."
+      - id: REQ-047.3
+        text: "Normal flow: Linking evidence to a memo on the selected vehicle resolves to the exact recording event and distinguishes the evidence from a hypothesis."
+      - id: REQ-047.4
+        text: "Normal flow: Archiving a memo removes it from the active list and keeps it available in that vehicle's archive."
+      - id: REQ-047.5
+        text: "Normal flow: Confirmed user deletion removes the memo from active, archived and search results, including after restart, without deleting the recording or another vehicle's memo. Existing audit entries remain until separately removed by the user's audit controls; deletion explains that distinction."
+      - id: REQ-047.6
+        text: "Failure condition a vehicle identity is unknown or ambiguous → safe stop: Refuse persistent memo reads and writes rather than falling back to another local vehicle."
+      - id: REQ-047.7
+        text: "Failure condition a replay belongs to another vehicle or cannot be tied to the selected record → safe stop: Refuse persistent reads and writes in that context. Replay does not create or select a private vehicle record."
+      - id: REQ-047.8
+        text: "Failure condition model text claims a hypothesis is proven without independent evidence → safe stop: Keep it unverified and distinguish the disagreement or missing evidence from the model's claim."
+      - id: REQ-047.9
+        text: "Failure condition the linked source recording is gone → different success: The memo remains visible with unavailable evidence, not an invented observation."
+      - id: REQ-047.10
+        text: "Failure condition writing the memo fails → safe stop: The previous store stays intact, the app shows the failure, and a retry is not reported as completed."
+      - id: REQ-047.11
+        text: "Failure condition memo migration fails → safe stop: Keep the prior store unchanged and report the failed migration; no silently empty replacement."
+      - id: REQ-047.12
+        text: "Normal flow: Reopening a pending question from a memo sends no automatic vehicle read. Memo operations never change effective Knowledge or process capabilities."
+      - id: REQ-047.13
+        text: "Normal flow: Memos are app-private, excluded from backup and transfer, and never silently exported."
+      - id: REQ-047.14
+        text: "Normal flow: Before disclosure show only the memo excerpts selected for the outgoing request. REQ-045 records the retrieval, mutation, outcome and exact subset sent, if any; the full private memo store does not leave the client."
+      - id: REQ-047.15
+        text: "Normal flow: A model-authored hypothesis can be saved without per-item confirmation for a verified selected vehicle. It is labeled unverified and attributed to the model; saving it initiates no vehicle read."
+      - id: REQ-047.16
+        text: "Failure condition the model requests deletion or confirmation of a memo → safe stop: Refuse the operation and leave the memo unchanged; deletion and confirmation remain user-controlled."
+      - id: REQ-047.17
+        text: "Normal flow: The confirmation for deleting a vehicle record states that all its active and archived memos will also be deleted. After confirmation and restart those memos are absent, while another vehicle's memos, recordings and historical audit entries remain unchanged."
+      - id: REQ-047.18
+        text: "Failure condition a vehicle already has 500 active and archived memos combined → safe stop: A create up to the cap is allowed; the next create is refused without deleting or changing an existing memo."
+      - id: REQ-047.19
+        text: "Failure condition a create or update would leave more than 16 KiB of UTF-8 text in one memo → safe stop: Allow a memo exactly at the cap; reject the larger write without truncation or loss of the previous contents."
+      - id: REQ-047.20
+        text: "Failure condition selected memo excerpt text for one model request exceeds 8 KiB UTF-8 → try again: Show that the selection is over budget and allow the user to reduce it. Do not send it as selected or silently alter the approved excerpts."
+      - id: REQ-047.21
+        text: "Failure condition the confirmed vehicle-and-memo deletion cannot be persisted → safe stop: Report that deletion failed and keep the vehicle record and its memos unchanged."
+
+  - id: REQ-048
+    title: Retrieve local diagnostic evidence with verifiable citations
+    type: functional
+    priority: should
+    status: accepted
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-041, REQ-045]
+    description: >
+      The assistant can look up bounded diagnostic evidence using the pinned
+      effective Vehicle Knowledge and separately classified documents. Retrieval
+      never defines a vehicle operation or grants authority to execute one.
+    acceptance:
+      - id: REQ-048.1
+        text: "Normal flow: With two source revisions and conflicting synthetic ECU applicability, repeating a query offline at the same pin returns the same ordered, bounded results. Every hit includes stable source ID, revision, citation, applicability, evidence grade and match reason."
+      - id: REQ-048.2
+        text: "Normal flow: Given a cited ID and revision, a targeted follow-up returns that exact bounded source passage and its provenance, not a passage from another revision."
+      - id: REQ-048.3
+        text: "Normal flow: A result identifies whether it is general prose or a machine-readable pinned definition; the same term in both sources does not change the effective definition."
+      - id: REQ-048.4
+        text: "Failure condition only a VIN prefix matches or a result is incompatible or experimental → different success: Label the unsupported applicability or evidence status; do not present it as an available vehicle function or authorize traffic."
+      - id: REQ-048.5
+        text: "Failure condition the local index is missing or stale → safe stop: Report its missing or mismatched version and do not return hits presented as current."
+      - id: REQ-048.6
+        text: "Failure condition the expected Knowledge pin is missing or stale → safe stop: Return a version error; do not silently substitute a corpus or revision."
+      - id: REQ-048.7
+        text: "Failure condition a source lacks cleared redistribution or indexing rights → safe stop: Exclude the source from the index and results."
+      - id: REQ-048.8
+        text: "Failure condition retrieved prose contains instructions posing as policy or vehicle operations → different success: Return it only as source text where relevant; execute zero adapter commands and make zero policy or capability changes."
+      - id: REQ-048.9
+        text: "Normal flow: The disclosure preview shows only the selected excerpts and source revisions. REQ-045 records the full local retrieval response separately from the exact approved subset actually sent."
+      - id: REQ-048.10
+        text: "Normal flow: The first shipped corpus contains only approved definitions from the pinned Knowledge, in German or English where available. Its source register gives rights for indexing and distribution, language and revision for every included source. External standards and manufacturer documents are excluded pending separate rights clearance."
+      - id: REQ-048.11
+        text: "Normal flow: The first Android search slice distributes at most 16 MiB of source text, uses at most 32 MiB for the resulting index, and adds at most 8 MiB to a like-for-like release APK."
+      - id: REQ-048.12
+        text: "Normal flow: A local answer returns at most 10 ranked hits and at most 4 KiB of UTF-8 quotation text in total; a targeted follow-up also respects the quotation cap."
+      - id: REQ-048.13
+        text: "Normal flow: On the supported Android reference configuration, a local build of the index for the maximum approved source size finishes within 10 seconds without network. It replaces the prior index only after the new index has passed verification against the pin."
+      - id: REQ-048.14
+        text: "Failure condition index construction, pin verification or a source/index limit fails → safe stop: Do not publish a partial or invalid replacement. The prior index remains intact, and a mismatch against the active pin is reported rather than hidden by serving stale hits."
+
+  - id: REQ-049
+    title: Query a selected recording locally with bounded work and exact source links
+    type: functional
+    priority: should
+    status: accepted
+    source: "M6 Android diagnostic assistant scope update, 2026-11-18; refinement"
+    depends_on: [REQ-041, REQ-045]
+    description: >
+      An analyst can select evidence and calculate statistics without granting
+      filesystem access or opening the entire recording as model context.
+      Query semantics use the shared replay interpretation; no independent
+      vehicle decoder or mandatory index is required.
+    acceptance:
+      - id: REQ-049.1
+        text: "Normal flow: One user-selected logical recording is opened through an opaque handle, including multiple rotation parts. A local offline query filters by time, signal, ECU and event type and projects only the requested fields without adapter or network access."
+      - id: REQ-049.2
+        text: "Normal flow: A synthetic window with RPM values 800 and 1200 in separate parts and another sample outside the window returns count 2 and mean 1000; original-event references resolve to those exact source events."
+      - id: REQ-049.3
+        text: "Normal flow: A mixed synthetic recording can select DTC and UDS events separately and resolve their original-event references without returning unrelated samples."
+      - id: REQ-049.4
+        text: "Normal flow: Filter time windows as start-inclusive, end-exclusive. Pages follow original event order across rotation parts, with no skips or duplicates. Opaque continuation cursors apply only to the same recording revision and query; repeated queries return the same page contents and boundaries."
+      - id: REQ-049.5
+        text: "Failure condition a rotation part is missing → different success: Identify the gap and mark the result partial or not evaluable; do not report a complete aggregate or a healthy diagnosis from it."
+      - id: REQ-049.6
+        text: "Failure condition a recording line is malformed → different success: Identify corrupt evidence and mark the response partial or not evaluable; do not silently treat the line as zero or healthy evidence."
+      - id: REQ-049.7
+        text: "Failure condition the Knowledge pin is missing, invalid or mismatched → safe stop: Return a pin error and mark the query not evaluable rather than decoding against a different version."
+      - id: REQ-049.8
+        text: "Failure condition a recording schema is unrecognized → safe stop: Return an explicit schema error and do not report a complete result."
+      - id: REQ-049.9
+        text: "Failure condition the handle is invalid or refers to an unselected recording → safe stop: Refuse with a typed handle error and do not open the referenced file."
+      - id: REQ-049.10
+        text: "Failure condition a raw path, unrelated file or the agent's own audit is requested → safe stop: Refuse with a typed scope error before any access."
+      - id: REQ-049.11
+        text: "Failure condition a jq-style expression is unsupported → safe stop: Refuse with a typed syntax or policy outcome before execution; expressions cannot access the filesystem, load modules, start processes or recurse without a bound."
+      - id: REQ-049.12
+        text: "Failure condition the user cancels a query in progress → safe stop: End it, identify cancellation and label any returned prefix partial, never a complete aggregate."
+      - id: REQ-049.13
+        text: "Failure condition a query would exceed 100,000 input lines in one call → safe stop: The boundary test finishes at the cap; one line beyond it stops with a typed limit and any returned prefix is labeled partial."
+      - id: REQ-049.14
+        text: "Failure condition a query would exceed 32 MiB of input in one call → safe stop: The boundary test finishes at the byte cap; one byte beyond it stops with a typed limit and any returned prefix is labeled partial."
+      - id: REQ-049.15
+        text: "Failure condition a query would exceed 200,000 operator evaluations in one call → safe stop: The boundary test can finish exactly at the cap; a next evaluation is not performed and any returned prefix is labeled partial."
+      - id: REQ-049.16
+        text: "Failure condition a query would exceed 1 second of execution in one call → safe stop: With controlled time the boundary test can finish at the cap but not run past it; return the time limit and mark any prefix partial."
+      - id: REQ-049.17
+        text: "Failure condition a query would exceed 8 MiB of intermediate memory in one call → safe stop: A boundary fixture completes at the cap; an operation that would go beyond it is not performed and any returned prefix is labeled partial."
+      - id: REQ-049.18
+        text: "Normal flow: REQ-045 records the query, its local outcome and the exact approved subset actually sent as distinguishable events; no whole recording is sent by default."
+      - id: REQ-049.19
+        text: "Normal flow: The documented jq text subset admits field access, literal comparisons (==, !=, <, <=, >, >=), conjunction with and, map(select(...)), object field projection, length and map(.value) | add / length for the mean. The tool accepts those forms over the documented event schema and rejects other expressions under REQ-049.11."
+      - id: REQ-049.20
+        text: "Normal flow: A result page has at most 100 hits and at most 64 KiB of encoded output. A subsequent page resumes at the next original event, not within a row."
+      - id: REQ-049.21
+        text: "Failure condition a cursor refers to a different query, recording or recording revision → safe stop: Return a typed invalid-cursor outcome and do not continue against different evidence."
+      - id: REQ-049.22
+        text: "Normal flow: An aggregate uses all matching events within the execution budgets, regardless of page size. An empty selection yields count zero and no mean, not a mean of zero."
+      - id: REQ-049.23
+        text: "Normal flow: Recording queries add at most 8 MiB to a like-for-like Android release APK."
+      - id: REQ-049.24
+        text: "Failure condition one projected result cannot fit in the 64 KiB page by itself → try again: Return a typed output limit and allow a narrower projection. Do not silently skip the event or return a cursor that cannot advance."
+
+  - id: REQ-050
+    title: Run a typed assistant diagnosis on one selected saved recording
+    type: functional
+    priority: should
+    status: accepted
+    source: "M6 Android assistant kickoff; offline recording diagnosis"
+    depends_on: [REQ-041, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046]
+    description: >
+      The user opens an existing saved recording and asks a typed question.
+      Diagnosis does not require a connected vehicle; deterministic acceptance
+      uses a scripted client offline. Real cloud inference is separate and
+      optional, and does not replace local replay.
+    acceptance:
+      - id: REQ-050.1
+        text: "Normal flow: In the saved recording replay the user can start the typed assistant with that recording identified and fixed for the diagnosis. In a fully offline scripted EGR/MAF fixture it uses the existing recording tool, starts zero adapter and network requests, and returns findings, uncertainty, missing evidence and resolvable recording-event references."
+      - id: REQ-050.2
+        text: "Normal flow: Before the first eligible cloud request, show the diagnostic facts and metadata about to leave the app. A later request with new diagnostic content requires renewed confirmation; the full request preview remains inspectable. Only approved semantic excerpts and reviewed necessary instructions/tool data are sent, never a full recording, raw frames, VIN, ECU or adapter identifiers, or credential data in the diagnostic JSON."
+      - id: REQ-050.3
+        text: "Normal flow: A user-started diagnosis reports progress, attempts at most four model requests and processes at most twelve tool proposals including refusals. Set a monotonic 60-second diagnosis deadline from the first model attempt. At the deadline the runtime stops the diagnosis, cancels any in-flight model request and starts no more work; an already-started live exchange is governed by REQ-051.7."
+      - id: REQ-050.4
+        text: "Normal flow: Use the accepted ChatGPT-plan account and one model client behind the same audited interface as the scripted client. REQ-045 records actual sends, streams and outcomes; inspection resolves evidence without re-running a model or tool."
+      - id: REQ-050.5
+        text: "Failure condition no recording is selected or the selected recording becomes unavailable → try again: Identify the missing source and start no diagnosis on another recording; the user may select one explicitly."
+      - id: REQ-050.6
+        text: "Failure condition the recording's Knowledge pin does not match → safe stop: Show the pin mismatch, start no inference with the recording evidence, and do not silently replay or decode against another revision."
+      - id: REQ-050.7
+        text: "Failure condition the user declines disclosure or no eligible ChatGPT-plan permission is active → different success: Initial denial or missing permission prevents any cloud diagnosis request from starting. Renewed denial stops further sends and preserves already approved exchanges as specified in REQ-045.8. Local replay remains usable; no alternative billing route or API key is offered."
+      - id: REQ-050.8
+        text: "Failure condition a reply requests a live read, a mutation, raw protocol, an unselected recording or an unknown tool → safe stop: Return a typed refusal before transport or unauthorized file access. Use only the tool bridge's current, closed recording vocabulary."
+      - id: REQ-050.9
+        text: "Failure condition the user cancels or a request, call or time budget is exhausted → safe stop: Start no additional work and show cancellation or the exhausted budget. If the deadline interrupts an in-flight stream, cancel it and do not use late content as a final diagnosis. Audit the actual terminal outcome rather than fabricate completion."
+      - id: REQ-050.10
+        text: "Failure condition the network fails, the provider reports a usage limit, or the stream ends incomplete → try again: Show the specific outcome and keep replay and any evidence received so far accessible. No automatic retry or assertion of a complete diagnosis."
+      - id: REQ-050.11
+        text: "Failure condition evidence is absent, stale or not attributable to the selected recording → different success: Leave the fact unknown or explicitly stale and distinguish any inference from evidence; never present an unknown fact as zero or evidence of health."
+      - id: REQ-050.12
+        text: "Failure condition the next serialized diagnostic request exceeds 128 KiB UTF-8 JSON → try again: Show the size limit before dispatch and let the user reduce context explicitly. Do not send a truncated or recomposed payload without new preview and confirmation."
+
+  - id: REQ-051
+    title: Run a bounded typed assistant diagnosis in an existing live vehicle session
+    type: functional
+    priority: should
+    status: accepted
+    source: "M6 Android assistant kickoff; live session diagnosis"
+    depends_on: [REQ-041, REQ-045, REQ-046, REQ-050]
+    description: >
+      A user can ask a typed diagnostic question while the vehicle is stationary.
+      The existing session owner executes only supported read-only work; the
+      runtime, private-data disclosure rules and audit are shared with recording diagnosis.
+    acceptance:
+      - id: REQ-051.1
+        text: "Normal flow: A user starts a typed diagnosis in a connected session with fresh observed vehicle speed zero. The assistant shows the active source, read progress and cancellation, obtains only currently supported typed facts from the existing session owner, and finishes with facts, uncertainty and exact capture evidence references."
+      - id: REQ-051.2
+        text: "Normal flow: Use the same four-attempt, twelve-proposal, 60-second and 128 KiB request ceilings, preview/confirmation and actual-send audit as recorded diagnosis. Also enforce REQ-041 live budgets and existing session rules; the stricter applicable budget always wins. No second owner, new restricted diagnostic session, raw operation or write is exposed."
+      - id: REQ-051.3
+        text: "Failure condition the session owner is busy with a job or observation that cannot share the serialized path → try again: Return the existing busy outcome without queueing, preempting that job, or taking another connection; the user may explicitly try again."
+      - id: REQ-051.4
+        text: "Failure condition speed is nonzero, unknown, or stale under the existing 10-second freshness contract → safe stop: Do not start the interactive live diagnosis, or stop starting work if the condition changes during it. Do not prompt for more input while movement is possible, start new probing solely to establish stationary state, or auto-resume."
+      - id: REQ-051.5
+        text: "Failure condition the session disconnects or changes during diagnosis → safe stop: End the affected work, expire affected identifiers and never use late results as evidence for a new session. After reconnecting the user may explicitly start a new diagnosis under a newly confirmed session; no automatic replay."
+      - id: REQ-051.6
+        text: "Failure condition a requested signal is unavailable, stale, from another target or would require a session change → different success: Return the existing typed outcome, preserve provenance and report the evidence gap rather than forcing a read, changing target/session or assuming health."
+      - id: REQ-051.7
+        text: "Failure condition the user cancels or a budget expires during a live exchange → safe stop: Stop the diagnosis immediately and start no further diagnostic requests. The already-started exchange may finish under its existing transport timeout and bounded safety cleanup. Do not use late results to resume diagnosis; the audit records whether the exchange finished."
+      - id: REQ-051.8
+        text: "Failure condition the account expires, the provider limits usage, or the network fails mid-stream → try again: End this diagnosis with the specific outcome and preserve the partial audit and local vehicle functions. No automatic retry, billing fallback or continued autonomous reads."
+
+  - id: REQ-052
+    title: Keep Android account-only and real-vehicle assistant acceptance distinct
+    type: constraint
+    priority: should
+    status: accepted
+    source: "M6 Android assistant kickoff; independent real-device acceptance"
+    depends_on: [REQ-044]
+    description: >
+      The account-only checklist is independent of live diagnosis. Only the
+      live assistant acceptance needs the live assistant, audit and harness
+      under REQ-045, REQ-046 and REQ-051.
+    acceptance:
+      - id: REQ-052.1
+        text: "Normal flow: The REQ-044.6–.8 account-only device checklist can be run without adapter, vehicle or assistant model requests and recorded separately before live diagnosis is available. It publishes sanitized pass/fail only."
+      - id: REQ-052.2
+        text: "Normal flow: In a separately approved bounded stationary phone/adapter/vehicle session, a user-started diagnosis establishes the actual read-only progression, provenance, one session owner and no additional commands beyond the allowed trace. Offline inspection reconstructs the resulting audit and opens its source references without the vehicle or network."
+      - id: REQ-052.3
+        text: "Failure condition the tester cancels, disconnects or interrupts a run → safe stop: In each case observe no new work after the stop, explicit terminal or partial status and no silently resumed diagnosis after reconnect."
+      - id: REQ-052.4
+        text: "Failure condition the tester declines disclosure, declines export or loses network access → safe stop: Record separate outcomes. The denied request and subsequent requests for that diagnosis are not dispatched, no in-app export is created on cancellation, and network loss is not shown as a success."
+      - id: REQ-052.5
+        text: "Failure condition no vehicle availability is explicitly confirmed for the agreed bounded session → safe stop: Do not open a live vehicle session for acceptance. Synthetic harness and account-only results remain independently reportable and never count as vehicle evidence."
+      - id: REQ-052.6
+        text: "Normal flow: Report the approved run scope and sanitized outcomes only. Actual audit, recordings, credentials and device/vehicle identifiers stay local; simulation and hardware evidence are labeled separately."
+
+  - id: REQ-053
+    title: Inspect a deterministic semantic snapshot through the typed mobile bridge
+    type: functional
+    priority: should
+    status: accepted
+    source: "M6 Android assistant kickoff; semantic snapshots"
+    depends_on: [REQ-041, REQ-045]
+    acceptance:
+      - id: REQ-053.1
+        text: "Normal flow: The first closed snapshot tool exposes the deterministic engine family built by the shared snapshot core. For equivalent catalog and samples containing RPM, speed, coolant temperature, load and MAF, live and replay report the same facts, sample times, availability and units with provenance identifying the actual source of each. Snapshot construction starts zero vehicle traffic."
+      - id: REQ-053.2
+        text: "Normal flow: In replay the tool reads only the user-selected recording and existing time cursor, treating each value's time and age separately. It does not select a recording, advance the cursor, interpolate samples or emit a diagnosis."
+      - id: REQ-053.3
+        text: "Failure condition a known snapshot field is missing, unsupported, stale or has a read/decode error → different success: Show the state, timestamp/age where known and source; a missing value is never zero and a stale value is never reported as fresh."
+      - id: REQ-053.4
+        text: "Failure condition the request names an unknown snapshot family, raw selector or unselected recording, or the pin is invalid → safe stop: Refuse with a typed outcome before fetching evidence or sending any adapter command."
+      - id: REQ-053.5
+        text: "Normal flow: The snapshot invocation and result use the same audit and disclosure contract as existing assistant tools. Opaque source references preserve provenance without exposing vehicle identifiers or an executable address."
+
+  - id: REQ-054
+    title: Make optional Android voice local and subordinate to typed diagnosis
+    type: functional
+    priority: could
+    status: accepted
+    source: "M6 Android assistant kickoff; optional voice"
+    depends_on: [REQ-050, REQ-051]
+    acceptance:
+      - id: REQ-054.1
+        text: "Normal flow: The Android manifest declares RECORD_AUDIO only for optional dictation. Explicit mic activation requests it on first use and uses an available Android on-device recognizer. The resulting German or English text, where installed, fills the editable typed composer and never sends or starts diagnosis without the ordinary user action and disclosure gate."
+      - id: REQ-054.2
+        text: "Normal flow: The user explicitly plays a completed answer using an available local Android TTS voice, can stop playback, and can use the entire typed flow without activating voice. Neither raw audio nor speech synthesis is sent to the ChatGPT-plan endpoint."
+      - id: REQ-054.3
+        text: "Failure condition mic permission is denied or the on-device recognizer, selected language or local TTS voice is unavailable → different success: Explain the unavailable option and preserve typing/readable text; do not fall back to a network speech service."
+      - id: REQ-054.4
+        text: "Failure condition the user cancels voice, the app leaves the foreground or the live stationary check fails → safe stop: Stop the affected recognition/playback and do not send a late transcript, prompt for attention, or auto-resume. Voice never starts its own adapter traffic."
+
+  - id: REQ-055
+    title: Organize the Android app by user tasks instead of subsystems
+    type: functional
+    priority: should
+    status: draft
+    source: "Conversation 2026-11-20: Android UI cleanup plan, decision by @frankherchet"
+    description: >
+      The app shows three work areas (Live, Diagnose, Aufnahmen); the adapter and the vehicle list are
+      context targets in the header. There is no debug view: raw TX/RX stays in private recordings for
+      offline analysis. Recording, replay, desktop evaluation and the transport contract are unchanged.
+    acceptance:
+      - id: REQ-055.1
+        text: "Normal flow: The bottom navigation holds exactly Live, Diagnose and Aufnahmen and the app starts in Live. From every work area one tap on the labelled connection/mode button opens the adapter view and one tap on the vehicle name opens the vehicle list; 'Zurück' and Android back return to the work area they were opened from, a main tab switches directly. The view, its return target and opened sections survive rotation; a missing, old or unknown saved view opens Live."
+      - id: REQ-055.2
+        text: "Normal flow: The header names in text live disconnected, live with adapter, demo simulated, replay with its source, a partial recording and an active extended session; a running job, an error or a missing response stays readable in the status line without repeating the connection state."
+      - id: REQ-055.3
+        text: "Normal flow: Without a connection Live shows one start surface: 'Adapter verbinden' opens the adapter view without a search and 'Demo starten' starts the simulation on Live; no locked recording or selection actions are shown. With a connection, demo or replay the selection/recording bar and the tiles lead, and eight demo signals fit the first portrait viewport of the reference emulator."
+      - id: REQ-055.4
+        text: "Normal flow: Diagnose shows 'Fehlercodes lesen' with stored and pending codes per responder, then 'Fahrzeug und Steuergeräte erfassen', before the closed 'Weitere Prüfungen'; an active extended session's card and its return action stay above them. An empty answer, an error or timeout and a successful answer are shown differently, and a timeout or missing answer is never shown as 'no fault codes'."
+      - id: REQ-055.5
+        text: "Normal flow: Aufnahmen shows the running recording, the export folder and 'Alle exportieren' first, then the newest 30 files with 'Als Replay öffnen'; each file's 'Weitere Aktionen' holds its export and confirmed delete, the running file and the loaded replay cannot be deleted, recording and export settings are closed, and an empty list offers 'Zu Live'."
+      - id: REQ-055.6
+        text: "Failure condition the user changes views, opens a section or rotates the phone → safe stop: Nothing starts a search, a diagnostic job or adapter traffic."
+      - id: REQ-055.7
+        text: "Failure condition raw traffic or a failed job is to be explained → different success: No view shows raw TX/RX, a log window or a debug copy action; a failed job names what was not determined and whether an earlier result still applies, and points to a recording for offline analysis only when that recording exists."
+      - id: REQ-055.8
+        text: "Failure condition large system text or a narrow display → different success: Header elements stack instead of cutting text, interactive targets are at least 48 dp, and mode, vehicle, the selected tab and action names stay distinguishable to accessibility services."
+
+  - id: REQ-056
+    title: Reject an invalid requirements file in CI
+    type: constraint
+    priority: should
+    status: accepted
+    source: "Retro of the Android UI cleanup; refinement with @frankherchet"
+    description: >
+      Skills, issues and tests rely on unique, well-formed requirement and criterion IDs. The file is
+      checked against its schema, used as shipped by the xp workflow, and for ID consistency, which
+      the schema cannot express.
+    acceptance:
+      - id: REQ-056.1
+        text: "Normal flow: The CI job 'check' validates docs/requirements.yaml against docs/requirements.schema.json on every pull request and every push to the default branch, including changes that touch only documentation or requirements; a valid file passes and the check adds at most 60 s to the job."
+      - id: REQ-056.2
+        text: "Failure condition the file is not valid YAML or violates the schema → safe stop: The job fails, and its output names the location (line, or JSON path of the element) and the violated rule."
+      - id: REQ-056.3
+        text: "Failure condition a requirement or criterion ID occurs more than once, a criterion ID does not start with its requirement's ID followed by '.', or depends_on names a requirement that does not exist → safe stop: The job fails, and its output names each offending ID."
+      - id: REQ-056.4
+        text: "Failure condition the validator cannot be installed or run → try again: The job fails instead of passing or skipping the check, and re-running the job repeats the installation."
+      - id: REQ-056.5
+        text: "Normal flow: The same check runs locally with one documented command from the repository root and gives the same verdict as CI; validator, its libraries and the CI action that provides it are pinned to exact versions."

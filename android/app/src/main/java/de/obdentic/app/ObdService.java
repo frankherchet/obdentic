@@ -79,7 +79,7 @@ public final class ObdService extends Service {
     private long coverageOriginNanos, coverageLastOffset; // the run clock: monotonic since the Smart start, never reset by a rotation
     /** #340 (REQ-038.6/.8/.10): the live coverage ledger of the running Smart run is fed from the records written into the recording. The queue is guarded by recordLock; every core call runs on the worker. */
     private final ArrayDeque<JSONObject> coverageQueue=new ArrayDeque<>();
-    private volatile boolean coverageLedgerOn; private boolean coverageInvalid, coverageSaveFailed;
+    private volatile boolean coverageLedgerOn; private boolean coverageInvalid, coverageSaveFailed; private String coverageSaveError="";
     private String coverageVin="", coverageProblem=""; // vehicle whose stored ledger this run credits ("" = run ledger only); why the vehicle ledger is unavailable
     private long coverageSavedAt, coveragePublishedAt;
     private volatile long gapSince;
@@ -97,7 +97,7 @@ public final class ObdService extends Service {
         synchronized (stateLock) {
             put(state,"phase","idle"); put(state,"mode","live"); put(state,"busy",false);
             put(state,"message","Carly verbinden oder Demo starten");
-            for (String key : new String[]{"devices","signals","profiles","values","debug","selected","records"}) put(state,key,new JSONArray());
+            for (String key : new String[]{"devices","signals","profiles","values","selected","records"}) put(state,key,new JSONArray());
             put(state,"recording",""); put(state,"autoRecording",""); put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject());
             put(state,"smart",idleSmart()); put(state,"component",new JSONObject()); put(state,"sessionCandidates",new JSONArray()); put(state,"knowledge",new JSONObject());
             put(state,"gap",idleGap());
@@ -205,7 +205,7 @@ public final class ObdService extends Service {
                 linked=false; destroyCore(); Link next;
                 if(connector != null) { next=connector.open(address); if(token != generation) { next.close(); return; } transport=next; }
                 else {
-                    BleTransport ble=new BleTransport(this::debug); transport=ble;
+                    BleTransport ble=new BleTransport(this::wire); transport=ble;
                     if(token != generation) { ble.close(); return; }
                     BluetoothAdapter adapter=adapter(); if(adapter == null) throw new IOException("Bluetooth nicht verfügbar");
                     ble.connect(this,adapter.getRemoteDevice(address)); next=ble; // direct GATT connect to the exact address, no scan needed
@@ -297,7 +297,7 @@ public final class ObdService extends Service {
     }
     private void resetSessionData() {
         replayFilename="";
-        synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
+        synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray());
             put(state,"uds",new JSONObject()); put(state,"udsCandidates",0);
             put(state,"replayFile","");
             put(state,"coverage",JSONObject.NULL); put(state,"coverageLive",JSONObject.NULL); put(state,"coverageStored",JSONObject.NULL);
@@ -430,7 +430,7 @@ public final class ObdService extends Service {
         String resume=established && !recordingProfile.equals(AUTO_PROFILE) ? ReconnectPolicy.resumeProfile(recordingProfile) : ""; // REQ-020.8: before the recording closes
         coverageLedgerFinish(); // #340: the core goes away next; store what the run credited
         Link active=transport; transport=null; if(active!=null) active.close(); destroyCore();
-        set("phase","error"); message(text); closeRecording("error",text); gapReset(); // the session ended: no gap carries over (a failed job leaves the session ready and keeps it)
+        set("phase","error"); message(text+coverageSaveNotice()); closeRecording("error",text); gapReset(); // the session ended: no gap carries over (a failed job leaves the session ready and keeps it)
         long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
         if(delay < 0) { pendingProfile=""; stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock(); return; }
         if(established && !resume.isEmpty()) pendingProfile=resume; // a loss before the resume started keeps the pending profile
@@ -591,6 +591,8 @@ public final class ObdService extends Service {
                 if(error!=null && token==generation) message(error);
             }
             if(token!=generation) return;
+            put(result,"action",action); // the Diagnose view names what was not determined
+            if(!own) { String file; synchronized(stateLock) { file=activeRecording(); } if(!file.isEmpty()) put(result,"recording",file); } // the running file holds this job's TX/RX; an own-file job's file has ended
             set("jobResult",result);
             if(own || knowledge) {
                 if(result.optBoolean("ok")) {
@@ -843,10 +845,14 @@ public final class ObdService extends Service {
                 long size=file.length(); if(file.delete()) { removed++; freed+=size; } } }
         message(removed+" automatische Aufnahmen gelöscht · "+freed/1024+" KB frei");
     }); }
-    private void debug(String direction,String text) {
+    /** Live and demo adapter traffic; counted, and kept only in an active recording (raw TX/RX is for offline analysis, never shown). */
+    private void wire(String direction,String text) {
+        wireEvents.incrementAndGet();
         JSONObject event=new JSONObject(); put(event,"type","wire"); put(event,"direction",direction); put(event,"text",text); put(event,"at",System.currentTimeMillis()); record(event);
-        synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } changed();
     }
+    private final java.util.concurrent.atomic.AtomicLong wireEvents=new java.util.concurrent.atomic.AtomicLong();
+    /** Monotonic count of live/demo wire events of this process; reading a recording never counts. For the no-traffic acceptance. */
+    public long wireEventCount() { return wireEvents.get(); }
     private JSONArray recordsCache=new JSONArray(); private long recordsStamp=-1; private int recordsCount=-1;
     /** REQ-028.13: rebuilt only when the folder changes; snapshot() runs every 500 ms on the main thread. ponytail: the size of the file being written refreshes with the next folder change. */
     public synchronized JSONArray listRecords() {
@@ -947,7 +953,7 @@ public final class ObdService extends Service {
                         if(event.optJSONObject("diagnostics")!=null && event.optJSONObject("diagnostics").has("raw_response")) { JSONObject decoded=new JSONObject(NativeCore.execute(core,"replay.dtc.scan",event.optJSONObject("diagnostics").toString())); set("diagnostics",decoded.opt("data")); }
                         set("replaySourceMode",event.optString("mode","unknown"));
                         if(event.optJSONObject("component")!=null && event.optJSONObject("component").length()>0) { JSONObject applied=new JSONObject(event.optJSONObject("component").toString()); put(applied,"replay",true); set("component",applied); } // the apply happened before this file began
-                    } else if(event.optString("type").equals("wire")) { synchronized(stateLock) { JSONArray rows=state.optJSONArray("debug"); rows.put(event); if(rows.length()>300) rows.remove(0); } }
+                    }
                 }
                 if(!headerFound) throw new IOException("Leere Aufnahme");
                 if(token==generation) { coverageDone=true; replayCoverage(file,coverage,coverageEnded); } // a Knowledge-pin mismatch of any part stops the replay here
@@ -1367,7 +1373,7 @@ public final class ObdService extends Service {
         JSONObject idle=idleSmart(); put(idle,"reason",reason); put(idle,"changes",new JSONArray(smartChanges)); put(idle,"latency_ms",smartLatencyMs);
         synchronized(stateLock) { put(state,"smart",idle); }
         AppLog.i("smart","end: "+reason);
-        message("Smart-Analyse beendet · "+reason);
+        message("Smart-Analyse beendet · "+reason+coverageSaveNotice());
         if(closeOwned && !autoRecordEnabled(this) && recordingProfile.equals(AUTO_PROFILE)) closeRecording("stopped","",false);
     }
     /** REQ-036.5: shows a recorded set change from the file; the selection follows the recorded set. Nothing is sent. */
@@ -1511,9 +1517,11 @@ public final class ObdService extends Service {
         if(ledger==null) return;
         String error=vehicles.setCoverageLedger(coverageVin,ledger);
         if(error!=null && !coverageSaveFailed) message("Fahrzeug-Abdeckung nicht gespeichert · "+error);
-        coverageSaveFailed=error!=null;
+        coverageSaveFailed=error!=null; coverageSaveError=error==null ? "" : error;
         if(error!=null) AppLog.w("coverage","ledger not stored");
     }
+    /** What the end of a run or session must still say after its own message replaced the one of the failed write; said once. */
+    private String coverageSaveNotice() { String notice=coverageSaveFailed ? " · Fahrzeug-Abdeckung nicht gespeichert · "+coverageSaveError : ""; coverageSaveFailed=false; return notice; }
     /** Worker, before the core goes away or when the run ends: last records in, ledger stored, run closed. */
     private void coverageLedgerFinish() {
         if(!coverageLedgerOn) return;
@@ -1613,8 +1621,8 @@ public final class ObdService extends Service {
         public void close() { open=false; }
         public String exchange(String command,long timeoutMs) throws Exception {
             if(!mode.equals(only) || !open) throw new IOException("Demo stopped");
-            debug("TX",command); String response=respond(command.trim().replace(" ","").toUpperCase(Locale.ROOT));
-            debug("RX",response); return response;
+            wire("TX",command); String response=respond(command.trim().replace(" ","").toUpperCase(Locale.ROOT));
+            wire("RX",response); return response;
         }
         private String respond(String c) {
             String response;

@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.system.OsConstants;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -23,20 +24,21 @@ import org.json.JSONObject;
  * vehicle session, the adapter transport or the diagnostic jobs (REQ-044.4), and it makes no request unless a user action or a caller
  * asking for an access token needs one (REQ-044.1).
  */
-final class ChatGptAccount {
-    static final String PLAN_SCOPE = "chatgpt.tokens.use.direct";
-    static final String SCOPE = "openid profile email offline_access resource.invoke " + PLAN_SCOPE;
-    static final String DYNAMIC_CLIENT = "dynamic_agent_client";
-    static final String AGENT_NAME = "OBDentic";
+public final class ChatGptAccount {
+    public static final String PLAN_SCOPE = "chatgpt.tokens.use.direct";
+    public static final String SCOPE = "openid profile email offline_access resource.invoke " + PLAN_SCOPE;
+    public static final String DYNAMIC_CLIENT = "dynamic_agent_client";
+    public static final String AGENT_NAME = "OBDentic";
     /** REQ-043.4: an access token valid for at least this long is used without a refresh. */
-    static final long REFRESH_MARGIN_MS = 300_000;
+    public static final long REFRESH_MARGIN_MS = 300_000;
 
-    static final String MSG_EXPIRED = "Anmeldung abgelaufen · bitte erneut mit ChatGPT anmelden";
-    static final String MSG_OFFLINE = "Keine Verbindung zu ChatGPT · erneut versuchen";
-    static final String MSG_REVOKED = "Abgemeldet · Zugriff widerrufen";
-    static final String MSG_UNCONFIRMED = "Abgemeldet · Widerruf nicht bestätigt. Der Zugriff lässt sich in den ChatGPT-Einstellungen unter „Manage usage“ entfernen.";
-    static final String MSG_UNREADABLE = "Nicht verbunden · die gespeicherte Anmeldung war nicht lesbar, bitte erneut mit ChatGPT verbinden";
-    static final String MSG_INVALID_CLIENT = "Registrierung ungültig · beim nächsten Anmelden registriert sich die App neu";
+    public static final String MSG_EXPIRED = "Anmeldung abgelaufen · bitte erneut mit ChatGPT anmelden";
+    public static final String MSG_OFFLINE = "Keine Verbindung zu ChatGPT · erneut versuchen";
+    public static final String MSG_REVOKED = "Abgemeldet · Zugriff widerrufen";
+    public static final String MSG_UNCONFIRMED = "Abgemeldet · Widerruf nicht bestätigt. Der Zugriff lässt sich in den ChatGPT-Einstellungen unter „Manage usage“ entfernen.";
+    public static final String MSG_UNREADABLE = "Nicht verbunden · die gespeicherte Anmeldung war nicht lesbar, bitte erneut mit ChatGPT verbinden";
+    public static final String MSG_INVALID_CLIENT = "Registrierung ungültig · beim nächsten Anmelden registriert sich die App neu";
+    private static final String SOCKET_DENIED = "socket_denied";
 
     /** REQ-043.7 */
     private static final Set<String> TERMINAL = new HashSet<>(Arrays.asList("invalid_grant", "invalid_refresh_token", "token_expired",
@@ -45,27 +47,27 @@ final class ChatGptAccount {
     private static final Set<String> CALLBACK_ERRORS = new HashSet<>(Arrays.asList("invalid_request", "unauthorized_client", "unsupported_response_type",
         "invalid_scope", "server_error", "temporarily_unavailable", "interaction_required", "login_required", "consent_required", "account_selection_required"));
 
-    enum Status {
+    public enum Status {
         NOT_CONNECTED("Nicht verbunden"), CONNECTED("Verbunden"), EXPIRED(MSG_EXPIRED), UNREACHABLE("ChatGPT nicht erreichbar"),
         PLAN_MISSING("ChatGPT-Plan-Nutzung nicht freigegeben");
-        final String label;
+        public final String label;
         Status(String label) { this.label = label; }
     }
 
-    enum Phase { IDLE, WAITING, EXCHANGING, DISCONNECTING }
+    public enum Phase { IDLE, WAITING, EXCHANGING, DISCONNECTING }
 
     /** Why a caller got no access token. */
-    enum Failure { NOT_CONNECTED, PLAN_NOT_ENABLED, EXPIRED, UNREACHABLE }
+    public enum Failure { NOT_CONNECTED, PLAN_NOT_ENABLED, EXPIRED, UNREACHABLE }
 
-    static final class Snapshot {
-        final Status status;
-        final Phase phase;
-        final String email, message;
+    public static final class Snapshot {
+        public final Status status;
+        public final Phase phase;
+        public final String email, message;
         /** Changes whenever anything shown changes. */
-        final long version;
-        final boolean revocationUnconfirmed;
+        public final long version;
+        public final boolean revocationUnconfirmed;
 
-        Snapshot(Status status, Phase phase, String email, String message, long version, boolean revocationUnconfirmed) {
+        public Snapshot(Status status, Phase phase, String email, String message, long version, boolean revocationUnconfirmed) {
             this.status = status;
             this.phase = phase;
             this.email = email;
@@ -76,9 +78,9 @@ final class ChatGptAccount {
     }
 
     /** Either a token or the reason there is none. */
-    static final class Token {
-        final String value;
-        final Failure failure;
+    public static final class Token {
+        public final String value;
+        public final Failure failure;
 
         private Token(String value, Failure failure) {
             this.value = value;
@@ -86,32 +88,32 @@ final class ChatGptAccount {
         }
     }
 
-    interface Launcher { void open(String url) throws ActivityNotFoundException; }
+    public interface Launcher { void open(String url) throws ActivityNotFoundException; }
 
     /** Holds the process in a network-allowed state while a sign-in waits for the browser (REQ-044.5). */
-    interface Keepalive { void start(); void stop(); }
+    public interface Keepalive { void start(); void stop(); }
 
-    interface Opener { LoopbackListener open(int port, long timeoutMs, boolean returnLink) throws IOException; }
+    public interface Opener { LoopbackListener open(int port, long timeoutMs, boolean returnLink) throws IOException; }
 
-    static final class Config {
-        String origin = "https://auth.openai.com";
-        String resource = "https://api.openai.com/v1";
-        String usageUrl = "https://chatgpt.com/settings/usage";
-        int preferredPort = 1455;
-        long callbackTimeoutMs = 300_000;
+    public static final class Config {
+        public String origin = "https://auth.openai.com";
+        public String resource = "https://api.openai.com/v1";
+        public String usageUrl = "https://chatgpt.com/settings/usage";
+        public int preferredPort = 1455;
+        public long callbackTimeoutMs = 300_000;
         /** REQ-043.11: pauses between the three revocation attempts. */
-        long[] revokeDelaysMs = {1000, 3000};
-        int revokeTimeoutMs = 10_000;
+        public long[] revokeDelaysMs = {1000, 3000};
+        public int revokeTimeoutMs = 10_000;
         /** Callback page link back to the app; removed when the phone measurement of REQ-044.7 says it does not work. */
-        boolean returnLink = true;
-        LongSupplier clock = System::currentTimeMillis;
-        AccountHttp.Transport transport;
-        Launcher launcher;
-        Keepalive keepalive;
-        Opener opener = LoopbackListener::open;
-        AccountStore store;
+        public boolean returnLink = true;
+        public LongSupplier clock = System::currentTimeMillis;
+        public AccountHttp.Transport transport;
+        public Launcher launcher;
+        public Keepalive keepalive;
+        public Opener opener = LoopbackListener::open;
+        public AccountStore store;
 
-        static Config defaults(Context context) {
+        public static Config defaults(Context context) {
             Config c = new Config();
             Context app = context.getApplicationContext();
             c.transport = new AccountHttp.HttpsTransport();
@@ -127,13 +129,13 @@ final class ChatGptAccount {
 
     private static ChatGptAccount instance;
 
-    static synchronized ChatGptAccount get(Context context) {
+    public static synchronized ChatGptAccount get(Context context) {
         if (instance == null) instance = new ChatGptAccount(Config.defaults(context));
         return instance;
     }
 
     /** Test seam: replaces the process-wide account. */
-    static synchronized void install(ChatGptAccount account) { instance = account; }
+    public static synchronized void install(ChatGptAccount account) { instance = account; }
 
     private final Config config;
     private final AccountStore store;
@@ -145,6 +147,7 @@ final class ChatGptAccount {
     /** Set by {@link #cancel()} for the running attempt, also while its listener does not exist yet. */
     private boolean cancelRequested;
     private String message = "";
+    private boolean networkSettingsPrompt;
     private boolean expired, unreachable, loaded;
     /** True while {@code record} is a rotated credential that storage does not hold yet: the one valid refresh token, retried on every access. */
     private boolean unsaved;
@@ -155,7 +158,7 @@ final class ChatGptAccount {
     private LoopbackListener listener;
     private volatile JSONObject discovery;
 
-    ChatGptAccount(Config config) {
+    public ChatGptAccount(Config config) {
         this.config = config;
         this.store = config.store;
         this.host = java.net.URI.create(config.origin).getHost();
@@ -183,11 +186,11 @@ final class ChatGptAccount {
     }
 
     /** Forgets the cached record; the next call reads the file again. A rotated record that is not stored yet is kept. */
-    void reload() {
+    public void reload() {
         synchronized (state) { if (!unsaved) loaded = false; version++; }
     }
 
-    Snapshot snapshot() {
+    public Snapshot snapshot() {
         synchronized (state) {
             AccountStore.Record r = current();
             Status s = r == null ? (expired ? Status.EXPIRED : Status.NOT_CONNECTED)
@@ -200,21 +203,30 @@ final class ChatGptAccount {
 
     // ---------------------------------------------------------------- one-time dialog (REQ-042.11)
 
-    boolean firstUseDue() { return "due".equals(store.firstUse()); }
+    public boolean firstUseDue() { return "due".equals(store.firstUse()); }
 
-    void firstUseAcknowledged() {
+    public void firstUseAcknowledged() {
         store.setFirstUse("done");
         synchronized (state) { changed(); }
     }
 
     /** REQ-042.10: opens the usage settings in the system browser; false when there is none. */
-    boolean openUsage() {
+    public boolean openUsage() {
         try {
             config.launcher.open(config.usageUrl);
             return true;
         } catch (ActivityNotFoundException e) {
             return false;
         }
+    }
+
+    /** Recovery stays available until the user decides, including across Activity recreation. */
+    boolean networkSettingsPromptDue() {
+        synchronized (state) { return networkSettingsPrompt; }
+    }
+
+    void dismissNetworkSettingsPrompt() {
+        synchronized (state) { networkSettingsPrompt = false; }
     }
 
     // ---------------------------------------------------------------- sign-in (REQ-042)
@@ -233,7 +245,7 @@ final class ChatGptAccount {
      * 'Continue with ChatGPT'. Returns false when ignored: an attempt or a disconnect is running, or the account is connected
      * (REQ-042.12). An inactive sign-in without the plan permission is repeated with prompt=consent (REQ-042.9).
      */
-    boolean signIn() {
+    public boolean signIn() {
         final long id, startEpoch;
         final boolean reauth;
         synchronized (state) {
@@ -243,6 +255,7 @@ final class ChatGptAccount {
             reauth = existing != null;
             phase = Phase.WAITING;
             message = "";
+            networkSettingsPrompt = false;
             id = ++signInId;
             cancelRequested = false;
             keepaliveOwner = id;
@@ -258,7 +271,7 @@ final class ChatGptAccount {
     }
 
     /** REQ-042.5: ends a waiting attempt. */
-    void cancel() {
+    public void cancel() {
         synchronized (state) {
             if (phase != Phase.WAITING) return;
             cancelRequested = true; // the attempt checks this before it publishes a listener and before it opens the browser
@@ -294,6 +307,7 @@ final class ChatGptAccount {
             if (signInId == id) {
                 phase = Phase.IDLE;
                 message = text == null ? "" : text;
+                networkSettingsPrompt = !cancelRequested && SOCKET_DENIED.equals(result);
                 changed();
             }
         }
@@ -313,8 +327,13 @@ final class ChatGptAccount {
         LoopbackListener l;
         try {
             l = config.opener.open(config.preferredPort, config.callbackTimeoutMs, config.returnLink);
-        } catch (IOException e) {
-            throw new Stop("Kein freier lokaler Port für die Anmeldung", "no_port");
+        } catch (IOException | SecurityException e) {
+            int errno = LoopbackListener.socketErrno(e);
+            if (e instanceof SecurityException || errno == OsConstants.EACCES || errno == OsConstants.EPERM) {
+                throw new Stop("Android verweigert den lokalen Netzwerkzugriff für die Anmeldung", SOCKET_DENIED);
+            }
+            if (errno == OsConstants.EADDRINUSE) throw new Stop("Lokaler Port für die Anmeldung belegt", "no_port");
+            throw new Stop("Lokaler Anmeldedienst konnte nicht gestartet werden", "listener_open");
         }
         synchronized (state) {
             if (signInId != id || cancelRequested) { l.close(); throw new CancellationException(); }
@@ -499,7 +518,7 @@ final class ChatGptAccount {
      * The access token for a caller (the assistant, #328), refreshed first when it is valid for less than 300 seconds. Blocking; call it
      * off the main thread. Without the plan permission it answers PLAN_NOT_ENABLED without any request (REQ-042.9).
      */
-    Token accessToken() {
+    public Token accessToken() {
         Held h = held();
         if (h == null) return failure();
         Token t = usable(h.record);
@@ -673,7 +692,7 @@ final class ChatGptAccount {
      * Disconnects: cancels a sign-in or refresh in progress, revokes the refresh token (three attempts), then deletes the credentials
      * locally in any case. Returns false when a disconnect is already running.
      */
-    boolean disconnect() {
+    public boolean disconnect() {
         final AccountStore.Record r;
         synchronized (state) {
             if (phase == Phase.DISCONNECTING) return false;
@@ -683,6 +702,7 @@ final class ChatGptAccount {
             r = current();
             phase = Phase.DISCONNECTING;
             message = "";
+            networkSettingsPrompt = false;
             changed();
         }
         log("disconnect start connected=" + (r != null));

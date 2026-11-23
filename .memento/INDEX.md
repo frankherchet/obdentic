@@ -6,3 +6,4 @@
 - [Bundle vehicle acceptance](bundle-vehicle-acceptance.md) — preference — minimize separate trips to the vehicle
 - [Local extracted profile archive](local-profile-archive.md) — reference — complete Car Scanner source archive stays local
 - [Finish bundled hardware acceptance](hardware-acceptance.md) — todo — test plan for next drive on #178; F187 confirmed; report on #283/#290/#292/#293
+- [Android acceptance on obdentic-acc](android-acceptance-run.md) — gotcha — ≥8 GB free disk, lint before the 5-min runner, HOME/default-selection/back-key pitfalls

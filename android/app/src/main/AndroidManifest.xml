@@ -13,7 +13,8 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <application android:label="${appLabel}" android:theme="@android:style/Theme.Material.NoActionBar"
         android:icon="@drawable/ic_obdentic" android:dataExtractionRules="@xml/data_extraction_rules"
-        android:allowBackup="false" android:fullBackupContent="false" android:supportsRtl="true" android:usesCleartextTraffic="false">
+        android:allowBackup="false" android:fullBackupContent="false" android:supportsRtl="true" android:usesCleartextTraffic="false"
+        android:enableOnBackInvokedCallback="true">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

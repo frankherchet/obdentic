@@ -18,8 +18,20 @@ The UI never accepts raw commands, addresses or mutation capabilities.
 - The engine baseline, drive and OBD expansion profiles of the catalog, offered as built-in
   presets ("Vorlage · Motor-Grundwerte", "Fahrt", "OBD-Zusatzwerte", "Weitere OBD-Werte") under
   Live → Messwerte auswählen → Preset anwenden (REQ-025.6); unsupported signals are skipped.
-  There is no recording-profile chooser: "Gewählte Messwerte aufzeichnen" below the Live tiles starts a
-  recording of the selection; while recording, "Aufzeichnung stoppen" stays above the tiles (REQ-025.7).
+  There is no recording-profile chooser: "Auswahl aufzeichnen" in the bar above the Live tiles starts a
+  recording of the selection; while recording, "Aufzeichnung stoppen" takes its place (REQ-025.7).
+- Task-oriented navigation: the bottom bar holds only **Live**, **Diagnose** and **Aufnahmen**; the app
+  opens in Live. The header shows the page title and a context bar: the labelled connection/mode button
+  (LIVE · GETRENNT / LIVE · ADAPTER / DEMO · SIMULIERT / REPLAY · DEMO|DATEI [· TEILAUFNAHME]) opens the
+  adapter view, the vehicle name the vehicle list. "Zurück" and Android back return to the last work area;
+  the view and the open sections survive rotation. Changing the view never starts a search or a job.
+  Without a connection Live shows one start surface ("Adapter verbinden" opens the adapter view without a
+  search, "Demo starten" starts the simulation). Diagnose leads with "Fehlercodes lesen" and "Fahrzeug und
+  Steuergeräte erfassen"; the special checks sit under the closed "Weitere Prüfungen" (an active extended
+  session's card stays above it). Aufnahmen is a library: running recording, export folder and
+  "Alle exportieren" first, then the newest files with "Als Replay öffnen" and per-file "Weitere Aktionen";
+  recording and export settings are collapsed. There is no debug view: raw TX/RX exists only in private
+  recordings for offline analysis (REQ-033 is obsolete).
 - Five OBDentic component presets ("dpf", "egr", "cooling", "turbo", "rail", German names) in the same
   "Preset anwenden" list (REQ-035) and the user-started smart analysis (REQ-036), see below.
 - Private recording, foreground connected-device service, screen-off operation,
@@ -122,7 +134,7 @@ attempt at once and the pauses start again at 2 seconds (REQ-020.10); the status
 foreground service stays up while waiting, so retries also run with the screen off. A manual
 "Verbindung trennen", the "Automatische Verbindung stoppen" button, starting the demo or opening
 a replay ends the attempts; none follow until the user connects or the app is started again.
-"Automatisch verbinden" on the Adapter tab (default on, persisted) switches the feature.
+"Automatisch verbinden" in the adapter view (default on, persisted) switches the feature.
 With Bluetooth off or a permission missing no attempt is made, the status line says why, and
 attempts resume when Bluetooth turns on (or when the app returns to the foreground).
 
@@ -131,7 +143,7 @@ connection (also after an automatic reconnect), once the automatic ECU identific
 availability jobs are done, the app runs the existing read-only `dtc.scan` once: stored (Mode 03)
 and pending (Mode 07) codes per responder, or "keine Fehler"; a negative response, NO DATA or
 timeout stays an explicit result and never ends the connection. Its TX/RX goes into the running
-automatic recording and replay shows both lists without traffic. Switch on the Adapter tab
+automatic recording and replay shows both lists without traffic. Switch in the adapter view
 (default on, persisted). Demo and replay never scan; nothing is ever cleared (no Mode 04).
 
 After an automatic connection only the existing initialization and inventory run, with the normal
@@ -468,6 +480,10 @@ disconnect confirmation, and when a caller (the assistant, #328) asks for an acc
   A sign-in whose credential cannot be stored is revoked and leaves no file or key behind. The ID token is accepted only with an RS256 signature from the discovery
   document's JWKS, issuer `https://auth.openai.com`, the client id as audience, an expiry in the future (60 s leeway) and the attempt's
   nonce.
+  If Android denies the local socket (#352, REQ-042.13), the account screen offers **Einstellungen öffnen** or **Abbrechen**.
+  The button opens this app's data usage in Android, falling back to its app info. On LineageOS, allow **Netzwerkzugriff**
+  and **WLAN-Daten** under **WLAN-Datennutzung**. Return and tap **Continue with ChatGPT** again; no settings change or retry
+  happens automatically. A port conflict, another socket failure or loss of connectivity does not offer the dialog.
 - **Plan permission missing:** a valid sign-in whose granted scope lacks `chatgpt.tokens.use.direct` is kept (as OpenAI advises) but
   inactive: no access token is handed out and no inference request is possible until **Continue with ChatGPT** repeats the
   authorization with `prompt=consent`. A repeat that returns another subject than the stored one is rejected: the stored account stays and the
@@ -492,7 +508,8 @@ disconnect confirmation, and when a caller (the assistant, #328) asks for an acc
   tags and now refuses a split tag), cleartext traffic stays disabled, and the only use is HTTPS to `auth.openai.com` (discovery, keys,
   token, revocation). While a sign-in waits for the browser a foreground service of type `dataSync` (`SignInService`, notification
   *ChatGPT-Anmeldung läuft*, permission `FOREGROUND_SERVICE_DATA_SYNC`) keeps the process in a network-allowed state; it starts with
-  the tap, stops within 2 s after the attempt ends and never runs otherwise. Debug builds only: a file `debug-no-signin-service` in the
+  the tap, stops within 2 s after the attempt ends and never runs otherwise. If an attempt ends before Android creates the service,
+  its stop is deferred until the service has entered the foreground (#350). Debug builds only: a file `debug-no-signin-service` in the
   app's files directory (`adb shell run-as de.obdentic.app.debug touch files/debug-no-signin-service`) switches it off for the
   measurement of REQ-044.6; whether the service and the callback page's return link stay is decided by the phone measurements
   (REQ-044.6, REQ-044.7), which are part of the real-phone checklist in #330.
@@ -543,8 +560,8 @@ can select a different compatible NDK installation. The build adds no Java/Kotli
 runtime dependencies beyond Android itself. APKs, JNI binaries, local SDK paths
 and Gradle caches remain untracked. The native crate has its own lockfile.
 
-Start OBDentic, open **Adapter**, and choose **Demo starten** for desk testing,
-or **Adapter suchen** for the real Carly. Android requests Nearby devices and
+Start OBDentic and choose **Demo starten** on Live for desk testing, or **Adapter verbinden** →
+**Adapter suchen** for the real Carly. Android requests Nearby devices and
 notification permissions as needed. No USB connection to the Mac is required for
 live use. A connected session remains owned by the service when switching tabs,
 recreating the Activity or locking the screen. Reopening after process death
@@ -773,11 +790,81 @@ git tag v0.2.0 && git push origin v0.2.0
 If the upload fails (network, quota), re-run the workflow; it uploads the same
 version again. Missing secrets are listed by name in the failing step.
 
+## ADR 0006 coverage matrix (REQ-046.19)
+
+This section classifies the 35 scenarios of the accepted
+[ADR 0006](adr/0006-multi-ecu-uds-sessions.md) simulation. It is a reading of the current code against the prototype
+case source; it adds no test and no production protocol stack, and no result below claims that a new test or any
+future #321 path has run. The cases come from the unmerged spike branch `spike/322-multi-ecu-uds-sim`
+(`spikes/322-multi-ecu-uds/`, test file `spikes/322-multi-ecu-uds/tests/scenarios.rs`), a throwaway reference model on a stateful simulated
+adapter that is not merged and not a diagnostic stack to merge. All data is synthetic.
+
+**Virtual time.** The prototype advances a synthetic virtual clock (milliseconds) instead of sleeping, so keepalive
+gaps, late-frame windows, S3 expiry, backoff (2 s, 4 s, 60 s cool-down) and the maintenance budget are properties of
+the modelled rules. They are not vehicle timing; real S3, gateway and adapter buffering behaviour stays with the
+separate hardware gates [#178](https://github.com/frankherchet/obdentic/issues/178) and #330.
+
+**Classes.**
+- *Production now*: the production path (`ElmSession`, `UdsSessionState`, `MobileCore`) already produces the observable
+  of the case, but only for the single-ECU slot it has today. A "partial" tag names the part that the single slot
+  cannot show; the case as written is not satisfied by it.
+- *Reference model only*: the observable depends on timing and ECU state that only the simulated adapter models
+  (S3 expiry under a blocked read, measured maintenance cost). Production has no counterpart and the case proves no
+  vehicle behaviour; it needs #321 and #178 before any production claim.
+- *Awaits #321*: production lacks the behaviour (several sessions, ledger, stop-all, backoff, NRC table, scheduler) or
+  does the opposite today (any rejected read or transport fault sends `10 01` and ends the one session). "Partial"
+  names the nearest existing production behaviour; it does not meet the case.
+
+Today's single slot is `UdsSessionState` (one target, one responder, ten-minute limit, `3E 80` after 2 s on a poll);
+existing tests are in `src/mobile/uds.rs` (`req_027_*`). Neither the matrix nor #359 changes them.
+
+| # | Prototype test function | Class | Reason |
+| --- | --- | --- | --- |
+| 1 | `two_sessions_interleaved_with_mode01_keep_s3_alive_without_relying_on_reads` | Awaits #321 | Production holds one session; no second session or maintenance of reads. |
+| 2 | `header_switches_are_tracked_and_never_redundant` | Production now (partial) | `ElmSession` tracks `configured_target` and sends `ATSH`/`ATCRA` only on target change; interleaving two held sessions is not possible. |
+| 3 | `multi_frame_response_is_assembled_for_the_requesting_target_only` | Production now (partial) | ISO-TP assembly checks responder header and sequence for the requested target; the second-ECU part needs #321. |
+| 4 | `foreign_responder_through_the_filter_stops_everything_without_further_traffic` | Awaits #321 | Production rejects an unexpected responder but then sends cleanup `10 01`; no stop-all without traffic. |
+| 5 | `stray_frame_without_an_unanswered_request_stops_everything` | Awaits #321 | No ledger of unanswered requests; a stray frame is not classified. |
+| 6 | `late_frame_matching_exactly_one_unanswered_request_is_discarded_without_coverage` | Awaits #321 | Needs the request ledger and late-frame attribution. |
+| 7 | `identical_request_is_not_repeated_while_its_late_answer_could_still_arrive` | Awaits #321 | No late-answer window in scheduling. |
+| 8 | `truncated_multi_frame_response_stops_everything` | Awaits #321 | Truncation is rejected as an error (partial), but cleanup `10 01` follows instead of stop-all. |
+| 9 | `missing_prompt_is_a_transport_failure_and_stops_everything` | Awaits #321 | Exchange error clears the header shadow and ends the session (partial); no transport classification or stop-all. |
+| 10 | `disconnect_marks_every_target_unconfirmed_and_sends_nothing` | Production now (partial) | `on_disconnect` makes the one session indeterminate and `tick` sends nothing; "every target" needs #321. |
+| 11 | `blocked_read_makes_overdue_session_unconfirmed_and_it_is_reverified_not_assumed` | Reference model only | Depends on modelled S3 expiry during a blocked read; re-verification needs #321, real timing #178. |
+| 12 | `nrc_table` | Awaits #321 | The NRC classification table does not exist in production. |
+| 13 | `ordinary_negative_response_to_one_read_marks_only_that_signal` | Awaits #321 | Today one rejected read ends the session (ADR 0003 behaviour). |
+| 14 | `nrc_7f_on_a_session_only_did_is_session_loss_evidence_and_the_session_is_reestablished` | Awaits #321 | No session-loss evidence or re-establishment. |
+| 15 | `nrc_31_after_a_spontaneous_session_end_is_decided_by_the_canary_read` | Awaits #321 | No canary read. |
+| 16 | `nrc_31_on_one_did_of_a_live_session_does_not_end_the_session` | Awaits #321 | Today a rejected read ends the session. |
+| 17 | `definitive_refusal_is_not_retried_and_other_targets_continue` | Production now (partial) | A final NRC on `10 03` leaves the session inactive without retry; "other targets continue" needs #321. |
+| 18 | `transient_refusal_backs_off_2_4_s_then_cools_down_60_s_and_never_gives_up` | Awaits #321 | No backoff or cool-down. |
+| 19 | `repeated_activation_then_immediate_session_loss_is_bounded_by_backoff_and_cooldown` | Awaits #321 | No failure-sequence tracking. |
+| 20 | `successful_default_session_reads_do_not_qualify_and_do_not_reset_the_sequence` | Awaits #321 | No qualifying-read rule. |
+| 21 | `a_qualifying_session_read_resets_the_failure_sequence` | Awaits #321 | No qualifying-read rule. |
+| 22 | `busy_repeat_request_on_activation_is_unconfirmed_cleaned_up_and_only_then_backed_off` | Production now (partial) | NRC `21` on `10 03` is not final: `10 01` cleanup runs first; the backoff afterwards needs #321. |
+| 23 | `busy_repeat_request_on_activation_without_a_positive_return_isolates_only_that_target` | Awaits #321 | Failed cleanup makes the single session indeterminate (partial); no per-target isolation. |
+| 24 | `unanswered_activation_is_cleaned_up_and_an_unconfirmed_return_isolates_only_that_target` | Awaits #321 | Cleanup after an unanswered activation exists (partial); no per-target isolation. |
+| 25 | `unconfirmed_return_over_a_failing_transport_stops_everything_instead` | Awaits #321 | No transport classification or stop-all. |
+| 26 | `keepalive_refusal_releases_the_ecu_and_marks_it_refused` | Awaits #321 | A failed `3E 80` sends `10 01` and ends the session (partial); no refused status. |
+| 27 | `two_unanswered_session_reads_in_a_row_trigger_reverification_by_10_03` | Awaits #321 | Today one failed read ends the session; no re-verification. |
+| 28 | `dpf_raw_request_keeps_priority_while_two_sessions_are_maintained_and_nothing_starves` | Awaits #321 | No scheduler with priorities across two sessions. |
+| 29 | `third_session_is_refused_when_measured_maintenance_cost_exceeds_the_budget` | Reference model only | Modelled adapter cost and budget; real cost and ceiling of 3 stay with #178; needs #321. |
+| 30 | `third_session_is_admitted_when_the_measured_cost_is_low` | Reference model only | Same modelled cost and ceiling; needs #321 and #178. |
+| 31 | `finished_goals_close_only_their_ecu_and_end_of_run_closes_the_rest` | Awaits #321 | `disable` closes the one session (partial); no goal tracking across ECUs. |
+| 32 | `tester_present_is_sent_only_when_a_target_is_due_never_continuously` | Production now (partial) | `tick` sends `3E 80` at most every 2 s for the one target; the several-target bound needs #321. |
+| 33 | `tester_present_goes_to_the_earliest_deadline_first_when_several_are_due` | Awaits #321 | Needs several targets and deadlines. |
+| 34 | `idle_scheduler_waits_for_the_next_deadline_instead_of_polling_the_keepalive` | Awaits #321 | Keepalive is polled once per poll today, not scheduled by deadline. |
+| 35 | `only_the_closed_vocabulary_ever_reaches_the_adapter` | Production now (partial) | Session wire commands are the fixed `10 03`, `10 01`, `3E 80` plus Knowledge DID reads; the multi-ECU vocabulary run needs #321. |
+
+Totals: 7 production now (all partial), 3 reference model only, 25 awaits #321. A "production now" row is not
+vehicle acceptance, and no row is a hardware result.
+
 ## Acceptance
 
-Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals); ids stay in the Debug tab.
+Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals).
 
-The Debug tab is one full-height TX/RX window that scrolls to the newest line after every update (REQ-033.1).
+No view shows raw TX/RX, a log window or a debug copy action; recordings keep timestamped `wire` events for the offline evaluation.
+`ObdService.wireEventCount()` counts live and demo wire events (never file reads), so no-traffic checks compare it before and after.
 
 Build and install the instrumentation APK, then run it with the phone unlocked:
 

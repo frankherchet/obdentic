@@ -16,11 +16,17 @@ import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.SystemClock;
+import android.provider.Settings;
+import android.system.ErrnoException;
+import android.system.OsConstants;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Button;
 import android.widget.TextView;
 import java.io.File;
+import java.io.IOException;
+import java.net.BindException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -98,9 +104,75 @@ final class AccountUiAcceptance {
     }
 
     private static void openAccountSection(Instrumentation inst, Activity a) throws Exception {
-        click(inst, a, "Adapter");
-        click(inst, a, "Konto öffnen"); // REQ-042.1: two taps from the main navigation
+        onMain(inst, () -> { UiNav.openAdapter(a); return null; }); // the labelled connection header
+        click(inst, a, "Konto öffnen"); // REQ-042.1: two taps from the main view
         waitText(inst, a, "ChatGPT-Konto", true, "account section");
+    }
+
+    private static AccessibilityNodeInfo dialogButton(UiAutomation ui, String text) {
+        AccessibilityNodeInfo root = ui.getRootInActiveWindow();
+        if (root == null) return null;
+        for (AccessibilityNodeInfo node : root.findAccessibilityNodeInfosByText(text)) {
+            if (node.getText() != null && text.equalsIgnoreCase(node.getText().toString()) && node.isClickable()) return node;
+        }
+        return null;
+    }
+
+    private static void returnFromSettings(UiAutomation ui, MainActivity activity) throws Exception {
+        // the back key must reach Settings, not the app's still-focused window during the transition
+        waitUntil(() -> { AccessibilityNodeInfo root = ui.getRootInActiveWindow(); return root != null && !activity.getPackageName().contentEquals(root.getPackageName()); }, 8000, "#352 settings in front");
+        try (android.os.ParcelFileDescriptor ignored = ui.executeShellCommand("input keyevent 4")) {
+            waitUntil(() -> MainActivity.resumed == activity, 8000, "#352 return from settings");
+        }
+    }
+
+    /** #352 / REQ-042.13: denied sockets offer OS settings, not for unrelated bind errors. Returning does not restart OAuth. */
+    private static void networkSettings(Instrumentation inst, MainActivity activity, Fixture f, Context ctx) throws Exception {
+        UiAutomation ui = inst.getUiAutomation();
+        try {
+            f.config.opener = (p, t, r) -> { throw new IOException(new ErrnoException("bind", OsConstants.EADDRINUSE)); };
+            click(inst, activity, "Continue with ChatGPT");
+            waitText(inst, activity, "Lokaler Port für die Anmeldung belegt", true, "#352 occupied port is reported separately");
+            require(dialogButton(ui, "Einstellungen öffnen") == null, "#352 no settings dialog for a port conflict");
+            f.config.opener = (p, t, r) -> { throw new IOException("socket unavailable"); };
+            click(inst, activity, "Continue with ChatGPT");
+            waitText(inst, activity, "Lokaler Anmeldedienst konnte nicht gestartet werden", true, "#352 unknown I/O failure is not called a port conflict");
+            require(dialogButton(ui, "Einstellungen öffnen") == null, "#352 no settings dialog for an unknown I/O failure");
+
+            for (int errno : new int[]{OsConstants.EPERM, OsConstants.EACCES}) {
+                f.config.opener = (p, t, r) -> {
+                    BindException denied = new BindException("socket unavailable");
+                    denied.initCause(new ErrnoException("socket", errno));
+                    throw denied;
+                };
+                click(inst, activity, "Continue with ChatGPT");
+                waitUntil(() -> dialogButton(ui, "Einstellungen öffnen") != null, 8000, "#352 denied socket offers settings");
+                require(f.browser.opened.isEmpty() && f.auth.requests.isEmpty(), "#352 no OAuth with a denied socket");
+                if (errno == OsConstants.EPERM) {
+                    inst.runOnMainSync(() -> activity.startActivity(new Intent(Settings.ACTION_SETTINGS)));
+                    waitUntil(() -> MainActivity.resumed != activity, 8000, "#352 app moved to background");
+                    returnFromSettings(ui, activity);
+                    waitUntil(() -> dialogButton(ui, "Einstellungen öffnen") != null, 8000, "#352 unresolved dialog returns");
+                }
+                String action = errno == OsConstants.EPERM ? "Abbrechen" : "Einstellungen öffnen";
+                AccessibilityNodeInfo button = dialogButton(ui, action);
+                require(button != null && button.performAction(AccessibilityNodeInfo.ACTION_CLICK), "#352 " + action);
+                if (errno == OsConstants.EACCES) {
+                    String appLabel = ctx.getApplicationInfo().loadLabel(ctx.getPackageManager()).toString();
+                    waitUntil(() -> {
+                        AccessibilityNodeInfo root = ui.getRootInActiveWindow();
+                        return root != null && !ctx.getPackageName().contentEquals(root.getPackageName())
+                            && !root.findAccessibilityNodeInfosByText(appLabel).isEmpty();
+                    }, 8000, "#352 opens system settings");
+                    returnFromSettings(ui, activity);
+                }
+                waitUntil(() -> dialogButton(ui, "Einstellungen öffnen") == null, 8000, "#352 prompt dismissed");
+                require(count(inst, activity, "Continue with ChatGPT") == 1 && f.browser.opened.isEmpty()
+                    && f.auth.requests.isEmpty(), "#352 only another tap retries sign-in");
+            }
+        } finally {
+            f.config.opener = LoopbackListener::open;
+        }
     }
 
     static void run(Instrumentation inst, MainActivity activity, ObdService service, Context ctx) throws Exception {
@@ -114,6 +186,7 @@ final class AccountUiAcceptance {
             require(count(inst, activity, "Continue with ChatGPT") == 1 && status(inst, activity).equals("Nicht verbunden"), "REQ-042.1 one button 'Continue with ChatGPT'; REQ-042.10 'Nicht verbunden'");
             require(!service.snapshot().optString("phase").equals("ready") || service.snapshot().optString("mode").equals("demo"), "REQ-042.1 no vehicle connection needed");
             require(f.auth.requests.isEmpty(), "REQ-044.1 opening the section sends no request");
+            networkSettings(inst, activity, f, ctx);
 
             // REQ-042.5, REQ-042.12: waiting state, pending feedback, second tap ignored, cancel
             f.browser.callback = null;
@@ -264,6 +337,23 @@ final class AccountUiAcceptance {
         Context app = ctx.getApplicationContext();
         File debugSwitch = new File(ctx.getFilesDir(), SignInService.DEBUG_SWITCH);
         debugSwitch.delete();
+        // #350: a failed listener can finish before Android delivers the service's onCreate.
+        Fixture immediate = new Fixture(ctx);
+        try {
+            immediate.config.keepalive = new ChatGptAccount.Keepalive() {
+                @Override public void start() { SignInService.start(app); }
+                @Override public void stop() { SignInService.stop(app); }
+            };
+            immediate.config.opener = (port, timeout, returnLink) -> { throw new IOException(new ErrnoException("socket", OsConstants.EPERM)); };
+            onMain(inst, () -> {
+                immediate.account.signIn(); immediate.waitIdle();
+                immediate.account.signIn(); immediate.waitIdle();
+                return null;
+            });
+            SystemClock.sleep(1000);
+            require(!SignInService.running && immediate.account.snapshot().message.contains("verweigert den lokalen Netzwerkzugriff"),
+                "#350 failed sign-in reports the error without crashing or leaving the service running");
+        } finally { immediate.close(); }
         String[] ends = {"cancel", "success", "denied", "timeout"};
         for (String end : ends) {
             Fixture f = new Fixture(ctx);
