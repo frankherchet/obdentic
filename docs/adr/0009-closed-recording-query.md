@@ -64,3 +64,32 @@ No criterion has been amended. The future documented event schema, precise expre
 ## Consequences
 
 #358 remains dependent on #306 and on evidence for the shared per-event/provenance and bounded-execution boundary. Before implementation readiness is claimed, obtain the missing synthetic boundary and cancellation evidence, supported-Android release APK comparison, runtime evidence and complete shipped-dependency rights inventory. Any actual conflict found later must be reported with a proposed amendment for human approval; do not silently change the accepted text or numbers. This session did not run tests, builds or hardware checks.
+
+## Synthetic follow-up — #365
+
+The earlier verdict describes the paper pass. The owner subsequently authorized one synthetic experiment. A standalone, dependency-free Rust prototype was run locally and is not part of this repository's product build.
+
+### Observations
+
+From the prototype crate, `cargo +1.98.0 test --locked` and `cargo +1.98.0 test --release --locked -- --test-threads=1 --nocapture` each passed 15 fixtures. The release fixture run took 0.42 s on the host, not on Android.
+
+| Fixture | Observed outcome |
+|---|---|
+| Half-open rotation window | RPM 800 at 10 and 1200 at 19 contribute to `[10, 20)`; the sample at 20 does not. Count 2, mean 1000, source refs `(0,3)` and `(1,2)`. |
+| Pages and cursors | 250 events yielded 100/100/50 in original order. Exactly 65,536 encoded bytes fit; a single oversized row produced `OutputLimit`. Wrong-query and changed-revision cursors were refused. |
+| Lines | 100,000 complete; input with 100,001 stops at the line limit. |
+| Input bytes | 33,554,432 complete; input with 33,554,433 stops at the byte limit (33,552,753 bytes consumed). |
+| Work | 200,000 counted evaluations complete; evaluation 200,001 is not performed. The prototype counts comparisons, conjunctions, projections and an aggregate charge. |
+| Time | Injected time completes at 1 s and reports `TimeLimit` beyond it. The clock is checked once per line. |
+| Memory | 8,388,608 accounted bytes complete; one more byte triggers `MemoryLimit`. Accounting includes parsed values and retained rows, not allocator overhead, input text or stack. |
+| Cancellation and empty selection | Cancellation before results and after a 10-event prefix yielded no mean. Empty selection completed with count 0 and no mean. |
+
+The ARM64 NDK release `cdylib` comparison used `cargo +1.98.0 build --locked --release --target aarch64-linux-android` with and without the prototype evaluator feature. The delta was 175,048 B unstripped, 131,592 B stripped and 71,692 B gzipped. The baseline links less of the standard library than the product. No signed release APK was built or device runtime measured. The prototype adds no crate dependency and includes no jq source.
+
+### Updated verdict
+
+- **Confirm — not met:** selected synthetic fixtures passed, but they used in-memory parts and did not run at the shared #306 replay boundary. Neither real replay resource accounting nor Android package/runtime costs were established.
+- **Refute — not demonstrated:** no approved bound was exceeded in the tested prototype accounting, and no forbidden syntax reached execution in the fixtures. This is not evidence about the eventual shared path or APK.
+- **Inconclusive — met:** the current report walker returns a summary; the shared #306 interface has not demonstrated ordered events with stable source positions, shared cancellation and per-call resource accounting. The prototype cursor depends on a header revision string and does not detect changes that leave it unchanged. Operator/memory accounting, mixed-type comparisons and time-check granularity are experimental, not product decisions.
+
+Keep this ADR proposed and #358 blocked. Re-run boundary and cancellation tests at the shared replay seam and obtain like-for-like signed APK and Android runtime evidence. Do not adopt the prototype as a second decoder.
