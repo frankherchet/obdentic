@@ -364,7 +364,7 @@ public class MainActivity extends Activity {
                 JSONObject live=s.optJSONObject("coverageLive");
                 if(live.optBoolean("invalid"))b.append("Abdeckung dieses Laufs nicht verlässlich · es werden keine Zahlen gezeigt");
                 else{
-                    if(live.optBoolean("session_only"))b.append("Nur dieser Lauf · Fahrzeug nicht bestätigt\n");
+                    if(live.optBoolean("session_only")&&live.optString("problem").isEmpty())b.append("Nur dieser Lauf · Fahrzeug nicht bestätigt\n"); // a named problem (unreadable store) is the cause, not the identity
                     coverageSummary(b,live.optJSONObject("run"),"Dieser Lauf");
                     if(live.optBoolean("vehicle_attached")){b.append('\n');coverageSummary(b,live.optJSONObject("vehicle"),"Fahrzeug gesamt");}
                 }

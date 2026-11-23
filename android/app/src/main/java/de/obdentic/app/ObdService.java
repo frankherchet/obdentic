@@ -622,6 +622,7 @@ public final class ObdService extends Service {
             if(uds) applyCatalog(execute("catalog",""));
             if(!argument.isEmpty()) updateValue(argument,result);
             String notice=action.equals("inventory") ? vehicleNotice(observeVehicle(result.optJSONObject("data")),result.optJSONObject("data")) : "";
+            if(action.equals("inventory") && mode.equals("live")) coverageStoredRefresh(); // the inventory may have switched the selected vehicle (REQ-038.10)
             message(result.optBoolean("ok") ? "Auftrag abgeschlossen: " + action + notice : result.optString("error"));
             succeeded[0]=result.optBoolean("ok");
             if(succeeded[0] && action.equals("inventory") && autoSurvey && mode.equals("live")) { chain.clear(); chain.add("ecu.discover"); chain.add(AVAILABILITY); scanFor=autoScanWanted() ? token : -1; } // REQ-030.4, REQ-034.1
@@ -1490,12 +1491,12 @@ public final class ObdService extends Service {
         String vin; synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); vin=vehicle==null ? "" : vehicle.optString("vin"); }
         boolean confirmed=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin());
         JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"goal_definition",1); put(argument,"knowledge_revision",coverageRevision); Object stored=JSONObject.NULL;
-        if(confirmed) {
-            if(vehicles.unreadable()) coverageProblem=VehicleStore.UNREADABLE;
-            else { JSONObject ledger=vehicles.coverageLedger(vin);
-                if(ledger!=null) stored=ledger;
-                else if(vehicles.hasCoverageEntry(vin)) coverageProblem="Abdeckungsdaten des Fahrzeugs nicht lesbar";
-                else try { stored=new JSONObject(EMPTY_LEDGER); } catch(JSONException e) { throw new IllegalStateException(e); } }
+        if(mode.equals("live") && vehicles.unreadable()) coverageProblem=VehicleStore.UNREADABLE; // checked before the identity: an unreadable store has no selection, and "not confirmed" would name the wrong cause
+        else if(confirmed) {
+            JSONObject ledger=vehicles.coverageLedger(vin);
+            if(ledger!=null) stored=ledger;
+            else if(vehicles.hasCoverageEntry(vin)) coverageProblem="Abdeckungsdaten des Fahrzeugs nicht lesbar";
+            else try { stored=new JSONObject(EMPTY_LEDGER); } catch(JSONException e) { throw new IllegalStateException(e); }
         }
         put(argument,"vehicle",stored);
         JSONObject started=coverageCore("coverage.live.start",argument);
@@ -1547,9 +1548,10 @@ public final class ObdService extends Service {
     /** Worker. The stored vehicle ledger of the selected vehicle, summarized for the Live tab when no run is on; an unreadable one is shown as unavailable, never as empty. */
     private void coverageStoredRefresh() {
         JSONObject view=null; String vin=selectedVin();
-        if(core!=0 && !vin.isEmpty() && mode.equals("live")) {
+        boolean unreadable=mode.equals("live") && vehicles.unreadable(); // an unreadable store has no selection: the reason, not the missing selection, is what the card must say
+        if(core!=0 && mode.equals("live") && (unreadable || !vin.isEmpty())) {
             view=new JSONObject(); put(view,"vehicle",JSONObject.NULL); put(view,"problem","");
-            if(vehicles.unreadable()) put(view,"problem",VehicleStore.UNREADABLE);
+            if(unreadable) put(view,"problem",VehicleStore.UNREADABLE);
             else { JSONObject ledger=vehicles.coverageLedger(vin);
                 if(ledger!=null) { JSONObject argument=new JSONObject(); put(argument,"ledger",ledger); JSONObject summary=coverageCore("coverage.ledger.summary",argument);
                     if(summary!=null) put(view,"vehicle",summary); else put(view,"problem","Abdeckungsdaten des Fahrzeugs nicht lesbar"); }

@@ -408,7 +408,10 @@ takes the core away, and about every 30 s during a run, so a killed app loses at
 A ledger that cannot be read (unreadable store, malformed entry, unknown version) is never replaced: the run still counts in its run ledger, the card says
 "Fahrzeug-Abdeckung nicht verfügbar" with the reason (never a zero), measurement and recording go on, and the stored data stays as it was. A run whose
 records could not all be folded in is shown as unreliable without figures and does not store. A failed write is announced once and the stored ledger is not
-changed. Identity that is only confirmed after the start is not credited to the vehicle in that run.
+changed. Identity that is only confirmed after the start is not credited to the vehicle in that run. An unreadable vehicle store has no selected vehicle, so it is
+checked first: on connect, on every refresh and at a run's start and end the card names "Fahrzeugspeicher nicht lesbar" as the reason, never the missing identity.
+Every entry point (connect, vehicle selection, an inventory that switches the vehicle, delete, reset, unreadable store, stop/job/disconnect/lost link ending a run, the
+30 s save) refreshes the same card and is covered by `ComponentSmartAcceptance`.
 
 The Live tab shows an "ABDECKUNG" card below the tiles and the Smart card (the first eight tiles keep their space, #239): per goal context (today only the
 "Technische Basisabdeckung") the covered, partial and not covered counts, the summed measured time, the longest segment and the latest non-success states,
