@@ -21,10 +21,12 @@ use serde_json::{json, Value};
 
 use crate::coverage_ledger::{
     Boundary, Decoded, DefinitionVersions, EvidenceRef, Fact, FactBody, GoalContext, Latest,
-    LatestState, Outcome, Reading, Rules, RunId, SessionKind, SessionState, SmartRun, Status,
-    BASELINE_CONTEXT, BASELINE_LABEL,
+    LatestState, Ledger, Outcome, Reading, Rules, RunId, SessionKind, SessionState, SmartRun,
+    Status, BASELINE_CONTEXT, BASELINE_LABEL,
 };
 use crate::knowledge_db::KnowledgeCatalog;
+
+pub(in crate::mobile) mod live;
 
 /// The most parts one run may have; more invalidates it.
 pub const MAX_PARTS: usize = 64;
@@ -578,10 +580,35 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
     }
     let complete = reasons.is_empty();
 
+    let (entries, contexts) = summarize(ledger.ledger(), &rules);
+    let parts: Vec<Value> = pieces
+        .iter()
+        .map(|piece| json!({"part":piece.part,"records":piece.file_records,"ended":piece.ended}))
+        .collect();
+    let joins: Vec<Value> = joins
+        .iter()
+        .map(|(from, to, join)| {
+            json!({"from":from,"to":to,"verified":matches!(join, Join::Verified),
+                "missing_parts":match join {Join::Missing(parts) => parts.clone(), _ => Vec::new()}})
+        })
+        .collect();
+    Ok(
+        json!({"run":run,"coverage_invalid":false,"run_complete":complete,
+        "partial":!complete,"partial_reasons":reasons,"missing_parts":missing_parts,
+        "figures":if complete {"exact"} else {"supplied_parts_only"},
+        "parts":parts,"joins":joins,"label":BASELINE_LABEL,
+        "contexts":contexts,"entries":entries,"issues":Vec::<String>::new(),
+        "first_at":pieces[0].first_at}),
+    )
+}
+
+/// The per-entry and per-context figures of a ledger, shared by the offline derivation and the live
+/// ledger so that both count and name them the same way.
+fn summarize(ledger: &Ledger, rules: &Rules) -> (Vec<Value>, Vec<Value>) {
     let mut entries = Vec::new();
     let mut contexts: BTreeMap<String, [u32; 3]> = BTreeMap::new();
-    for (key, entry) in &ledger.ledger().entries {
-        let status = ledger.ledger().status(&rules, key);
+    for (key, entry) in &ledger.entries {
+        let status = ledger.status(rules, key);
         let counts = contexts.entry(key.context.id().to_owned()).or_default();
         counts[match status {
             Status::Covered => 0,
@@ -602,32 +629,14 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
             "latest":latest_json(entry.latest.as_ref()),
         }));
     }
-    let contexts: Vec<Value> = contexts
+    let contexts = contexts
         .into_iter()
         .map(|(context, counts)| {
             json!({"context":context,"covered":counts[0],"partial":counts[1],
             "not_covered":counts[2]})
         })
         .collect();
-    let parts: Vec<Value> = pieces
-        .iter()
-        .map(|piece| json!({"part":piece.part,"records":piece.file_records,"ended":piece.ended}))
-        .collect();
-    let joins: Vec<Value> = joins
-        .iter()
-        .map(|(from, to, join)| {
-            json!({"from":from,"to":to,"verified":matches!(join, Join::Verified),
-                "missing_parts":match join {Join::Missing(parts) => parts.clone(), _ => Vec::new()}})
-        })
-        .collect();
-    Ok(
-        json!({"run":run,"coverage_invalid":false,"run_complete":complete,
-        "partial":!complete,"partial_reasons":reasons,"missing_parts":missing_parts,
-        "figures":if complete {"exact"} else {"supplied_parts_only"},
-        "parts":parts,"joins":joins,"label":BASELINE_LABEL,
-        "contexts":contexts,"entries":entries,"issues":Vec::<String>::new(),
-        "first_at":pieces[0].first_at}),
-    )
+    (entries, contexts)
 }
 
 fn duration_us(duration: Duration) -> u64 {

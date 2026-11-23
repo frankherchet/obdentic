@@ -68,6 +68,8 @@ pub struct MobileCore<E> {
     /// REQ-038.9: the parts of a recorded run handed over by `replay.coverage.part` until
     /// `replay.coverage` derives them; parts go in file by file so no argument holds a whole run.
     coverage_parts: Vec<coverage::Part>,
+    /// REQ-038.6: the live run ledger and the attached vehicle ledger (`coverage.live.*`).
+    coverage_live: coverage::live::Live,
 }
 
 impl<E: Exchange> MobileCore<E> {
@@ -87,6 +89,7 @@ impl<E: Exchange> MobileCore<E> {
             failure_evidence: Map::new(),
             assistant: assistant::AssistantState::default(),
             coverage_parts: Vec::new(),
+            coverage_live: coverage::live::Live::default(),
         })
     }
 
@@ -175,6 +178,10 @@ impl<E: Exchange> MobileCore<E> {
         }
         if action == "replay.coverage" {
             return coverage::derive_parts(std::mem::take(&mut self.coverage_parts));
+        }
+        if action.starts_with("coverage.live.") || action == "coverage.ledger.summary" {
+            // REQ-038.6/.8/.10: the live coverage ledger; pure state, no transport access.
+            return self.coverage_live.act(action, argument);
         }
         if action == "coverage.run" {
             return coverage::run_data(argument);
@@ -1698,6 +1705,27 @@ mod tests {
         );
         assert_eq!(run(&mut core, "read", "dtc.clear")["ok"], false);
         assert_eq!(run(&mut core, "read", "vehicle.speed")["ok"], false);
+    }
+
+    #[test]
+    fn req_038_6_the_live_coverage_actions_are_closed_core_actions() {
+        let mut core = core(&[]);
+        let start = json!({"run":"run-a","goal_definition":1,"knowledge_revision":"rev",
+            "vehicle":{"v":1,"entries":[],"identity":[]}})
+        .to_string();
+        let started = run(&mut core, "coverage.live.start", &start);
+        assert_eq!(started["data"]["vehicle_available"], true, "{started}");
+        let exported = run(&mut core, "coverage.live.export", "{}");
+        assert_eq!(exported["data"], json!({"v":1,"entries":[],"identity":[]}));
+        let snapshot = run(&mut core, "coverage.live.snapshot", "{}");
+        assert_eq!(snapshot["data"]["active"], true);
+        let summary = run(
+            &mut core,
+            "coverage.ledger.summary",
+            &json!({"ledger":1}).to_string(),
+        );
+        assert_eq!(summary["ok"], false);
+        assert_eq!(run(&mut core, "coverage.live.bogus", "{}")["ok"], false);
     }
 
     #[test]

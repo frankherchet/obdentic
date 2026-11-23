@@ -233,9 +233,39 @@ public final class VehicleStore {
         return null;
     }
     public synchronized String name(String vin) { JSONObject row = find(data, vin); return row == null ? "" : row.optString("name"); }
+    public synchronized boolean unreadable() { return unreadable; }
+    /**
+     * REQ-038.6: the vehicle coverage ledger of a record, a copy, or null when the record has none. It lives in the record (so deleting the
+     * record deletes it, REQ-013.9) and is kept out of {@link #snapshot()}: the service state and the UI never carry it.
+     */
+    public synchronized JSONObject coverageLedger(String vin) {
+        JSONObject row = unreadable ? null : find(data, vin), ledger = row == null ? null : row.optJSONObject(COVERAGE);
+        return ledger == null ? null : copy(ledger);
+    }
+    /** True when the record carries a ledger entry of any shape: a malformed one is unreadable, never "no ledger yet" (REQ-038.8). */
+    public synchronized boolean hasCoverageEntry(String vin) { JSONObject row = unreadable ? null : find(data, vin); return row != null && row.has(COVERAGE); }
+    /** REQ-038.6/.8: stores the ledger on its record; a failed write leaves the last persisted state. Returns null on success, else a German error text. */
+    public synchronized String setCoverageLedger(String vin, JSONObject ledger) {
+        return mutate(vin, next -> put(find(next, vin), COVERAGE, copy(ledger)));
+    }
+    /** The selected VIN, or "" when none; no copy of the store. */
+    public synchronized String selected() { return data.optString("selected"); }
+    /** A copy of every record without its ledger: the ledger is never serialised here, however large it has grown. */
     public synchronized JSONObject snapshot() {
-        JSONObject out = copy(data);
+        JSONArray rows = data.optJSONArray("vehicles"), kept = new JSONArray();
+        for (int i = 0; rows != null && i < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i), out = new JSONObject();
+            for (java.util.Iterator<String> keys = row.keys(); keys.hasNext(); ) {
+                String key = keys.next();
+                if (COVERAGE.equals(key)) continue;
+                Object value = row.opt(key);
+                put(out, key, value instanceof JSONObject ? copy((JSONObject) value) : value instanceof JSONArray ? copyArray((JSONArray) value) : value);
+            }
+            kept.put(out);
+        }
+        JSONObject out = build(kept, data.optString("selected"));
         put(out, "unreadable", unreadable);
         return out;
     }
+    private static final String COVERAGE = "coverage_ledger";
 }
