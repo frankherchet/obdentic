@@ -394,7 +394,7 @@ public final class ObdService extends Service {
         coverageStoredRefresh(); return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
     public void renameVehicle(String vin,String name) { vehicleAction(() -> { String error=vehicles.rename(vin,name); return error==null?"Fahrzeug umbenannt: "+vehicles.name(vin):error; }); }
     public void deleteVehicle(String vin) { vehicleAction(() -> { String name=vehicles.name(vin), error=vehicles.delete(vin); if(error==null && vin.equals(coverageVin)) coverageDetach(); coverageStoredRefresh(); return error==null?"Fahrzeug gelöscht: "+name:error; }); }
-    public void resetVehicleStore() { vehicleAction(() -> { String error=vehicles.reset(); if(error==null) coverageDetach(); return error==null?"Fahrzeugspeicher zurückgesetzt":error; }); }
+    public void resetVehicleStore() { vehicleAction(() -> { String error=vehicles.reset(); if(error==null) { coverageDetach(); coverageStoredRefresh(); } return error==null?"Fahrzeugspeicher zurückgesetzt":error; }); }
     /** Worker. The record the run credited is gone (REQ-038.6): the core drops its vehicle ledger, nothing is stored for it, the card shows the run only. */
     private void coverageDetach() {
         if(coverageVin.isEmpty()) return;

@@ -603,6 +603,23 @@ final class ComponentSmartAcceptance {
         } finally { folder.setWritable(true, false); }
         require(before.equals(new String(java.nio.file.Files.readAllBytes(storeFile.toPath()), StandardCharsets.UTF_8)), "REQ-038.8 a failed write leaves the stored ledger as it was");
         coverageLostLink(service, link, vin);
+        coverageStoreReset(service, link, vin);
+    }
+    /** REQ-038.8/.10 (#340 review): after a confirmed reset of an unreadable vehicle store the Live tab no longer says the coverage is unavailable and the stored card is cleared. */
+    private static void coverageStoreReset(ObdService service, Link[] link, String vin) throws Exception {
+        require(MainActivity.coverageKind(service.snapshot()).equals("stored"), "test setup: a stored card is shown before the store becomes unreadable");
+        File broken = new File(storeFile.getParentFile(), "unreadable-" + System.nanoTime() + ".json");
+        VehicleStore good = service.vehicles;
+        try {
+            java.nio.file.Files.write(broken.toPath(), "not json".getBytes(StandardCharsets.UTF_8));
+            service.vehicles = new VehicleStore(broken);
+            require(service.vehicles.unreadable(), "test setup: the store is unreadable");
+            service.resetVehicleStore();
+            waitFor(() -> service.snapshot().optString("message").contains("Fahrzeugspeicher zurückgesetzt"), "REQ-038.8 the reset is confirmed");
+            waitFor(() -> MainActivity.coverageKind(service.snapshot()).isEmpty(), "REQ-038.8/.10 the stored card is cleared after the reset: " + service.snapshot().optJSONObject("coverageStored"));
+            require(!MainActivity.coverageText(service.snapshot()).contains("nicht verfügbar"), "REQ-038.8 no 'nicht verfügbar' text after the reset: " + MainActivity.coverageText(service.snapshot()));
+        } finally { service.vehicles = good; broken.delete(); }
+        reconnect(service, link, false);
     }
     /** REQ-038.6 (#340 review): a lost link stores what the run credited before the core goes away, and a failed write on that path is part of the error message. */
     private static void coverageLostLink(ObdService service, Link[] link, String vin) throws Exception {
