@@ -138,7 +138,7 @@ For Android changes, also run the APK build and lint locally using the SDK/JDK s
 rtk ./android/gradlew -p android :app:assembleDebug :app:lintDebug
 ```
 
-Build the test APK and run relevant simulated phone acceptance for affected Android behavior as described in `docs/android.md`. JNI changes also require strict Clippy for `android/native/Cargo.toml`. Compile the Swift BLE probe when it changes. Keep actual adapter/vehicle acceptance separate from demo/replay checks; never initiate live traffic merely to complete software checks.
+Build the test APK and run relevant simulated phone acceptance for affected Android behavior as described in `docs/android.md`. Run `AcceptanceRunner` only on the dedicated `obdentic-acc` AVD (`adb -s emulator-5584`, 1080×2220, 440 dpi), never on a shared emulator. JNI changes also require strict Clippy for `android/native/Cargo.toml`. Compile the Swift BLE probe when it changes. Keep actual adapter/vehicle acceptance separate from demo/replay checks; never initiate live traffic merely to complete software checks.
 
 ### Issues
 - Every epic belongs to exactly one milestone. Its children are native sub-issues; fallback: a task list in the epic body.
