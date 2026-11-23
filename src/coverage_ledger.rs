@@ -161,6 +161,8 @@ pub enum Boundary {
 pub enum FactBody {
     Reading(Reading),
     Boundary(Boundary),
+    /// Ends only this context's contiguous intervals, without affecting other contexts.
+    ContextEnd(GoalContext),
 }
 
 /// One recorded fact the ledgers are folded from.
@@ -484,6 +486,7 @@ pub struct SmartRun {
     failures: BTreeMap<(DefinitionVersions, String), BTreeSet<Duration>>,
     /// Offsets of the boundaries that were folded; each ends the freshness of every signal.
     boundaries: BTreeSet<Duration>,
+    context_ends: BTreeMap<(DefinitionVersions, GoalContext), BTreeSet<Duration>>,
 }
 
 impl SmartRun {
@@ -498,6 +501,7 @@ impl SmartRun {
             freshness: BTreeMap::new(),
             failures: BTreeMap::new(),
             boundaries: BTreeSet::new(),
+            context_ends: BTreeMap::new(),
         }
     }
 
@@ -555,6 +559,17 @@ impl SmartRun {
         let vehicle = vehicle.filter(|_| credited);
         match &fact.body {
             FactBody::Boundary(_) => self.end_segments(fact.offset),
+            FactBody::ContextEnd(context) => {
+                self.context_ends
+                    .entry((fact.versions.clone(), context.clone()))
+                    .or_default()
+                    .insert(fact.offset);
+                self.open.retain(|key, segment| {
+                    key.versions != fact.versions
+                        || key.context != *context
+                        || segment.last > fact.offset
+                });
+            }
             FactBody::Reading(reading) => self.apply_reading(vehicle, fact, reading),
         }
         Ok(())
@@ -677,7 +692,7 @@ impl SmartRun {
                     ..previous
                 };
             } else if offset - previous.last <= FRESHNESS_LIMIT
-                && !self.broken_between(&key.versions, &key.signal_key, previous.last, offset)
+                && !self.broken_between(key, previous.last, offset)
             {
                 let interval = offset - previous.last;
                 let confirmed = self
@@ -798,18 +813,16 @@ impl SmartRun {
     /// readings spans it: the reading at `from` belongs to what the break ended, and one at the
     /// break's own offset was folded after it and starts anew. No time of such an interval is
     /// counted: a reading in between ends the contiguous segment and adds none (REQ-038.4).
-    fn broken_between(
-        &self,
-        versions: &DefinitionVersions,
-        signal: &str,
-        from: Duration,
-        to: Duration,
-    ) -> bool {
+    fn broken_between(&self, key: &EntryKey, from: Duration, to: Duration) -> bool {
         let range = (Bound::Excluded(from), Bound::Included(to));
         self.boundaries.range(range).next().is_some()
             || self
+                .context_ends
+                .get(&(key.versions.clone(), key.context.clone()))
+                .is_some_and(|offsets| offsets.range(range).next().is_some())
+            || self
                 .failures
-                .get(&(versions.clone(), signal.to_owned()))
+                .get(&(key.versions.clone(), key.signal_key.clone()))
                 .is_some_and(|offsets| offsets.range(range).next().is_some())
     }
 
@@ -2132,6 +2145,25 @@ mod tests {
                 "{earlier:?}"
             );
         }
+    }
+
+    #[test]
+    fn req_038_4_context_end_at_last_reading_does_not_break_baseline() {
+        let facts = [
+            sample("x", "egr", 0),
+            sample("x", "baseline", 0),
+            sample("x", "egr", 5),
+            sample("x", "baseline", 5),
+            fact(RUN, 5, false, FactBody::ContextEnd(GoalContext::new("egr"))),
+            sample("x", "egr", 8),
+            sample("x", "baseline", 8),
+        ];
+        let run = run_with(Rules::generic_baseline(), SessionKind::Replay, &facts);
+        assert_eq!(entry(run.ledger(), "x", "egr").longest_segment, secs(5));
+        assert_eq!(
+            entry(run.ledger(), "x", "baseline").longest_segment,
+            secs(8)
+        );
     }
 
     #[test]

@@ -22,13 +22,20 @@
 //!   unknown, even when another input alone would decide it (REQ-039.6).
 //! - The warm-up goal holds while the coolant temperature is below the warm threshold; the
 //!   warm-dependent goals are cooling warm driving, dpf warm driving and rail.
-//! - Goal membership of a signal is decided by its key (see [`Goal::includes`]); every signal is
-//!   a member of the baseline.
+//! - Goal membership of a signal follows the REQ-035 component presets (REQ-039.15, see
+//!   [`Goal::includes`]); a signal can belong to several goals, and every signal is a member of
+//!   the baseline. A reading counts toward every goal whose condition holds plus the baseline, so
+//!   [`Selected::contexts`] lists all of them.
 //! - The planner must be asked for a plan at least once per step; re-arming and the turbo hold
 //!   are evaluated at the offsets of those calls and of the readings.
 //! - A goal that has not been active yet needs no re-arm time. After it was active, the 10 seconds
-//!   count from the first fresh reading that shows its condition not holding, whatever ended the
-//!   goal (REQ-039.4, REQ-039.12); an unknown reading neither starts nor continues that count.
+//!   count fresh not-holding readings by their timestamps, from the first such reading after the
+//!   goal was active, whatever ended the goal (REQ-039.4, REQ-039.12). An unknown reading pauses
+//!   the count; a reading in which the condition holds resets it.
+//! - A goal is not reachable when one of its condition inputs or all of its signals are
+//!   unavailable or absent from the catalog (REQ-039.7), whether or not its condition holds.
+//! - The egr interval of 30 contiguous seconds is tracked from the reading that started the goal;
+//!   it ends when the condition stops holding or becomes unknown (REQ-039.2, REQ-039.12).
 //! - The retry schedule of a failed signal (30 s, 2 min, then once per drive, REQ-039.14) starts
 //!   anew in every drive; earlier drives in the ledger do not shorten it.
 
@@ -38,8 +45,8 @@ use std::{
 };
 
 use crate::coverage_ledger::{
-    ContextRule, DefinitionVersions, EntryKey, GoalContext, Ledger, Outcome, Rules, Status,
-    FRESHNESS_LIMIT, MIN_SAMPLES, MIN_VALID_TIME,
+    ContextRule, Decoded, DefinitionVersions, EntryKey, GoalContext, Ledger, Outcome, Rules,
+    Status, FRESHNESS_LIMIT, MIN_SAMPLES, MIN_VALID_TIME,
 };
 
 /// REQ-036.1/REQ-039.5: signals selected per step.
@@ -72,6 +79,76 @@ const PEDAL: &str = "vehicle.accelerator_pedal_e";
 const REGEN: &str = "dpf.field_regeneration_request_status";
 /// REQ-039.4: the continuously monitored trigger set, selected in every step whenever readable.
 pub const TRIGGER_SIGNALS: [&str; 6] = [COOLANT, SPEED, RPM, LOAD, PEDAL, REGEN];
+
+/// REQ-039.15: the semantics of the REQ-035 component presets, mirrored from `ComponentPresets.java`
+/// (a test keeps both in step). A goal's signals are the entries of its component's preset.
+const PRESET_DPF: &[&str] = &[
+    "dpf.differential_pressure",
+    "dpf.differential_pressure_offset",
+    "dpf.soot_mass_calculated",
+    "dpf.soot_mass_measured",
+    "dpf.distance_since_regeneration",
+    "dpf.time_since_regeneration",
+    "dpf.field_regeneration_request_status",
+    "dpf.field_regeneration_lock_status",
+    "exhaust.temperature.pre_dpf",
+    "exhaust.temperature.post_dpf",
+    "dpf.surface_temperature",
+    "engine.rpm",
+];
+const PRESET_EGR: &[&str] = &[
+    "engine.egr.commanded",
+    "engine.egr.error",
+    "egr.valve_duty",
+    "egr.low_pressure_closing",
+    "engine.maf",
+    "engine.intake_manifold_pressure",
+    "engine.boost_pressure_actual",
+    "engine.boost_pressure_commanded",
+    "engine.rpm",
+    "engine.load",
+];
+const PRESET_COOLING: &[&str] = &[
+    "engine.coolant_temperature",
+    "engine.oil_temperature",
+    "cooling.radiator_outlet_temperature_actual",
+    "cooling.radiator_outlet_temperature_commanded",
+    "cooling.fan1_duty",
+    "cooling.fan2_duty",
+    "vehicle.ambient_air_temperature",
+    "vehicle.speed",
+    "engine.load",
+];
+const PRESET_TURBO: &[&str] = &[
+    "engine.boost_pressure_actual",
+    "engine.boost_pressure_commanded",
+    "boost.regulator_feedback",
+    "boost.turbine_actuator_activation",
+    "air.intercooler_outlet_temperature",
+    "engine.maf",
+    "engine.intake_manifold_pressure",
+    "engine.barometric_pressure",
+    "pedal.accelerator_sensor_1",
+    "engine.rpm",
+];
+const PRESET_RAIL: &[&str] = &[
+    "engine.rail_pressure_actual",
+    "engine.rail_pressure_commanded",
+    "fuel.rail_pressure_control_deviation",
+    "fuel.metering_valve_duty",
+    "fuel.pressure_regulator_duty",
+    "injection.quantity_deviation_cylinder1",
+    "injection.quantity_deviation_cylinder2",
+    "injection.quantity_deviation_cylinder3",
+    "injection.quantity_deviation_cylinder4",
+    "engine.rpm",
+];
+
+/// The semantic of a catalog key: a Knowledge signal is addressed as `<semantic>@<target id>`,
+/// a standard PID by its bare semantic.
+fn semantic(key: &str) -> &str {
+    key.rsplit_once('@').map_or(key, |(semantic, _)| semantic)
+}
 
 /// Versions a new planner and the run it belongs to are recorded under (REQ-039.10).
 pub fn current_versions(knowledge_revision: impl Into<String>) -> DefinitionVersions {
@@ -157,18 +234,23 @@ impl Goal {
         }
     }
 
-    /// Whether a signal belongs to the goal. Provisional key-based grouping owned by OBDentic;
-    /// the baseline includes every signal.
-    pub fn includes(self, key: &str) -> bool {
-        let under = |prefix: &str| key.starts_with(prefix);
+    /// The REQ-035 component preset behind the goal (REQ-039.15); the baseline has none.
+    fn preset(self) -> &'static [&'static str] {
         match self {
-            Goal::CoolingWarmUp | Goal::CoolingWarmDriving => key == COOLANT || under("cooling."),
-            Goal::DpfWarmDriving | Goal::DpfRaw => under("dpf."),
-            Goal::Turbo => under("turbo.") || key == "engine.intake_manifold_pressure",
-            Goal::Rail => under("rail.") || under("engine.fuel_rail"),
-            Goal::Egr => under("egr.") || under("engine.egr."),
-            Goal::Baseline => true,
+            Goal::CoolingWarmUp | Goal::CoolingWarmDriving => PRESET_COOLING,
+            Goal::DpfWarmDriving | Goal::DpfRaw => PRESET_DPF,
+            Goal::Turbo => PRESET_TURBO,
+            Goal::Rail => PRESET_RAIL,
+            Goal::Egr => PRESET_EGR,
+            Goal::Baseline => &[],
         }
+    }
+
+    /// Whether a signal belongs to the goal: its semantic is an entry of the goal's component
+    /// preset (REQ-039.15), on every ECU target that offers it. The baseline includes every
+    /// signal.
+    pub fn includes(self, key: &str) -> bool {
+        self == Goal::Baseline || self.preset().contains(&semantic(key))
     }
 
     fn holds(self, values: &[f64]) -> bool {
@@ -230,6 +312,11 @@ pub struct CatalogEntry {
     pub source: Source,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogError {
+    DuplicateSignal { signal_key: String },
+}
+
 /// Why something is unknown, skipped, interrupted or ended. Shown and recorded with plan changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
@@ -250,6 +337,7 @@ pub enum Reason {
     HigherPriority,
     NoSignalsInCatalog,
     AllSignalsUnavailable,
+    ConditionInputUnavailable,
     UserStop,
 }
 
@@ -317,6 +405,8 @@ pub enum EventKind {
     },
     Resumed,
     Completed,
+    /// A contiguous EGR condition ended; fold a context-end fact into the ledger.
+    ContextEnded,
     Expired,
     NotReachable,
     Stopped,
@@ -342,7 +432,9 @@ pub struct PlanEvent {
 pub struct Selected {
     pub signal_key: String,
     pub ecu_target: Option<String>,
-    pub context: GoalContext,
+    /// Every goal context whose condition holds and whose component preset contains the signal,
+    /// in priority order, then the baseline (REQ-039.2): a reading counts toward all of them.
+    pub contexts: Vec<GoalContext>,
     /// Selected as member of the monitored trigger set (REQ-039.4).
     pub trigger: bool,
 }
@@ -354,6 +446,9 @@ pub struct GoalStatus {
     /// Mean per-signal share of the target over the goal's plannable signals (REQ-039.13).
     pub share: f64,
     pub warm: Option<Warm>,
+    /// Egr only: contiguous time of the interval in progress, from the reading that started it to
+    /// the latest reading (REQ-039.2); `None` while the goal is not active.
+    pub contiguous: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -381,11 +476,17 @@ enum Availability {
 struct GoalState {
     /// May start when its condition holds.
     armed: bool,
-    unarmed_since: Option<Duration>,
     pressed: bool,
     hold_until: Option<Duration>,
     /// Active since it last re-armed: a not-holding reading must start the re-arm wait.
     used: bool,
+    /// Fresh not-holding time counted toward the re-arm (REQ-039.12), the timestamp of the last
+    /// reading counted, and whether an unknown reading paused the count since.
+    rearm: Duration,
+    rearm_from: Option<Duration>,
+    rearm_paused: bool,
+    /// Egr: timestamp of the reading that started the interval in progress.
+    segment_start: Option<Duration>,
     phase: Option<Phase>,
 }
 
@@ -393,6 +494,8 @@ struct Evaluation {
     active: bool,
     inactive: Phase,
     inputs: Vec<ConditionInput>,
+    contiguous: Option<Duration>,
+    context_ended: bool,
 }
 
 struct Candidates {
@@ -420,13 +523,20 @@ pub struct Planner {
 }
 
 impl Planner {
+    /// Builds the planner over a closed catalog. A signal key is the identity the ledger and
+    /// every observation address, and it already carries the ECU target of a Knowledge signal
+    /// (`semantic@target`); a repeated key, with the same or another target, is rejected
+    /// (REQ-039.3).
     pub fn new(
         catalog: impl IntoIterator<Item = CatalogEntry>,
         versions: DefinitionVersions,
-    ) -> Self {
+    ) -> Result<Self, CatalogError> {
         let mut entries = BTreeMap::new();
         for entry in catalog {
-            entries.entry(entry.signal_key.clone()).or_insert(entry);
+            let signal_key = entry.signal_key.clone();
+            if entries.insert(signal_key.clone(), entry).is_some() {
+                return Err(CatalogError::DuplicateSignal { signal_key });
+            }
         }
         let availability = entries
             .values()
@@ -453,7 +563,7 @@ impl Planner {
                 )
             })
             .collect();
-        Self {
+        Ok(Self {
             rules: goal_rules(),
             versions,
             catalog: entries,
@@ -465,7 +575,7 @@ impl Planner {
             pending: Vec::new(),
             announced_handoff: false,
             stopped: false,
-        }
+        })
     }
 
     pub fn versions(&self) -> &DefinitionVersions {
@@ -619,11 +729,12 @@ impl Planner {
                 .partial_cmp(&(b.level(), data[b].share, *b))
                 .expect("shares are finite")
         });
+        let is_trigger = |key: &str| TRIGGER_SIGNALS.contains(&key);
 
         let mut selection: Vec<Selected> = Vec::new();
         for key in TRIGGER_SIGNALS {
             if self.plannable(key) && self.attemptable(key, now) {
-                selection.push(self.selected(key, Goal::Baseline, true));
+                selection.push(self.selected(key, true));
             }
         }
         let room = MAX_SELECTION - selection.len();
@@ -634,79 +745,95 @@ impl Planner {
             .count();
         let reserve = BASELINE_RESERVE.min(room).min(baseline_ready);
         let mut contextual = room - reserve;
-        let mut taken: BTreeMap<Goal, usize> = BTreeMap::new();
+        // Goals that got one of the signals competing for slots; the always-selected trigger
+        // signals do not count as being served.
+        let mut served: BTreeSet<Goal> = BTreeSet::new();
         for goal in order.iter().filter(|goal| **goal != Goal::Baseline) {
-            for key in &data[goal].ready {
-                let seat = selection.iter().position(|s| s.signal_key == *key);
-                match seat {
-                    Some(at)
-                        if selection[at].trigger && selection[at].context.id() == "baseline" =>
-                    {
-                        selection[at].context = goal.context();
-                        *taken.entry(*goal).or_default() += 1;
-                    }
-                    Some(_) => {}
-                    None if contextual > 0 => {
-                        contextual -= 1;
-                        selection.push(self.selected(key, *goal, false));
-                        *taken.entry(*goal).or_default() += 1;
-                    }
-                    None => {}
+            for key in data[goal].ready.iter().filter(|key| !is_trigger(key)) {
+                if selection.iter().any(|s| s.signal_key == *key) {
+                    served.insert(*goal);
+                } else if contextual > 0 {
+                    contextual -= 1;
+                    selection.push(self.selected(key, false));
+                    served.insert(*goal);
                 }
             }
         }
         let mut baseline_room = MAX_SELECTION - selection.len();
-        if evaluations[&Goal::Baseline].active {
-            for key in &data[&Goal::Baseline].ready {
-                if baseline_room == 0 {
-                    break;
-                }
-                if !selection.iter().any(|s| s.signal_key == *key) {
-                    baseline_room -= 1;
-                    selection.push(self.selected(key, Goal::Baseline, false));
-                    *taken.entry(Goal::Baseline).or_default() += 1;
-                }
+        for key in data[&Goal::Baseline]
+            .ready
+            .iter()
+            .filter(|key| !is_trigger(key))
+        {
+            if selection.iter().any(|s| s.signal_key == *key) {
+                served.insert(Goal::Baseline);
+            } else if baseline_room > 0 {
+                baseline_room -= 1;
+                selection.push(self.selected(key, false));
+                served.insert(Goal::Baseline);
             }
+        }
+        // REQ-039.2: a reading counts toward every holding goal context that includes the signal,
+        // plus the baseline.
+        for selected in &mut selection {
+            selected.contexts = order
+                .iter()
+                .filter(|goal| **goal != Goal::Baseline && goal.includes(&selected.signal_key))
+                .map(|goal| goal.context())
+                .chain([Goal::Baseline.context()])
+                .collect();
         }
         for selected in &selection {
             self.last_planned
                 .insert(selected.signal_key.clone(), self.step);
         }
 
-        let first_served = order
-            .iter()
-            .copied()
-            .find(|goal| taken.get(goal).is_some_and(|n| *n > 0));
         let warm = self.warm(now);
         let mut statuses = Vec::new();
         for goal in Goal::ALL {
             let evaluation = &evaluations[&goal];
             let candidates = &data[&goal];
-            let phase = if !evaluation.active {
+            let competing = candidates.ready.iter().any(|key| !is_trigger(key));
+            let phase = if let Some(reason) = self.unreachable(goal, candidates.plannable) {
+                Phase::NotReachable(reason)
+            } else if !evaluation.active {
                 evaluation.inactive
-            } else if candidates.plannable == 0 {
-                Phase::NotReachable(if self.members(goal).next().is_none() {
-                    Reason::NoSignalsInCatalog
-                } else {
-                    Reason::AllSignalsUnavailable
-                })
             } else if candidates.unfinished == 0 {
                 Phase::Complete
             } else if candidates.ready.is_empty() {
                 Phase::AwaitingRetry
-            } else if taken.get(&goal).is_none_or(|n| *n == 0) {
-                Phase::Interrupted {
-                    by: first_served.unwrap_or(Goal::DpfRaw),
-                }
+            } else if competing && !served.contains(&goal) {
+                let by = order
+                    .iter()
+                    .copied()
+                    .find(|other| {
+                        *other != goal && other.level() <= goal.level() && served.contains(other)
+                    })
+                    .or_else(|| served.iter().next().copied())
+                    .unwrap_or(Goal::DpfRaw);
+                Phase::Interrupted { by }
             } else {
                 Phase::Serving
             };
+            if evaluation.context_ended {
+                events.push(self.event(
+                    now,
+                    Some(goal),
+                    EventKind::ContextEnded,
+                    Some(match evaluation.inactive {
+                        Phase::ConditionUnknown(reason) => reason,
+                        _ => Reason::ConditionEnded,
+                    }),
+                    evaluation.inputs.clone(),
+                ));
+            }
             self.transition(goal, phase, now, &evaluation.inputs, &mut events);
             statuses.push(GoalStatus {
                 goal,
                 phase,
                 share: candidates.share,
                 warm: goal.warm_dependent().then_some(warm),
+                contiguous: evaluation.contiguous,
             });
         }
         Plan {
@@ -735,11 +862,11 @@ impl Planner {
         }
     }
 
-    fn selected(&self, key: &str, goal: Goal, trigger: bool) -> Selected {
+    fn selected(&self, key: &str, trigger: bool) -> Selected {
         Selected {
             signal_key: key.to_owned(),
             ecu_target: self.catalog[key].ecu_target.clone(),
-            context: goal.context(),
+            contexts: Vec::new(),
             trigger,
         }
     }
@@ -860,6 +987,22 @@ impl Planner {
         }
     }
 
+    /// Why the goal can never run in this drive, whether or not its condition holds (REQ-039.7):
+    /// a condition input that cannot be read, or no readable signal of its own.
+    fn unreachable(&self, goal: Goal, plannable: usize) -> Option<Reason> {
+        if goal.inputs().iter().any(|key| !self.plannable(key)) {
+            Some(Reason::ConditionInputUnavailable)
+        } else if plannable == 0 {
+            Some(if self.members(goal).next().is_none() {
+                Reason::NoSignalsInCatalog
+            } else {
+                Reason::AllSignalsUnavailable
+            })
+        } else {
+            None
+        }
+    }
+
     /// Updates the condition state of `goal` and says whether it is active now.
     fn evaluate(&mut self, goal: Goal, now: Duration) -> Evaluation {
         let inputs: Vec<ConditionInput> = goal
@@ -875,6 +1018,8 @@ impl Planner {
                 active: true,
                 inactive: Phase::WaitingForCondition,
                 inputs,
+                contiguous: None,
+                context_ended: false,
             };
         }
         let unknown = inputs.iter().find_map(|input| input.value.err());
@@ -887,23 +1032,31 @@ impl Planner {
             .unwrap_or(now);
         let warm_missing = goal.warm_dependent() && self.warm(now) == Warm::NotYetReached;
         let state = self.goals.get_mut(&goal).expect("every goal has a state");
+        let had_segment = state.segment_start.is_some();
 
         let (active, inactive) = match unknown {
             Some(reason) => {
-                // Unknown ends the goal without a re-arm wait and never counts toward re-arming
-                // (REQ-039.6, REQ-039.12): armed and used stay as they were.
-                state.unarmed_since = None;
+                // Unknown ends the goal and its egr interval without a re-arm wait, pauses the
+                // re-arm count and never counts toward it (REQ-039.6, REQ-039.12): armed and
+                // used stay as they were.
+                state.rearm_paused |= state.rearm_from.is_some();
                 state.pressed = false;
                 state.hold_until = None;
+                state.segment_start = None;
                 (false, Phase::ConditionUnknown(reason))
             }
             None if goal.holds(&values) => {
-                state.unarmed_since = None;
-                let held = state.hold_until.take().is_some();
+                state.rearm = Duration::ZERO;
+                state.rearm_from = None;
+                state.rearm_paused = false;
+                let held = state.hold_until.take().is_some_and(|until| now < until);
                 state.pressed = true;
                 if state.armed || held {
                     state.armed = true;
                     state.used = true;
+                    if goal == Goal::Egr {
+                        state.segment_start.get_or_insert(reading_at);
+                    }
                     (true, Phase::Rearming)
                 } else {
                     (false, Phase::Rearming)
@@ -914,17 +1067,31 @@ impl Planner {
                     state.hold_until = Some(reading_at + TURBO_RELEASE_HOLD);
                 }
                 state.pressed = false;
+                state.segment_start = None;
                 if state.armed && state.used {
                     // First fresh not-holding reading since the goal was active.
                     state.armed = false;
                     state.used = false;
-                    state.unarmed_since = Some(now);
+                    state.rearm = Duration::ZERO;
+                    state.rearm_from = None;
+                    state.rearm_paused = false;
                 }
                 if !state.armed {
-                    let since = *state.unarmed_since.get_or_insert(now);
-                    if now.saturating_sub(since) >= REARM {
+                    match state.rearm_from {
+                        Some(from) if reading_at > from => {
+                            if !state.rearm_paused {
+                                state.rearm += reading_at - from;
+                            }
+                            state.rearm_from = Some(reading_at);
+                            state.rearm_paused = false;
+                        }
+                        Some(_) => {}
+                        None => state.rearm_from = Some(reading_at),
+                    }
+                    if state.rearm >= REARM {
                         state.armed = true;
-                        state.unarmed_since = None;
+                        state.rearm = Duration::ZERO;
+                        state.rearm_from = None;
                     }
                 }
                 let held = state.hold_until.is_some_and(|until| now < until);
@@ -939,10 +1106,16 @@ impl Planner {
                 (held, phase)
             }
         };
+        let contiguous = state
+            .segment_start
+            .filter(|_| active)
+            .map(|start| reading_at.saturating_sub(start));
         Evaluation {
             active,
             inactive,
             inputs,
+            contiguous,
+            context_ended: had_segment && state.segment_start.is_none(),
         }
     }
 
@@ -981,6 +1154,7 @@ impl Planner {
 
 fn usable(observation: &Observation) -> Result<f64, Reason> {
     match (&observation.outcome, observation.value) {
+        (Outcome::Decoded(Decoded::Numeric { finite: false }), _) => Err(Reason::NonFinite),
         (Outcome::Decoded(_), Some(value)) if value.is_finite() => {
             if observation.implausible {
                 Err(Reason::Implausible)
@@ -1037,7 +1211,7 @@ mod tests {
     fn planner(extra: &[&str]) -> Planner {
         let mut catalog = triggers();
         catalog.extend(extra.iter().map(|k| entry(k)));
-        Planner::new(catalog, versions())
+        Planner::new(catalog, versions()).unwrap()
     }
 
     fn ok(key: &str, at: u64, value: f64) -> Observation {
@@ -1093,7 +1267,7 @@ mod tests {
         plan.selection
             .iter()
             .filter(|s| s.signal_key == key)
-            .map(|s| s.context.id().to_owned())
+            .flat_map(|s| s.contexts.iter().map(|c| c.id().to_owned()))
             .collect()
     }
 
@@ -1162,7 +1336,7 @@ mod tests {
         let driving = p.plan(secs(1), &ledger);
         assert_eq!(
             contexts(&driving, "cooling.radiator_outlet_temperature_actual"),
-            ["cooling.warm_driving"]
+            ["cooling.warm_driving", "baseline"]
         );
     }
 
@@ -1182,7 +1356,7 @@ mod tests {
                 reported_supported: false,
             },
         });
-        let mut p = Planner::new(catalog.clone(), versions());
+        let mut p = Planner::new(catalog.clone(), versions()).unwrap();
         let plan = p.plan(secs(0), &Ledger::default());
         let known: BTreeSet<_> = catalog.iter().map(|c| c.signal_key.clone()).collect();
         assert!(plan.selection.iter().all(|s| known.contains(&s.signal_key)));
@@ -1226,7 +1400,7 @@ mod tests {
         assert_eq!(phase(&regen, Goal::DpfRaw), Phase::Serving);
         assert_eq!(
             contexts(&regen, "dpf.soot_mass_calculated"),
-            ["dpf.raw_request"]
+            ["dpf.raw_request", "dpf.warm_driving", "baseline"]
         );
         assert!(kinds(&regen, Goal::DpfRaw).contains(&EventKind::Started));
 
@@ -1237,7 +1411,7 @@ mod tests {
         assert_eq!(kinds(&after, Goal::DpfRaw), [EventKind::Expired]);
         assert_eq!(
             contexts(&after, "dpf.soot_mass_calculated"),
-            ["dpf.warm_driving"]
+            ["dpf.warm_driving", "baseline"]
         );
     }
 
@@ -1291,7 +1465,7 @@ mod tests {
         let keys: Vec<String> = (0..100).map(|i| format!("engine.sig{i:03}")).collect();
         let mut catalog = triggers();
         catalog.extend(keys.iter().map(|k| entry(k)));
-        let mut p = Planner::new(catalog, versions());
+        let mut p = Planner::new(catalog, versions()).unwrap();
         let ledger = Ledger::default();
         let mut seen = BTreeSet::new();
         for step in 0..8 {
@@ -1321,14 +1495,14 @@ mod tests {
     #[test]
     fn req_039_6_unknown_conditions_never_start_a_goal() {
         let ledger = Ledger::default();
-        let mut p = planner(&["turbo.boost"]);
+        let mut p = planner(&["engine.boost_pressure_actual"]);
         // No reading at all.
         assert_eq!(
             phase(&p.plan(secs(0), &ledger), Goal::Turbo),
             Phase::ConditionUnknown(Reason::NoReading)
         );
         for (outcome, reason) in [
-            (Outcome::Unsupported, Reason::Unsupported),
+            (Outcome::Error { reason: "x".into() }, Reason::ReadError),
             (
                 Outcome::Rejected {
                     response_code: 0x31,
@@ -1338,6 +1512,7 @@ mod tests {
             (Outcome::Empty, Reason::Empty),
             (Outcome::Gap, Reason::Gap),
         ] {
+            let mut p = planner(&["engine.boost_pressure_actual"]);
             p.record(&failed(PEDAL, 1, outcome));
             assert_eq!(
                 phase(&p.plan(secs(1), &ledger), Goal::Turbo),
@@ -1368,7 +1543,7 @@ mod tests {
 
     #[test]
     fn req_039_6_event_carries_the_condition_readings() {
-        let mut p = planner(&["turbo.boost"]);
+        let mut p = planner(&["engine.boost_pressure_actual"]);
         feed(&mut p, 0, &[(PEDAL, 95.0)]);
         let plan = p.plan(secs(0), &Ledger::default());
         let started = plan
@@ -1418,13 +1593,45 @@ mod tests {
     }
 
     #[test]
-    fn req_039_7_goal_without_available_signals_is_not_reachable_and_others_continue() {
-        let mut p = planner(&["dpf.soot_mass_calculated", "engine.maf"]);
-        let ledger = Ledger::default();
+    fn req_039_7_reachability_is_independent_of_condition() {
+        let mut catalog = triggers();
+        catalog
+            .iter_mut()
+            .find(|e| e.signal_key == PEDAL)
+            .unwrap()
+            .source = Source::StandardPid {
+            reported_supported: false,
+        };
+        let mut p = Planner::new(catalog, versions()).unwrap();
+        feed(&mut p, 0, &[(PEDAL, 0.0)]);
+        let plan = p.plan(secs(0), &Ledger::default());
+        assert_eq!(
+            phase(&plan, Goal::Turbo),
+            Phase::NotReachable(Reason::ConditionInputUnavailable)
+        );
+        let mut q = Planner::new([entry(PEDAL)], versions()).unwrap();
+        feed(&mut q, 0, &[(PEDAL, 0.0)]);
+        assert_eq!(
+            phase(&q.plan(secs(0), &Ledger::default()), Goal::Turbo),
+            Phase::NotReachable(Reason::NoSignalsInCatalog)
+        );
+    }
+
+    #[test]
+    fn req_039_7_unavailable_goal_is_reported_and_other_goals_continue() {
+        let mut p = Planner::new(
+            [
+                entry(COOLANT),
+                entry(SPEED),
+                entry("dpf.soot_mass_calculated"),
+                entry("engine.maf"),
+            ],
+            versions(),
+        )
+        .unwrap();
         p.record(&failed("dpf.soot_mass_calculated", 0, Outcome::Unsupported));
-        p.record(&failed(REGEN, 0, Outcome::Unsupported));
-        feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0)[..5]);
-        let plan = p.plan(secs(1), &ledger);
+        feed(&mut p, 0, &[(COOLANT, 90.0), (SPEED, 30.0)]);
+        let plan = p.plan(secs(0), &Ledger::default());
         assert_eq!(
             phase(&plan, Goal::DpfWarmDriving),
             Phase::NotReachable(Reason::AllSignalsUnavailable)
@@ -1432,20 +1639,11 @@ mod tests {
         let event = plan
             .events
             .iter()
-            .find(|e| e.kind == EventKind::NotReachable)
+            .find(|e| e.goal == Some(Goal::DpfWarmDriving) && e.kind == EventKind::NotReachable)
             .unwrap();
-        assert_eq!(event.goal, Some(Goal::DpfWarmDriving));
         assert_eq!(event.reason, Some(Reason::AllSignalsUnavailable));
         assert_eq!(phase(&plan, Goal::Baseline), Phase::Serving);
         assert_eq!(contexts(&plan, "engine.maf"), ["baseline"]);
-        // A goal without any catalog signal says so.
-        assert_eq!(phase(&plan, Goal::Egr), Phase::WaitingForCondition);
-        let mut again = planner(&[]);
-        feed(&mut again, 0, &base(90.0, 60.0, 2000.0, 30.0, 10.0, 0.0));
-        assert_eq!(
-            phase(&again.plan(secs(0), &ledger), Goal::Egr),
-            Phase::NotReachable(Reason::NoSignalsInCatalog)
-        );
     }
 
     #[test]
@@ -1483,7 +1681,7 @@ mod tests {
         let plan = p.plan(secs(0), &ledger);
         assert_eq!(
             contexts(&plan, "cooling.radiator_outlet_temperature_actual"),
-            ["cooling.warm_up"]
+            ["cooling.warm_up", "baseline"]
         );
         assert_eq!(
             phase(&plan, Goal::CoolingWarmDriving),
@@ -1495,10 +1693,10 @@ mod tests {
             .find(|g| g.goal == Goal::CoolingWarmDriving)
             .unwrap();
         assert_eq!(status.warm, Some(Warm::NotYetReached));
-        assert!(plan
-            .events
-            .iter()
-            .all(|e| e.kind != EventKind::NotReachable));
+        assert_ne!(
+            phase(&plan, Goal::CoolingWarmUp),
+            Phase::NotReachable(Reason::NoSignalsInCatalog)
+        );
         // Unknown coolant is neither warm nor below.
         p.record(&failed(COOLANT, 1, Outcome::Empty));
         let unknown = p.plan(secs(1), &ledger);
@@ -1516,7 +1714,7 @@ mod tests {
 
     #[test]
     fn req_039_12_turbo_holds_twenty_seconds_after_release_and_pressing_continues() {
-        let mut p = planner(&["turbo.boost"]);
+        let mut p = planner(&["engine.boost_pressure_actual"]);
         let ledger = Ledger::default();
         feed(&mut p, 0, &[(PEDAL, 95.0)]);
         assert_eq!(
@@ -1527,7 +1725,10 @@ mod tests {
         feed(&mut p, 5, &[(PEDAL, 80.0)]);
         let released = p.plan(secs(5), &ledger);
         assert_eq!(phase(&released, Goal::Turbo), Phase::Serving);
-        assert_eq!(contexts(&released, "turbo.boost"), ["turbo"]);
+        assert_eq!(
+            contexts(&released, "engine.boost_pressure_actual"),
+            ["turbo", "baseline"]
+        );
         feed(&mut p, 20, &[(PEDAL, 10.0)]);
         assert_eq!(
             phase(&p.plan(secs(24), &ledger), Goal::Turbo),
@@ -1536,9 +1737,12 @@ mod tests {
         feed(&mut p, 25, &[(PEDAL, 10.0)]);
         let ended = p.plan(secs(25), &ledger);
         assert_eq!(phase(&ended, Goal::Turbo), Phase::WaitingForCondition);
-        assert_eq!(contexts(&ended, "turbo.boost"), ["baseline"]);
+        assert_eq!(
+            contexts(&ended, "engine.boost_pressure_actual"),
+            ["baseline"]
+        );
         // Pressing again during the hold continues it.
-        let mut q = planner(&["turbo.boost"]);
+        let mut q = planner(&["engine.boost_pressure_actual"]);
         feed(&mut q, 0, &[(PEDAL, 95.0)]);
         q.plan(secs(0), &ledger);
         feed(&mut q, 2, &[(PEDAL, 30.0)]);
@@ -1590,7 +1794,7 @@ mod tests {
     #[test]
     fn req_039_12_turbo_rearm_counts_from_the_first_not_holding_reading_during_the_hold() {
         let ledger = Ledger::default();
-        let mut p = planner(&["turbo.boost"]);
+        let mut p = planner(&["engine.boost_pressure_actual"]);
         feed(&mut p, 0, &[(PEDAL, 95.0)]);
         p.plan(secs(0), &ledger);
         // Released at 1: hold until 21; the 10 s count from 1 ends at 11, before the hold ends.
@@ -1613,7 +1817,7 @@ mod tests {
     #[test]
     fn req_039_12_unknown_ends_the_turbo_hold_but_the_wait_since_the_release_still_applies() {
         let ledger = Ledger::default();
-        let mut p = planner(&["turbo.boost"]);
+        let mut p = planner(&["engine.boost_pressure_actual"]);
         feed(&mut p, 0, &[(PEDAL, 95.0)]);
         p.plan(secs(0), &ledger);
         feed(&mut p, 1, &[(PEDAL, 20.0)]);
@@ -1682,8 +1886,8 @@ mod tests {
     fn req_039_13_strict_priority_and_one_shared_level() {
         let mut p = planner(&[
             "dpf.soot_mass_calculated",
-            "turbo.boost",
-            "rail.pressure",
+            "engine.boost_pressure_actual",
+            "engine.rail_pressure_actual",
             "egr.valve_duty",
             "cooling.radiator_outlet_temperature_actual",
         ]);
@@ -1693,10 +1897,16 @@ mod tests {
         let plan = p.plan(secs(0), &ledger);
         assert_eq!(
             contexts(&plan, "dpf.soot_mass_calculated"),
-            ["dpf.raw_request"]
+            ["dpf.raw_request", "baseline"]
         );
-        assert_eq!(contexts(&plan, "rail.pressure"), ["rail"]);
-        assert_eq!(contexts(&plan, "turbo.boost"), ["turbo"]);
+        assert_eq!(
+            contexts(&plan, "engine.rail_pressure_actual"),
+            ["rail", "baseline"]
+        );
+        assert_eq!(
+            contexts(&plan, "engine.boost_pressure_actual"),
+            ["turbo", "baseline"]
+        );
 
         let order: Vec<Goal> = {
             let mut goals: Vec<Goal> = Goal::ALL.to_vec();
@@ -1719,59 +1929,72 @@ mod tests {
     }
 
     #[test]
-    fn req_039_13_lower_goal_is_interrupted_when_a_higher_one_takes_every_slot() {
-        let dpf: Vec<String> = (0..40).map(|i| format!("dpf.s{i:02}")).collect();
+    fn req_039_4_and_13_lower_goal_is_interrupted_and_resumed() {
+        let dpf: Vec<String> = (0..40)
+            .map(|i| format!("dpf.soot_mass_calculated@ecu{i:02}"))
+            .collect();
         let mut catalog = triggers();
         catalog.extend(dpf.iter().map(|k| entry(k)));
-        catalog.push(entry("turbo.boost"));
-        let mut p = Planner::new(catalog, versions());
+        catalog.push(entry("cooling.fan1_duty"));
+        let mut p = Planner::new(catalog, versions()).unwrap();
         let ledger = Ledger::default();
-        feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 95.0, 0.0));
-        let both = p.plan(secs(0), &ledger);
-        // Turbo (level 2) goes before warm driving (level 4); dpf warm driving is squeezed out
-        // of contextual slots but keeps progress and the baseline keeps its reserve.
-        assert_eq!(phase(&both, Goal::Turbo), Phase::Serving);
-        assert_eq!(contexts(&both, "turbo.boost"), ["turbo"]);
-        assert!(both.selection.len() <= MAX_SELECTION);
-        assert!(matches!(
-            phase(&both, Goal::DpfWarmDriving),
-            Phase::Serving | Phase::Interrupted { .. }
-        ));
-        let baseline = both
-            .selection
-            .iter()
-            .filter(|s| s.context.id() == "baseline" && !s.trigger)
-            .count();
-        assert!(baseline <= BASELINE_RESERVE);
+        feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0));
+        assert_eq!(
+            phase(&p.plan(secs(0), &ledger), Goal::CoolingWarmDriving),
+            Phase::Serving
+        );
+        feed(&mut p, 1, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 2.0));
+        let interrupted = p.plan(secs(1), &ledger);
+        assert_eq!(
+            phase(&interrupted, Goal::CoolingWarmDriving),
+            Phase::Interrupted { by: Goal::DpfRaw }
+        );
+        assert_eq!(
+            kinds(&interrupted, Goal::CoolingWarmDriving),
+            [EventKind::Interrupted { by: Goal::DpfRaw }]
+        );
+        feed(&mut p, 2, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0));
+        let resumed = p.plan(secs(2), &ledger);
+        assert_eq!(phase(&resumed, Goal::CoolingWarmDriving), Phase::Serving);
+        assert_eq!(
+            kinds(&resumed, Goal::CoolingWarmDriving),
+            [EventKind::Resumed]
+        );
     }
 
     #[test]
     fn req_039_13_baseline_keeps_its_reserved_share() {
-        let dpf: Vec<String> = (0..40).map(|i| format!("dpf.s{i:02}")).collect();
-        let others: Vec<String> = (0..40).map(|i| format!("engine.o{i:02}")).collect();
+        let dpf: Vec<String> = (0..40)
+            .map(|i| format!("dpf.soot_mass_calculated@ecu{i:02}"))
+            .collect();
+        let others: Vec<String> = (0..40).map(|i| format!("aaa.o{i:02}")).collect();
         let mut catalog = triggers();
         catalog.extend(dpf.iter().map(|k| entry(k)));
         catalog.extend(others.iter().map(|k| entry(k)));
-        let mut p = Planner::new(catalog, versions());
+        let mut p = Planner::new(catalog, versions()).unwrap();
         feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 2.0));
         let plan = p.plan(secs(0), &Ledger::default());
         assert_eq!(plan.selection.len(), MAX_SELECTION);
         let baseline = plan
             .selection
             .iter()
-            .filter(|s| s.context.id() == "baseline" && !s.trigger)
+            .filter(|s| s.contexts.len() == 1 && !s.trigger)
             .count();
         assert_eq!(baseline, BASELINE_RESERVE);
         assert!(plan
             .selection
             .iter()
-            .any(|s| s.context.id() == "dpf.raw_request"));
+            .any(|s| s.contexts.iter().any(|c| c.id() == "dpf.raw_request")));
     }
 
     #[test]
     fn req_039_13_within_a_level_the_goal_with_the_lowest_share_goes_first() {
-        let cooling: Vec<String> = (0..30).map(|i| format!("cooling.c{i:02}")).collect();
-        let dpf: Vec<String> = (0..30).map(|i| format!("dpf.d{i:02}")).collect();
+        let cooling: Vec<String> = (0..30)
+            .map(|i| format!("cooling.fan1_duty@ecu{i:02}"))
+            .collect();
+        let dpf: Vec<String> = (0..30)
+            .map(|i| format!("dpf.soot_mass_calculated@ecu{i:02}"))
+            .collect();
         let mut catalog = triggers();
         catalog.extend(cooling.iter().map(|k| entry(k)));
         catalog.extend(dpf.iter().map(|k| entry(k)));
@@ -1779,18 +2002,18 @@ mod tests {
         for key in &cooling {
             at_least(&mut ledger, key, Goal::CoolingWarmDriving, 2, 30);
         }
-        let mut p = Planner::new(catalog.clone(), versions());
+        let mut p = Planner::new(catalog.clone(), versions()).unwrap();
         feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0));
         let plan = p.plan(secs(0), &ledger);
         let first = plan.selection.iter().find(|s| !s.trigger).unwrap();
-        assert_eq!(first.context.id(), "dpf.warm_driving");
+        assert_eq!(first.contexts[0].id(), "dpf.warm_driving");
 
         // On equal shares the goal listed first in REQ-039.2 wins.
-        let mut tie = Planner::new(catalog, versions());
+        let mut tie = Planner::new(catalog, versions()).unwrap();
         feed(&mut tie, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0));
         let plan = tie.plan(secs(0), &Ledger::default());
         let first = plan.selection.iter().find(|s| !s.trigger).unwrap();
-        assert_eq!(first.context.id(), "cooling.warm_driving");
+        assert_eq!(first.contexts[0].id(), "cooling.warm_driving");
     }
 
     #[test]
@@ -1875,7 +2098,8 @@ mod tests {
         let mut p = Planner::new(
             triggers().into_iter().chain([entry("engine.flaky")]),
             versions(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             contexts(&p.plan(secs(0), &ledger), "engine.flaky"),
             ["baseline"]
@@ -1913,7 +2137,7 @@ mod tests {
 
     #[test]
     fn req_039_8_stop_ends_active_goals_with_the_reason() {
-        let mut p = planner(&["turbo.boost"]);
+        let mut p = planner(&["engine.boost_pressure_actual"]);
         feed(&mut p, 0, &[(PEDAL, 95.0)]);
         p.plan(secs(0), &Ledger::default());
         let events = p.stop(secs(3), Reason::UserStop);
@@ -1950,7 +2174,7 @@ mod tests {
         catalog.extend(keys.iter().map(|k| entry(k)));
         let mut vehicle = Ledger::default();
         let mut run = SmartRun::new(goal_rules(), RunId("r".into()), SessionKind::Live);
-        let mut p = Planner::new(catalog, versions.clone());
+        let mut p = Planner::new(catalog, versions.clone()).unwrap();
         let mut history = Vec::new();
         for at in (0..=179u64).step_by(2) {
             let live = script(at);
@@ -1958,9 +2182,25 @@ mod tests {
             history.push(
                 plan.selection
                     .iter()
-                    .map(|s| format!("{}@{}", s.signal_key, s.context.id()))
+                    .map(|s| format!("{}@{:?}", s.signal_key, s.contexts))
                     .collect(),
             );
+            for event in &plan.events {
+                if event.kind == EventKind::ContextEnded {
+                    run.apply(
+                        Some(&mut vehicle),
+                        &Fact {
+                            run: RunId("r".into()),
+                            wall_clock_unix_ms: at as i64 * 1000,
+                            offset: event.at,
+                            versions: versions.clone(),
+                            identity_confirmed: true,
+                            body: FactBody::ContextEnd(event.goal.unwrap().context()),
+                        },
+                    )
+                    .unwrap();
+                }
+            }
             for selected in &plan.selection {
                 let value = live
                     .iter()
@@ -1968,24 +2208,26 @@ mod tests {
                     .map_or(1.0 + seed as f64, |(_, v)| *v);
                 let observation = ok(&selected.signal_key, at, value);
                 p.record(&observation);
-                let fact = Fact {
-                    run: RunId("r".into()),
-                    wall_clock_unix_ms: at as i64 * 1000,
-                    offset: secs(at),
-                    versions: versions.clone(),
-                    identity_confirmed: true,
-                    body: FactBody::Reading(Reading {
-                        signal_key: selected.signal_key.clone(),
-                        context: selected.context.clone(),
-                        ecu_target: None,
-                        session: SessionState::Default,
-                        outcome: observation.outcome.clone(),
-                        implausible: false,
-                        static_identity: false,
-                        evidence: EvidenceRef("e".into()),
-                    }),
-                };
-                run.apply(Some(&mut vehicle), &fact).unwrap();
+                for context in &selected.contexts {
+                    let fact = Fact {
+                        run: RunId("r".into()),
+                        wall_clock_unix_ms: at as i64 * 1000,
+                        offset: secs(at),
+                        versions: versions.clone(),
+                        identity_confirmed: true,
+                        body: FactBody::Reading(Reading {
+                            signal_key: selected.signal_key.clone(),
+                            context: context.clone(),
+                            ecu_target: None,
+                            session: SessionState::Default,
+                            outcome: observation.outcome.clone(),
+                            implausible: false,
+                            static_identity: false,
+                            evidence: EvidenceRef("e".into()),
+                        }),
+                    };
+                    run.apply(Some(&mut vehicle), &fact).unwrap();
+                }
             }
         }
         (history, vehicle)
@@ -2021,5 +2263,250 @@ mod tests {
             context: Goal::CoolingWarmUp.context(),
         };
         assert_ne!(ledger.status(&rules, &warm_up), Status::NotCovered);
+    }
+    #[test]
+    fn req_039_15_membership_matches_component_presets() {
+        let java =
+            include_str!("../android/app/src/main/java/de/obdentic/app/ComponentPresets.java");
+        for (name, goal) in [
+            ("dpf", Goal::DpfRaw),
+            ("egr", Goal::Egr),
+            ("cooling", Goal::CoolingWarmDriving),
+            ("turbo", Goal::Turbo),
+            ("rail", Goal::Rail),
+        ] {
+            let block = java
+                .split(&format!("add(\"{name}\","))
+                .nth(1)
+                .unwrap()
+                .split(");")
+                .next()
+                .unwrap();
+            let parts: Vec<_> = block.split('"').collect();
+            let actual: Vec<_> = parts.iter().skip(3).step_by(2).copied().collect();
+            assert_eq!(actual, goal.preset(), "{name}");
+        }
+        for (goal, key) in [
+            (Goal::Rail, "engine.rail_pressure_actual"),
+            (Goal::Turbo, "engine.boost_pressure_actual"),
+            (Goal::Egr, "engine.egr.commanded"),
+            (Goal::DpfRaw, "exhaust.temperature.pre_dpf"),
+        ] {
+            assert!(goal.includes(key));
+            assert!(goal.includes(&format!("{key}@ecu")));
+        }
+        assert!(!Goal::Rail.includes("rail.fake"));
+    }
+
+    #[test]
+    fn req_039_3_duplicate_signal_keys_are_rejected_even_for_different_ecus() {
+        let mut other = entry("engine.rpm");
+        other.ecu_target = Some("other".into());
+        assert!(
+            matches!(Planner::new([entry("engine.rpm"), other], versions()),
+            Err(CatalogError::DuplicateSignal { signal_key }) if signal_key == "engine.rpm")
+        );
+    }
+
+    #[test]
+    fn req_039_2_shared_reading_counts_for_every_holding_context_and_baseline() {
+        let mut p = planner(&["engine.boost_pressure_actual"]);
+        feed(&mut p, 0, &base(90.0, 60.0, 2000.0, 30.0, 95.0, 0.0));
+        assert_eq!(
+            contexts(
+                &p.plan(secs(0), &Ledger::default()),
+                "engine.boost_pressure_actual"
+            ),
+            ["turbo", "egr", "baseline"]
+        );
+    }
+
+    #[test]
+    fn req_039_2_and_12_egr_contiguous_restarts_after_short_break_and_unknown() {
+        let mut p = planner(&["egr.valve_duty"]);
+        let ledger = Ledger::default();
+        let duration = |plan: &Plan| {
+            plan.goals
+                .iter()
+                .find(|g| g.goal == Goal::Egr)
+                .unwrap()
+                .contiguous
+        };
+        for at in [0, 10, 20, 30] {
+            feed(&mut p, at, &base(90.0, 60.0, 2000.0, 30.0, 10.0, 0.0));
+            assert_eq!(duration(&p.plan(secs(at), &ledger)), Some(secs(at)));
+        }
+        feed(&mut p, 31, &[(SPEED, 20.0), (LOAD, 30.0)]);
+        assert_eq!(duration(&p.plan(secs(31), &ledger)), None);
+        feed(&mut p, 35, &[(SPEED, 60.0), (LOAD, 30.0)]);
+        assert_eq!(duration(&p.plan(secs(35), &ledger)), None);
+        for at in [36, 46] {
+            feed(&mut p, at, &[(SPEED, 20.0), (LOAD, 30.0)]);
+            p.plan(secs(at), &ledger);
+        }
+        feed(&mut p, 47, &[(SPEED, 60.0), (LOAD, 30.0)]);
+        assert_eq!(duration(&p.plan(secs(47), &ledger)), Some(secs(0)));
+        p.record(&failed(LOAD, 48, Outcome::Gap));
+        assert_eq!(duration(&p.plan(secs(48), &ledger)), None);
+        feed(&mut p, 49, &[(SPEED, 60.0), (LOAD, 30.0)]);
+        assert_eq!(duration(&p.plan(secs(49), &ledger)), Some(secs(0)));
+    }
+
+    #[test]
+    fn req_039_6_nonfinite_trigger_makes_condition_unknown() {
+        let mut p = planner(&["engine.boost_pressure_actual"]);
+        for value in [f64::NAN, f64::INFINITY] {
+            p.record(&ok(PEDAL, 1, value));
+            assert_eq!(
+                phase(&p.plan(secs(1), &Ledger::default()), Goal::Turbo),
+                Phase::ConditionUnknown(Reason::NonFinite)
+            );
+        }
+    }
+
+    #[test]
+    fn req_039_12_rearm_uses_reading_times_and_pauses_for_unknown() {
+        let mut p = planner(&[]);
+        let ledger = Ledger::default();
+        feed(&mut p, 0, &[(REGEN, 1.0)]);
+        p.plan(secs(0), &ledger);
+        feed(&mut p, 1, &[(REGEN, 0.0)]);
+        p.plan(secs(3), &ledger);
+        feed(&mut p, 5, &[(REGEN, 0.0)]);
+        p.plan(secs(7), &ledger);
+        p.record(&failed(REGEN, 8, Outcome::Gap));
+        p.plan(secs(8), &ledger);
+        feed(&mut p, 20, &[(REGEN, 0.0)]);
+        p.plan(secs(21), &ledger);
+        feed(&mut p, 26, &[(REGEN, 0.0)]);
+        p.plan(secs(27), &ledger);
+        feed(&mut p, 28, &[(REGEN, 1.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(28), &ledger), Goal::DpfRaw),
+            Phase::Serving
+        );
+    }
+
+    #[test]
+    fn req_039_14_error_gap_and_success_obey_retry_schedule() {
+        let mut p = planner(&["engine.flaky"]);
+        let ledger = Ledger::default();
+        p.record(&failed(
+            "engine.flaky",
+            0,
+            Outcome::Error { reason: "x".into() },
+        ));
+        p.record(&failed("engine.flaky", 10, Outcome::Gap));
+        assert!(contexts(&p.plan(secs(29), &ledger), "engine.flaky").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(30), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
+        p.record(&failed(
+            "engine.flaky",
+            30,
+            Outcome::Error { reason: "x".into() },
+        ));
+        assert!(contexts(&p.plan(secs(149), &ledger), "engine.flaky").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(150), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
+        p.record(&ok("engine.flaky", 150, 1.0));
+        p.record(&failed(
+            "engine.flaky",
+            151,
+            Outcome::Error { reason: "x".into() },
+        ));
+        assert!(contexts(&p.plan(secs(180), &ledger), "engine.flaky").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(181), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
+    }
+    #[test]
+    fn req_039_2_and_12_replay_does_not_bridge_egr_breaks() {
+        for unknown in [false, true] {
+            let mut p = planner(&["egr.valve_duty"]);
+            let mut run = SmartRun::new(goal_rules(), RunId("r".into()), SessionKind::Replay);
+            let ledger = Ledger::default();
+            for at in [0, 5, 10, 15, 20, 25, 26, 27, 28, 29, 30, 35, 40] {
+                let speed = if !unknown && (26..=28).contains(&at) {
+                    20.0
+                } else {
+                    60.0
+                };
+                feed(&mut p, at, &[(SPEED, speed), (LOAD, 30.0)]);
+                if unknown && at == 26 {
+                    p.record(&failed(LOAD, at, Outcome::Gap));
+                }
+                let plan = p.plan(secs(at), &ledger);
+                if at == 29 {
+                    assert_eq!(
+                        phase(&plan, Goal::Egr),
+                        if unknown {
+                            Phase::Serving
+                        } else {
+                            Phase::Rearming
+                        }
+                    );
+                }
+                for event in &plan.events {
+                    if event.goal == Some(Goal::Egr) && event.kind == EventKind::ContextEnded {
+                        assert_eq!(event.inputs.len(), 2);
+                        run.apply(
+                            None,
+                            &Fact {
+                                run: RunId("r".into()),
+                                wall_clock_unix_ms: 0,
+                                offset: event.at,
+                                versions: versions(),
+                                identity_confirmed: false,
+                                body: FactBody::ContextEnd(Goal::Egr.context()),
+                            },
+                        )
+                        .unwrap();
+                    }
+                }
+                for key in [SPEED, LOAD, "egr.valve_duty"] {
+                    let context = if key == "egr.valve_duty" {
+                        Goal::Egr.context()
+                    } else {
+                        Goal::Baseline.context()
+                    };
+                    if key == "egr.valve_duty" && !contexts(&plan, key).contains(&"egr".to_owned())
+                    {
+                        continue;
+                    }
+                    run.apply(
+                        None,
+                        &Fact {
+                            run: RunId("r".into()),
+                            wall_clock_unix_ms: 0,
+                            offset: secs(at),
+                            versions: versions(),
+                            identity_confirmed: false,
+                            body: FactBody::Reading(Reading {
+                                signal_key: key.into(),
+                                context,
+                                ecu_target: None,
+                                session: SessionState::Default,
+                                outcome: Outcome::Decoded(Decoded::Numeric { finite: true }),
+                                implausible: false,
+                                static_identity: false,
+                                evidence: EvidenceRef("e".into()),
+                            }),
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            let key = EntryKey {
+                versions: versions(),
+                signal_key: "egr.valve_duty".into(),
+                context: Goal::Egr.context(),
+            };
+            assert_eq!(run.ledger().entry(&key).unwrap().longest_segment, secs(25));
+        }
     }
 }
