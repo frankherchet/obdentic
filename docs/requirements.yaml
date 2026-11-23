@@ -930,7 +930,7 @@ requirements:
     title: Plan Smart measurements automatically by diagnostic context over the whole safely readable catalog
     type: functional
     priority: should
-    status: draft
+    status: accepted
     source: "Conversation 2026-11-14: Smart measurement coverage, decisions by @frankherchet"
     description: |
       After one user start, Smart plans which
@@ -980,7 +980,7 @@ requirements:
       - id: REQ-039.3
         text: "The planner covers the entire safely readable catalog of the connected vehicle, not only the signals of the five component presets: the standard PIDs the vehicle reports as supported, the default-session signals of the effective Knowledge (REQ-035.2) and, only under REQ-040, the session-flagged DIDs of every eligible ECU, meaning an identified ECU with a validated target and explicit typed Knowledge entries for those DIDs. It uses only closed, validated read and session operations; it adds no write, raw command, caller-provided service byte, arbitrary address or DID, elevated capability or automatic DTC clearing (Mode 04 or any other clearing service), and no caller, profile, vehicle preset, MCP call or AI prompt can add a target."
       - id: REQ-039.4
-        text: "The raw dpf.field_regeneration_request_status reading remains in the continuously monitored trigger set whenever readable. When a fresh reading is nonzero, its goal context has the highest planning priority until the existing REQ-036 DPF window ends; every lower-priority goal it interrupts keeps its progress in the ledger and is resumed when the DPF priority ends. The reading is shown and recorded as a raw request status and is never described as confirmed regeneration."
+        text: "The raw dpf.field_regeneration_request_status reading remains in the continuously monitored trigger set whenever readable. When a fresh reading is nonzero, its goal context has the highest planning priority until the first fresh reading of 0 (REQ-039.12, REQ-039.13); every lower-priority goal it interrupts keeps its progress in the ledger and is resumed when the DPF priority ends. The reading is shown and recorded as a raw request status and is never described as confirmed regeneration."
       - id: REQ-039.5
         text: "Within the limit of 32 selected signals per step (REQ-036.1) the planner distributes the catalog over successive steps so every plannable signal is attempted in its context, resumes unfinished work across steps, drives and restarts using the vehicle ledger, and never lets one unavailable signal block other signals or goals."
       - id: REQ-039.6
@@ -990,11 +990,17 @@ requirements:
       - id: REQ-039.8
         text: "Plan changes (goal start, interruption, resumption, completion, skip with reason, expiry, stop) are shown with their reason and remaining time and are written into the analysis recording with wallclock time, monotonic offset, goal, reason, the condition readings behind it and the definition versions; replay shows the same without adapter traffic. Condition values stay in the private recording and in memory; the operational app log (REQ-029) names only goals and reasons."
       - id: REQ-039.9
-        text: "Diagnostic goals and planning thresholds are owned by OBDentic. Knowledge, profiles, stored vehicle presets, MCP calls and AI prompts cannot alter planning policies or elevate vehicle capabilities."
+        text: "Diagnostic goals and planning thresholds are owned by OBDentic. Knowledge, profiles, stored vehicle presets, MCP calls and AI prompts cannot alter planning policies or elevate vehicle capabilities. This planner succeeds the windows, priority and rotation of REQ-035 and REQ-036: the change that implements it updates REQ-035 and REQ-036 (including the fixed 3- and 10-minute windows and the 3-minute rotation of REQ-036.3 and REQ-036.4) explicitly in the same change, and keeps the other REQ-036.1 end conditions (REQ-039.1) and the recording and replay duties of REQ-036.5."
       - id: REQ-039.10
-        text: "The goal, condition and threshold definitions are versioned (REQ-038.7). Changing them or the Knowledge definitions of a vehicle starts a new definition version, never rewrites stored progress and never silently mixes progress between versions."
+        text: "The goal, condition and threshold definitions are versioned (REQ-038.7). Changing them or the Knowledge definitions of a vehicle starts a new definition version, never rewrites stored progress and never silently mixes progress between versions. A running Smart run finishes on the definition version it started with; the new version applies from the next Smart start."
       - id: REQ-039.11
         text: "Warm-up and driving below the warm threshold of 80 degC are recorded separately from measurements at or above it, in the ledger, recording and display of every warm-dependent goal; until the threshold is reached the goal shows warm not yet reached (cold or warming), not unmet, failed, fault or complete. The 80 degC threshold is a provisional technical default: reaching or missing it, or measuring in either range, is never reported as a fault, as healthy, or as a diagnosis. An unknown coolant reading makes the warm condition unknown (REQ-039.6), not warm and not below."
+      - id: REQ-039.12
+        text: "A goal context is active only while its condition holds; there are no fixed maximum window lengths and no timed rotation steps. A goal context ends when its condition does not hold or is unknown, except that the turbo context continues for 20 seconds after the first fresh reading at or below 80 % and pressing again continues it. A goal can start again only after its condition has not held for at least 10 seconds (the maximum age of REQ-039.6); progress within a drive and across drives accumulates in the ledger. There is no hysteresis and no user setting: the thresholds of REQ-039.2 are fixed provisional defaults owned by OBDentic."
+      - id: REQ-039.13
+        text: "Among the goals whose condition holds, the planner serves them in this order: dpf raw request, rail, turbo, egr, cooling, then the generic baseline; within one priority level it picks the goal furthest from its target. A fixed share of each plan cycle of at most 8 of the 32 slots is reserved for baseline signals that have not reached their target, so that they are never starved by contextual goals."
+      - id: REQ-039.14
+        text: "A signal that was rejected, empty or unanswered is retried after 30 seconds, then after 2 minutes, then at most once per drive, never in a tight loop; a signal not yet checked for availability is attempted once per drive. A signal reported unsupported, and a session-restricted signal without a validated session of REQ-040, is not retried in that drive. Every skip, retry and its reason is shown and recorded (REQ-039.8)."
 
   - id: REQ-040
     title: Automatically use extended UDS sessions on several validated ECU targets during Smart, only as long as needed
