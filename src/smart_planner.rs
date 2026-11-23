@@ -26,10 +26,11 @@
 //!   a member of the baseline.
 //! - The planner must be asked for a plan at least once per step; re-arming and the turbo hold
 //!   are evaluated at the offsets of those calls and of the readings.
-//! - A goal that has not been active yet needs no re-arm time; the 10 seconds apply after it ended
-//!   because its condition did not hold (REQ-039.12).
-//! - A signal whose latest ledger state is a rejected, empty or unanswered read is attempted once
-//!   in a new drive and not retried within it ("then once per drive", REQ-039.14).
+//! - A goal that has not been active yet needs no re-arm time. After it was active, the 10 seconds
+//!   count from the first fresh reading that shows its condition not holding, whatever ended the
+//!   goal (REQ-039.4, REQ-039.12); an unknown reading neither starts nor continues that count.
+//! - The retry schedule of a failed signal (30 s, 2 min, then once per drive, REQ-039.14) starts
+//!   anew in every drive; earlier drives in the ledger do not shorten it.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,8 +38,8 @@ use std::{
 };
 
 use crate::coverage_ledger::{
-    ContextRule, DefinitionVersions, EntryKey, GoalContext, LatestState, Ledger, Outcome, Rules,
-    Status, FRESHNESS_LIMIT, MIN_SAMPLES, MIN_VALID_TIME,
+    ContextRule, DefinitionVersions, EntryKey, GoalContext, Ledger, Outcome, Rules, Status,
+    FRESHNESS_LIMIT, MIN_SAMPLES, MIN_VALID_TIME,
 };
 
 /// REQ-036.1/REQ-039.5: signals selected per step.
@@ -383,7 +384,8 @@ struct GoalState {
     unarmed_since: Option<Duration>,
     pressed: bool,
     hold_until: Option<Duration>,
-    active_before: bool,
+    /// Active since it last re-armed: a not-holding reading must start the re-arm wait.
+    used: bool,
     phase: Option<Phase>,
 }
 
@@ -408,8 +410,6 @@ pub struct Planner {
     rules: Rules,
     catalog: BTreeMap<String, CatalogEntry>,
     availability: BTreeMap<String, Availability>,
-    /// Signals whose read failed in the ledger before this drive: attempted once, not retried.
-    chronic: BTreeSet<String>,
     context: BTreeMap<String, (Duration, Result<f64, Reason>)>,
     goals: BTreeMap<Goal, GoalState>,
     last_planned: BTreeMap<String, u64>,
@@ -420,11 +420,9 @@ pub struct Planner {
 }
 
 impl Planner {
-    /// `ledger` is only read for signals whose latest read failed before this drive (REQ-039.14).
     pub fn new(
         catalog: impl IntoIterator<Item = CatalogEntry>,
         versions: DefinitionVersions,
-        ledger: &Ledger,
     ) -> Self {
         let mut entries = BTreeMap::new();
         for entry in catalog {
@@ -443,23 +441,6 @@ impl Planner {
                 (entry.signal_key.clone(), state)
             })
             .collect();
-        let chronic = ledger
-            .entries
-            .iter()
-            .filter(|(key, entry)| {
-                key.versions == versions
-                    && entry.latest.as_ref().is_some_and(|latest| {
-                        matches!(
-                            latest.state,
-                            LatestState::Rejected { .. }
-                                | LatestState::Empty
-                                | LatestState::Error { .. }
-                                | LatestState::NoAnswer { .. }
-                        )
-                    })
-            })
-            .map(|(key, _)| key.signal_key.clone())
-            .collect();
         let goals = Goal::ALL
             .iter()
             .map(|goal| {
@@ -477,7 +458,6 @@ impl Planner {
             versions,
             catalog: entries,
             availability,
-            chronic,
             context: BTreeMap::new(),
             goals,
             last_planned: BTreeMap::new(),
@@ -539,9 +519,7 @@ impl Planner {
                     Availability::Failed { count, .. } => count + 1,
                     _ => 1,
                 };
-                let delay = (!self.chronic.contains(key))
-                    .then(|| RETRY_DELAYS.get(count as usize - 1))
-                    .flatten();
+                let delay = RETRY_DELAYS.get(count as usize - 1);
                 (
                     Availability::Failed {
                         count,
@@ -912,11 +890,8 @@ impl Planner {
 
         let (active, inactive) = match unknown {
             Some(reason) => {
-                // Ended only by an unknown reading: no re-arm wait, and unknown time never
-                // counts toward re-arming (REQ-039.6, REQ-039.12).
-                if state.active_before {
-                    state.armed = true;
-                }
+                // Unknown ends the goal without a re-arm wait and never counts toward re-arming
+                // (REQ-039.6, REQ-039.12): armed and used stay as they were.
                 state.unarmed_since = None;
                 state.pressed = false;
                 state.hold_until = None;
@@ -928,6 +903,7 @@ impl Planner {
                 state.pressed = true;
                 if state.armed || held {
                     state.armed = true;
+                    state.used = true;
                     (true, Phase::Rearming)
                 } else {
                     (false, Phase::Rearming)
@@ -938,8 +914,10 @@ impl Planner {
                     state.hold_until = Some(reading_at + TURBO_RELEASE_HOLD);
                 }
                 state.pressed = false;
-                if state.active_before {
+                if state.armed && state.used {
+                    // First fresh not-holding reading since the goal was active.
                     state.armed = false;
+                    state.used = false;
                     state.unarmed_since = Some(now);
                 }
                 if !state.armed {
@@ -961,7 +939,6 @@ impl Planner {
                 (held, phase)
             }
         };
-        state.active_before = active;
         Evaluation {
             active,
             inactive,
@@ -1033,8 +1010,8 @@ fn failure_reason(outcome: &Outcome) -> Reason {
 mod tests {
     use super::*;
     use crate::coverage_ledger::{
-        Decoded, Entry, EvidenceRef, Fact, FactBody, Reading, RunId, SessionKind, SessionState,
-        SmartRun,
+        Decoded, Entry, EvidenceRef, Fact, FactBody, LatestState, Reading, RunId, SessionKind,
+        SessionState, SmartRun,
     };
 
     fn secs(s: u64) -> Duration {
@@ -1060,7 +1037,7 @@ mod tests {
     fn planner(extra: &[&str]) -> Planner {
         let mut catalog = triggers();
         catalog.extend(extra.iter().map(|k| entry(k)));
-        Planner::new(catalog, versions(), &Ledger::default())
+        Planner::new(catalog, versions())
     }
 
     fn ok(key: &str, at: u64, value: f64) -> Observation {
@@ -1205,7 +1182,7 @@ mod tests {
                 reported_supported: false,
             },
         });
-        let mut p = Planner::new(catalog.clone(), versions(), &Ledger::default());
+        let mut p = Planner::new(catalog.clone(), versions());
         let plan = p.plan(secs(0), &Ledger::default());
         let known: BTreeSet<_> = catalog.iter().map(|c| c.signal_key.clone()).collect();
         assert!(plan.selection.iter().all(|s| known.contains(&s.signal_key)));
@@ -1314,7 +1291,7 @@ mod tests {
         let keys: Vec<String> = (0..100).map(|i| format!("engine.sig{i:03}")).collect();
         let mut catalog = triggers();
         catalog.extend(keys.iter().map(|k| entry(k)));
-        let mut p = Planner::new(catalog, versions(), &Ledger::default());
+        let mut p = Planner::new(catalog, versions());
         let ledger = Ledger::default();
         let mut seen = BTreeSet::new();
         for step in 0..8 {
@@ -1581,7 +1558,60 @@ mod tests {
     }
 
     #[test]
-    fn req_039_12_unknown_ends_the_turbo_hold_and_a_press_restarts_at_once() {
+    fn req_039_4_unknown_then_fresh_zero_then_nonzero_needs_the_rearm() {
+        let ledger = Ledger::default();
+        let mut p = planner(&[]);
+        feed(&mut p, 0, &base(90.0, 0.0, 800.0, 20.0, 10.0, 3.0));
+        assert_eq!(
+            phase(&p.plan(secs(0), &ledger), Goal::DpfRaw),
+            Phase::Serving
+        );
+        p.record(&failed(REGEN, 2, Outcome::NoAnswer { reason: "t".into() }));
+        p.plan(secs(2), &ledger);
+        // A fresh 0 after the unknown reading starts the 10-second re-arm.
+        feed(&mut p, 3, &[(REGEN, 0.0)]);
+        p.plan(secs(3), &ledger);
+        feed(&mut p, 4, &[(REGEN, 1.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(4), &ledger), Goal::DpfRaw),
+            Phase::Rearming
+        );
+        feed(&mut p, 5, &[(REGEN, 0.0)]);
+        p.plan(secs(5), &ledger);
+        feed(&mut p, 15, &[(REGEN, 0.0)]);
+        p.plan(secs(15), &ledger);
+        feed(&mut p, 16, &[(REGEN, 1.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(16), &ledger), Goal::DpfRaw),
+            Phase::Serving
+        );
+    }
+
+    #[test]
+    fn req_039_12_turbo_rearm_counts_from_the_first_not_holding_reading_during_the_hold() {
+        let ledger = Ledger::default();
+        let mut p = planner(&["turbo.boost"]);
+        feed(&mut p, 0, &[(PEDAL, 95.0)]);
+        p.plan(secs(0), &ledger);
+        // Released at 1: hold until 21; the 10 s count from 1 ends at 11, before the hold ends.
+        for at in 1..=21 {
+            feed(&mut p, at, &[(PEDAL, 10.0)]);
+            p.plan(secs(at), &ledger);
+        }
+        feed(&mut p, 22, &[(PEDAL, 10.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(22), &ledger), Goal::Turbo),
+            Phase::WaitingForCondition
+        );
+        feed(&mut p, 23, &[(PEDAL, 95.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(23), &ledger), Goal::Turbo),
+            Phase::Serving
+        );
+    }
+
+    #[test]
+    fn req_039_12_unknown_ends_the_turbo_hold_but_the_wait_since_the_release_still_applies() {
         let ledger = Ledger::default();
         let mut p = planner(&["turbo.boost"]);
         feed(&mut p, 0, &[(PEDAL, 95.0)]);
@@ -1593,10 +1623,11 @@ mod tests {
             phase(&p.plan(secs(2), &ledger), Goal::Turbo),
             Phase::ConditionUnknown(Reason::Unanswered)
         );
+        // A fresh reading showed the pedal released at 1, so a press at 3 waits for the re-arm.
         feed(&mut p, 3, &[(PEDAL, 95.0)]);
         assert_eq!(
             phase(&p.plan(secs(3), &ledger), Goal::Turbo),
-            Phase::Serving
+            Phase::Rearming
         );
     }
 
@@ -1693,7 +1724,7 @@ mod tests {
         let mut catalog = triggers();
         catalog.extend(dpf.iter().map(|k| entry(k)));
         catalog.push(entry("turbo.boost"));
-        let mut p = Planner::new(catalog, versions(), &Ledger::default());
+        let mut p = Planner::new(catalog, versions());
         let ledger = Ledger::default();
         feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 95.0, 0.0));
         let both = p.plan(secs(0), &ledger);
@@ -1721,7 +1752,7 @@ mod tests {
         let mut catalog = triggers();
         catalog.extend(dpf.iter().map(|k| entry(k)));
         catalog.extend(others.iter().map(|k| entry(k)));
-        let mut p = Planner::new(catalog, versions(), &Ledger::default());
+        let mut p = Planner::new(catalog, versions());
         feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 2.0));
         let plan = p.plan(secs(0), &Ledger::default());
         assert_eq!(plan.selection.len(), MAX_SELECTION);
@@ -1748,14 +1779,14 @@ mod tests {
         for key in &cooling {
             at_least(&mut ledger, key, Goal::CoolingWarmDriving, 2, 30);
         }
-        let mut p = Planner::new(catalog.clone(), versions(), &ledger);
+        let mut p = Planner::new(catalog.clone(), versions());
         feed(&mut p, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0));
         let plan = p.plan(secs(0), &ledger);
         let first = plan.selection.iter().find(|s| !s.trigger).unwrap();
         assert_eq!(first.context.id(), "dpf.warm_driving");
 
         // On equal shares the goal listed first in REQ-039.2 wins.
-        let mut tie = Planner::new(catalog, versions(), &Ledger::default());
+        let mut tie = Planner::new(catalog, versions());
         feed(&mut tie, 0, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0));
         let plan = tie.plan(secs(0), &Ledger::default());
         let first = plan.selection.iter().find(|s| !s.trigger).unwrap();
@@ -1821,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn req_039_14_a_signal_that_failed_before_is_attempted_once_per_drive() {
+    fn req_039_14_a_signal_that_failed_in_an_earlier_drive_gets_the_full_schedule_again() {
         let mut ledger = Ledger::default();
         ledger.entries.insert(
             EntryKey {
@@ -1844,14 +1875,25 @@ mod tests {
         let mut p = Planner::new(
             triggers().into_iter().chain([entry("engine.flaky")]),
             versions(),
-            &ledger,
         );
         assert_eq!(
             contexts(&p.plan(secs(0), &ledger), "engine.flaky"),
             ["baseline"]
         );
         p.record(&failed("engine.flaky", 0, Outcome::Empty));
-        assert!(contexts(&p.plan(secs(31), &ledger), "engine.flaky").is_empty());
+        assert!(contexts(&p.plan(secs(29), &ledger), "engine.flaky").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(30), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
+        p.record(&failed("engine.flaky", 30, Outcome::Empty));
+        assert!(contexts(&p.plan(secs(149), &ledger), "engine.flaky").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(150), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
+        p.record(&failed("engine.flaky", 150, Outcome::Empty));
+        assert!(contexts(&p.plan(secs(2000), &ledger), "engine.flaky").is_empty());
     }
 
     #[test]
@@ -1908,7 +1950,7 @@ mod tests {
         catalog.extend(keys.iter().map(|k| entry(k)));
         let mut vehicle = Ledger::default();
         let mut run = SmartRun::new(goal_rules(), RunId("r".into()), SessionKind::Live);
-        let mut p = Planner::new(catalog, versions.clone(), &vehicle);
+        let mut p = Planner::new(catalog, versions.clone());
         let mut history = Vec::new();
         for at in (0..=179u64).step_by(2) {
             let live = script(at);
