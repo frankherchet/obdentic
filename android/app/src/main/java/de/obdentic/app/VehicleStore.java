@@ -248,10 +248,22 @@ public final class VehicleStore {
     public synchronized String setCoverageLedger(String vin, JSONObject ledger) {
         return mutate(vin, next -> put(find(next, vin), COVERAGE, copy(ledger)));
     }
+    /** The selected VIN, or "" when none; no copy of the store. */
+    public synchronized String selected() { return data.optString("selected"); }
+    /** A copy of every record without its ledger: the ledger is never serialised here, however large it has grown. */
     public synchronized JSONObject snapshot() {
-        JSONObject out = copy(data);
-        JSONArray rows = out.optJSONArray("vehicles");
-        for (int i = 0; rows != null && i < rows.length(); i++) rows.optJSONObject(i).remove(COVERAGE);
+        JSONArray rows = data.optJSONArray("vehicles"), kept = new JSONArray();
+        for (int i = 0; rows != null && i < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i), out = new JSONObject();
+            for (java.util.Iterator<String> keys = row.keys(); keys.hasNext(); ) {
+                String key = keys.next();
+                if (COVERAGE.equals(key)) continue;
+                Object value = row.opt(key);
+                put(out, key, value instanceof JSONObject ? copy((JSONObject) value) : value instanceof JSONArray ? copyArray((JSONArray) value) : value);
+            }
+            kept.put(out);
+        }
+        JSONObject out = build(kept, data.optString("selected"));
         put(out, "unreadable", unreadable);
         return out;
     }

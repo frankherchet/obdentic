@@ -68,7 +68,7 @@ final class ComponentSmartAcceptance {
         boolean savedAutoRecord = ObdService.autoRecordEnabled(context);
         Link[] link = new Link[1];
         try {
-            presetsAndBlockers(); coverageUiText();
+            presetsAndBlockers(); coverageUiText(); coverageSnapshotCost(context);
             service.permissionOverride = Boolean.TRUE; service.bluetoothOverride = Boolean.TRUE;
             storeFile = new File(context.getCacheDir(), "component-smart-" + System.nanoTime() + ".json");
             service.vehicles = new VehicleStore(storeFile);
@@ -592,6 +592,54 @@ final class ComponentSmartAcceptance {
             waitFor(() -> service.snapshot().optString("message").contains("Fahrzeug-Abdeckung nicht gespeichert"), "REQ-038.8 the failed write is reported");
         } finally { folder.setWritable(true, false); }
         require(before.equals(new String(java.nio.file.Files.readAllBytes(storeFile.toPath()), StandardCharsets.UTF_8)), "REQ-038.8 a failed write leaves the stored ledger as it was");
+        coverageLostLink(service, link, vin);
+    }
+    /** REQ-038.6 (#340 review): a lost link stores what the run credited before the core goes away, and a failed write on that path is part of the error message. */
+    private static void coverageLostLink(ObdService service, Link[] link, String vin) throws Exception {
+        service.setAutoConnect(false);
+        reconnect(service, link, false);
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started before the link is lost");
+        waitFor(() -> { JSONObject live = liveCoverage(service); return live != null && entryCount(live.optJSONObject("run")) > 0; }, "the run ledger fills before the link is lost");
+        SystemClock.sleep(1500);
+        int before = samples(service.vehicles.coverageLedger(vin));
+        link[0].drop();
+        waitFor(() -> "error".equals(service.snapshot().optString("phase")) && !smart(service).optBoolean("active"), "the lost link ends the analysis");
+        waitFor(() -> { try { return samples(service.vehicles.coverageLedger(vin)) > before; } catch (Exception e) { return false; } }, "REQ-038.6 a lost link still stores what the run credited");
+        require(!service.snapshot().optString("message").contains("Fahrzeug-Abdeckung nicht gespeichert"), "REQ-038.6 a stored ledger is not reported as lost: " + service.snapshot().optString("message"));
+
+        reconnect(service, link, false);
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started before the write fails");
+        waitFor(() -> { JSONObject live = liveCoverage(service); return live != null && entryCount(live.optJSONObject("run")) > 0; }, "the run ledger fills before the write fails");
+        SystemClock.sleep(1500);
+        File folder = storeFile.getParentFile(); String stored = new String(java.nio.file.Files.readAllBytes(storeFile.toPath()), StandardCharsets.UTF_8);
+        require(folder.setWritable(false, false), "test setup: the store folder becomes read-only");
+        try {
+            link[0].drop();
+            waitFor(() -> "error".equals(service.snapshot().optString("phase")) && !smart(service).optBoolean("active"), "the lost link ends the analysis without a writable store");
+            String message = service.snapshot().optString("message");
+            require(message.contains("Fahrzeug-Abdeckung nicht gespeichert") && message.contains(VehicleStore.WRITE_FAILED), "REQ-038.8 the failed write on a lost link is part of the error message: " + message);
+        } finally { folder.setWritable(true, false); }
+        require(stored.equals(new String(java.nio.file.Files.readAllBytes(storeFile.toPath()), StandardCharsets.UTF_8)), "REQ-038.8 the failed write on a lost link leaves the stored ledger as it was");
+        reconnect(service, link, false);
+    }
+    /** REQ-038.6 (#340 review): the service state and the selected VIN never copy a vehicle's stored ledger; its size does not matter. */
+    private static void coverageSnapshotCost(Context context) throws Exception {
+        File file = new File(context.getCacheDir(), "snapshot-cost-" + System.nanoTime() + ".json");
+        try {
+            VehicleStore store = new VehicleStore(file); String vin = "WVW00000000004444";
+            store.observe(new JSONObject().put("vin", vin).put("responders", new JSONArray()).put("signals", new JSONArray()), 1L);
+            JSONArray entries = new JSONArray(); String pad = "x".repeat(120);
+            for (int i = 0; i < 20000; i++) entries.put(new JSONObject().put("context", "baseline").put("qualifying_samples", 1).put("pad", pad + i));
+            require(store.setCoverageLedger(vin, new JSONObject().put("v", 1).put("entries", entries)) == null, "test setup: a large ledger on the record");
+            long start = SystemClock.elapsedRealtime();
+            for (int i = 0; i < 200; i++) require(store.selected().equals(vin) && store.snapshot().getJSONArray("vehicles").length() == 1, "the selected VIN and the snapshot are readable");
+            long took = SystemClock.elapsedRealtime() - start;
+            JSONObject snapshot = store.snapshot();
+            require(!snapshot.toString().contains("coverage_ledger") && snapshot.getJSONArray("vehicles").getJSONObject(0).optString("vin").equals(vin) && snapshot.getJSONArray("vehicles").getJSONObject(0).has("first_connected"),
+                "REQ-038.6 the snapshot keeps the record without its ledger");
+            require(took < 1500, "REQ-038.6 200 snapshots with a 3 MB stored ledger take " + took + " ms");
+            require(samples(store.coverageLedger(vin)) == 20000, "REQ-038.6 the ledger itself is intact");
+        } finally { file.delete(); }
     }
     /** REQ-038.8/.10: the card text of unavailable, unreliable and partial coverage; pure, no service. */
     private static void coverageUiText() throws Exception {

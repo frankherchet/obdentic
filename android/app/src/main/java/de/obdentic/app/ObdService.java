@@ -348,7 +348,7 @@ public final class ObdService extends Service {
             for(int i=0;i<signals.length();i++) if(semantic.equals(signals.optJSONObject(i).optString("semantic")) && signals.optJSONObject(i).optString("status").equals("supported")) defaults.put(semantic);
         return defaults;
     }
-    private String selectedVin() { return vehicles.snapshot().optString("selected"); }
+    private String selectedVin() { return vehicles.selected(); }
     /** REQ-014.1: applies the record's stored selection (catalog-filtered, no adapter traffic); false when it has none. Live mode only (REQ-013.4). */
     private boolean restoreSelection(String vin) {
         JSONArray stored=mode.equals("live") && !vin.isEmpty() ? vehicles.selection(vin) : null;
@@ -430,7 +430,7 @@ public final class ObdService extends Service {
         String resume=established && !recordingProfile.equals(AUTO_PROFILE) ? ReconnectPolicy.resumeProfile(recordingProfile) : ""; // REQ-020.8: before the recording closes
         coverageLedgerFinish(); // #340: the core goes away next; store what the run credited
         Link active=transport; transport=null; if(active!=null) active.close(); destroyCore();
-        set("phase","error"); message(text+coverageSaveNotice()); closeRecording("error",text); gapReset(); // the session ended: no gap carries over (a failed job leaves the session ready and keeps it)
+        String notice=coverageSaveNotice(); set("phase","error"); message(text+notice); closeRecording("error",text); if(!notice.isEmpty()) message(text+notice); /* closing the recording says its own message; a ledger that was not stored must stay readable */ gapReset(); // the session ended: no gap carries over (a failed job leaves the session ready and keeps it)
         long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
         if(delay < 0) { pendingProfile=""; stopForeground(STOP_FOREGROUND_REMOVE); releaseWakeLock(); return; }
         if(established && !resume.isEmpty()) pendingProfile=resume; // a loss before the resume started keeps the pending profile

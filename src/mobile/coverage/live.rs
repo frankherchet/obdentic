@@ -120,7 +120,7 @@ impl Live {
             Some(active) if !active.ended => active,
             _ => return Err("no active coverage run".into()),
         };
-        // The record is folded into copies and committed only when every step succeeded.
+        // Every check that can reject a record runs before the fold; `apply` itself only fails before it changes anything.
         let outcome = (|| {
             let parsed = parse(record).map_err(|invalid| invalid.reason)?;
             if parsed.run != active.smart.id().0 {
@@ -130,7 +130,7 @@ impl Live {
                 return Err("run_offset_us goes backwards".to_owned());
             }
             let fact = match parsed.parsed {
-                Parsed::Run { .. } => return Ok(None),
+                Parsed::Run { .. } => return Ok(false),
                 Parsed::Item(Item::Read(fact)) => fact,
                 Parsed::Item(Item::Break {
                     boundary,
@@ -145,21 +145,16 @@ impl Live {
                     body: FactBody::Boundary(boundary),
                 },
             };
-            let mut smart = active.smart.clone();
-            let mut vehicle = self.vehicle.clone();
-            smart
-                .apply(vehicle.as_mut(), &fact)
+            active
+                .smart
+                .apply(self.vehicle.as_mut(), &fact)
                 .map_err(|error| error.to_string())?;
-            Ok(Some((smart, vehicle, fact.offset)))
+            active.last_offset = fact.offset;
+            Ok(true)
         })();
         match outcome {
-            Ok(None) => Ok(json!({"counted":false})),
-            Ok(Some((smart, vehicle, offset))) => {
-                active.smart = smart;
-                active.last_offset = offset;
-                self.vehicle = vehicle;
-                Ok(json!({"counted":true}))
-            }
+            Ok(false) => Ok(json!({"counted":false})),
+            Ok(true) => Ok(json!({"counted":true})),
             Err(reason) => {
                 self.invalid = true;
                 Err(reason)
