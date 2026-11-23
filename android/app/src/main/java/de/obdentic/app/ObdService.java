@@ -77,6 +77,11 @@ public final class ObdService extends Service {
     private String coverageRun, coverageRevision=""; // run id (null: no run is on) and the Knowledge revision its start record carried
     private int coveragePart, coverageRecords, fileSerial; // part number of the open file; coverage.* records written into it; files begun so far
     private long coverageOriginNanos, coverageLastOffset; // the run clock: monotonic since the Smart start, never reset by a rotation
+    /** #340 (REQ-038.6/.8/.10): the live coverage ledger of the running Smart run is fed from the records written into the recording. The queue is guarded by recordLock; every core call runs on the worker. */
+    private final ArrayDeque<JSONObject> coverageQueue=new ArrayDeque<>();
+    private volatile boolean coverageLedgerOn; private boolean coverageInvalid, coverageSaveFailed;
+    private String coverageVin="", coverageProblem=""; // vehicle whose stored ledger this run credits ("" = run ledger only); why the vehicle ledger is unavailable
+    private long coverageSavedAt, coveragePublishedAt;
     private volatile long gapSince;
     private volatile int gapProbes;
     private volatile String gapOutcome="";
@@ -218,7 +223,7 @@ public final class ObdService extends Service {
         AppLog.i("conn","ready "+address);
         sessionAddress=address; getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString(KNOWN,address).commit();
         policy.success();
-        foreground();
+        foreground(); worker.execute(this::coverageStoredRefresh);
     }
     /** REQ-028.5: "Dauer-Aufzeichnung", on by default. */
     public static boolean autoRecordEnabled(Context context) { return context.getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean(AUTO_REC,true); }
@@ -295,7 +300,7 @@ public final class ObdService extends Service {
         synchronized(stateLock) { values.clear(); put(state,"values",new JSONArray()); put(state,"debug",new JSONArray());
             put(state,"uds",new JSONObject()); put(state,"udsCandidates",0);
             put(state,"replayFile","");
-            put(state,"coverage",JSONObject.NULL);
+            put(state,"coverage",JSONObject.NULL); put(state,"coverageLive",JSONObject.NULL); put(state,"coverageStored",JSONObject.NULL);
             put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"availability",new JSONObject()); put(state,"replayPartial",false);
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
@@ -386,9 +391,9 @@ public final class ObdService extends Service {
     public void selectVehicle(String vin) { vehicleAction(() -> { String error=vehicles.select(vin);
         boolean noRecording; synchronized(stateLock) { noRecording=state.optString("recording").isEmpty(); }
         if(error==null && noRecording && !smartOn) restoreSelection(vin); // REQ-014.1; a running smart analysis keeps its own selection
-        return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
+        coverageStoredRefresh(); return error==null?"Fahrzeug gewählt: "+vehicles.name(vin):error; }); }
     public void renameVehicle(String vin,String name) { vehicleAction(() -> { String error=vehicles.rename(vin,name); return error==null?"Fahrzeug umbenannt: "+vehicles.name(vin):error; }); }
-    public void deleteVehicle(String vin) { vehicleAction(() -> { String name=vehicles.name(vin), error=vehicles.delete(vin); return error==null?"Fahrzeug gelöscht: "+name:error; }); }
+    public void deleteVehicle(String vin) { vehicleAction(() -> { String name=vehicles.name(vin), error=vehicles.delete(vin); coverageStoredRefresh(); return error==null?"Fahrzeug gelöscht: "+name:error; }); }
     public void resetVehicleStore() { vehicleAction(() -> { String error=vehicles.reset(); return error==null?"Fahrzeugspeicher zurückgesetzt":error; }); }
     private void vehicleAction(java.util.function.Supplier<String> action) { if(!worker.isShutdown()) worker.execute(() -> message(action.get())); }
     private void applySupport(JSONObject support) {
@@ -423,6 +428,7 @@ public final class ObdService extends Service {
         boolean live=mode.equals("live"), established=!sessionAddress.isEmpty(); sessionAddress="";
         AppLog.e("conn",(established?"session lost: ":"attempt failed: ")+text,error);
         String resume=established && !recordingProfile.equals(AUTO_PROFILE) ? ReconnectPolicy.resumeProfile(recordingProfile) : ""; // REQ-020.8: before the recording closes
+        coverageLedgerFinish(); // #340: the core goes away next; store what the run credited
         Link active=transport; transport=null; if(active!=null) active.close(); destroyCore();
         set("phase","error"); message(text); closeRecording("error",text); gapReset(); // the session ended: no gap carries over (a failed job leaves the session ready and keeps it)
         long delay=!live ? -1 : established ? policy.lost() : policy.failed(); // REQ-020.3: a lost session, or a failed automatic attempt
@@ -1356,6 +1362,7 @@ public final class ObdService extends Service {
         selectSignals(saved); // the user's own selection, restored before the stop event: a rotation inside that write must start its header with it; nothing the analysis chose was ever stored
         recordSmart(data);
         coverageEnd(); // REQ-038.9: the run's last record; a rotation inside the stop event above already continued the run in the new file
+        coverageLedgerFinish(); // #340: that record counts, then the vehicle ledger is stored
         smart=null; smartComponent=null; smartSaved=null; smartLast=null;
         JSONObject idle=idleSmart(); put(idle,"reason",reason); put(idle,"changes",new JSONArray(smartChanges)); put(idle,"latency_ms",smartLatencyMs);
         synchronized(stateLock) { put(state,"smart",idle); }
@@ -1394,6 +1401,7 @@ public final class ObdService extends Service {
             coverageRun=run; coveragePart=1; coverageOriginNanos=origin; coverageLastOffset=0; coverageRevision=data.optString("knowledge_revision");
             coverageWrite("coverage.run",data);
         }
+        coverageLedgerBegin(run);
     }
     /** Caller holds recordLock (a wire callback may rotate while the core is busy, so no core call here): the first record of a file that continues the run. A run whose file cannot say so ends here. */
     private void coverageResume(int previousRecords) {
@@ -1410,7 +1418,8 @@ public final class ObdService extends Service {
     /** Caller holds recordLock. One coverage record in the same envelope as every other event; record() adds at and offset_us and counts it. */
     private void coverageWrite(String action,JSONObject data) {
         JSONObject envelope=new JSONObject(), result=new JSONObject(); put(envelope,"type","action"); put(envelope,"action",action); put(envelope,"argument","");
-        put(result,"ok",true); put(result,"data",data); put(envelope,"result",result); record(envelope);
+        put(result,"ok",true); put(result,"data",data); put(envelope,"result",result);
+        if(record(envelope)>=0 && coverageLedgerOn) { if(coverageQueue.size()<20000) coverageQueue.add(envelope); else coverageInvalid=true; } // written records only; a lost one would let the ledger overstate time
     }
     private JSONObject coverageCore(String action,JSONObject argument) {
         try { JSONObject result=new JSONObject(NativeCore.execute(core,action,argument.toString())); return result.optBoolean("ok") ? result.optJSONObject("data") : null; }
@@ -1457,6 +1466,81 @@ public final class ObdService extends Service {
             put(fact,"run_offset_us",coverageOffset());
             coverageWrite("coverage.fact",fact);
         }
+        coverageLedgerPump();
+    }
+    // ---- #340 (REQ-038.6/.8/.10): live and vehicle coverage ledger ---------------------------------------------------------------
+    private static final String EMPTY_LEDGER="{\"v\":1,\"entries\":[],\"identity\":[]}";
+    /** Worker, run just started. Attaches the stored vehicle ledger when the identity is confirmed; every other case keeps only the run ledger and says why. */
+    private void coverageLedgerBegin(String run) {
+        coverageProblem=""; coverageVin=""; coverageInvalid=false; coverageSaveFailed=false; synchronized(recordLock) { coverageQueue.clear(); }
+        String vin; synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); vin=vehicle==null ? "" : vehicle.optString("vin"); }
+        boolean confirmed=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin());
+        JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"goal_definition",1); put(argument,"knowledge_revision",coverageRevision); Object stored=JSONObject.NULL;
+        if(confirmed) {
+            if(vehicles.unreadable()) coverageProblem=VehicleStore.UNREADABLE;
+            else { JSONObject ledger=vehicles.coverageLedger(vin);
+                if(ledger!=null) stored=ledger;
+                else if(vehicles.hasCoverageEntry(vin)) coverageProblem="Abdeckungsdaten des Fahrzeugs nicht lesbar";
+                else try { stored=new JSONObject(EMPTY_LEDGER); } catch(JSONException e) { throw new IllegalStateException(e); } }
+        }
+        put(argument,"vehicle",stored);
+        JSONObject started=coverageCore("coverage.live.start",argument);
+        if(started==null) { coverageLedgerOn=false; AppLog.w("coverage","ledger not started"); publishCoverage(null); return; }
+        if(stored!=JSONObject.NULL && started.optBoolean("vehicle_available")) coverageVin=vin;
+        else if(stored!=JSONObject.NULL) coverageProblem="Abdeckungsdaten des Fahrzeugs nicht lesbar"+(started.isNull("vehicle_error") ? "" : " · "+started.optString("vehicle_error"));
+        coverageLedgerOn=true; coverageSavedAt=SystemClock.elapsedRealtime(); coveragePublishedAt=0;
+        publishCoverage(coverageCore("coverage.live.snapshot",new JSONObject()));
+    }
+    /** Worker, after each fact: the queued records go into the core, the state refreshes about once a second, the vehicle ledger is stored about every 30 s. */
+    private void coverageLedgerPump() {
+        if(!coverageLedgerOn) return;
+        List<JSONObject> batch=new ArrayList<>(); synchronized(recordLock) { batch.addAll(coverageQueue); coverageQueue.clear(); }
+        for(JSONObject record:batch) {
+            try { JSONObject answer=new JSONObject(NativeCore.execute(core,"coverage.live.record",record.toString())); if(!answer.optBoolean("ok")) { coverageInvalid=true; AppLog.w("coverage","ledger record refused"); } }
+            catch(Exception e) { coverageInvalid=true; AppLog.w("coverage","ledger record failed"); }
+        }
+        long now=SystemClock.elapsedRealtime();
+        if(now-coveragePublishedAt>=1000) { coveragePublishedAt=now; publishCoverage(coverageCore("coverage.live.snapshot",new JSONObject())); }
+        if(now-coverageSavedAt>=30000) coverageLedgerSave();
+    }
+    /** Worker. Stores the vehicle ledger on its record. Never stores an unreliable ledger; a failed write is shown once and the run goes on. */
+    private void coverageLedgerSave() {
+        coverageSavedAt=SystemClock.elapsedRealtime();
+        if(!coverageLedgerOn || coverageVin.isEmpty() || coverageInvalid) return;
+        JSONObject ledger=coverageCore("coverage.live.export",new JSONObject());
+        if(ledger==null) return;
+        String error=vehicles.setCoverageLedger(coverageVin,ledger);
+        if(error!=null && !coverageSaveFailed) message("Fahrzeug-Abdeckung nicht gespeichert · "+error);
+        coverageSaveFailed=error!=null;
+        if(error!=null) AppLog.w("coverage","ledger not stored");
+    }
+    /** Worker, before the core goes away or when the run ends: last records in, ledger stored, run closed. */
+    private void coverageLedgerFinish() {
+        if(!coverageLedgerOn) return;
+        coverageLedgerPump(); coverageLedgerSave();
+        coverageCore("coverage.live.end",new JSONObject()); coverageLedgerOn=false;
+        publishCoverage(null); coverageStoredRefresh();
+    }
+    /** The state the Live tab shows for a run: the core's snapshot plus what is unavailable and why; null clears it. */
+    private void publishCoverage(JSONObject snapshot) {
+        JSONObject view=null;
+        if(snapshot!=null) { view=copyOf(snapshot); put(view,"problem",coverageSaveFailed ? "Fahrzeug-Abdeckung nicht gespeichert" : coverageProblem); put(view,"vehicle_attached",!coverageVin.isEmpty()); if(coverageInvalid) put(view,"invalid",true); }
+        synchronized(stateLock) { put(state,"coverageLive",view==null ? JSONObject.NULL : view); }
+        changed();
+    }
+    /** Worker. The stored vehicle ledger of the selected vehicle, summarized for the Live tab when no run is on; an unreadable one is shown as unavailable, never as empty. */
+    private void coverageStoredRefresh() {
+        JSONObject view=null; String vin=selectedVin();
+        if(core!=0 && !vin.isEmpty() && mode.equals("live")) {
+            view=new JSONObject(); put(view,"vehicle",JSONObject.NULL); put(view,"problem","");
+            if(vehicles.unreadable()) put(view,"problem",VehicleStore.UNREADABLE);
+            else { JSONObject ledger=vehicles.coverageLedger(vin);
+                if(ledger!=null) { JSONObject argument=new JSONObject(); put(argument,"ledger",ledger); JSONObject summary=coverageCore("coverage.ledger.summary",argument);
+                    if(summary!=null) put(view,"vehicle",summary); else put(view,"problem","Abdeckungsdaten des Fahrzeugs nicht lesbar"); }
+                else if(vehicles.hasCoverageEntry(vin)) put(view,"problem","Abdeckungsdaten des Fahrzeugs nicht lesbar"); }
+        }
+        synchronized(stateLock) { put(state,"coverageStored",view==null ? JSONObject.NULL : view); }
+        changed();
     }
     // ---- #314 (REQ-037): gap in live measurement ----------------------------------------------------------------------------
     private static JSONObject idleGap() {

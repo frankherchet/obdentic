@@ -181,7 +181,7 @@ public class MainActivity extends Activity {
         if(!historyMode.equals(mode)){historyMode=mode;histories.clear();lastSamples.clear();}
         collectHistory();
         String key=pending.signature()+"|"+tab+"|"+mode+"|"+phase+"|"+state.optString("recording")+"|"+state.optString("autoRecording")+state.optBoolean("autoRecord")+"|"+array("selected").toString()+"|"+state.opt("vehicles")+"|"+udsStructureKey();
-        if(tab==0)key+="|"+smartStructureKey()+"|"+state.opt("component")+"|"+gapStructureKey();
+        if(tab==0)key+="|"+smartStructureKey()+"|"+state.opt("component")+"|"+gapStructureKey()+"|"+coverageKind(state);
         if(tab==1||tab==2||tab==4)key+="|"+state.optBoolean("busy");
         if(tab==1)key+="|"+state.opt("diagnostics")+"|"+state.opt("jobResult")+"|"+state.opt("vehicle")+"|"+state.opt("throughput");
         if(tab==2)key+="|"+shownRecords()+"|"+array("records").length()+"|"+RecordingExporter.folder(this)+"|"+RecordingExporter.auto(this)+"|"+state.optString("recording")+"|"+state.optString("replayFile");
@@ -190,6 +190,7 @@ public class MainActivity extends Activity {
         if(tab==4||tab==6)key+="|"+ChatGptAccount.get(this).snapshot().version;
         if(!key.equals(structure)){structure=key;int y=scroll.getScrollY();render();scroll.post(()->{if(debugLog!=null)scroll.fullScroll(View.FOCUS_DOWN);else scroll.scrollTo(0,y);});}
         updateValues();
+        updateCoverage();
         updateUdsStatus();
         updateSmartStatus();
         announceSmartSet();
@@ -250,7 +251,79 @@ public class MainActivity extends Activity {
             .setPositiveButton("Got it",(d,w)->account.firstUseAcknowledged()).create();
         firstUseDialog.setOnDismissListener(d->firstUseDialog=null);firstUseDialog.show();
     }
-    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;udsRemaining=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;case 6:accountTab();break;default:connection();}}
+    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();debugLog=null;udsRemaining=null;coverageView=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;switch(tab){case 0:live();break;case 1:diagnose();break;case 2:recordings();break;case 3:debug();break;case 5:vehicles();break;case 6:accountTab();break;default:connection();}}
+    // ---- #340 (REQ-038.10): coverage per goal context on the Live tab, plain text, no input needed --------------------------------
+    private TextView coverageView;
+    /** Below the tiles, beside the Smart card: the first screen keeps its eight tiles (#239). The text refreshes in place. */
+    private void coverageCard(){
+        if(coverageKind(state).isEmpty())return;
+        LinearLayout c=card();note(c,"ABDECKUNG",ACCENT);
+        coverageView=text(coverageText(state),14,TEXT);coverageView.setTag("coverage-text");c.addView(coverageView);
+    }
+    private void updateCoverage(){if(coverageView==null)return;String now=coverageText(state);if(!now.contentEquals(coverageView.getText()))coverageView.setText(now);}
+    /** "" when there is nothing to show, else replay, live (a running run) or stored (the selected vehicle's persisted ledger). */
+    static String coverageKind(JSONObject s){
+        if("replay".equals(s.optString("mode"))){JSONObject set=s.optJSONObject("coverage");JSONArray runs=set==null?null:set.optJSONArray("runs");return runs!=null&&runs.length()>0?"replay":"";}
+        if(s.optJSONObject("coverageLive")!=null)return "live";
+        JSONObject stored=s.optJSONObject("coverageStored");
+        return stored!=null&&(stored.optJSONObject("vehicle")!=null||!stored.optString("problem").isEmpty())?"stored":"";
+    }
+    /** The card text. Pure: an unavailable or unreliable ledger says so and shows no figure, never a zero (REQ-038.8); a replayed partial set never reads as the whole run. */
+    static String coverageText(JSONObject s){
+        StringBuilder b=new StringBuilder();
+        switch(coverageKind(s)){
+            case "replay":{
+                JSONArray runs=s.optJSONObject("coverage").optJSONArray("runs");
+                for(int i=0;i<runs.length();i++){JSONObject r=runs.optJSONObject(i);if(r==null)continue;if(b.length()>0)b.append("\n\n");
+                    if(r.optBoolean("coverage_invalid")){JSONArray issues=r.optJSONArray("issues");b.append("Abdeckung aus der Aufnahme nicht verlässlich · ").append(issues!=null&&issues.length()>0?issues.optString(0):"Aufnahme unvollständig");continue;}
+                    if(r.optBoolean("partial")){JSONArray why=r.optJSONArray("partial_reasons");StringBuilder reasons=new StringBuilder();for(int k=0;why!=null&&k<why.length();k++){if(k>0)reasons.append(", ");reasons.append(partialReason(why.optString(k)));}
+                        b.append("Teil der Aufnahme · nur die gelieferten Teile, nicht der ganze Lauf").append(reasons.length()>0?" ("+reasons+")":"").append('\n');}
+                    else b.append("Ganzer Lauf aus der Aufnahme\n");
+                    coverageSummary(b,r,"Lauf");}
+                break;}
+            case "live":{
+                JSONObject live=s.optJSONObject("coverageLive");
+                if(live.optBoolean("invalid"))b.append("Abdeckung dieses Laufs nicht verlässlich · es werden keine Zahlen gezeigt");
+                else{
+                    if(live.optBoolean("session_only"))b.append("Nur dieser Lauf · Fahrzeug nicht bestätigt\n");
+                    coverageSummary(b,live.optJSONObject("run"),"Dieser Lauf");
+                    if(live.optBoolean("vehicle_attached")){b.append('\n');coverageSummary(b,live.optJSONObject("vehicle"),"Fahrzeug gesamt");}
+                }
+                String problem=live.optString("problem");if(!problem.isEmpty())b.append("\nFahrzeug-Abdeckung nicht verfügbar · ").append(problem);
+                break;}
+            case "stored":{
+                JSONObject stored=s.optJSONObject("coverageStored"),summary=stored.optJSONObject("vehicle");
+                if(summary!=null)coverageSummary(b,summary,"Fahrzeug gesamt (gespeichert)");
+                String problem=stored.optString("problem");if(!problem.isEmpty()){if(b.length()>0)b.append('\n');b.append("Fahrzeug-Abdeckung nicht verfügbar · ").append(problem);}
+                break;}
+            default:break;
+        }
+        return b.toString();
+    }
+    private static String partialReason(String reason){
+        switch(reason){case "missing_start":return "Anfang fehlt";case "missing_parts":return "Teile fehlen";case "unverified_join":return "Übergang nicht belegt";case "no_run_end":return "Ende fehlt";default:return reason;}
+    }
+    /** One line group per goal context: counts, summed measured time, longest segment and the latest states that are not a success. A summary that is missing is unavailable, never empty. */
+    private static void coverageSummary(StringBuilder b,JSONObject summary,String title){
+        if(summary==null){b.append(title).append(" · nicht verfügbar");return;}
+        JSONArray contexts=summary.optJSONArray("contexts"),entries=summary.optJSONArray("entries");
+        if(contexts==null||contexts.length()==0){b.append(title).append(" · noch nichts gemessen");return;}
+        for(int i=0;i<contexts.length();i++){JSONObject c=contexts.optJSONObject(i);if(c==null)continue;String id=c.optString("context");
+            long total=0,longest=0;java.util.TreeMap<String,Integer> states=new java.util.TreeMap<>();
+            for(int k=0;entries!=null&&k<entries.length();k++){JSONObject e=entries.optJSONObject(k);if(e==null||!id.equals(e.optString("context")))continue;
+                total+=e.optLong("valid_time_ms");longest=Math.max(longest,e.optLong("longest_segment_ms"));
+                JSONObject latest=e.optJSONObject("latest");String state=latest==null?"":latest.optString("state");String name=latestState(state);if(!name.isEmpty())states.merge(name,1,Integer::sum);}
+            if(b.length()>0&&b.charAt(b.length()-1)!='\n')b.append('\n');
+            b.append(title).append(" · ").append(id.equals("baseline")?"Technische Basisabdeckung":id).append(": ")
+                .append(c.optInt("covered")).append(" abgedeckt · ").append(c.optInt("partial")).append(" teilweise · ").append(c.optInt("not_covered")).append(" nicht abgedeckt")
+                .append("\nMesszeit ").append(duration(total)).append(" · längstes Segment ").append(duration(longest));
+            if(!states.isEmpty()){StringBuilder latest=new StringBuilder();for(java.util.Map.Entry<String,Integer> e:states.entrySet()){if(latest.length()>0)latest.append(" · ");latest.append(e.getValue()).append(' ').append(e.getKey());}b.append("\nZuletzt: ").append(latest);}
+        }
+    }
+    private static String latestState(String state){
+        switch(state){case "rejected":return "abgelehnt";case "error":return "Fehler";case "no_answer":return "ohne Antwort";case "unsupported":return "nicht unterstützt";case "empty":return "leer";case "gap":return "Messlücke";case "session_restricted":return "Sitzung nötig";case "implausible":return "unplausibel";case "context_not_fresh":return "Kontext veraltet";default:return "";}
+    }
+    private static String duration(long ms){long s=ms/1000;return s>=60?(s/60)+" min "+(s%60)+" s":s+" s";}
     private void live(){
         title("Live-Messwerte","Werte und Verlauf auf einen Blick");
         addButton(body,"Messwerte auswählen",this::chooseSignals).setEnabled(state.optString("recording").isEmpty()&&!(smartActive(state)&&!state.optString("mode","live").equals("replay")));
@@ -286,6 +359,7 @@ public class MainActivity extends Activity {
         if(!recordingNow)actionButton(body,REC_START,"","Gewählte Messwerte aufzeichnen",canRecordSelection,()->perform(REC_START,"",()->service().startRecording("live-selection")));
         // below the tiles: the first screen keeps its tile density (#239)
         smartCard();
+        coverageCard();
         if(!recordingNow&&smartRecordingBlocker(state)!=null)note(body,smartRecordingBlocker(state),MUTED);
         componentCard();
         JSONObject vehicle=state.optJSONObject("vehicle");if(vehicle!=null&&vehicle.length()>0){LinearLayout c=card();note(c,"FAHRZEUG",ACCENT);note(c,vehicle.optString("vin","Fahrzeug erfasst"),TEXT);JSONArray responders=vehicle.optJSONArray("responders");if(responders!=null)note(c,responders.length()+" Responder · Details unter Diagnose",MUTED);}

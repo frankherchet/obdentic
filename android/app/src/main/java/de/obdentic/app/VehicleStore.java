@@ -233,9 +233,27 @@ public final class VehicleStore {
         return null;
     }
     public synchronized String name(String vin) { JSONObject row = find(data, vin); return row == null ? "" : row.optString("name"); }
+    public synchronized boolean unreadable() { return unreadable; }
+    /**
+     * REQ-038.6: the vehicle coverage ledger of a record, a copy, or null when the record has none. It lives in the record (so deleting the
+     * record deletes it, REQ-013.9) and is kept out of {@link #snapshot()}: the service state and the UI never carry it.
+     */
+    public synchronized JSONObject coverageLedger(String vin) {
+        JSONObject row = unreadable ? null : find(data, vin), ledger = row == null ? null : row.optJSONObject(COVERAGE);
+        return ledger == null ? null : copy(ledger);
+    }
+    /** True when the record carries a ledger entry of any shape: a malformed one is unreadable, never "no ledger yet" (REQ-038.8). */
+    public synchronized boolean hasCoverageEntry(String vin) { JSONObject row = unreadable ? null : find(data, vin); return row != null && row.has(COVERAGE); }
+    /** REQ-038.6/.8: stores the ledger on its record; a failed write leaves the last persisted state. Returns null on success, else a German error text. */
+    public synchronized String setCoverageLedger(String vin, JSONObject ledger) {
+        return mutate(vin, next -> put(find(next, vin), COVERAGE, copy(ledger)));
+    }
     public synchronized JSONObject snapshot() {
         JSONObject out = copy(data);
+        JSONArray rows = out.optJSONArray("vehicles");
+        for (int i = 0; rows != null && i < rows.length(); i++) rows.optJSONObject(i).remove(COVERAGE);
         put(out, "unreadable", unreadable);
         return out;
     }
+    private static final String COVERAGE = "coverage_ledger";
 }

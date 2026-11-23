@@ -68,9 +68,10 @@ final class ComponentSmartAcceptance {
         boolean savedAutoRecord = ObdService.autoRecordEnabled(context);
         Link[] link = new Link[1];
         try {
-            presetsAndBlockers();
+            presetsAndBlockers(); coverageUiText();
             service.permissionOverride = Boolean.TRUE; service.bluetoothOverride = Boolean.TRUE;
-            service.vehicles = new VehicleStore(new File(context.getCacheDir(), "component-smart-" + System.nanoTime() + ".json"));
+            storeFile = new File(context.getCacheDir(), "component-smart-" + System.nanoTime() + ".json");
+            service.vehicles = new VehicleStore(storeFile);
             service.connector = address -> { link[0] = new Link(service.simulatedLink()); return link[0]; };
             service.setAutoConnect(false); service.setAutoRecord(true);
             service.disconnect(); connect(service); discover(service);
@@ -96,6 +97,7 @@ final class ComponentSmartAcceptance {
             continuingAndEnding(service, link, dir, vin, user);
             coverageRace(service, link, dir); // REQ-038.9 (#344 review): a rotation right before a raw read never misplaces its fact's evidence
             coverageNegativeResponse(service, link, dir); // REQ-038.9 (#344 review): a standard negative response is a rejection with its NRC; facts never copy error text
+            coverageLedger(service, link, vin); // REQ-038.6/.8/.10 (#340): the vehicle ledger is live, stored, restored and never overwritten when unreadable or unwritable
             replay(service, link, dir, before, chain);
             coverage(service, link, dir, chain); // REQ-038.9 (#339): the same three files, as facts and as the rebuilt whole run
             coverageDiscovery(service, link, dir, chain); // REQ-038.9 (#344 review): parts are found anywhere in the folder; untrusted records invalidate
@@ -107,6 +109,12 @@ final class ComponentSmartAcceptance {
             service.setDemo();
             waitFor(() -> "demo".equals(service.snapshot().optString("mode")) && "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"), "demo after replay");
             require(service.snapshot().isNull("coverage"), "REQ-038.9 demo cannot inherit replay coverage");
+            // REQ-038.6 / REQ-013.9: deleting the record deletes its ledger; recordings stay
+            Set<String> recordingsBefore = names(dir);
+            require(service.vehicles.hasCoverageEntry(vin), "test setup: the record carries its ledger before it is deleted");
+            service.deleteVehicle(vin);
+            waitFor(() -> !service.vehicles.hasCoverageEntry(vin) && service.vehicles.coverageLedger(vin) == null, "REQ-038.6 the vehicle ledger is deleted with its record");
+            require(names(dir).equals(recordingsBefore), "REQ-038.6 deleting the record leaves the recordings unchanged");
         } finally {
             service.rotateAfterSmart = ""; service.rotateMs = 30L * 60 * 1000;
             service.disconnect(); service.connector = savedConnector; service.vehicles = savedStore; service.permissionOverride = savedPermission; service.bluetoothOverride = savedBluetooth;
@@ -524,6 +532,84 @@ final class ComponentSmartAcceptance {
             require(raw, "REQ-038.9 the evidence reference names the raw read that carries the structured negative response: " + e);
         }
         require(rejected > 0, "REQ-038.9 the rejected reads left facts");
+    }
+    // ---- #340 (REQ-038.6/.8/.10) --------------------------------------------------------------------------------------------------
+    private static File storeFile;
+    private static JSONObject liveCoverage(ObdService service) { return service.snapshot().optJSONObject("coverageLive"); }
+    private static int entryCount(JSONObject summary) throws Exception { return summary == null || summary.optJSONArray("entries") == null ? 0 : summary.getJSONArray("entries").length(); }
+    private static int samples(JSONObject ledger) throws Exception { int n = 0; JSONArray entries = ledger.getJSONArray("entries"); for (int i = 0; i < entries.length(); i++) n += entries.getJSONObject(i).optInt("qualifying_samples"); return n; }
+    private static void stopSmart(ObdService service) throws Exception { service.stopSmart(); waitFor(() -> !smart(service).optBoolean("active"), "smart analysis stopped"); }
+    /**
+     * REQ-038.6/.8/.10 through the service: the run and vehicle ledgers are live on the Live tab, persisted with the vehicle record, kept across an app
+     * restart and a second run, never overwritten when unreadable or unwritable, and removed with the record. Simulated adapter, no vehicle traffic.
+     */
+    private static void coverageLedger(ObdService service, Link[] link, String vin) throws Exception {
+        reconnect(service, link, false);
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started for the ledger");
+        waitFor(() -> { JSONObject live = liveCoverage(service); return live != null && entryCount(live.optJSONObject("run")) > 0; }, "REQ-038.10 the run ledger fills while the run is on");
+        JSONObject live = liveCoverage(service);
+        require(live.optBoolean("vehicle_attached") && !live.optBoolean("session_only") && live.optString("problem").isEmpty(), "REQ-038.1/.10 the confirmed vehicle's ledger is attached: " + live);
+        String text = MainActivity.coverageText(service.snapshot());
+        require(text.contains("Dieser Lauf · Technische Basisabdeckung") && text.contains("Fahrzeug gesamt · Technische Basisabdeckung") && text.contains("abgedeckt") && text.contains("Messzeit") && text.contains("längstes Segment"),
+            "REQ-038.10 the Live card names the baseline label, counts, measured time and longest segment: " + text);
+        stopSmart(service);
+        waitFor(() -> service.vehicles.coverageLedger(vin) != null, "REQ-038.6 the vehicle ledger is stored when the run ends");
+        int first = samples(service.vehicles.coverageLedger(vin));
+        require(first > 0 && entryCount(service.snapshot().optJSONObject("vehicles")) == 0 && !service.snapshot().toString().contains("coverage_ledger"), "REQ-038.6 the ledger is stored with the record and never rides in the service state: " + first);
+        VehicleStore reopened = new VehicleStore(storeFile);
+        require(reopened.coverageLedger(vin) != null && samples(reopened.coverageLedger(vin)) == first, "REQ-038.6 the ledger survives an app restart");
+        waitFor(() -> { JSONObject stored = service.snapshot().optJSONObject("coverageStored"); return stored != null && stored.optJSONObject("vehicle") != null; }, "REQ-038.10 the stored ledger is shown while no run is on");
+        require(MainActivity.coverageText(service.snapshot()).contains("Fahrzeug gesamt (gespeichert)"), "REQ-038.10 stored coverage is labeled as stored");
+
+        // a later run adds to the same ledger
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "second run");
+        waitFor(() -> { JSONObject l = liveCoverage(service); return l != null && entryCount(l.optJSONObject("vehicle")) > 0; }, "second run ledger");
+        SystemClock.sleep(1500); stopSmart(service);
+        waitFor(() -> { try { return samples(service.vehicles.coverageLedger(vin)) > first; } catch (Exception e) { return false; } }, "REQ-038.6 the second run adds to the vehicle ledger");
+
+        // REQ-038.8: an unreadable ledger is shown as unavailable, the run goes on, the stored data stays as it is
+        JSONObject good = service.vehicles.coverageLedger(vin);
+        JSONObject unreadable = new JSONObject().put("v", 99).put("entries", new JSONArray());
+        require(service.vehicles.setCoverageLedger(vin, unreadable) == null, "test setup: an unreadable ledger on the record");
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "run with an unreadable ledger");
+        waitFor(() -> { JSONObject l = liveCoverage(service); return l != null && !l.optString("problem").isEmpty() && entryCount(l.optJSONObject("run")) > 0; }, "REQ-038.8 the problem is shown and the run ledger still counts");
+        live = liveCoverage(service);
+        require(!live.optBoolean("vehicle_attached") && live.optString("problem").contains("nicht lesbar"), "REQ-038.8 no vehicle ledger is attached: " + live);
+        text = MainActivity.coverageText(service.snapshot());
+        require(text.contains("Fahrzeug-Abdeckung nicht verfügbar") && !text.contains("Fahrzeug gesamt ·"), "REQ-038.8 unavailable, never zero: " + text);
+        require(smart(service).optBoolean("active") && !service.snapshot().optString("autoRecording").isEmpty(), "REQ-038.8 measurement and recording are not stopped by it");
+        stopSmart(service);
+        require(service.vehicles.coverageLedger(vin).optInt("v") == 99, "REQ-038.8 an unreadable ledger is never overwritten by the run");
+        service.vehicles.setCoverageLedger(vin, good);
+
+        // REQ-038.8: an unwritable store shows once that the ledger was not stored; the run was not stopped; the stored file is unchanged
+        File folder = storeFile.getParentFile(); String before = new String(java.nio.file.Files.readAllBytes(storeFile.toPath()), StandardCharsets.UTF_8);
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "run before the write failure");
+        waitFor(() -> { JSONObject l = liveCoverage(service); return l != null && entryCount(l.optJSONObject("run")) > 0; }, "ledger before the write failure");
+        require(folder.setWritable(false, false), "test setup: the store folder becomes read-only");
+        try {
+            stopSmart(service);
+            waitFor(() -> service.snapshot().optString("message").contains("Fahrzeug-Abdeckung nicht gespeichert"), "REQ-038.8 the failed write is reported");
+        } finally { folder.setWritable(true, false); }
+        require(before.equals(new String(java.nio.file.Files.readAllBytes(storeFile.toPath()), StandardCharsets.UTF_8)), "REQ-038.8 a failed write leaves the stored ledger as it was");
+    }
+    /** REQ-038.8/.10: the card text of unavailable, unreliable and partial coverage; pure, no service. */
+    private static void coverageUiText() throws Exception {
+        JSONObject run = new JSONObject("{\"contexts\":[{\"context\":\"baseline\",\"covered\":1,\"partial\":2,\"not_covered\":3}],\"entries\":[{\"context\":\"baseline\",\"valid_time_ms\":65000,\"longest_segment_ms\":20000,\"latest\":{\"state\":\"rejected\"}}]}");
+        JSONObject live = new JSONObject().put("run", run).put("session_only", true).put("vehicle_attached", false).put("problem", "");
+        String text = MainActivity.coverageText(new JSONObject().put("mode", "live").put("coverageLive", live));
+        require(text.contains("Nur dieser Lauf · Fahrzeug nicht bestätigt") && text.contains("1 abgedeckt · 2 teilweise · 3 nicht abgedeckt") && text.contains("Messzeit 1 min 5 s · längstes Segment 20 s") && text.contains("1 abgelehnt"), "REQ-038.10 counts, time, segment and latest states: " + text);
+        text = MainActivity.coverageText(new JSONObject().put("mode", "live").put("coverageLive", new JSONObject().put("invalid", true).put("run", run)));
+        require(text.contains("nicht verlässlich") && !text.contains("abgedeckt"), "REQ-038.8 an unreliable run shows no figures: " + text);
+        text = MainActivity.coverageText(new JSONObject().put("mode", "live").put("coverageLive", new JSONObject().put("run", run).put("problem", "Fahrzeugspeicher nicht lesbar")));
+        require(text.contains("Fahrzeug-Abdeckung nicht verfügbar · Fahrzeugspeicher nicht lesbar") && !text.contains("Fahrzeug gesamt"), "REQ-038.8 a problem is named: " + text);
+        JSONObject partial = new JSONObject("{\"coverage_invalid\":false,\"partial\":true,\"partial_reasons\":[\"missing_parts\",\"no_run_end\"],\"contexts\":[],\"entries\":[]}");
+        text = MainActivity.coverageText(new JSONObject().put("mode", "replay").put("coverage", new JSONObject().put("runs", new JSONArray().put(partial))));
+        require(text.contains("nur die gelieferten Teile, nicht der ganze Lauf") && text.contains("Teile fehlen") && !text.contains("Ganzer Lauf"), "REQ-038.9/.10 a partial replay never reads as the whole run: " + text);
+        JSONObject broken = new JSONObject("{\"coverage_invalid\":true,\"issues\":[\"record after run_end\"]}");
+        text = MainActivity.coverageText(new JSONObject().put("mode", "replay").put("coverage", new JSONObject().put("runs", new JSONArray().put(broken))));
+        require(text.contains("nicht verlässlich") && text.contains("record after run_end") && !text.contains("abgedeckt"), "REQ-038.9 an invalid replay shows its reason and no figures: " + text);
+        require(MainActivity.coverageKind(new JSONObject().put("mode", "live")).isEmpty(), "no card without coverage");
     }
     private static boolean rejectedPedal(JSONObject e) throws Exception {
         if (!"coverage.fact".equals(e.optString("action"))) return false;

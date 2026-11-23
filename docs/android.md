@@ -382,7 +382,27 @@ same whatever the argument order. One file prints its report with the `coverage`
 Replay scans every automatic recording in the app's folder under the recording's size and line limits for run ids,
 including markers after earlier runs. It includes related files transitively (`replay.coverage.part`, `replay.coverage`;
 at most 65 supplied files, so an excessive run is invalidated). A deleted or unavailable part is not supplied, so the
-run is partial. The result is kept in the service state as `coverage`; this slice adds no screen (#340 shows it).
+run is partial. The result is kept in the service state as `coverage` and shown on the Live tab (see below).
+
+## Vehicle coverage ledger and Live card (REQ-038.6, REQ-038.8, REQ-038.10)
+
+While Smart runs, the core keeps a run ledger and, when the identity is confirmed (the VIN of the session is the selected record), the vehicle ledger of
+that record. Both are fed from the very records that go into the recording (`coverage.run`, `coverage.fact`, `coverage.boundary`), so live, replay and report
+count the same way; the closed core actions `coverage.live.start|record|snapshot|export|detach_vehicle|end` and `coverage.ledger.summary` send nothing to
+the adapter. The vehicle ledger is stored as `coverage_ledger` inside the vehicle record of `vehicles.json` (app-private, excluded from backup, never
+exported, shared, logged or part of the service state); deleting the record deletes it, recordings stay. It is stored when a run ends, before a lost link
+takes the core away, and about every 30 s during a run, so a killed app loses at most that interval.
+
+A ledger that cannot be read (unreadable store, malformed entry, unknown version) is never replaced: the run still counts in its run ledger, the card says
+"Fahrzeug-Abdeckung nicht verfügbar" with the reason (never a zero), measurement and recording go on, and the stored data stays as it was. A run whose
+records could not all be folded in is shown as unreliable without figures and does not store. A failed write is announced once and the stored ledger is not
+changed. Identity that is only confirmed after the start is not credited to the vehicle in that run.
+
+The Live tab shows an "ABDECKUNG" card below the tiles and the Smart card (the first eight tiles keep their space, #239): per goal context (today only the
+"Technische Basisabdeckung") the covered, partial and not covered counts, the summed measured time, the longest segment and the latest non-success states,
+as plain text for the run, the vehicle in total and, without a run, the selected vehicle's stored ledger. In replay it shows the derived run; a partial set
+says "nur die gelieferten Teile, nicht der ganze Lauf" with its reasons and an invalid one only its reason. Nothing here is a diagnosis or a health claim.
+Simulated acceptance: `ComponentSmartAcceptance`; behaviour on the vehicle belongs to #178.
 
 ## Semantic assistant tool bridge (REQ-041)
 
