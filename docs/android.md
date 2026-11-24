@@ -278,6 +278,8 @@ the baseline: the service writes one `coverage.fact` per context and a `coverage
 goal's contiguous interval ends. Missing, stale (older than 10 s), rejected or unanswered readings
 make a condition unknown, never zero, a crossing, a release or a holding condition. A signal that fails
 is skipped and retried after 30 s, 2 min, then once per drive, with the reason shown and recorded.
+Failed probes during a measurement gap mark the planner input as a gap, not a signal failure:
+they neither consume retries nor make signals or goals unreachable.
 
 The Live card names the goals in progress ("wird gemessen", "pausiert · Vorrang: …", "wartet auf neuen
 Versuch"), the one remaining time the planner defines (the EGR time still missing for 30 contiguous
@@ -289,8 +291,9 @@ action (`kind`: `started`, `interrupted`, `resumed`, `completed`, `expired`, `no
 `stopped`, plus `selection` with the chosen keys and `resume` at the start of a rotated file), with the
 wallclock time and offset of the record, `at_us` (the run clock), `goal`, `reason`, the condition readings
 (`inputs`: signal, value or reason) and the definition versions, continues across file rotation and is
-replayed offline without adapter traffic. Records of the earlier set switching (`smart.set`) are skipped on
-replay with the note "Ältere Smart-Analyse in dieser Aufnahme nicht angezeigt". Results stay in the private recording and the app's memory: no condition value ever goes into the
+replayed offline without adapter traffic. `obdentic-mobile-report` also shows the recorded planner
+changes with their original times and offsets. Records of the earlier set switching (`smart.set`)
+are skipped on replay with the note "Ältere Smart-Analyse in dieser Aufnahme nicht angezeigt". Results stay in the private recording and the app's memory: no condition value ever goes into the
 app log (only goal names and reasons), and nothing is exported, shared or published as vehicle
 evidence automatically. Behaviour while driving is not validated and belongs to the separate #178 gate.
 

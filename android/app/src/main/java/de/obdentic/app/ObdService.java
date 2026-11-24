@@ -1330,7 +1330,7 @@ public final class ObdService extends Service {
     /** The counting side of a read: the planner takes the reading and says which goal contexts it counts toward (REQ-039.2). null: no planner, the fact counts as the baseline. */
     private JSONArray smartObserve(String key,JSONObject fact,JSONObject result) {
         if(!smartRunning || smartVersions==null) return null;
-        JSONObject data=result.optJSONObject("data"), argument=new JSONObject(); put(argument,"fact",fact);
+        JSONObject data=result.optJSONObject("data"), argument=new JSONObject(); put(argument,"fact",fact); put(argument,"gap",gap.active());
         Object value=result.optBoolean("ok") && data!=null && !data.isNull("value") ? data.opt("value") : null;
         if(value instanceof Number) put(argument,"value",((Number)value).doubleValue());
         smartAwaiting.remove(key);

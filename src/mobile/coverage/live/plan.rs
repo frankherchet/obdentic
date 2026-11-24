@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::{parse_argument, Live};
-use crate::coverage_ledger::Ledger;
+use crate::coverage_ledger::{Decoded, Ledger, Outcome};
 use crate::mobile::coverage::reading_of;
 use crate::smart_planner::{
     CatalogEntry, ConditionInput, EventKind, Goal, Observation, Phase, Plan, PlanEvent, Planner,
@@ -250,7 +250,18 @@ impl Live {
                 run.planner.record(&Observation {
                     signal_key: key.clone(),
                     at,
-                    outcome: reading.outcome,
+                    outcome: if argument["gap"] == true
+                        && !matches!(
+                            reading.outcome,
+                            Outcome::Decoded(
+                                Decoded::Numeric { finite: true }
+                                    | Decoded::Text { nonempty: true }
+                            )
+                        ) {
+                        Outcome::Gap
+                    } else {
+                        reading.outcome
+                    },
                     value,
                     implausible: reading.implausible,
                 });
@@ -370,6 +381,43 @@ mod tests {
             .iter()
             .filter(|event| event["kind"] == kind)
             .collect()
+    }
+
+    #[test]
+    fn req_039_14_gap_probes_do_not_consume_retries() {
+        let mut live = started(&[]);
+        step(&mut live, 0); // drain the catalog's session-restricted notice
+        let failed = |seconds| {
+            fact_with(
+                RUN,
+                "engine.rpm",
+                secs(seconds),
+                json!({"outcome":"rejected","response_code":18}),
+            )
+        };
+        let ordinary = failed(1);
+        live.plan_act(
+            "smart.plan.observe",
+            &json!({"fact":ordinary["result"]["data"]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(events(&step(&mut live, 1), "skipped").len(), 1);
+        for seconds in [5, 35, 155, 160] {
+            let probe = failed(seconds);
+            live.plan_act(
+                "smart.plan.observe",
+                &json!({"fact":probe["result"]["data"],"gap":true}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                events(&step(&mut live, seconds), "skipped").is_empty(),
+                "gap probes must not advance retries"
+            );
+        }
+        assert!(
+            keys(&step(&mut live, 161)).contains(&"engine.rpm"),
+            "the original retry remains available"
+        );
     }
 
     #[test]
