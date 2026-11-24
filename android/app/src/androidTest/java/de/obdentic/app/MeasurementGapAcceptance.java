@@ -306,13 +306,13 @@ final class MeasurementGapAcceptance {
                 require(!"started".equals(change.optString("kind")) && !"condition_ended".equals(change.optString("reason")), "REQ-039.6 unknown readings neither start a goal nor count as a release: " + change);
             }
             require(smart(service).optBoolean("active") && MainActivity.gapText(service.snapshot()).equals(TEXT), "the analysis keeps running with the notice shown");
-            // REQ-039.14 / #381: repeated five-second gap probes over the whole retry schedule
+            // REQ-039.14 / #381: repeated five-second gap probes past the first two retry delays
             // neither advance retry deadlines nor mark any of the skipped signals unavailable.
             String skippedBefore = smart(service).getJSONArray("skipped").toString();
             require(!"[]".equals(skippedBefore), "the initial failed reads establish retry state");
             int gapProbesBefore = gap(service).optInt("probes");
             SystemClock.sleep(155_000);
-            require(gap(service).optBoolean("active") && gap(service).optInt("probes") >= gapProbesBefore + 28, "REQ-039.14 the gap outlasts both retry delays with repeated probes");
+            require(gap(service).optBoolean("active") && gap(service).optInt("probes") >= gapProbesBefore + 28, "REQ-039.14 the gap outlasts the first two retry delays with repeated probes");
             require(skippedBefore.equals(smart(service).getJSONArray("skipped").toString()), "REQ-039.14 gap probes leave signal availability and retry deadlines unchanged");
             // REQ-037.2: the retry-waiting Smart selection can recover through the bounded probe.
             int probesBefore = gap(service).optInt("probes"); link.silentAll = false; link.silent.clear();

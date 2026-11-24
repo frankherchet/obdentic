@@ -75,6 +75,7 @@ public final class ObdService extends Service {
     private boolean fileGap; // guarded by recordLock: the open recording file holds a gap that has no end yet (separate from the live gap, which outlives files)
     /** REQ-038.9: coverage facts of a running Smart run (all guarded by recordLock). Part 1 is the file the run started in; each rotation continues it as the next part. */
     private String coverageRun, coverageRevision=""; // run id (null: no run is on) and the Knowledge revision its start record carried
+    private int coverageGoalDefinition;
     private int coveragePart, coverageRecords, fileSerial; // part number of the open file; coverage.* records written into it; files begun so far
     private long coverageOriginNanos, coverageLastOffset; // the run clock: monotonic since the Smart start, never reset by a rotation
     /** #340 (REQ-038.6/.8/.10): the live coverage ledger of the running Smart run is fed from the records written into the recording. The queue is guarded by recordLock; every core call runs on the worker. */
@@ -1393,7 +1394,7 @@ public final class ObdService extends Service {
         JSONObject data=coverageCore("coverage.run",argument);
         synchronized(recordLock) {
             if(data==null || writer==null) { AppLog.w("coverage","run not recorded"); return; }
-            coverageRun=run; coveragePart=1; coverageOriginNanos=origin; coverageLastOffset=0; coverageRevision=data.optString("knowledge_revision");
+            coverageRun=run; coveragePart=1; coverageOriginNanos=origin; coverageLastOffset=0; coverageRevision=data.optString("knowledge_revision"); coverageGoalDefinition=data.optInt("goal_definition");
             coverageWrite("coverage.run",data);
         }
         coverageLedgerBegin(run);
@@ -1402,7 +1403,7 @@ public final class ObdService extends Service {
     private void coverageResume(int previousRecords) {
         if(coverageRun==null || writer==null) return;
         JSONObject data=new JSONObject(); put(data,"run",coverageRun); put(data,"action","resume"); put(data,"part",++coveragePart); put(data,"previous_part_records",previousRecords);
-        put(data,"goal_definition",1); put(data,"knowledge_revision",coverageRevision); put(data,"run_offset_us",coverageOffset());
+        put(data,"goal_definition",coverageGoalDefinition); put(data,"knowledge_revision",coverageRevision); put(data,"run_offset_us",coverageOffset());
         coverageWrite("coverage.run",data);
     }
     /** The run's own monotonic clock in microseconds, never backwards (caller holds recordLock). */
@@ -1453,7 +1454,7 @@ public final class ObdService extends Service {
             AppLog.w("coverage","classification failed");
             fact=new JSONObject(); put(fact,"run",run); put(fact,"signal_key",key); put(fact,"context","baseline"); put(fact,"ecu_target",JSONObject.NULL); put(fact,"session",session);
             put(fact,"outcome","error"); put(fact,"reason","classification_failed"); put(fact,"implausible",false); put(fact,"static_identity",false); put(fact,"identity_confirmed",confirmed);
-            put(fact,"goal_definition",1); put(fact,"knowledge_revision",coverageRevision); put(fact,"evidence",evidence); put(fact,"run_offset_us",origin);
+            put(fact,"goal_definition",coverageGoalDefinition); put(fact,"knowledge_revision",coverageRevision); put(fact,"evidence",evidence); put(fact,"run_offset_us",origin);
         }
         JSONArray contexts=smartObserve(key,fact,result); // REQ-039.2: the read counts toward every goal context whose condition holds, and always toward the baseline
         synchronized(recordLock) {
@@ -1472,7 +1473,7 @@ public final class ObdService extends Service {
         coverageProblem=""; coverageVin=""; coverageInvalid=false; coverageSaveFailed=false; synchronized(recordLock) { coverageQueue.clear(); }
         String vin; synchronized(stateLock) { JSONObject vehicle=state.optJSONObject("vehicle"); vin=vehicle==null ? "" : vehicle.optString("vin"); }
         boolean confirmed=mode.equals("live") && !vin.isEmpty() && vin.equals(selectedVin());
-        JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"goal_definition",1); put(argument,"knowledge_revision",coverageRevision); Object stored=JSONObject.NULL;
+        JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"goal_definition",coverageGoalDefinition); put(argument,"knowledge_revision",coverageRevision); Object stored=JSONObject.NULL;
         if(mode.equals("live") && vehicles.unreadable()) coverageProblem=VehicleStore.UNREADABLE; // checked before the identity: an unreadable store has no selection, and "not confirmed" would name the wrong cause
         else if(confirmed) {
             JSONObject ledger=vehicles.coverageLedger(vin);

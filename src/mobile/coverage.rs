@@ -2083,7 +2083,7 @@ mod tests {
         assert_eq!(fact["context"], "baseline");
         assert_eq!(fact["session"], "default");
         assert_eq!(fact["identity_confirmed"], true);
-        assert_eq!(fact["goal_definition"], 1);
+        assert_eq!(fact["goal_definition"], GOAL_DEFINITION);
         assert_eq!(fact["run_offset_us"], secs(3));
         assert_eq!(fact["knowledge_revision"], pin_revision());
         assert_eq!(fact["evidence"], json!({"at":at(secs(3)),"offset_us":777}));
@@ -2189,7 +2189,7 @@ mod tests {
             json!({"run":RUN,"action":"resume","part":2,"previous_part_records":2,"run_offset_us":5}),
         );
         assert_eq!(first["ok"], true, "{first}");
-        assert_eq!(first["data"]["goal_definition"], 1);
+        assert_eq!(first["data"]["goal_definition"], GOAL_DEFINITION);
         assert_eq!(first["data"]["knowledge_revision"], pin_revision());
         assert_eq!(second["data"]["previous_part_records"], 2);
         for bad in [

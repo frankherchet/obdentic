@@ -267,7 +267,7 @@ target), the planner reads the vehicle ledger when one is attached, else the run
 run stays on the definition versions it started with. The service plans a step once every signal of
 the previous selection was attempted, at the latest after 10 s (the REQ-036.1 limit of 32 signals
 per step applies), selects the keys and records every plan change. The goals are cooling
-(warm-up, warm driving), dpf (warm driving, raw regeneration request), turbo, rail, egr and the
+(warm-up, warm driving), dpf (warm-up, warm driving, raw regeneration request), turbo, rail (warm-up, warm idle), egr and the
 technical baseline of every safely readable signal; a goal is active only while its condition holds
 (no fixed windows, no timed rotation). Thresholds, priorities and retry timings are constants of the
 planner; Knowledge, profiles, presets, MCP calls and AI prompts cannot change them. The component
@@ -277,13 +277,13 @@ A reading counts toward every goal context whose condition holds at its own time
 the baseline: the service writes one `coverage.fact` per context and a `coverage.context_end` when a
 goal's contiguous interval ends. Missing, stale (older than 10 s), rejected or unanswered readings
 make a condition unknown, never zero, a crossing, a release or a holding condition. A signal that fails
-is skipped and retried after 30 s, 2 min, then once per drive, with the reason shown and recorded.
+is skipped and retried after 30 s, 2 min, then 10 min after each failed attempt; further attempts wait for the next drive, with the reason shown and recorded.
 Failed probes during a measurement gap mark the planner input as a gap, not a signal failure:
 they neither consume retries nor make signals or goals unreachable.
 
 The Live card names the goals in progress ("wird gemessen", "pausiert · Vorrang: …", "wartet auf neuen
-Versuch"), the one remaining time the planner defines (the EGR time still missing for 30 contiguous
-seconds; the retry time of a skipped signal), "Warm noch nicht erreicht" without any verdict, unknown
+Versuch"), the time still missing for EGR's 30 contiguous seconds, a retry, the turbo release hold
+and the fresh not-holding time required for re-arm, "Warm noch nicht erreicht" without any verdict, unknown
 conditions and unreachable goals with their reason, skipped signals and the latest plan changes. The raw
 DPF regeneration request is shown as "Regenerationsanforderung (Rohwert)", never as a confirmed
 regeneration. Every plan change is written into the running automatic recording as a `smart.plan`
