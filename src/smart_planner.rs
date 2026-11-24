@@ -722,6 +722,27 @@ impl Planner {
         self.step += 1;
         if !self.announced_handoff {
             self.announced_handoff = true;
+            // Entries the vehicle reports as unsupported are reported with their reason (REQ-039.7,
+            // REQ-039.14).
+            for entry in self.catalog.values().filter(|entry| {
+                matches!(
+                    entry.source,
+                    Source::StandardPid {
+                        reported_supported: false
+                    }
+                )
+            }) {
+                events.push(self.event(
+                    now,
+                    None,
+                    EventKind::SignalSkipped {
+                        signal_key: entry.signal_key.clone(),
+                        retry_at: None,
+                    },
+                    Some(Reason::Unsupported),
+                    Vec::new(),
+                ));
+            }
             for key in &session_targets {
                 events.push(self.event(
                     now,
@@ -1557,6 +1578,38 @@ mod tests {
             contexts(&driving, "cooling.radiator_outlet_temperature_actual"),
             ["cooling.warm_driving", "baseline"]
         );
+    }
+
+    #[test]
+    fn req_039_7_and_14_unsupported_catalog_entries_are_reported_once_with_their_reason() {
+        let mut catalog = triggers();
+        catalog.push(CatalogEntry {
+            signal_key: "engine.timing_advance".into(),
+            ecu_target: None,
+            source: Source::StandardPid {
+                reported_supported: false,
+            },
+        });
+        let mut p = Planner::new(catalog, versions()).unwrap();
+        let skipped = |plan: &Plan| -> Vec<(Option<Reason>, EventKind)> {
+            plan.events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::SignalSkipped { signal_key, .. } if signal_key == "engine.timing_advance"))
+                .map(|e| (e.reason, e.kind.clone()))
+                .collect()
+        };
+        let first = p.plan(secs(0), &Ledger::default());
+        assert_eq!(
+            skipped(&first),
+            [(
+                Some(Reason::Unsupported),
+                EventKind::SignalSkipped {
+                    signal_key: "engine.timing_advance".into(),
+                    retry_at: None,
+                }
+            )]
+        );
+        assert!(skipped(&p.plan(secs(1), &Ledger::default())).is_empty());
     }
 
     #[test]
