@@ -301,7 +301,7 @@ public final class ObdService extends Service {
             put(state,"uds",new JSONObject()); put(state,"udsCandidates",0);
             put(state,"replayFile","");
             put(state,"coverage",JSONObject.NULL); put(state,"coverageLive",JSONObject.NULL); put(state,"coverageStored",JSONObject.NULL);
-            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"availability",new JSONObject()); put(state,"replayPartial",false);
+            put(state,"vehicle",new JSONObject()); put(state,"diagnostics",new JSONObject()); put(state,"jobResult",new JSONObject()); put(state,"throughput",new JSONObject()); put(state,"ecuDiscovery",new JSONObject()); put(state,"knowledgeLearning",new JSONObject()); put(state,"availability",new JSONObject()); put(state,"replayPartial",false); put(state,"replayLegacySmart",false);
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
         synchronized(due) { due.clear(); }
@@ -672,8 +672,8 @@ public final class ObdService extends Service {
                 }
                 if(!unsupported) eligible.add(candidate);
             }
-            if(live) gapApply(gap.select(eligible)); // REQ-037.2: a selection change breaks a pending window; an open gap with nothing left to probe ends without recovery
-            if(selected.length()==0) return;
+            if(live) { gapApply(gap.select(eligible,smartRunning)); gapApply(gap.tick(now)); } // REQ-037.1: Smart retry waits count toward the gap
+            if(selected.length()==0 && !(live && gap.active())) return;
             if(live && gap.active()) { semantic=gap.nextProbe(now); wait=gap.probeWait(now); probe=semantic!=null; } // REQ-037.2: during a gap only a previously successful selected signal, at most every 5 s
             else synchronized(due) { semantic=PollSchedule.next(eligible,due,now); wait=PollSchedule.waitMs(eligible,due,now); }
             if(semantic!=null) {
@@ -916,14 +916,13 @@ public final class ObdService extends Service {
                     }
                     if(event.optString("action").startsWith("coverage.")) { coverage.put(event); continue; } // validate even when the envelope type is corrupt
                     if(event.optString("type").equals("session_end")) { endFound=true; outcome=event.optString("reason"); outcomeDetail=event.optString("detail"); coverageEnded=outcome; }
-                    if(event.optString("type").equals("action")) { String action=event.optString("action"); JSONObject result=event.optJSONObject("result"); if(result==null) continue;
+                    if(event.optString("type").equals("action")) { String action=event.optString("action"); if(action.equals("smart.set")) { set("replayLegacySmart",true); continue; } JSONObject result=event.optJSONObject("result"); if(result==null) continue;
                         if(action.equals("read")) { JSONObject recorded=result.optJSONObject("data");
                             JSONObject decoded=recorded==null?result:new JSONObject(NativeCore.execute(core,"replay.read",recorded.toString()));
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
                         else if(action.equals("catalog")) { applyCatalog(result); continue; } // REQ-028.10: automatic files start before the handshake
                         else if(action.equals("smart.plan")) { replaySmart(event); continue; } // REQ-039.8: shown from the file, never sent
-                        else if(action.equals("smart.set")) continue; // the set switching of REQ-036 was replaced by the planner: such records are skipped and never sent
                         else if(action.equals("measurement.gap")) { replayGap(event); continue; } // REQ-037.3: shown from the file, never sent
                         else if(action.equals("component.apply")) { JSONObject applied=result.optJSONObject("data"); if(applied!=null) { put(applied,"replay",true); set("component",applied); } continue; }
                         else if(action.equals("initialize")) { JSONObject support=result.optJSONObject("data"); if(support!=null) { restoreVehicle(support); applySupport(support); } continue; }

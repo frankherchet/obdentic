@@ -570,10 +570,11 @@ public class MainActivity extends Activity {
             s.append("Aus der Aufnahme");
             if(!smart.optString("reason").isEmpty())s.append(" · beendet: ").append(smartReason(smart.optString("reason")));
         }else{
-            s.append(replay?"In dieser Aufnahme wurde keine Smart-Analyse mitgeschnitten.":"Nicht aktiv");
+            s.append(replay?(state.optBoolean("replayLegacySmart")?"Ältere Smart-Analyse in dieser Aufnahme nicht angezeigt":"In dieser Aufnahme wurde keine Smart-Analyse mitgeschnitten."):"Nicht aktiv");
             if(!replay&&smart!=null&&!smart.optString("reason").isEmpty())s.append("\nZuletzt beendet: ").append(smart.optString("reason"));
             return s.toString();
         }
+        if(replay&&state.optBoolean("replayLegacySmart"))s.append("\nÄltere Smart-Analyse in dieser Aufnahme nicht angezeigt");
         boolean warmWaiting=false;StringBuilder gone=new StringBuilder(),unknown=new StringBuilder();
         for(int i=0;goals!=null&&i<goals.length();i++){
             JSONObject goal=goals.optJSONObject(i);if(goal==null)continue;String label=goalLabel(goal.optString("goal")),reason=smartReason(goal.optString("reason"));

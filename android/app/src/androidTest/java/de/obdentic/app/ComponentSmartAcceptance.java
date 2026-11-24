@@ -431,6 +431,16 @@ final class ComponentSmartAcceptance {
         require("stopped".equals(changes.getJSONObject(changes.length() - 1).optString("kind")) && "user".equals(view.optString("reason")) && view.getJSONArray("goals").length() == 0 && sameSelection(service, new JSONArray().put(USER)), "REQ-039.8 the continuation file replays ... stop and the user's selection: " + changes);
         open(service, chain.get(2));
         require(sameSelection(service, new JSONArray().put(USER)) && smart(service).optJSONArray("changes").length() == 0 && !smart(service).optBoolean("active"), "REQ-036.1 replay of the file after the stop shows the restored selection and no analysis: " + service.snapshot().getJSONArray("selected"));
+        // REQ-039.8: legacy set changes are skipped visibly, without sending an adapter command.
+        String legacy = "synthetic-legacy-smart.jsonl";
+        JSONObject header = read(new File(dir, chain.get(2))).get(0);
+        JSONObject oldSet = new JSONObject().put("type", "action").put("action", "smart.set").put("result", new JSONObject().put("ok", true));
+        JSONObject end = new JSONObject().put("type", "session_end").put("reason", "stopped");
+        java.nio.file.Files.write(new File(dir, legacy).toPath(), (header.toString()+"\n"+oldSet+"\n"+end+"\n").getBytes(StandardCharsets.UTF_8));
+        open(service, legacy);
+        require(MainActivity.smartSummaryText(service.snapshot()).contains("Ältere Smart-Analyse in dieser Aufnahme nicht angezeigt"), "REQ-039.8 legacy analysis skip is visible in replay");
+        open(service, chain.get(2));
+        require(!MainActivity.smartSummaryText(service.snapshot()).contains("Ältere Smart-Analyse"), "REQ-039.8 the legacy note does not leak to another replay");
         require(link[0].commands.size() == traffic, "replay sent nothing to an adapter: " + link[0].commands.subList(traffic, link[0].commands.size()));
     }
 

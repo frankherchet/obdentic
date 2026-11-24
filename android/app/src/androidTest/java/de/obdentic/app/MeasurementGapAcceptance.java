@@ -50,6 +50,21 @@ final class MeasurementGapAcceptance {
         for (long t = 500; t < 60_000; t += 500) require(g.observe(IAT, false, t, t + 100, 1000) == none, "REQ-037.1 a previously successful signal that is no longer selected cannot start a gap");
         require(!g.active(), "no gap without a selected, previously successful signal");
 
+        // REQ-037.1: Smart changes selections without erasing the continuous failed-read window.
+        g = new MeasurementGap(); g.select(Arrays.asList(RPM), true); g.observe(RPM, true, 0, 100, 1000);
+        g.observe(RPM, false, 500, 600, 1000);
+        for (long t = 1000; t < 10_500; t += 500) {
+            g.select(t % 1000 == 0 ? Arrays.asList(RPM, IAT) : Arrays.asList(RPM), true);
+            require(g.observe(RPM, false, t, t + 100, 1000) == none, "Smart selection changes do not start a gap early");
+        }
+        require(g.observe(RPM, false, 10_500, 10_600, 1000) == MeasurementGap.Change.START, "REQ-037.1 Smart selection changes preserve the ten-second window");
+        // REQ-037.1/.2: retry waits do not suspend Smart's gap clock; a formerly selected signal can recover by probe.
+        g = new MeasurementGap(); g.select(Arrays.asList(RPM), true); g.observe(RPM, true, 0, 100, 1000);
+        g.observe(RPM, false, 500, 600, 1000); g.select(Collections.emptyList(), true);
+        require(g.tick(10_499) == none && g.tick(10_500) == MeasurementGap.Change.START, "REQ-037.1 Smart retry wait reaches the gap at ten seconds");
+        require(g.nextProbe(15_499) == null && RPM.equals(g.nextProbe(15_500)), "REQ-037.2 Smart probes a retry-waiting previously successful signal after five seconds");
+        require(g.observe(RPM, true, 15_500, 15_600, 1000) == MeasurementGap.Change.RECOVERED, "REQ-037.2 a finite probe recovers Smart");
+
         // REQ-037.1: exactly 10 s of attempted reads without a finite value
         g = new MeasurementGap(); g.select(Arrays.asList(RPM, COOLANT, IAT));
         require(g.observe(RPM, true, 0, 100, 1000) == none, "first value");
@@ -291,6 +306,12 @@ final class MeasurementGapAcceptance {
                 require(!"started".equals(change.optString("kind")) && !"condition_ended".equals(change.optString("reason")), "REQ-039.6 unknown readings neither start a goal nor count as a release: " + change);
             }
             require(smart(service).optBoolean("active") && MainActivity.gapText(service.snapshot()).equals(TEXT), "the analysis keeps running with the notice shown");
+            // REQ-037.2: the retry-waiting Smart selection can recover through the bounded probe.
+            int probesBefore = gap(service).optInt("probes"); link.silentAll = false; link.silent.clear();
+            waitFor(() -> !gap(service).optBoolean("active"), "Smart probe recovery", 12_000);
+            require(gap(service).optInt("probes") > probesBefore && "recovered".equals(gap(service).optString("outcome")), "REQ-037.2 a finite probe recovers the Smart gap");
+            link.silentAll = true;
+            waitFor(() -> gap(service).optBoolean("active"), "second Smart gap", 40_000);
 
             // REQ-037.3: the stop ends the open gap in the recording without claiming recovery
             service.disconnect();
@@ -304,10 +325,10 @@ final class MeasurementGapAcceptance {
             require(chain.size() >= 2, "the forced rotation produced at least two files: " + chain);
             List<List<JSONObject>> files = new ArrayList<>(); for (String n : chain) files.add(read(new File(dir, n)));
             String sequence = checkChain(files);
-            require(sequence.matches("start:no_values(,resume:no_values)+,end:recovered,start:no_values(,resume:no_values)*,end:stopped"), "REQ-037.3 start, a resume in the rotated file, recovery, a second gap and its end by the stop, nothing else: " + sequence);
+            require(sequence.matches("start:no_values(,resume:no_values)+,end:recovered,start:no_values(,resume:no_values)*,end:recovered,start:no_values(,resume:no_values)*,end:stopped"), "REQ-037.3 the Smart probe recovery and later gap are recorded without inferring a cause: " + sequence);
             List<JSONObject> gapEvents = new ArrayList<>(); for (List<JSONObject> f : files) for (JSONObject e : f) if (isGap(e)) gapEvents.add(e);
             JSONObject start = gapEvents.get(0), recovered = null;
-            for (JSONObject e : gapEvents) if ("recovered".equals(data(e).optString("reason"))) recovered = e;
+            for (JSONObject e : gapEvents) if (recovered == null && "recovered".equals(data(e).optString("reason"))) recovered = e;
             require(start.optLong("at") - last.wall >= 10_000 && start.optLong("at") <= System.currentTimeMillis(), "REQ-037.3 the start is timestamped no earlier than 10 s after the last value: " + (start.optLong("at") - last.wall) + " ms");
             require(recovered.optLong("at") - start.optLong("at") >= 16_000, "REQ-037.3 the recorded recovery follows the 17 s silence: " + (recovered.optLong("at") - start.optLong("at")) + " ms");
             JSONObject stoppedEnd = gapEvents.get(gapEvents.size() - 1);

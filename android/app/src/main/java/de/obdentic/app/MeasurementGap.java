@@ -20,6 +20,8 @@ public final class MeasurementGap {
 
     private final Set<String> succeeded = new HashSet<>(); // signals that returned a finite value in this session
     private List<String> eligible = Collections.emptyList(); // the selected signals that are actually read, in selection order
+    private final List<String> smartSignals = new ArrayList<>(); // selected during the current Smart run, including retry waits
+    private boolean smart;
     private boolean active;
     private long windowStart = -1, lastAttemptEnd = -1, lastProbe = -1;
     private final Set<String> failed = new HashSet<>(); // signals attempted without a finite value since the window was last restarted
@@ -28,7 +30,7 @@ public final class MeasurementGap {
     public synchronized boolean active() { return active; }
 
     /** Fresh initialization: nothing carries over from an earlier session. */
-    public synchronized void reset() { succeeded.clear(); eligible = Collections.emptyList(); active = false; lastProbe = -1; lastProbed = ""; restart(); }
+    public synchronized void reset() { succeeded.clear(); eligible = Collections.emptyList(); smartSignals.clear(); smart = false; active = false; lastProbe = -1; lastProbed = ""; restart(); }
 
     /** The failed-read timer starts over: no finite-free stretch of attempted reads is known any more. */
     private void restart() { windowStart = lastAttemptEnd = -1; failed.clear(); }
@@ -45,23 +47,33 @@ public final class MeasurementGap {
 
     private List<String> candidates() {
         List<String> out = new ArrayList<>();
-        for (String key : eligible) if (succeeded.contains(key)) out.add(key);
+        for (String key : smart ? smartSignals : eligible) if (succeeded.contains(key)) out.add(key);
         return out;
     }
 
     /**
-     * The signals that are currently read (selected and supported). A change of selection breaks a pending window; an open gap
-     * with nothing left to probe ends without recovery (STOPPED), because no measurement can ever answer it.
+     * Smart remembers selected signals through retry waits and preserves the pending window across selections.
+     * Outside Smart, selection changes restart the window and an open gap without probe candidates ends.
      */
-    public synchronized Change select(List<String> signals) {
-        if (signals.equals(eligible)) return Change.NONE;
-        eligible = new ArrayList<>(signals); restart();
+    public synchronized Change select(List<String> signals) { return select(signals, false); }
+    public synchronized Change select(List<String> signals, boolean preserveWindow) {
+        boolean modeChanged = smart != preserveWindow;
+        if (modeChanged) { smartSignals.clear(); smart = preserveWindow; }
+        if (smart) for (String key : signals) if (!smartSignals.contains(key)) smartSignals.add(key);
+        if (signals.equals(eligible) && !modeChanged) return Change.NONE;
+        eligible = new ArrayList<>(signals); if (!preserveWindow) restart();
         if (active && candidates().isEmpty()) { active = false; return Change.STOPPED; }
         return Change.NONE;
     }
 
     /** Reads are not being attempted (a job runs): a pending window starts over; an open gap stays open. */
     public synchronized void interrupt() { restart(); }
+
+    /** REQ-037.1: Smart retry waits count toward the finite-free interval even with no selected reads. */
+    public synchronized Change tick(long now) {
+        if (!smart || active || windowStart < 0 || now - windowStart < START_AFTER_MS || candidates().isEmpty()) return Change.NONE;
+        active = true; lastProbe = now; lastProbed = ""; return Change.START;
+    }
 
     /**
      * One attempted read of a selected signal. A gap starts only when the failure window has lasted START_AFTER_MS and every
@@ -75,11 +87,12 @@ public final class MeasurementGap {
             if (!active) return Change.NONE;
             active = false; return Change.RECOVERED;
         }
-        if (lastAttemptEnd >= 0 && startedAt - lastAttemptEnd > maxPauseMs) restart(); // reads were not being attempted in between
+        if (!smart && lastAttemptEnd >= 0 && startedAt - lastAttemptEnd > maxPauseMs) restart(); // non-Smart pauses break the window
         lastAttemptEnd = endedAt;
         if (active) return Change.NONE;
         if (windowStart < 0) { if (eligible.contains(key) && succeeded.contains(key)) { windowStart = startedAt; failed.add(key); } return Change.NONE; }
         failed.add(key);
+        if (smart) return tick(endedAt);
         List<String> known = candidates();
         if (endedAt - windowStart < START_AFTER_MS || known.isEmpty() || !failed.containsAll(known)) return Change.NONE;
         active = true; lastProbe = endedAt; lastProbed = ""; return Change.START;
@@ -88,7 +101,7 @@ public final class MeasurementGap {
     /** Ends an open gap without recovery (the observation stopped); false when none was open. Previously successful signals are kept. */
     public synchronized boolean stop() { boolean was = active; active = false; restart(); return was; }
 
-    /** During a gap: the one previously successful, selected signal to read now (at most once per PROBE_EVERY_MS), or null. */
+    /** During a gap: probe a previously successful selected signal, or a Smart signal in retry wait. */
     public synchronized String nextProbe(long now) {
         if (!active || (lastProbe >= 0 && now - lastProbe < PROBE_EVERY_MS)) return null;
         List<String> list = candidates(); if (list.isEmpty()) return null;

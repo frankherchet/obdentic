@@ -290,7 +290,7 @@ action (`kind`: `started`, `interrupted`, `resumed`, `completed`, `expired`, `no
 wallclock time and offset of the record, `at_us` (the run clock), `goal`, `reason`, the condition readings
 (`inputs`: signal, value or reason) and the definition versions, continues across file rotation and is
 replayed offline without adapter traffic. Records of the earlier set switching (`smart.set`) are skipped on
-replay. Results stay in the private recording and the app's memory: no condition value ever goes into the
+replay with the note "Ältere Smart-Analyse in dieser Aufnahme nicht angezeigt". Results stay in the private recording and the app's memory: no condition value ever goes into the
 app log (only goal names and reasons), and nothing is exported, shared or published as vehicle
 evidence automatically. Behaviour while driving is not validated and belongs to the separate #178 gate.
 
@@ -303,6 +303,9 @@ notice states only that no values arrive. It does not claim that the ignition is
 the adapter or vehicle has disconnected: the cause is not known and the app does not infer it
 (no ignition state is asserted anywhere). Missing and stale trigger values stay unknown, never
 zero and never proof that an event did not occur.
+During Smart, the ten-second clock continues across selection changes and retry waits, even
+when no signal is being read. A previously selected, successful Smart signal waiting for retry
+can be probed at the normal five-second cadence; a finite probe ends the gap.
 
 "Value" here means only a finite decoded result. It is not proof that the reading is plausible:
 a numeric sentinel that decodes to a finite number still ends or prevents a gap and can never
