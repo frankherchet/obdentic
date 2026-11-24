@@ -29,7 +29,7 @@ final class ComponentSmartAcceptance {
     private static final Set<String> STATUSES = new HashSet<>(Arrays.asList("selected", "unsupported", "missing", "no_ecu", "ambiguous", "rejected", "not_answered",
         "uds_unavailable", "uds_ended", "pending_uds", "session_excluded"));
     /** The ledger contexts of REQ-039.2: the five goal groups' conditions and the generic baseline. */
-    private static final Set<String> GOAL_CONTEXTS = new HashSet<>(Arrays.asList("baseline", "cooling.warm_up", "cooling.warm_driving", "dpf.warm_driving", "dpf.raw_request", "turbo", "rail", "egr"));
+    private static final Set<String> GOAL_CONTEXTS = new HashSet<>(Arrays.asList("baseline", "cooling.warm_up", "cooling.warm_driving", "dpf.warm_up", "dpf.warm_driving", "dpf.raw_request", "turbo", "rail.warm_up", "rail", "egr"));
 
     /** Answers like the demo adapter, except for the steered trigger inputs and the engine's DIDs; every command is logged with its target. */
     private static final class Link implements ObdService.Link {
@@ -322,7 +322,7 @@ final class ComponentSmartAcceptance {
             for (JSONObject e : files.get(f)) { JSONObject data = smartData(e); if (data == null) continue;
                 require(e.has("at") && e.optLong("offset_us", -1) >= lastOffset, "REQ-039.8 wall time and monotonic offset on every change, ascending: " + e); lastOffset = e.optLong("offset_us");
                 String kind = data.optString("kind");
-                require(data.optInt("goal_definition", -1) == 1 && !data.optString("knowledge_revision").isEmpty() && data.has("inputs") && data.has("reason") && data.has("goal"), "REQ-039.8 every change names the definition versions, the inputs, the goal and the reason: " + data);
+                require(data.optInt("goal_definition", -1) == 2 && !data.optString("knowledge_revision").isEmpty() && data.has("inputs") && data.has("reason") && data.has("goal"), "REQ-039.8 every change names the definition versions, the inputs, the goal and the reason: " + data);
                 JSONArray inputs = data.getJSONArray("inputs");
                 for (int i = 0; i < inputs.length(); i++) { JSONObject input = inputs.getJSONObject(i);
                     require(input.isNull("value") != input.isNull("reason"), "REQ-039.6 an unknown condition reading carries its reason and never a value, zero included: " + input); }
@@ -470,7 +470,7 @@ final class ComponentSmartAcceptance {
                 if ("coverage.fact".equals(e.optString("action"))) {
                     facts++; JSONObject evidence = data.getJSONObject("evidence");
                     contexts.add(data.optString("context"));
-                    require(GOAL_CONTEXTS.contains(data.optString("context")) && data.optInt("goal_definition") == 1 && !data.optString("knowledge_revision").isEmpty() && !data.optString("outcome").isEmpty()
+                    require(GOAL_CONTEXTS.contains(data.optString("context")) && data.optInt("goal_definition") == 2 && !data.optString("knowledge_revision").isEmpty() && !data.optString("outcome").isEmpty()
                         && data.has("session") && data.has("identity_confirmed") && data.has("implausible") && data.has("static_identity"), "REQ-038.9 the fact has every field of the ledger: " + e);
                     if (!evidence.optBoolean("in_previous_file")) require(reads.contains(evidence.getLong("offset_us")), "REQ-038.9 the evidence reference names the raw read record in the same file: " + e);
                 }

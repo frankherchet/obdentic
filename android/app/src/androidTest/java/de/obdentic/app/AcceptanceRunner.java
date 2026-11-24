@@ -353,6 +353,10 @@ public final class AcceptanceRunner extends Instrumentation {
         require(card.contains("Warm noch nicht erreicht")&&card.contains("keine Aussage über den Zustand"),"REQ-039.11 'warm not yet reached' is no verdict: "+card);
         require(card.contains("Bedingung unbekannt")&&card.contains("Messwert veraltet")&&card.contains("In dieser Fahrt nicht erreichbar: "+MainActivity.REGEN_REQUEST_LABEL+" (Eingangswert der Bedingung nicht verfügbar)"),"REQ-039.6/.7 an unknown condition and an unreachable goal show their reason: "+card);
         require(card.contains("Übersprungen: 1 Messwerte")&&card.contains("lehnt ab")&&card.contains("neuer Versuch in")&&card.contains("3 Messwerte brauchen die erweiterte Sitzung"),"REQ-039.7 a skipped signal shows its reason and retry time: "+card);
+        // REQ-039.21: both clocks are visible, including a paused re-arm.
+        JSONObject timed=new JSONObject().put("active",true).put("goals",new JSONArray().put(new JSONObject().put("goal","turbo").put("phase","serving").put("hold_remaining_ms",15000L).put("rearm_remaining_ms",5000L)));
+        String timing=MainActivity.smartSummaryText(new JSONObject().put("smart",timed));
+        require(timing.contains("Nachlauf noch 15 s")&&timing.contains("erneute Bereitschaft benötigt noch 5,0 s"),"REQ-039.21 turbo hold and re-arm remaining times: "+timing);
         require(!card.contains("Komponente")&&!card.contains("Rotation")&&!card.contains("Auslöser"),"no set switching, no rotation, no windows any more: "+card);
         String changesText=MainActivity.smartChangesText(new JSONObject().put("changes",new JSONArray()
             .put(new JSONObject().put("at",1000L).put("kind","interrupted").put("goal","rail").put("by","dpf.raw_request").put("reason","higher_priority"))

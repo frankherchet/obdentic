@@ -516,8 +516,8 @@ public class MainActivity extends Activity {
     /** German name of a planner goal context id (REQ-039.2). The baseline is a technical baseline, never a diagnosis. */
     public static String goalLabel(String id){
         switch(id){
-            case "cooling.warm_up":return "Kühlung · Warmlauf";case "cooling.warm_driving":return "Kühlung · warme Fahrt";case "dpf.warm_driving":return "DPF · warme Fahrt";
-            case "dpf.raw_request":return REGEN_REQUEST_LABEL;case "turbo":return "Turbo · hohe Last";case "rail":return "Rail · warmer Leerlauf";
+            case "cooling.warm_up":return "Kühlung · Warmlauf";case "cooling.warm_driving":return "Kühlung · warme Fahrt";case "dpf.warm_up":return "DPF · Warmlauf";case "dpf.warm_driving":return "DPF · warme Fahrt";
+            case "dpf.raw_request":return REGEN_REQUEST_LABEL;case "turbo":return "Turbo · hohe Last";case "rail.warm_up":return "Rail · Warmlauf";case "rail":return "Rail · warmer Leerlauf";
             case "egr":return "AGR · gleichmäßige Teillast";case "baseline":return "Technische Basisabdeckung";default:return id;
         }
     }
@@ -542,7 +542,7 @@ public class MainActivity extends Activity {
     }
     /** Why a named recording of the selection is not offered while smart analysis drives the selection (it records on its own), or null. */
     public static String smartRecordingBlocker(JSONObject state){return smartActive(state)&&!state.optString("mode","live").equals("replay")?"Während der Smart-Analyse nicht verfügbar: Sie zeichnet selbst auf, eine Aufzeichnung der Auswahl würde die vom Planer gewählten Messwerte nicht festhalten.":null;}
-    /** What a goal in progress is doing, with the one remaining time the planner defines: the EGR time still missing for 30 contiguous seconds (REQ-039.2). */
+    /** What a goal in progress is doing, including its remaining times (REQ-039.21). */
     private static String goalPhaseText(JSONObject goal){
         String id=goal.optString("goal");
         switch(goal.optString("phase")){
@@ -584,6 +584,8 @@ public class MainActivity extends Activity {
                 case "condition_unknown":if(unknown.length()>0)unknown.append(", ");unknown.append(label).append(" (").append(reason).append(")");break;
                 default:break;
             }
+            if(goal.has("hold_remaining_ms")&&!goal.isNull("hold_remaining_ms"))s.append("\n• ").append(label).append(": Nachlauf noch ").append(ageText(goal.optLong("hold_remaining_ms")));
+            if(goal.has("rearm_remaining_ms")&&!goal.isNull("rearm_remaining_ms"))s.append("\n• ").append(label).append(": erneute Bereitschaft benötigt noch ").append(ageText(goal.optLong("rearm_remaining_ms"))).append(" frische Zeit ohne Bedingung");
             if("not_yet_reached".equals(goal.optString("warm")))warmWaiting=true;
         }
         if(warmWaiting)s.append("\nWarm noch nicht erreicht · technische Grenze 80 °C Kühlmitteltemperatur, keine Aussage über den Zustand");

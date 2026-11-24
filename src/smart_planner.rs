@@ -23,8 +23,8 @@
 //!   fresh known reading, and is false otherwise (REQ-039.6). A condition with an input that has
 //!   no fresh, finite, plausible, successfully decoded reading on any target is unknown, even
 //!   when another input alone would decide it.
-//! - The warm-up goal holds while the coolant temperature is below the warm threshold; the
-//!   warm-dependent goals are cooling warm driving, dpf warm driving and rail.
+//! - Cooling warm-up holds below the warm threshold; rail and DPF warm-up additionally
+//!   require their respective idle and driving conditions.
 //! - Goal membership of a signal follows the REQ-035 component presets (REQ-039.15, see
 //!   [`Goal::includes`]); a signal can belong to several goals, and every signal is a member of
 //!   the baseline. A reading counts toward every goal whose condition holds plus the baseline, so
@@ -42,7 +42,7 @@
 //!   regeneration request trigger keeps being re-attempted under REQ-039.14 (REQ-039.4).
 //! - The egr interval of 30 contiguous seconds is tracked from the reading that started the goal;
 //!   it ends when the condition stops holding or becomes unknown (REQ-039.2, REQ-039.12).
-//! - The retry schedule of a failed signal (30 s, 2 min, then once per drive, REQ-039.14) starts
+//! - The retry schedule of a failed signal (30 s, 2 min, 10 min, REQ-039.14) starts
 //!   anew in every drive; earlier drives in the ledger do not shorten it. An unknown reading
 //!   that ends the turbo release hold leaves the 10 s re-arm counted from the release.
 //! - A reading that arrives after the plan that selected it counts toward the contexts whose
@@ -79,11 +79,15 @@ pub const EGR_CONTIGUOUS: Duration = Duration::from_secs(30);
 pub const TURBO_RELEASE_HOLD: Duration = Duration::from_secs(20);
 /// REQ-039.12: a goal can start again only after its condition did not hold for this long.
 pub const REARM: Duration = FRESHNESS_LIMIT;
-/// REQ-039.14: delays before the first and the second retry of a failed signal.
-pub const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(30), Duration::from_secs(120)];
+/// REQ-039.14: delays before each retry of a failed signal.
+pub const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+];
 /// REQ-038.7: version of the goal, condition and threshold definitions of this module. Changing
 /// any of them requires a new number; stored progress of the old number stays separate.
-pub const GOAL_DEFINITION_VERSION: u32 = 1;
+pub const GOAL_DEFINITION_VERSION: u32 = 2;
 
 const COOLANT: &str = "engine.coolant_temperature";
 const SPEED: &str = "vehicle.speed";
@@ -177,22 +181,26 @@ pub fn current_versions(knowledge_revision: impl Into<String>) -> DefinitionVers
 pub enum Goal {
     CoolingWarmUp,
     CoolingWarmDriving,
+    DpfWarmUp,
     DpfWarmDriving,
     DpfRaw,
     Turbo,
     Rail,
+    RailWarmUp,
     Egr,
     Baseline,
 }
 
 impl Goal {
-    pub const ALL: [Goal; 8] = [
+    pub const ALL: [Goal; 10] = [
         Goal::CoolingWarmUp,
         Goal::CoolingWarmDriving,
         Goal::DpfWarmDriving,
+        Goal::DpfWarmUp,
         Goal::DpfRaw,
         Goal::Turbo,
         Goal::Rail,
+        Goal::RailWarmUp,
         Goal::Egr,
         Goal::Baseline,
     ];
@@ -202,10 +210,12 @@ impl Goal {
         match self {
             Goal::CoolingWarmUp => "cooling.warm_up",
             Goal::CoolingWarmDriving => "cooling.warm_driving",
+            Goal::DpfWarmUp => "dpf.warm_up",
             Goal::DpfWarmDriving => "dpf.warm_driving",
             Goal::DpfRaw => "dpf.raw_request",
             Goal::Turbo => "turbo",
             Goal::Rail => "rail",
+            Goal::RailWarmUp => "rail.warm_up",
             Goal::Egr => "egr",
             Goal::Baseline => crate::coverage_ledger::BASELINE_CONTEXT,
         }
@@ -222,7 +232,11 @@ impl Goal {
             Goal::Rail => 1,
             Goal::Turbo => 2,
             Goal::Egr => 3,
-            Goal::CoolingWarmUp | Goal::CoolingWarmDriving | Goal::DpfWarmDriving => 4,
+            Goal::CoolingWarmUp
+            | Goal::CoolingWarmDriving
+            | Goal::DpfWarmUp
+            | Goal::DpfWarmDriving
+            | Goal::RailWarmUp => 4,
             Goal::Baseline => 5,
         }
     }
@@ -239,10 +253,10 @@ impl Goal {
     fn inputs(self) -> &'static [&'static str] {
         match self {
             Goal::CoolingWarmUp => &[COOLANT],
-            Goal::CoolingWarmDriving | Goal::DpfWarmDriving => &[COOLANT, SPEED],
+            Goal::CoolingWarmDriving | Goal::DpfWarmUp | Goal::DpfWarmDriving => &[COOLANT, SPEED],
             Goal::DpfRaw => &[REGEN],
             Goal::Turbo => &[PEDAL],
-            Goal::Rail => &[COOLANT, SPEED, RPM],
+            Goal::Rail | Goal::RailWarmUp => &[COOLANT, SPEED, RPM],
             Goal::Egr => &[SPEED, LOAD],
             Goal::Baseline => &[],
         }
@@ -252,9 +266,9 @@ impl Goal {
     fn preset(self) -> &'static [&'static str] {
         match self {
             Goal::CoolingWarmUp | Goal::CoolingWarmDriving => PRESET_COOLING,
-            Goal::DpfWarmDriving | Goal::DpfRaw => PRESET_DPF,
+            Goal::DpfWarmUp | Goal::DpfWarmDriving | Goal::DpfRaw => PRESET_DPF,
             Goal::Turbo => PRESET_TURBO,
-            Goal::Rail => PRESET_RAIL,
+            Goal::Rail | Goal::RailWarmUp => PRESET_RAIL,
             Goal::Egr => PRESET_EGR,
             Goal::Baseline => &[],
         }
@@ -271,6 +285,10 @@ impl Goal {
         let inside = |v: f64, (low, high): (f64, f64)| (low..=high).contains(&v);
         match (self, values) {
             (Goal::CoolingWarmUp, [coolant]) => *coolant < WARM_CELSIUS,
+            (Goal::DpfWarmUp, [coolant, speed]) => *coolant < WARM_CELSIUS && *speed > 0.0,
+            (Goal::RailWarmUp, [coolant, speed, rpm]) => {
+                *coolant < WARM_CELSIUS && *speed <= 0.0 && inside(*rpm, RAIL_RPM)
+            }
             (Goal::CoolingWarmDriving | Goal::DpfWarmDriving, [coolant, speed]) => {
                 *coolant >= WARM_CELSIUS && *speed > 0.0
             }
@@ -463,6 +481,10 @@ pub struct GoalStatus {
     /// Egr only: contiguous time of the interval in progress, from the reading that started it to
     /// the latest reading (REQ-039.2); `None` while the goal is not active.
     pub contiguous: Option<Duration>,
+    /// Time left in the turbo release hold, if one is active.
+    pub hold_remaining: Option<Duration>,
+    /// Fresh not-holding time still required to re-arm, if re-arming.
+    pub rearm_remaining: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -798,7 +820,13 @@ impl Planner {
         // Goals that got one of the signals competing for slots; the always-selected trigger
         // signals do not count as being served.
         let mut served: BTreeSet<Goal> = BTreeSet::new();
-        for goal in order.iter().filter(|goal| **goal != Goal::Baseline) {
+        for goal in order.iter().filter(|goal| {
+            **goal != Goal::Baseline
+                && (**goal != Goal::Egr
+                    || evaluations[goal]
+                        .contiguous
+                        .is_some_and(|time| time >= EGR_CONTIGUOUS))
+        }) {
             for key in data[goal].ready.iter().filter(|key| !is_trigger(key)) {
                 if selection.iter().any(|s| s.signal_key == *key) {
                     served.insert(*goal);
@@ -822,6 +850,13 @@ impl Planner {
                 selection.push(self.selected(key, false));
                 served.insert(Goal::Baseline);
             }
+        }
+        if evaluations[&Goal::Egr].active
+            && selection
+                .iter()
+                .any(|selected| !selected.trigger && Goal::Egr.includes(&selected.signal_key))
+        {
+            served.insert(Goal::Egr);
         }
         // REQ-039.2: a reading counts toward every holding goal context that includes the signal,
         // plus the baseline.
@@ -896,6 +931,11 @@ impl Planner {
                 share: candidates.share,
                 warm: goal.warm_dependent().then_some(warm),
                 contiguous: evaluation.contiguous,
+                hold_remaining: self.goals[&goal]
+                    .hold_until
+                    .map(|until| until.saturating_sub(now)),
+                rearm_remaining: (!self.goals[&goal].armed)
+                    .then(|| REARM.saturating_sub(self.goals[&goal].rearm)),
             });
         }
         self.last_plan = Some(now);
@@ -1987,6 +2027,55 @@ mod tests {
         );
     }
 
+    // REQ-039.20: each warm-dependent component has its own cold context.
+    #[test]
+    fn req_039_20_warmup_contexts_follow_idle_and_driving_conditions() {
+        let ledger = Ledger::default();
+        let mut p = planner(&["engine.rail_pressure_actual", "dpf.soot_mass_calculated"]);
+        feed(&mut p, 0, &base(60.0, 0.0, 800.0, 20.0, 10.0, 0.0));
+        let idle = p.plan(secs(0), &ledger);
+        assert!(contexts(&idle, "engine.rail_pressure_actual").contains(&"rail.warm_up".to_owned()));
+        assert!(!contexts(&idle, "dpf.soot_mass_calculated").contains(&"dpf.warm_up".to_owned()));
+        feed(&mut p, 1, &base(60.0, 20.0, 800.0, 20.0, 10.0, 0.0));
+        let driving = p.plan(secs(1), &ledger);
+        assert!(contexts(&driving, "dpf.soot_mass_calculated").contains(&"dpf.warm_up".to_owned()));
+        assert!(
+            !contexts(&driving, "engine.rail_pressure_actual").contains(&"rail.warm_up".to_owned())
+        );
+        assert_eq!(Goal::RailWarmUp.level(), Goal::CoolingWarmUp.level());
+        assert_eq!(Goal::DpfWarmUp.level(), Goal::CoolingWarmUp.level());
+    }
+
+    // REQ-039.18 and REQ-039.21
+    #[test]
+    fn first_turbo_start_and_remaining_hold_and_rearm_times() {
+        let mut p = planner(&["engine.boost_pressure_actual"]);
+        let ledger = Ledger::default();
+        feed(&mut p, 0, &[(PEDAL, 95.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(0), &ledger), Goal::Turbo),
+            Phase::Serving
+        );
+        feed(&mut p, 5, &[(PEDAL, 20.0)]);
+        let plan = p.plan(secs(5), &ledger);
+        let turbo = plan
+            .goals
+            .iter()
+            .find(|goal| goal.goal == Goal::Turbo)
+            .unwrap();
+        assert_eq!(turbo.hold_remaining, Some(secs(20)));
+        assert_eq!(turbo.rearm_remaining, Some(secs(10)));
+        feed(&mut p, 10, &[(PEDAL, 20.0)]);
+        let plan = p.plan(secs(10), &ledger);
+        let turbo = plan
+            .goals
+            .iter()
+            .find(|goal| goal.goal == Goal::Turbo)
+            .unwrap();
+        assert_eq!(turbo.hold_remaining, Some(secs(15)));
+        assert_eq!(turbo.rearm_remaining, Some(secs(5)));
+    }
+
     #[test]
     fn req_039_12_turbo_holds_twenty_seconds_after_release_and_pressing_continues() {
         let mut p = planner(&["engine.boost_pressure_actual"]);
@@ -2198,8 +2287,39 @@ mod tests {
                 Goal::CoolingWarmUp,
                 Goal::CoolingWarmDriving,
                 Goal::DpfWarmDriving,
+                Goal::DpfWarmUp,
+                Goal::RailWarmUp,
                 Goal::Baseline
             ]
+        );
+    }
+
+    // REQ-039.19: EGR signals compete at baseline until the continuous condition is confirmed.
+    #[test]
+    fn req_039_19_egr_priority_requires_thirty_confirmed_seconds() {
+        let cooling: Vec<String> = (0..40)
+            .map(|i| format!("cooling.fan1_duty@ecu{i:02}"))
+            .collect();
+        let mut catalog = triggers();
+        catalog.extend(cooling.iter().map(|key| entry(key)));
+        catalog.push(entry("egr.valve_duty"));
+        let mut p = Planner::new(catalog, versions()).unwrap();
+        let ledger = Ledger::default();
+        for at in [0, 5, 10, 15, 20, 25] {
+            feed(&mut p, at, &base(90.0, 60.0, 2000.0, 30.0, 10.0, 0.0));
+            let plan = p.plan(secs(at), &ledger);
+            let first = plan.selection.iter().find(|s| !s.trigger).unwrap();
+            assert!(first.signal_key.starts_with("cooling.fan1_duty"));
+        }
+        feed(&mut p, 30, &base(90.0, 60.0, 2000.0, 30.0, 10.0, 0.0));
+        let plan = p.plan(secs(30), &ledger);
+        assert_eq!(
+            plan.selection
+                .iter()
+                .find(|s| !s.trigger)
+                .unwrap()
+                .signal_key,
+            "egr.valve_duty"
         );
     }
 
@@ -2291,8 +2411,9 @@ mod tests {
         assert_eq!(first.contexts[0].id(), "cooling.warm_driving");
     }
 
+    // REQ-039.16
     #[test]
-    fn req_039_14_failed_signal_is_retried_after_30s_then_2min_then_not_again() {
+    fn req_039_14_and_16_failed_signal_gets_three_retries_then_waits_for_next_drive() {
         let ledger = Ledger::default();
         let mut p = planner(&["engine.flaky"]);
         assert_eq!(
@@ -2322,10 +2443,18 @@ mod tests {
             150,
             Outcome::NoAnswer { reason: "t".into() },
         ));
-        for at in 151..2000 {
-            assert!(contexts(&p.plan(secs(at), &ledger), "engine.flaky").is_empty());
-        }
-        assert!(p.plan(secs(2000), &ledger).events.is_empty());
+        assert!(contexts(&p.plan(secs(749), &ledger), "engine.flaky").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(750), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
+        p.record(&failed("engine.flaky", 750, Outcome::Empty));
+        assert!(contexts(&p.plan(secs(2000), &ledger), "engine.flaky").is_empty());
+        let mut next_drive = planner(&["engine.flaky"]);
+        assert_eq!(
+            contexts(&next_drive.plan(secs(0), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
     }
 
     #[test]
@@ -2392,6 +2521,12 @@ mod tests {
             ["baseline"]
         );
         p.record(&failed("engine.flaky", 150, Outcome::Empty));
+        assert!(contexts(&p.plan(secs(749), &ledger), "engine.flaky").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(750), &ledger), "engine.flaky"),
+            ["baseline"]
+        );
+        p.record(&failed("engine.flaky", 750, Outcome::Empty));
         assert!(contexts(&p.plan(secs(2000), &ledger), "engine.flaky").is_empty());
     }
 
@@ -3163,6 +3298,7 @@ mod tests {
     }
 
     #[test]
+    // REQ-039.17
     fn req_039_14_and_4_regeneration_request_trigger_is_retried_while_readable() {
         let mut p = planner(&[]);
         let ledger = Ledger::default();
@@ -3179,9 +3315,16 @@ mod tests {
         p.record(&failed(REGEN, 30, Outcome::Empty));
         assert!(!selected(&p.plan(secs(149), &ledger)));
         assert!(selected(&p.plan(secs(150), &ledger)));
-        // Unsupported ends it for the drive and makes the goal not reachable.
-        p.record(&failed(REGEN, 150, Outcome::Unsupported));
-        let plan = p.plan(secs(151), &ledger);
+        p.record(&failed(REGEN, 150, Outcome::Empty));
+        let plan = p.plan(secs(749), &ledger);
+        assert!(!selected(&plan));
+        assert_eq!(
+            phase(&plan, Goal::DpfRaw),
+            Phase::ConditionUnknown(Reason::Empty)
+        );
+        assert!(selected(&p.plan(secs(750), &ledger)));
+        p.record(&failed(REGEN, 750, Outcome::Empty));
+        let plan = p.plan(secs(751), &ledger);
         assert!(!selected(&plan));
         assert_eq!(
             phase(&plan, Goal::DpfRaw),

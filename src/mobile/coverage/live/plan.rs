@@ -147,12 +147,14 @@ fn plan_json(plan: &Plan) -> Value {
             goal["goal"] = json!(status.goal.context_id());
             goal["share"] = json!(status.share);
             goal["warm"] = warm_json(status.warm);
-            // EGR needs 30 s in one contiguous segment (REQ-039.2): the time still missing is the
-            // only remaining time the planner defines for a goal in progress.
+            // REQ-039.21: hold and re-arm have different clocks; do not extrapolate
+            // re-arm time between fresh condition readings.
             goal["contiguous_ms"] = json!(status.contiguous.map(millis));
             goal["contiguous_missing_ms"] = json!(status.contiguous.map(|contiguous| {
                 millis(crate::smart_planner::EGR_CONTIGUOUS.saturating_sub(contiguous))
             }));
+            goal["hold_remaining_ms"] = json!(status.hold_remaining.map(millis));
+            goal["rearm_remaining_ms"] = json!(status.rearm_remaining.map(millis));
             goal
         }).collect::<Vec<_>>(),
         "session_targets":plan.session_targets.len(),
