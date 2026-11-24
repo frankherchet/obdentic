@@ -18,8 +18,11 @@
 //! - The module only reads: the plan is a list of read targets for the default session.
 //!
 //! Conventions the criteria leave open:
-//! - A condition with any input that is not fresh, finite, plausible and successfully decoded is
-//!   unknown, even when another input alone would decide it (REQ-039.6).
+//! - A condition input is addressed by semantic: a trigger offered by several ECUs
+//!   (`semantic@target`) holds if any fresh reading holds, is unknown only if no target has a
+//!   fresh known reading, and is false otherwise (REQ-039.6). A condition with an input that has
+//!   no fresh, finite, plausible, successfully decoded reading on any target is unknown, even
+//!   when another input alone would decide it.
 //! - The warm-up goal holds while the coolant temperature is below the warm threshold; the
 //!   warm-dependent goals are cooling warm driving, dpf warm driving and rail.
 //! - Goal membership of a signal follows the REQ-035 component presets (REQ-039.15, see
@@ -32,12 +35,16 @@
 //!   count fresh not-holding readings by their timestamps, from the first such reading after the
 //!   goal was active, whatever ended the goal (REQ-039.4, REQ-039.12). An unknown reading pauses
 //!   the count; a reading in which the condition holds resets it.
-//! - A goal is not reachable when one of its condition inputs or all of its signals are
-//!   unavailable or absent from the catalog (REQ-039.7), whether or not its condition holds.
+//! - A goal is not reachable for the drive as soon as one of its condition inputs is unavailable
+//!   (no target of it can be read: unsupported, session-restricted or out of retries) or all of
+//!   its signals are unavailable or absent from the catalog (REQ-039.7), whether or not its
+//!   condition holds. A failed input still awaiting its retry is not unavailable; the
+//!   regeneration request trigger keeps being re-attempted under REQ-039.14 (REQ-039.4).
 //! - The egr interval of 30 contiguous seconds is tracked from the reading that started the goal;
 //!   it ends when the condition stops holding or becomes unknown (REQ-039.2, REQ-039.12).
 //! - The retry schedule of a failed signal (30 s, 2 min, then once per drive, REQ-039.14) starts
-//!   anew in every drive; earlier drives in the ledger do not shorten it.
+//!   anew in every drive; earlier drives in the ledger do not shorten it. An unknown reading
+//!   that ends the turbo release hold leaves the 10 s re-arm counted from the release.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -598,7 +605,7 @@ impl Planner {
     /// An unsuccessful read is never counted as a measurement, as 0 or as success.
     pub fn record(&mut self, observation: &Observation) {
         let key = observation.signal_key.as_str();
-        if TRIGGER_SIGNALS.contains(&key)
+        if TRIGGER_SIGNALS.contains(&semantic(key))
             && self
                 .context
                 .get(key)
@@ -617,7 +624,9 @@ impl Planner {
             return;
         }
         let (next, reason) = match &observation.outcome {
-            Outcome::Decoded(_) => (Availability::Available, None),
+            Outcome::Decoded(
+                Decoded::Numeric { finite: true } | Decoded::Text { nonempty: true },
+            ) => (Availability::Available, None),
             Outcome::Gap => return,
             Outcome::Unsupported => (Availability::Unsupported, Some(Reason::Unsupported)),
             Outcome::SessionRestricted { .. } => (
@@ -729,12 +738,14 @@ impl Planner {
                 .partial_cmp(&(b.level(), data[b].share, *b))
                 .expect("shares are finite")
         });
-        let is_trigger = |key: &str| TRIGGER_SIGNALS.contains(&key);
+        let is_trigger = |key: &str| TRIGGER_SIGNALS.contains(&semantic(key));
 
         let mut selection: Vec<Selected> = Vec::new();
-        for key in TRIGGER_SIGNALS {
-            if self.plannable(key) && self.attemptable(key, now) {
-                selection.push(self.selected(key, true));
+        for trigger in TRIGGER_SIGNALS {
+            for key in self.catalog.keys().filter(|key| semantic(key) == trigger) {
+                if self.plannable(key) && self.attemptable(key, now) {
+                    selection.push(self.selected(key, true));
+                }
             }
         }
         let room = MAX_SELECTION - selection.len();
@@ -815,15 +826,23 @@ impl Planner {
             } else {
                 Phase::Serving
             };
-            if evaluation.context_ended {
+            let ended_now =
+                self.goals[&goal].phase.is_some_and(Phase::is_active) && !phase.is_active();
+            if evaluation.context_ended || ended_now {
                 events.push(self.event(
                     now,
                     Some(goal),
                     EventKind::ContextEnded,
-                    Some(match evaluation.inactive {
-                        Phase::ConditionUnknown(reason) => reason,
-                        _ => Reason::ConditionEnded,
-                    }),
+                    Some(
+                        match if phase.is_active() {
+                            evaluation.inactive
+                        } else {
+                            phase
+                        } {
+                            Phase::ConditionUnknown(reason) | Phase::NotReachable(reason) => reason,
+                            _ => Reason::ConditionEnded,
+                        },
+                    ),
                     evaluation.inputs.clone(),
                 ));
             }
@@ -970,27 +989,53 @@ impl Planner {
         }
     }
 
-    fn input(&self, key: &str, now: Duration) -> Result<f64, Reason> {
-        match self.context.get(key) {
-            None => Err(Reason::NoReading),
-            Some((_, Err(reason))) => Err(*reason),
-            Some((at, Ok(_))) if now.saturating_sub(*at) > FRESHNESS_LIMIT => Err(Reason::Stale),
-            Some((_, Ok(value))) => Ok(*value),
+    /// Every reading of the trigger `semantic`, one per target that has delivered one, with its
+    /// freshness applied; a single `NoReading` entry when none has (REQ-039.6).
+    fn readings(&self, semantic_key: &str, now: Duration) -> Vec<ConditionInput> {
+        let mut found: Vec<ConditionInput> = self
+            .context
+            .iter()
+            .filter(|(key, _)| semantic(key) == semantic_key)
+            .map(|(key, (at, value))| ConditionInput {
+                signal_key: key.clone(),
+                value: match value {
+                    Err(reason) => Err(*reason),
+                    Ok(_) if now.saturating_sub(*at) > FRESHNESS_LIMIT => Err(Reason::Stale),
+                    Ok(value) => Ok(*value),
+                },
+            })
+            .collect();
+        if found.is_empty() {
+            found.push(ConditionInput {
+                signal_key: semantic_key.to_owned(),
+                value: Err(Reason::NoReading),
+            });
         }
+        found
     }
 
     fn warm(&self, now: Duration) -> Warm {
-        match self.input(COOLANT, now) {
-            Err(reason) => Warm::Unknown(reason),
-            Ok(value) if value >= WARM_CELSIUS => Warm::Reached,
-            Ok(_) => Warm::NotYetReached,
+        let readings = self.readings(COOLANT, now);
+        let known: Vec<f64> = readings.iter().filter_map(|r| r.value.ok()).collect();
+        if known.is_empty() {
+            Warm::Unknown(readings[0].value.err().unwrap_or(Reason::NoReading))
+        } else if known.iter().any(|value| *value >= WARM_CELSIUS) {
+            Warm::Reached
+        } else {
+            Warm::NotYetReached
         }
     }
 
     /// Why the goal can never run in this drive, whether or not its condition holds (REQ-039.7):
-    /// a condition input that cannot be read, or no readable signal of its own.
+    /// a condition input that cannot be read, or no readable signal of its own. An input is
+    /// unavailable when no target offering it is plannable.
     fn unreachable(&self, goal: Goal, plannable: usize) -> Option<Reason> {
-        if goal.inputs().iter().any(|key| !self.plannable(key)) {
+        if goal.inputs().iter().any(|input| {
+            !self
+                .catalog
+                .keys()
+                .any(|key| semantic(key) == *input && self.plannable(key))
+        }) {
             Some(Reason::ConditionInputUnavailable)
         } else if plannable == 0 {
             Some(if self.members(goal).next().is_none() {
@@ -1005,14 +1050,12 @@ impl Planner {
 
     /// Updates the condition state of `goal` and says whether it is active now.
     fn evaluate(&mut self, goal: Goal, now: Duration) -> Evaluation {
-        let inputs: Vec<ConditionInput> = goal
+        let groups: Vec<Vec<ConditionInput>> = goal
             .inputs()
             .iter()
-            .map(|key| ConditionInput {
-                signal_key: (*key).to_owned(),
-                value: self.input(key, now),
-            })
+            .map(|semantic| self.readings(semantic, now))
             .collect();
+        let inputs: Vec<ConditionInput> = groups.iter().flatten().cloned().collect();
         if goal == Goal::Baseline {
             return Evaluation {
                 active: true,
@@ -1022,12 +1065,22 @@ impl Planner {
                 context_ended: false,
             };
         }
-        let unknown = inputs.iter().find_map(|input| input.value.err());
-        let values: Vec<f64> = inputs.iter().filter_map(|input| input.value.ok()).collect();
-        let reading_at = goal
-            .inputs()
+        let known: Vec<Vec<f64>> = groups
             .iter()
-            .filter_map(|key| self.context.get(*key).map(|(at, _)| *at))
+            .map(|group| group.iter().filter_map(|input| input.value.ok()).collect())
+            .collect();
+        // A condition is unknown only when some input has no fresh known reading on any target
+        // (REQ-039.6).
+        let unknown = groups
+            .iter()
+            .zip(&known)
+            .find(|(_, values)| values.is_empty())
+            .and_then(|(group, _)| group.iter().find_map(|input| input.value.err()));
+        let reading_at = self
+            .context
+            .iter()
+            .filter(|(key, _)| goal.inputs().contains(&semantic(key)))
+            .map(|(_, (at, _))| *at)
             .max()
             .unwrap_or(now);
         let warm_missing = goal.warm_dependent() && self.warm(now) == Warm::NotYetReached;
@@ -1045,13 +1098,14 @@ impl Planner {
                 state.segment_start = None;
                 (false, Phase::ConditionUnknown(reason))
             }
-            None if goal.holds(&values) => {
+            None if any_holds(goal, &known) => {
                 state.rearm = Duration::ZERO;
                 state.rearm_from = None;
                 state.rearm_paused = false;
                 let held = state.hold_until.take().is_some_and(|until| now < until);
-                state.pressed = true;
                 if state.armed || held {
+                    // Only a press the goal could act on counts as pressed (REQ-039.12).
+                    state.pressed = true;
                     state.armed = true;
                     state.used = true;
                     if goal == Goal::Egr {
@@ -1152,6 +1206,25 @@ impl Planner {
     }
 }
 
+/// Whether the condition of `goal` holds for any combination of fresh known readings, one per
+/// input, when a trigger is offered by several ECUs (REQ-039.6).
+fn any_holds(goal: Goal, known: &[Vec<f64>]) -> bool {
+    let mut combinations: Vec<Vec<f64>> = vec![Vec::new()];
+    for readings in known {
+        combinations = combinations
+            .iter()
+            .flat_map(|prefix| {
+                readings.iter().map(move |value| {
+                    let mut next = prefix.clone();
+                    next.push(*value);
+                    next
+                })
+            })
+            .collect();
+    }
+    combinations.iter().any(|values| goal.holds(values))
+}
+
 fn usable(observation: &Observation) -> Result<f64, Reason> {
     match (&observation.outcome, observation.value) {
         (Outcome::Decoded(Decoded::Numeric { finite: false }), _) => Err(Reason::NonFinite),
@@ -1169,7 +1242,8 @@ fn usable(observation: &Observation) -> Result<f64, Reason> {
 
 fn failure_reason(outcome: &Outcome) -> Reason {
     match outcome {
-        Outcome::Decoded(_) => Reason::NonFinite,
+        Outcome::Decoded(Decoded::Numeric { .. }) => Reason::NonFinite,
+        Outcome::Decoded(Decoded::Text { .. }) => Reason::Empty,
         Outcome::Unsupported => Reason::Unsupported,
         Outcome::Rejected { .. } => Reason::Rejected,
         Outcome::Empty => Reason::Empty,
@@ -1408,7 +1482,10 @@ mod tests {
         feed(&mut p, 8, &base(90.0, 30.0, 2000.0, 20.0, 10.0, 0.0));
         let after = p.plan(secs(8), &ledger);
         assert_eq!(phase(&after, Goal::DpfRaw), Phase::WaitingForCondition);
-        assert_eq!(kinds(&after, Goal::DpfRaw), [EventKind::Expired]);
+        assert_eq!(
+            kinds(&after, Goal::DpfRaw),
+            [EventKind::ContextEnded, EventKind::Expired]
+        );
         assert_eq!(
             contexts(&after, "dpf.soot_mass_calculated"),
             ["dpf.warm_driving", "baseline"]
@@ -2508,5 +2585,373 @@ mod tests {
             };
             assert_eq!(run.ledger().entry(&key).unwrap().longest_segment, secs(25));
         }
+    }
+
+    fn entry_at(key: &str, target: &str) -> CatalogEntry {
+        CatalogEntry {
+            signal_key: key.into(),
+            ecu_target: Some(target.into()),
+            source: Source::DefaultSession,
+        }
+    }
+
+    const REGEN_A: &str = "dpf.field_regeneration_request_status@a";
+    const REGEN_B: &str = "dpf.field_regeneration_request_status@b";
+
+    /// The trigger catalog with the regeneration request offered as Knowledge signals.
+    fn planner_with_regen_at(targets: &[(&str, &str)], extra: &[&str]) -> Planner {
+        let mut catalog: Vec<CatalogEntry> = triggers()
+            .into_iter()
+            .filter(|entry| entry.signal_key != REGEN)
+            .collect();
+        catalog.extend(targets.iter().map(|(key, target)| entry_at(key, target)));
+        catalog.extend(extra.iter().map(|key| entry(key)));
+        Planner::new(catalog, versions()).unwrap()
+    }
+
+    #[test]
+    fn req_039_4_regeneration_request_resolves_knowledge_keys_by_semantic() {
+        let mut p = planner_with_regen_at(&[(REGEN_A, "a")], &["dpf.soot_mass_calculated"]);
+        let ledger = Ledger::default();
+        feed(&mut p, 0, &[(REGEN_A, 3.0)]);
+        let plan = p.plan(secs(0), &ledger);
+        assert_eq!(phase(&plan, Goal::DpfRaw), Phase::Serving);
+        assert!(plan
+            .selection
+            .iter()
+            .any(|s| s.signal_key == REGEN_A && s.trigger));
+        assert_eq!(
+            contexts(&plan, "dpf.soot_mass_calculated"),
+            ["dpf.raw_request", "baseline"]
+        );
+        feed(&mut p, 2, &[(REGEN_A, 0.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(2), &ledger), Goal::DpfRaw),
+            Phase::WaitingForCondition
+        );
+        // A failed read of the Knowledge key makes the condition unknown, not zero.
+        p.record(&failed(REGEN_A, 3, Outcome::Empty));
+        assert_eq!(
+            phase(&p.plan(secs(3), &ledger), Goal::DpfRaw),
+            Phase::ConditionUnknown(Reason::Empty)
+        );
+    }
+
+    #[test]
+    fn req_039_6_trigger_offered_by_several_ecus_holds_if_any_fresh_reading_holds() {
+        let targets = [(REGEN_A, "a"), (REGEN_B, "b")];
+        let ledger = Ledger::default();
+        let no_answer = Outcome::NoAnswer { reason: "t".into() };
+
+        // Holds: one target at 0, the other nonzero.
+        let mut p = planner_with_regen_at(&targets, &[]);
+        feed(&mut p, 0, &[(REGEN_A, 0.0), (REGEN_B, 3.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(0), &ledger), Goal::DpfRaw),
+            Phase::Serving
+        );
+        // False: every fresh reading is 0.
+        feed(&mut p, 2, &[(REGEN_A, 0.0), (REGEN_B, 0.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(2), &ledger), Goal::DpfRaw),
+            Phase::WaitingForCondition
+        );
+
+        // False, not unknown: one target unanswered, the other fresh and 0.
+        let mut p = planner_with_regen_at(&targets, &[]);
+        p.record(&failed(REGEN_A, 0, no_answer.clone()));
+        feed(&mut p, 0, &[(REGEN_B, 0.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(0), &ledger), Goal::DpfRaw),
+            Phase::WaitingForCondition
+        );
+
+        // False, not unknown: one target stale, the other fresh and 0.
+        let mut p = planner_with_regen_at(&targets, &[]);
+        feed(&mut p, 0, &[(REGEN_A, 3.0)]);
+        feed(&mut p, 12, &[(REGEN_B, 0.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(12), &ledger), Goal::DpfRaw),
+            Phase::WaitingForCondition
+        );
+
+        // Unknown only when no target has a fresh known reading.
+        let mut p = planner_with_regen_at(&targets, &[]);
+        p.record(&failed(REGEN_A, 0, no_answer.clone()));
+        p.record(&failed(REGEN_B, 0, Outcome::Empty));
+        assert!(matches!(
+            phase(&p.plan(secs(0), &ledger), Goal::DpfRaw),
+            Phase::ConditionUnknown(_)
+        ));
+    }
+
+    #[test]
+    fn req_039_12_unarmed_press_does_not_start_the_turbo_hold() {
+        let mut p = planner(&["engine.boost_pressure_actual"]);
+        let ledger = Ledger::default();
+        feed(&mut p, 0, &[(PEDAL, 95.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(0), &ledger), Goal::Turbo),
+            Phase::Serving
+        );
+        // Release: the hold starts and the goal waits for its re-arm.
+        feed(&mut p, 10, &[(PEDAL, 10.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(10), &ledger), Goal::Turbo),
+            Phase::Serving
+        );
+        // An unknown reading ends the hold; the 10 s re-arm still counts from the release.
+        p.record(&failed(PEDAL, 12, Outcome::NoAnswer { reason: "t".into() }));
+        assert_eq!(
+            phase(&p.plan(secs(12), &ledger), Goal::Turbo),
+            Phase::ConditionUnknown(Reason::Unanswered)
+        );
+        // The press is not armed yet and must not count as pressed ...
+        feed(&mut p, 14, &[(PEDAL, 95.0)]);
+        assert_eq!(
+            phase(&p.plan(secs(14), &ledger), Goal::Turbo),
+            Phase::Rearming
+        );
+        // ... so its release starts no 20-second hold.
+        feed(&mut p, 16, &[(PEDAL, 10.0)]);
+        let plan = p.plan(secs(16), &ledger);
+        assert_eq!(phase(&plan, Goal::Turbo), Phase::WaitingForCondition);
+        assert_eq!(
+            contexts(&plan, "engine.boost_pressure_actual"),
+            ["baseline"]
+        );
+    }
+
+    #[test]
+    fn req_039_14_empty_text_and_nonfinite_numeric_reads_are_failures() {
+        let mut p = planner(&["engine.text", "engine.number", "engine.fine"]);
+        let ledger = Ledger::default();
+        p.record(&failed(
+            "engine.text",
+            0,
+            Outcome::Decoded(Decoded::Text { nonempty: false }),
+        ));
+        p.record(&failed(
+            "engine.number",
+            0,
+            Outcome::Decoded(Decoded::Numeric { finite: false }),
+        ));
+        p.record(&ok("engine.fine", 0, 1.0));
+        let plan = p.plan(secs(1), &ledger);
+        let skipped = |key: &str| {
+            plan.events
+                .iter()
+                .find(|e| matches!(&e.kind, EventKind::SignalSkipped { signal_key, .. } if signal_key == key))
+                .map(|e| (e.reason, e.kind.clone()))
+        };
+        assert_eq!(
+            skipped("engine.text"),
+            Some((
+                Some(Reason::Empty),
+                EventKind::SignalSkipped {
+                    signal_key: "engine.text".into(),
+                    retry_at: Some(secs(30)),
+                }
+            ))
+        );
+        assert_eq!(
+            skipped("engine.number"),
+            Some((
+                Some(Reason::NonFinite),
+                EventKind::SignalSkipped {
+                    signal_key: "engine.number".into(),
+                    retry_at: Some(secs(30)),
+                }
+            ))
+        );
+        assert!(skipped("engine.fine").is_none());
+        assert!(contexts(&plan, "engine.text").is_empty());
+        assert!(contexts(&plan, "engine.number").is_empty());
+        assert_eq!(
+            contexts(&p.plan(secs(30), &ledger), "engine.text"),
+            ["baseline"]
+        );
+    }
+
+    #[test]
+    fn req_039_2_replay_does_not_bridge_turbo_gaps() {
+        let mut p = planner(&["engine.boost_pressure_actual"]);
+        let mut run = SmartRun::new(goal_rules(), RunId("r".into()), SessionKind::Replay);
+        let ledger = Ledger::default();
+        let mut ended = Vec::new();
+        for at in [0, 2, 4, 5, 6, 8, 10] {
+            feed(&mut p, at, &[(PEDAL, 95.0)]);
+            if at == 5 {
+                p.record(&failed(PEDAL, at, Outcome::Gap));
+            }
+            let plan = p.plan(secs(at), &ledger);
+            for event in &plan.events {
+                if event.kind == EventKind::ContextEnded {
+                    ended.push((event.goal, event.at));
+                    run.apply(
+                        None,
+                        &Fact {
+                            run: RunId("r".into()),
+                            wall_clock_unix_ms: 0,
+                            offset: event.at,
+                            versions: versions(),
+                            identity_confirmed: false,
+                            body: FactBody::ContextEnd(event.goal.unwrap().context()),
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            for key in [PEDAL, "engine.boost_pressure_actual"] {
+                let context = if key == PEDAL {
+                    Goal::Baseline.context()
+                } else if contexts(&plan, key).contains(&"turbo".to_owned()) {
+                    Goal::Turbo.context()
+                } else {
+                    continue;
+                };
+                run.apply(
+                    None,
+                    &Fact {
+                        run: RunId("r".into()),
+                        wall_clock_unix_ms: 0,
+                        offset: secs(at),
+                        versions: versions(),
+                        identity_confirmed: false,
+                        body: FactBody::Reading(Reading {
+                            signal_key: key.into(),
+                            context,
+                            ecu_target: None,
+                            session: SessionState::Default,
+                            outcome: Outcome::Decoded(Decoded::Numeric { finite: true }),
+                            implausible: false,
+                            static_identity: false,
+                            evidence: EvidenceRef("e".into()),
+                        }),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(ended, [(Some(Goal::Turbo), secs(5))]);
+        let entry = run
+            .ledger()
+            .entry(&EntryKey {
+                versions: versions(),
+                signal_key: "engine.boost_pressure_actual".into(),
+                context: Goal::Turbo.context(),
+            })
+            .unwrap();
+        assert_eq!(entry.valid_time, secs(8));
+        assert_eq!(entry.longest_segment, secs(4));
+    }
+
+    #[test]
+    fn req_039_2_every_goal_emits_a_context_end_when_it_stops_being_active() {
+        let mut p = planner(&["dpf.soot_mass_calculated"]);
+        let ledger = Ledger::default();
+        feed(&mut p, 0, &base(90.0, 0.0, 800.0, 20.0, 10.0, 3.0));
+        p.plan(secs(0), &ledger);
+        feed(&mut p, 2, &[(REGEN, 0.0)]);
+        let plan = p.plan(secs(2), &ledger);
+        assert_eq!(
+            kinds(&plan, Goal::DpfRaw),
+            [EventKind::ContextEnded, EventKind::Expired]
+        );
+        assert!(kinds(&plan, Goal::Baseline).is_empty());
+    }
+
+    #[test]
+    fn req_039_4_regeneration_request_is_selected_in_every_step_while_readable() {
+        let mut keys: BTreeSet<&str> = BTreeSet::new();
+        for goal in [
+            Goal::DpfRaw,
+            Goal::Rail,
+            Goal::Turbo,
+            Goal::Egr,
+            Goal::CoolingWarmDriving,
+        ] {
+            keys.extend(
+                goal.preset()
+                    .iter()
+                    .filter(|key| !TRIGGER_SIGNALS.contains(key)),
+            );
+        }
+        let extra: Vec<String> = (0..60).map(|i| format!("engine.sig{i:02}")).collect();
+        keys.extend(extra.iter().map(String::as_str));
+        let extra_keys: Vec<&str> = keys.into_iter().collect();
+        let mut p = planner(&extra_keys);
+        let ledger = Ledger::default();
+        let values = base(90.0, 0.0, 800.0, 20.0, 95.0, 3.0);
+        let mut full_with_goals = false;
+        for at in 0..60 {
+            feed(&mut p, at, &values);
+            let plan = p.plan(secs(at), &ledger);
+            assert!(
+                plan.selection
+                    .iter()
+                    .any(|s| s.signal_key == REGEN && s.trigger),
+                "step {at}"
+            );
+            assert!(plan.selection.len() <= MAX_SELECTION);
+            assert_eq!(phase(&plan, Goal::DpfRaw), Phase::Serving);
+            assert_eq!(phase(&plan, Goal::Rail), Phase::Serving);
+            full_with_goals |= plan.selection.len() == MAX_SELECTION;
+            for selected in &plan.selection {
+                p.record(&ok(&selected.signal_key, at, 1.0));
+            }
+        }
+        assert!(full_with_goals);
+    }
+
+    #[test]
+    fn req_039_7_goal_is_not_reachable_once_one_condition_input_is_unavailable() {
+        // Turbo has its own signals and its pedal input is unsupported: not reachable for the
+        // drive, though a signal of the goal is readable.
+        let mut p = planner(&["engine.boost_pressure_actual"]);
+        p.record(&failed(PEDAL, 0, Outcome::Unsupported));
+        let plan = p.plan(secs(1), &Ledger::default());
+        assert_eq!(
+            phase(&plan, Goal::Turbo),
+            Phase::NotReachable(Reason::ConditionInputUnavailable)
+        );
+        // The other goals continue.
+        assert_eq!(phase(&plan, Goal::Baseline), Phase::Serving);
+
+        // Offered by several ECUs, one unsupported target does not make the input unavailable.
+        let mut q = planner_with_regen_at(&[(REGEN_A, "a"), (REGEN_B, "b")], &[]);
+        q.record(&failed(REGEN_A, 0, Outcome::Unsupported));
+        feed(&mut q, 0, &[(REGEN_B, 3.0)]);
+        assert_eq!(
+            phase(&q.plan(secs(1), &Ledger::default()), Goal::DpfRaw),
+            Phase::Serving
+        );
+    }
+
+    #[test]
+    fn req_039_14_and_4_regeneration_request_trigger_is_retried_while_readable() {
+        let mut p = planner(&[]);
+        let ledger = Ledger::default();
+        let selected = |plan: &Plan| plan.selection.iter().any(|s| s.signal_key == REGEN);
+        p.record(&failed(REGEN, 0, Outcome::Empty));
+        // The goal is unknown, not unreachable, while the trigger is awaiting its retry.
+        let plan = p.plan(secs(29), &ledger);
+        assert!(!selected(&plan));
+        assert_eq!(
+            phase(&plan, Goal::DpfRaw),
+            Phase::ConditionUnknown(Reason::Empty)
+        );
+        assert!(selected(&p.plan(secs(30), &ledger)));
+        p.record(&failed(REGEN, 30, Outcome::Empty));
+        assert!(!selected(&p.plan(secs(149), &ledger)));
+        assert!(selected(&p.plan(secs(150), &ledger)));
+        // Unsupported ends it for the drive and makes the goal not reachable.
+        p.record(&failed(REGEN, 150, Outcome::Unsupported));
+        let plan = p.plan(secs(151), &ledger);
+        assert!(!selected(&plan));
+        assert_eq!(
+            phase(&plan, Goal::DpfRaw),
+            Phase::NotReachable(Reason::ConditionInputUnavailable)
+        );
     }
 }
