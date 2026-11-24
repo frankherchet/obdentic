@@ -1,0 +1,6 @@
+end 20:42:36
+  AC powered: true
+  level: 80
+  temperature: 308
+  Capacity level: 3
+avail_kb 77703952
