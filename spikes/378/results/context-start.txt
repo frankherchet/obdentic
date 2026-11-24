@@ -1,0 +1,8 @@
+Mi 9T
+16
+36.1
+  AC powered: true
+  level: 57
+  temperature: 236
+  Capacity level: 3
+/dev/fuse      116535276 38461612  77942592  34% /storage/emulated
