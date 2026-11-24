@@ -1265,7 +1265,7 @@ requirements:
       - id: REQ-045.9
         text: "Normal flow: Inspecting audit events triggers no tools, model calls or vehicle access."
       - id: REQ-045.10
-        text: "Failure condition an outbound audit entry cannot be persisted before dispatch → safe stop: Do not dispatch the request or tool, including offline tools."
+        text: "Failure condition an outbound audit entry cannot be persisted before dispatch → safe stop: Do not dispatch the request or tool, including offline tools. An entry counts as stored once its write and sync() on the file descriptor in the user-selected SAF folder return successfully."
       - id: REQ-045.11
         text: "Failure condition audit persistence fails during a request or tool → safe stop: Cancel in-flight work where possible; start no subsequent call or automatic retry. Do not report the audit or diagnosis as complete because an error record could not be written."
       - id: REQ-045.12
@@ -1291,7 +1291,7 @@ requirements:
       - id: REQ-045.22
         text: "Failure condition an outgoing diagnostic payload contains disallowed secret material → safe stop: Reject it before sending without logging the forbidden material. Never alter the private record of a payload that was actually sent to make it appear compliant."
       - id: REQ-045.23
-        text: "Normal flow: Before the first audited session, the user explicitly selects a directory on shared internal device storage. The app warns that full unencrypted JSONL files will be visible in the file manager and can be copied or backed up outside OBDentic without its export preview. The app itself does not upload or back up the audit or select a remote provider. The model cannot select or change the directory."
+        text: "Normal flow: Before the first audited session, the user explicitly selects a SAF directory on shared internal device storage provided by a local document provider; cloud providers are not allowed. The app warns that full unencrypted JSONL files will be visible in the file manager and can be copied or backed up outside OBDentic without its export preview. The app itself does not upload or back up the audit or select a remote provider. The model cannot select or change the directory."
       - id: REQ-045.24
         text: "Normal flow: Export through OBDentic requires explicit session selection, a sensitive-data warning and a redaction preview before the user confirms the output; the local source audit remains unchanged. File-manager copies are not controlled by this workflow."
       - id: REQ-045.25
@@ -1301,7 +1301,7 @@ requirements:
       - id: REQ-045.27
         text: "Failure condition storage is full → safe stop: Report storage exhaustion and follow the persistence stop rules; do not silently discard older sessions to make room."
       - id: REQ-045.28
-        text: "Failure condition no valid local directory was selected, access was revoked, or the destination cannot confirm a durable append → safe stop: Report the destination error; start no unaudited model or tool work, including offline. Do not silently switch locations."
+        text: "Failure condition no valid local directory was selected, the folder's provider is not local, access was revoked, or the write or sync() on the file descriptor fails → safe stop: Report the destination error; start no unaudited model or tool work, including offline. Do not silently switch locations."
       - id: REQ-045.29
         text: "Normal flow: Starting at 80% of the 256 MiB total audit budget, show a storage warning before more work. Count persisted audit bytes in the selected directory, including active and incomplete sessions."
       - id: REQ-045.30
