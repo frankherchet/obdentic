@@ -148,5 +148,6 @@ The maintainer retired the REQ-045.33 latency budget and removed the criterion; 
 - The 25 ms budget is no longer an acceptance criterion; no replacement latency target is established by this decision.
 - The user-selected SAF folder remains in scope. Direct path access with all-files permission was measured without a product commitment and is not a latency solution on this device.
 - Durability is still unproven: process death tests demonstrate ordering, not survival of abrupt power or storage loss; no power-loss test was performed.
+- The maintainer defines a stored entry as one whose write and file-descriptor `sync()` have both returned successfully in the selected local SAF folder; a non-local provider or sync failure fails closed. Power loss at the moment of a write was not tested and remains a residual risk; no further durability spike is required.
 - Batching helps concurrent warm writers in the measured workload; cold and post-pause cases were not established.
 - Published synthetic results remain under `spikes/378/results/`; the throwaway prototype and harness remain only on the [`spike-378-audit-write` branch](https://github.com/frankherchet/obdentic/tree/spike-378-audit-write/spikes/378).
