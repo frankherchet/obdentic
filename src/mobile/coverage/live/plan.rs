@@ -385,6 +385,42 @@ mod tests {
             .collect()
     }
 
+    // REQ-039.21: the action JSON consumed by Live carries both clocks, including nulls.
+    #[test]
+    fn req_039_21_plan_action_reports_turbo_hold_and_rearm_remaining() {
+        let mut live = started(&[]);
+        let pedal = "vehicle.accelerator_pedal_e";
+        observe(&mut live, pedal, 1, 95.0);
+        let initial = step(&mut live, 1);
+        let turbo = |plan: Value| {
+            plan["goals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|goal| goal["goal"] == "turbo")
+                .unwrap()
+                .clone()
+        };
+        let armed = turbo(initial);
+        assert_eq!(armed.get("hold_remaining_ms"), Some(&Value::Null));
+        assert_eq!(armed.get("rearm_remaining_ms"), Some(&Value::Null));
+
+        observe(&mut live, pedal, 2, 20.0);
+        let released = turbo(step(&mut live, 2));
+        assert_eq!(released.get("hold_remaining_ms"), Some(&json!(20_000)));
+        assert_eq!(released.get("rearm_remaining_ms"), Some(&json!(10_000)));
+
+        observe(&mut live, pedal, 7, 20.0);
+        let waiting = turbo(step(&mut live, 7));
+        assert_eq!(waiting.get("hold_remaining_ms"), Some(&json!(15_000)));
+        assert_eq!(waiting.get("rearm_remaining_ms"), Some(&json!(5_000)));
+
+        observe(&mut live, pedal, 12, 20.0);
+        let rearmed = turbo(step(&mut live, 12));
+        assert_eq!(rearmed.get("hold_remaining_ms"), Some(&json!(10_000)));
+        assert_eq!(rearmed.get("rearm_remaining_ms"), Some(&Value::Null));
+    }
+
     #[test]
     fn req_039_14_gap_probes_do_not_consume_retries() {
         let mut live = started(&[]);
