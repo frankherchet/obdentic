@@ -60,8 +60,9 @@ final class AvailabilityAcceptance {
             require(!rejected.has("value"), "REQ-030.2 a negative response yields no value: " + rejected);
             JSONObject oil = entry(entries, OIL);
             require(oil != null && oil.has("value") && oil.has("unit") && oil.has("response"), "REQ-030.8 an answered entry carries response, value and unit: " + oil);
-            List<String> services = new ArrayList<>(); for (String c : link[0].commands) { String wire = c.substring(c.indexOf(':') + 1); if (!wire.startsWith("AT") && !wire.startsWith("01") && !wire.startsWith("09") && !wire.startsWith("03") && !wire.startsWith("07")) services.add(wire); }
-            require(!link[0].commands.toString().contains(":1003") && services.stream().allMatch(w -> w.startsWith("22")), "REQ-030.1 only 0x22 reads and no session change: " + services);
+            List<String> issued; synchronized (link[0].commands) { issued = new ArrayList<>(link[0].commands); }
+            List<String> services = new ArrayList<>(); for (String c : issued) { String wire = c.substring(c.indexOf(':') + 1); if (!wire.startsWith("AT") && !wire.startsWith("01") && !wire.startsWith("09") && !wire.startsWith("03") && !wire.startsWith("07")) services.add(wire); }
+            require(!issued.toString().contains(":1003") && services.stream().allMatch(w -> w.startsWith("22")), "REQ-030.1 only 0x22 reads and no session change: " + services);
 
             // REQ-030.5 / REQ-028.4: stored with the vehicle; the jobs write into the one running automatic recording
             JSONObject record = firstVehicle(service);
