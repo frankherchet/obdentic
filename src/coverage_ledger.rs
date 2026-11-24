@@ -469,6 +469,12 @@ struct Update {
     segment_length: Option<Duration>,
 }
 
+/// The semantic of a signal key: a Knowledge signal is addressed as `<semantic>@<target id>`, a
+/// standard PID by its bare semantic.
+pub(crate) fn semantic(key: &str) -> &str {
+    key.rsplit_once('@').map_or(key, |(semantic, _)| semantic)
+}
+
 /// The run ledger of one Smart start and the fold that also credits a vehicle ledger.
 #[derive(Debug, Clone)]
 pub struct SmartRun {
@@ -765,8 +771,26 @@ impl SmartRun {
         }
     }
 
+    /// The freshness spans of the readings of `signal` under `versions`: a required context signal
+    /// is a semantic and is delivered as `semantic` or as `semantic@target` by any ECU target
+    /// (REQ-039.6), so every key of the semantic counts.
+    fn spans_of<'a>(
+        &'a self,
+        versions: &'a DefinitionVersions,
+        signal: &'a str,
+    ) -> impl Iterator<Item = &'a Vec<Span>> {
+        self.freshness
+            .range((versions.clone(), signal.to_owned())..)
+            .take_while(move |((spans_versions, key), _)| {
+                spans_versions == versions && key.starts_with(signal)
+            })
+            .filter(move |((_, key), _)| semantic(key) == signal)
+            .map(|(_, spans)| spans)
+    }
+
     /// Instant until which every required context signal of `context` stays continuously fresh
-    /// under `versions`, counted from `at`; `None` when one is not fresh at `at`.
+    /// under `versions`, counted from `at`; `None` when one is not fresh at `at`. A signal is
+    /// fresh while any target of it is.
     fn extent(
         &self,
         versions: &DefinitionVersions,
@@ -775,13 +799,12 @@ impl SmartRun {
     ) -> Option<Duration> {
         let mut until = Duration::MAX;
         for signal in &self.rules.rule_for(context).required_signals {
-            let span = self
-                .freshness
-                .get(&(versions.clone(), signal.clone()))?
-                .iter()
-                .rev()
-                .find(|span| span.holds(at))?;
-            until = until.min(span.until);
+            let freshest = self
+                .spans_of(versions, signal)
+                .filter_map(|spans| spans.iter().rev().find(|span| span.holds(at)))
+                .map(|span| span.until)
+                .max()?;
+            until = until.min(freshest);
         }
         Some(until)
     }
@@ -801,10 +824,13 @@ impl SmartRun {
             .required_signals
             .iter()
             .all(|signal| {
-                self.freshness
-                    .get(&(versions.clone(), signal.clone()))
-                    .and_then(|spans| spans.iter().rev().find(|span| span.holds(from)))
-                    .is_some_and(|span| span.holds(to))
+                self.spans_of(versions, signal).any(|spans| {
+                    spans
+                        .iter()
+                        .rev()
+                        .find(|span| span.holds(from))
+                        .is_some_and(|span| span.holds(to))
+                })
             })
     }
 
@@ -887,7 +913,7 @@ impl SmartRun {
                     .rule_for(&entry.context)
                     .required_signals
                     .iter()
-                    .any(|required| required == signal);
+                    .any(|required| required == semantic(signal));
             !(same_signal || depends && segment.last == at)
         });
     }

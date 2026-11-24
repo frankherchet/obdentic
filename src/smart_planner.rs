@@ -45,6 +45,13 @@
 //! - The retry schedule of a failed signal (30 s, 2 min, then once per drive, REQ-039.14) starts
 //!   anew in every drive; earlier drives in the ledger do not shorten it. An unknown reading
 //!   that ends the turbo release hold leaves the 10 s re-arm counted from the release.
+//! - A reading that arrives after the plan that selected it counts toward the contexts whose
+//!   condition held at the reading's own time ([`Planner::contexts_at`]), not toward those of the
+//!   plan; [`Selected::contexts`] is that attribution as of the plan. A context end is stamped at
+//!   the reading that ended the condition (the end of the release hold for turbo, the moment the
+//!   last reading went stale when nothing newer ended it), not at the plan time.
+//! - A successful reading of a trigger key the planner cannot read in this drive (unsupported,
+//!   session-restricted, out of retries) is no condition input.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -52,8 +59,8 @@ use std::{
 };
 
 use crate::coverage_ledger::{
-    ContextRule, Decoded, DefinitionVersions, EntryKey, GoalContext, Ledger, Outcome, Rules,
-    Status, FRESHNESS_LIMIT, MIN_SAMPLES, MIN_VALID_TIME,
+    semantic, ContextRule, Decoded, DefinitionVersions, EntryKey, GoalContext, Ledger, Outcome,
+    Rules, Status, FRESHNESS_LIMIT, MIN_SAMPLES, MIN_VALID_TIME,
 };
 
 /// REQ-036.1/REQ-039.5: signals selected per step.
@@ -151,11 +158,11 @@ const PRESET_RAIL: &[&str] = &[
     "engine.rpm",
 ];
 
-/// The semantic of a catalog key: a Knowledge signal is addressed as `<semantic>@<target id>`,
-/// a standard PID by its bare semantic.
-fn semantic(key: &str) -> &str {
-    key.rsplit_once('@').map_or(key, |(semantic, _)| semantic)
-}
+/// A trigger reading: when it was taken and its value, or why it is no value.
+type ContextReading = (Duration, Result<f64, Reason>);
+
+/// How long the readings of the trigger signals stay known to attribute later readings.
+const CONTEXT_HISTORY: Duration = Duration::from_secs(60);
 
 /// Versions a new planner and the run it belongs to are recorded under (REQ-039.10).
 pub fn current_versions(knowledge_revision: impl Into<String>) -> DefinitionVersions {
@@ -503,6 +510,10 @@ struct Evaluation {
     inputs: Vec<ConditionInput>,
     contiguous: Option<Duration>,
     context_ended: bool,
+    /// Newest reading time of the condition inputs; the plan time when there is none.
+    reading_at: Duration,
+    /// The turbo release hold that ran out in this evaluation.
+    hold_expired: Option<Duration>,
 }
 
 struct Candidates {
@@ -520,7 +531,11 @@ pub struct Planner {
     rules: Rules,
     catalog: BTreeMap<String, CatalogEntry>,
     availability: BTreeMap<String, Availability>,
-    context: BTreeMap<String, (Duration, Result<f64, Reason>)>,
+    /// Per trigger key its readings in time order, the newest last, kept for
+    /// [`CONTEXT_HISTORY`] (and the one before) so that a reading can be judged by the conditions
+    /// at its own time.
+    context: BTreeMap<String, Vec<ContextReading>>,
+    last_plan: Option<Duration>,
     goals: BTreeMap<Goal, GoalState>,
     last_planned: BTreeMap<String, u64>,
     step: u64,
@@ -576,6 +591,7 @@ impl Planner {
             catalog: entries,
             availability,
             context: BTreeMap::new(),
+            last_plan: None,
             goals,
             last_planned: BTreeMap::new(),
             step: 0,
@@ -605,14 +621,14 @@ impl Planner {
     /// An unsuccessful read is never counted as a measurement, as 0 or as success.
     pub fn record(&mut self, observation: &Observation) {
         let key = observation.signal_key.as_str();
-        if TRIGGER_SIGNALS.contains(&semantic(key))
-            && self
-                .context
-                .get(key)
-                .is_none_or(|(at, _)| observation.at >= *at)
-        {
-            self.context
-                .insert(key.to_owned(), (observation.at, usable(observation)));
+        if TRIGGER_SIGNALS.contains(&semantic(key)) {
+            let history = self.context.entry(key.to_owned()).or_default();
+            if history.last().is_none_or(|(at, _)| observation.at >= *at) {
+                history.push((observation.at, usable(observation)));
+                let older =
+                    history.partition_point(|(at, _)| *at + CONTEXT_HISTORY < observation.at);
+                history.drain(..older.saturating_sub(1));
+            }
         }
         let Some(current) = self.availability.get(key) else {
             return;
@@ -731,7 +747,9 @@ impl Planner {
 
         let mut order: Vec<Goal> = Goal::ALL
             .into_iter()
-            .filter(|goal| evaluations[goal].active)
+            .filter(|goal| {
+                evaluations[goal].active && self.unreachable(*goal, data[goal].plannable).is_none()
+            })
             .collect();
         order.sort_by(|a, b| {
             (a.level(), data[a].share, *a)
@@ -829,8 +847,12 @@ impl Planner {
             let ended_now =
                 self.goals[&goal].phase.is_some_and(Phase::is_active) && !phase.is_active();
             if evaluation.context_ended || ended_now {
+                let ended = match phase {
+                    Phase::NotReachable(_) => now,
+                    _ => self.ended_at(goal, evaluation, now),
+                };
                 events.push(self.event(
-                    now,
+                    ended,
                     Some(goal),
                     EventKind::ContextEnded,
                     Some(
@@ -855,6 +877,7 @@ impl Planner {
                 contiguous: evaluation.contiguous,
             });
         }
+        self.last_plan = Some(now);
         Plan {
             selection,
             events,
@@ -992,17 +1015,37 @@ impl Planner {
     /// Every reading of the trigger `semantic`, one per target that has delivered one, with its
     /// freshness applied; a single `NoReading` entry when none has (REQ-039.6).
     fn readings(&self, semantic_key: &str, now: Duration) -> Vec<ConditionInput> {
+        self.readings_as_of(semantic_key, now, None)
+    }
+
+    /// [`Self::readings`] counting only the readings taken up to `cutoff`, when given. A
+    /// successful reading of a key the planner cannot read in this drive is no condition input
+    /// (REQ-039.7).
+    fn readings_as_of(
+        &self,
+        semantic_key: &str,
+        now: Duration,
+        cutoff: Option<Duration>,
+    ) -> Vec<ConditionInput> {
         let mut found: Vec<ConditionInput> = self
             .context
             .iter()
             .filter(|(key, _)| semantic(key) == semantic_key)
-            .map(|(key, (at, value))| ConditionInput {
-                signal_key: key.clone(),
-                value: match value {
+            .filter_map(|(key, history)| {
+                let (at, value) = history
+                    .iter()
+                    .rev()
+                    .find(|(at, _)| cutoff.is_none_or(|cutoff| *at <= cutoff))?;
+                let value = match value {
                     Err(reason) => Err(*reason),
+                    Ok(_) if !self.plannable(key) => return None,
                     Ok(_) if now.saturating_sub(*at) > FRESHNESS_LIMIT => Err(Reason::Stale),
                     Ok(value) => Ok(*value),
-                },
+                };
+                Some(ConditionInput {
+                    signal_key: key.clone(),
+                    value,
+                })
             })
             .collect();
         if found.is_empty() {
@@ -1012,6 +1055,103 @@ impl Planner {
             });
         }
         found
+    }
+
+    /// Whether the condition of `goal` holds for the readings known at `at` and fresh then:
+    /// `None` when it is unknown (REQ-039.6).
+    fn holds_as_of(&self, goal: Goal, at: Duration) -> Option<bool> {
+        let known: Vec<Vec<f64>> = goal
+            .inputs()
+            .iter()
+            .map(|input| {
+                self.readings_as_of(input, at, Some(at))
+                    .iter()
+                    .filter_map(|reading| reading.value.ok())
+                    .collect()
+            })
+            .collect();
+        if known.iter().any(Vec::is_empty) {
+            None
+        } else {
+            Some(any_holds(goal, &known))
+        }
+    }
+
+    /// The first reading time since the previous plan, up to `to`, at which the condition of
+    /// `goal` satisfies `matches`.
+    fn first_instant(
+        &self,
+        goal: Goal,
+        to: Duration,
+        matches: impl Fn(Option<bool>) -> bool,
+    ) -> Option<Duration> {
+        let from = self.last_plan.unwrap_or(Duration::ZERO);
+        let mut instants: Vec<Duration> = self
+            .context
+            .iter()
+            .filter(|(key, _)| goal.inputs().contains(&semantic(key)))
+            .flat_map(|(_, history)| history.iter().map(|(at, _)| *at))
+            .filter(|at| (from..=to).contains(at))
+            .collect();
+        instants.sort();
+        instants.dedup();
+        instants
+            .into_iter()
+            .find(|at| matches(self.holds_as_of(goal, *at)))
+    }
+
+    /// When the context of `goal` ended that this plan found ended (REQ-039.2, REQ-039.11): the
+    /// end of the turbo release hold, else the reading that ended the condition, else the moment
+    /// its last reading stopped being fresh; never later than `now`.
+    fn ended_at(&self, goal: Goal, evaluation: &Evaluation, now: Duration) -> Duration {
+        if let Some(until) = evaluation.hold_expired {
+            return until.min(now);
+        }
+        self.first_instant(goal, now, |holds| holds != Some(true))
+            .unwrap_or_else(|| (evaluation.reading_at + FRESHNESS_LIMIT).min(now))
+    }
+
+    /// Whether `goal` is active for a reading taken at `at`: its condition holds by the readings
+    /// known at that time (or the turbo release hold runs) and it is armed as of the last plan.
+    fn active_at(&self, goal: Goal, at: Duration) -> bool {
+        let state = &self.goals[&goal];
+        let held = state.hold_until.is_some_and(|until| at < until);
+        match self.holds_as_of(goal, at) {
+            Some(true) => state.armed || held,
+            Some(false) if goal == Goal::Turbo => {
+                held || state.pressed
+                    && self
+                        .first_instant(goal, at, |holds| holds == Some(false))
+                        .is_some_and(|release| at < release + TURBO_RELEASE_HOLD)
+            }
+            _ => false,
+        }
+    }
+
+    /// The goal contexts a reading of `key` taken at `at` counts toward (REQ-039.2): every
+    /// reachable goal that includes the signal and whose condition holds by the condition
+    /// readings at that time, in priority level order, then the baseline. A reading that arrives
+    /// after the plan that selected it is attributed with this, not with the conditions of that
+    /// plan. Condition readings older than [`CONTEXT_HISTORY`] before the newest one are no
+    /// longer known; arming is the state of the last plan.
+    pub fn contexts_at(&self, key: &str, at: Duration) -> Vec<GoalContext> {
+        if !self.catalog.contains_key(key) {
+            return Vec::new();
+        }
+        let mut goals: Vec<Goal> = Goal::ALL
+            .into_iter()
+            .filter(|goal| *goal != Goal::Baseline && goal.includes(key))
+            .filter(|goal| {
+                let plannable = self.members(*goal).filter(|m| self.plannable(m)).count();
+                self.unreachable(*goal, plannable).is_none() && self.active_at(*goal, at)
+            })
+            .collect();
+        goals.sort_by_key(|goal| goal.level());
+        goals
+            .into_iter()
+            .map(Goal::context)
+            .chain([Goal::Baseline.context()])
+            .collect()
     }
 
     fn warm(&self, now: Duration) -> Warm {
@@ -1063,6 +1203,8 @@ impl Planner {
                 inputs,
                 contiguous: None,
                 context_ended: false,
+                reading_at: now,
+                hold_expired: None,
             };
         }
         let known: Vec<Vec<f64>> = groups
@@ -1080,13 +1222,14 @@ impl Planner {
             .context
             .iter()
             .filter(|(key, _)| goal.inputs().contains(&semantic(key)))
-            .map(|(_, (at, _))| *at)
+            .map(|(_, history)| history.last().expect("a context history is never empty").0)
             .max()
             .unwrap_or(now);
         let warm_missing = goal.warm_dependent() && self.warm(now) == Warm::NotYetReached;
         let state = self.goals.get_mut(&goal).expect("every goal has a state");
         let had_segment = state.segment_start.is_some();
 
+        let mut hold_expired = None;
         let (active, inactive) = match unknown {
             Some(reason) => {
                 // Unknown ends the goal and its egr interval without a re-arm wait, pauses the
@@ -1150,7 +1293,7 @@ impl Planner {
                 }
                 let held = state.hold_until.is_some_and(|until| now < until);
                 if !held {
-                    state.hold_until = None;
+                    hold_expired = state.hold_until.take();
                 }
                 let phase = if warm_missing {
                     Phase::WaitingForWarm
@@ -1170,6 +1313,8 @@ impl Planner {
             inputs,
             contiguous,
             context_ended: had_segment && state.segment_start.is_none(),
+            reading_at,
+            hold_expired,
         }
     }
 
@@ -2455,6 +2600,25 @@ mod tests {
         p.plan(secs(8), &ledger);
         feed(&mut p, 20, &[(REGEN, 0.0)]);
         p.plan(secs(21), &ledger);
+
+        // The unknown time 5..20 is not counted: only the 4 s before it are.
+        let mut early = p.clone();
+        feed(&mut early, 22, &[(REGEN, 1.0)]);
+        assert_eq!(
+            phase(&early.plan(secs(22), &ledger), Goal::DpfRaw),
+            Phase::Rearming
+        );
+        // The count follows the reading timestamps, not the plan calls: 4 s + 5 s are 9 s even
+        // though the plan was asked at 27.
+        let mut late = p.clone();
+        feed(&mut late, 25, &[(REGEN, 0.0)]);
+        late.plan(secs(27), &ledger);
+        feed(&mut late, 28, &[(REGEN, 1.0)]);
+        assert_eq!(
+            phase(&late.plan(secs(28), &ledger), Goal::DpfRaw),
+            Phase::Rearming
+        );
+
         feed(&mut p, 26, &[(REGEN, 0.0)]);
         p.plan(secs(27), &ledger);
         feed(&mut p, 28, &[(REGEN, 1.0)]);
@@ -2861,8 +3025,9 @@ mod tests {
         assert!(kinds(&plan, Goal::Baseline).is_empty());
     }
 
-    #[test]
-    fn req_039_4_regeneration_request_is_selected_in_every_step_while_readable() {
+    /// The regeneration request trigger is selected in every step, whatever the request value and
+    /// however many other goals compete for the slots (REQ-039.4).
+    fn assert_request_selected_in_every_step(regen: f64, dpf_raw: Phase, turbo: Phase) {
         let mut keys: BTreeSet<&str> = BTreeSet::new();
         for goal in [
             Goal::DpfRaw,
@@ -2882,7 +3047,7 @@ mod tests {
         let extra_keys: Vec<&str> = keys.into_iter().collect();
         let mut p = planner(&extra_keys);
         let ledger = Ledger::default();
-        let values = base(90.0, 0.0, 800.0, 20.0, 95.0, 3.0);
+        let values = base(90.0, 0.0, 800.0, 20.0, 95.0, regen);
         let mut full_with_goals = false;
         for at in 0..60 {
             feed(&mut p, at, &values);
@@ -2894,14 +3059,30 @@ mod tests {
                 "step {at}"
             );
             assert!(plan.selection.len() <= MAX_SELECTION);
-            assert_eq!(phase(&plan, Goal::DpfRaw), Phase::Serving);
+            assert_eq!(phase(&plan, Goal::DpfRaw), dpf_raw, "step {at}");
             assert_eq!(phase(&plan, Goal::Rail), Phase::Serving);
+            assert_eq!(phase(&plan, Goal::Turbo), turbo, "step {at}");
             full_with_goals |= plan.selection.len() == MAX_SELECTION;
-            for selected in &plan.selection {
+            for selected in plan.selection.iter().filter(|s| !s.trigger) {
                 p.record(&ok(&selected.signal_key, at, 1.0));
             }
         }
         assert!(full_with_goals);
+    }
+
+    #[test]
+    fn req_039_4_regeneration_request_is_selected_in_every_step_while_readable() {
+        assert_request_selected_in_every_step(
+            3.0,
+            Phase::Serving,
+            Phase::Interrupted { by: Goal::DpfRaw },
+        );
+    }
+
+    #[test]
+    fn req_039_4_inactive_request_is_selected_in_every_step_with_slots_saturated() {
+        // Request 0: the dpf raw goal is inactive; rail and turbo take every contextual slot.
+        assert_request_selected_in_every_step(0.0, Phase::WaitingForCondition, Phase::Serving);
     }
 
     #[test]
@@ -2952,6 +3133,126 @@ mod tests {
         assert_eq!(
             phase(&plan, Goal::DpfRaw),
             Phase::NotReachable(Reason::ConditionInputUnavailable)
+        );
+    }
+
+    #[test]
+    fn req_039_2_ledger_covers_goals_whose_inputs_exist_only_as_knowledge_keys() {
+        let mut run = SmartRun::new(goal_rules(), RunId("r".into()), SessionKind::Live);
+        let fact = |key: &str, at: u64| Fact {
+            run: RunId("r".into()),
+            wall_clock_unix_ms: at as i64 * 1000,
+            offset: secs(at),
+            versions: versions(),
+            identity_confirmed: true,
+            body: FactBody::Reading(Reading {
+                signal_key: key.into(),
+                context: Goal::DpfRaw.context(),
+                ecu_target: None,
+                session: SessionState::Default,
+                outcome: Outcome::Decoded(Decoded::Numeric { finite: true }),
+                implausible: false,
+                static_identity: false,
+                evidence: EvidenceRef("e".into()),
+            }),
+        };
+        let entry_of = |run: &SmartRun, key: &str| {
+            run.ledger()
+                .entry(&EntryKey {
+                    versions: versions(),
+                    signal_key: key.into(),
+                    context: Goal::DpfRaw.context(),
+                })
+                .cloned()
+                .unwrap()
+        };
+        for at in [0, 10, 20, 30] {
+            run.apply(None, &fact(REGEN_A, at)).unwrap();
+            run.apply(None, &fact("dpf.soot_mass_calculated", at))
+                .unwrap();
+        }
+        let rules = goal_rules();
+        for key in [REGEN_A, "dpf.soot_mass_calculated"] {
+            let entry_key = EntryKey {
+                versions: versions(),
+                signal_key: key.into(),
+                context: Goal::DpfRaw.context(),
+            };
+            assert_eq!(
+                run.ledger().status(&rules, &entry_key),
+                Status::Covered,
+                "{key}"
+            );
+        }
+        // Any fresh target of the request keeps the condition fresh (REQ-039.6).
+        run.apply(None, &fact(REGEN_B, 40)).unwrap();
+        run.apply(None, &fact("dpf.soot_mass_calculated", 45))
+            .unwrap();
+        assert_eq!(
+            entry_of(&run, "dpf.soot_mass_calculated").qualifying_samples,
+            5
+        );
+        // No fresh reading of any target: the reading does not count.
+        run.apply(None, &fact("dpf.soot_mass_calculated", 100))
+            .unwrap();
+        assert_eq!(
+            entry_of(&run, "dpf.soot_mass_calculated").qualifying_samples,
+            5
+        );
+    }
+
+    #[test]
+    fn req_039_2_a_reading_is_attributed_by_the_conditions_at_its_own_time() {
+        let key = "engine.boost_pressure_actual";
+        let mut p = planner(&[key]);
+        let ledger = Ledger::default();
+        feed(&mut p, 0, &base(90.0, 0.0, 800.0, 20.0, 10.0, 0.0));
+        let first = p.plan(secs(0), &ledger);
+        // The conditions change after the plan and before the reading arrives.
+        feed(&mut p, 5, &base(90.0, 60.0, 2000.0, 30.0, 95.0, 0.0));
+        let ids = |at: u64| -> Vec<String> {
+            p.contexts_at(key, secs(at))
+                .iter()
+                .map(|context| context.id().to_owned())
+                .collect()
+        };
+        assert_eq!(contexts(&first, key), ["baseline"]);
+        assert_eq!(ids(3), ["baseline"]);
+        assert_eq!(ids(6), ["turbo", "egr", "baseline"]);
+    }
+
+    #[test]
+    fn req_039_2_and_11_context_end_is_stamped_at_the_reading_that_ended_it() {
+        let mut p = planner(&["egr.valve_duty"]);
+        let ledger = Ledger::default();
+        feed(&mut p, 0, &base(90.0, 60.0, 2000.0, 30.0, 10.0, 0.0));
+        p.plan(secs(0), &ledger);
+        feed(&mut p, 5, &[(SPEED, 20.0)]);
+        let plan = p.plan(secs(9), &ledger);
+        let ended: Vec<Duration> = plan
+            .events
+            .iter()
+            .filter(|e| e.goal == Some(Goal::Egr) && e.kind == EventKind::ContextEnded)
+            .map(|e| e.at)
+            .collect();
+        assert_eq!(ended, [secs(5)]);
+    }
+
+    #[test]
+    fn req_039_7_a_goal_not_reachable_is_not_served_through_a_holding_trigger_reading() {
+        let key = "engine.boost_pressure_actual";
+        let mut p = planner(&[key]);
+        p.record(&failed(PEDAL, 0, Outcome::Unsupported));
+        feed(&mut p, 1, &[(PEDAL, 95.0)]);
+        let plan = p.plan(secs(2), &Ledger::default());
+        assert_eq!(
+            phase(&plan, Goal::Turbo),
+            Phase::NotReachable(Reason::ConditionInputUnavailable)
+        );
+        assert_eq!(contexts(&plan, key), ["baseline"]);
+        assert_eq!(
+            p.contexts_at(key, secs(2)),
+            [Goal::Baseline.context()].to_vec()
         );
     }
 }
