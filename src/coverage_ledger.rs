@@ -161,6 +161,8 @@ pub enum Boundary {
 pub enum FactBody {
     Reading(Reading),
     Boundary(Boundary),
+    /// Ends only this context's contiguous intervals, without affecting other contexts.
+    ContextEnd(GoalContext),
 }
 
 /// One recorded fact the ledgers are folded from.
@@ -467,6 +469,12 @@ struct Update {
     segment_length: Option<Duration>,
 }
 
+/// The semantic of a signal key: a Knowledge signal is addressed as `<semantic>@<target id>`, a
+/// standard PID by its bare semantic.
+pub(crate) fn semantic(key: &str) -> &str {
+    key.rsplit_once('@').map_or(key, |(semantic, _)| semantic)
+}
+
 /// The run ledger of one Smart start and the fold that also credits a vehicle ledger.
 #[derive(Debug, Clone)]
 pub struct SmartRun {
@@ -484,6 +492,7 @@ pub struct SmartRun {
     failures: BTreeMap<(DefinitionVersions, String), BTreeSet<Duration>>,
     /// Offsets of the boundaries that were folded; each ends the freshness of every signal.
     boundaries: BTreeSet<Duration>,
+    context_ends: BTreeMap<(DefinitionVersions, GoalContext), BTreeSet<Duration>>,
 }
 
 impl SmartRun {
@@ -498,6 +507,7 @@ impl SmartRun {
             freshness: BTreeMap::new(),
             failures: BTreeMap::new(),
             boundaries: BTreeSet::new(),
+            context_ends: BTreeMap::new(),
         }
     }
 
@@ -555,6 +565,17 @@ impl SmartRun {
         let vehicle = vehicle.filter(|_| credited);
         match &fact.body {
             FactBody::Boundary(_) => self.end_segments(fact.offset),
+            FactBody::ContextEnd(context) => {
+                self.context_ends
+                    .entry((fact.versions.clone(), context.clone()))
+                    .or_default()
+                    .insert(fact.offset);
+                self.open.retain(|key, segment| {
+                    key.versions != fact.versions
+                        || key.context != *context
+                        || segment.last > fact.offset
+                });
+            }
             FactBody::Reading(reading) => self.apply_reading(vehicle, fact, reading),
         }
         Ok(())
@@ -677,7 +698,7 @@ impl SmartRun {
                     ..previous
                 };
             } else if offset - previous.last <= FRESHNESS_LIMIT
-                && !self.broken_between(&key.versions, &key.signal_key, previous.last, offset)
+                && !self.broken_between(key, previous.last, offset)
             {
                 let interval = offset - previous.last;
                 let confirmed = self
@@ -750,8 +771,26 @@ impl SmartRun {
         }
     }
 
+    /// The freshness spans of the readings of `signal` under `versions`: a required context signal
+    /// is a semantic and is delivered as `semantic` or as `semantic@target` by any ECU target
+    /// (REQ-039.6), so every key of the semantic counts.
+    fn spans_of<'a>(
+        &'a self,
+        versions: &'a DefinitionVersions,
+        signal: &'a str,
+    ) -> impl Iterator<Item = &'a Vec<Span>> {
+        self.freshness
+            .range((versions.clone(), signal.to_owned())..)
+            .take_while(move |((spans_versions, key), _)| {
+                spans_versions == versions && key.starts_with(signal)
+            })
+            .filter(move |((_, key), _)| semantic(key) == signal)
+            .map(|(_, spans)| spans)
+    }
+
     /// Instant until which every required context signal of `context` stays continuously fresh
-    /// under `versions`, counted from `at`; `None` when one is not fresh at `at`.
+    /// under `versions`, counted from `at`; `None` when one is not fresh at `at`. A signal is
+    /// fresh while any target of it is.
     fn extent(
         &self,
         versions: &DefinitionVersions,
@@ -760,13 +799,12 @@ impl SmartRun {
     ) -> Option<Duration> {
         let mut until = Duration::MAX;
         for signal in &self.rules.rule_for(context).required_signals {
-            let span = self
-                .freshness
-                .get(&(versions.clone(), signal.clone()))?
-                .iter()
-                .rev()
-                .find(|span| span.holds(at))?;
-            until = until.min(span.until);
+            let freshest = self
+                .spans_of(versions, signal)
+                .filter_map(|spans| spans.iter().rev().find(|span| span.holds(at)))
+                .map(|span| span.until)
+                .max()?;
+            until = until.min(freshest);
         }
         Some(until)
     }
@@ -786,10 +824,13 @@ impl SmartRun {
             .required_signals
             .iter()
             .all(|signal| {
-                self.freshness
-                    .get(&(versions.clone(), signal.clone()))
-                    .and_then(|spans| spans.iter().rev().find(|span| span.holds(from)))
-                    .is_some_and(|span| span.holds(to))
+                self.spans_of(versions, signal).any(|spans| {
+                    spans
+                        .iter()
+                        .rev()
+                        .find(|span| span.holds(from))
+                        .is_some_and(|span| span.holds(to))
+                })
             })
     }
 
@@ -798,18 +839,16 @@ impl SmartRun {
     /// readings spans it: the reading at `from` belongs to what the break ended, and one at the
     /// break's own offset was folded after it and starts anew. No time of such an interval is
     /// counted: a reading in between ends the contiguous segment and adds none (REQ-038.4).
-    fn broken_between(
-        &self,
-        versions: &DefinitionVersions,
-        signal: &str,
-        from: Duration,
-        to: Duration,
-    ) -> bool {
+    fn broken_between(&self, key: &EntryKey, from: Duration, to: Duration) -> bool {
         let range = (Bound::Excluded(from), Bound::Included(to));
         self.boundaries.range(range).next().is_some()
             || self
+                .context_ends
+                .get(&(key.versions.clone(), key.context.clone()))
+                .is_some_and(|offsets| offsets.range(range).next().is_some())
+            || self
                 .failures
-                .get(&(versions.clone(), signal.to_owned()))
+                .get(&(key.versions.clone(), key.signal_key.clone()))
                 .is_some_and(|offsets| offsets.range(range).next().is_some())
     }
 
@@ -874,7 +913,7 @@ impl SmartRun {
                     .rule_for(&entry.context)
                     .required_signals
                     .iter()
-                    .any(|required| required == signal);
+                    .any(|required| required == semantic(signal));
             !(same_signal || depends && segment.last == at)
         });
     }
@@ -2132,6 +2171,25 @@ mod tests {
                 "{earlier:?}"
             );
         }
+    }
+
+    #[test]
+    fn req_038_4_context_end_at_last_reading_does_not_break_baseline() {
+        let facts = [
+            sample("x", "egr", 0),
+            sample("x", "baseline", 0),
+            sample("x", "egr", 5),
+            sample("x", "baseline", 5),
+            fact(RUN, 5, false, FactBody::ContextEnd(GoalContext::new("egr"))),
+            sample("x", "egr", 8),
+            sample("x", "baseline", 8),
+        ];
+        let run = run_with(Rules::generic_baseline(), SessionKind::Replay, &facts);
+        assert_eq!(entry(run.ledger(), "x", "egr").longest_segment, secs(5));
+        assert_eq!(
+            entry(run.ledger(), "x", "baseline").longest_segment,
+            secs(8)
+        );
     }
 
     #[test]

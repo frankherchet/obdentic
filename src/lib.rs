@@ -34,6 +34,7 @@ pub mod safety;
 pub mod scheduler;
 pub mod semantic_tools;
 mod signal_read;
+pub mod smart_planner;
 pub mod subscription_policy;
 pub mod telemetry;
 #[cfg(test)]

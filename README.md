@@ -94,6 +94,15 @@ signal ids, a 20-read/1-scan/60 s budget per diagnosis) runs through the same `M
 (`mobile/assistant.rs`) and reuses `mobile/report.rs` for offline recording inspection; see
 [Android workbench](docs/android.md#semantic-assistant-tool-bridge-req-041).
 
+`smart_planner.rs` is the pure Smart planner of REQ-039: from the effective catalog, the vehicle ledger and timestamped
+readings it selects at most 32 default-session signals per step, attributed to every holding goal context and baseline.
+Goals use the component preset memberships; the planner evaluates conditions as holds / does not hold / unknown,
+applies re-arm, turbo hold, strict priority, the baseline share and retry policy, and reports plan changes with reasons.
+A context-end event, emitted whenever a goal stops being active, must be folded as a context-end fact into the coverage
+ledger before later readings, so a short interruption cannot join contiguous segments. The planner only reads, cannot add a target, and has no I/O,
+clock, Android or adapter; session-flagged signals are handed to REQ-040. Android integration and recording of plan
+changes are separate.
+
 `coverage_ledger.rs` is the pure measurement-coverage model of REQ-038: facts folded into a run ledger and a
 vehicle ledger count qualifying samples, valid measured time and contiguous segments per signal and goal
 context, keep the latest availability state apart, and make no health claim. It has no I/O, clock or adapter.
