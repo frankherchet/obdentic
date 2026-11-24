@@ -33,7 +33,7 @@ The UI never accepts raw commands, addresses or mutation capabilities.
   recording and export settings are collapsed. There is no debug view: raw TX/RX exists only in private
   recordings for offline analysis (REQ-033 is obsolete).
 - Five OBDentic component presets ("dpf", "egr", "cooling", "turbo", "rail", German names) in the same
-  "Preset anwenden" list (REQ-035) and the user-started smart analysis (REQ-036), see below.
+  "Preset anwenden" list (REQ-035) and the user-started smart analysis (REQ-036.1, REQ-039), see below.
 - Private recording, foreground connected-device service, screen-off operation,
   explicit export, offline replay and timestamped raw TX/RX.
 - Confirmed deletion of completed internal recordings; active recordings and loaded
@@ -250,36 +250,49 @@ the per-entry resolution, that a preset requested the activation and the session
 every read; replay shows the same offline. Behaviour on the vehicle (answers, activation,
 cycle time of up to 12 signals) is not validated and belongs to the separate #178 gate.
 
-**Smart-Analyse (REQ-036).** The user starts and stops it in the Live tab in a ready live
+**Smart-Analyse (REQ-036.1, REQ-039).** The user starts and stops it in the Live tab in a ready live
 session; one action starts it. It continues the running automatic recording or, with
 "Dauer-Aufzeichnung" off, starts one itself and fails visibly if none can be written; stopping
 leaves the setting unchanged. It is never automatic and is refused (with the
 reason) in demo, replay, while an extended session, a job, a named recording or a test
 sequence runs. It stays in the default session, sends no session change and needs no
-interaction while driving. Every set is the available signals of one component preset plus
-all available trigger readings (raw `dpf.field_regeneration_request_status`, coolant
-temperature, `vehicle.accelerator_pedal_e`, speed, rpm, load), within 32 signals. Missing,
-stale (older than 10 s) or unavailable readings are shown as such and never treated as zero,
-a crossing, a release or a holding condition; they do not start or extend a window.
+interaction while driving. It ends on user stop, disconnect, loss of the recording, error or
+conflicting work, with the reason recorded and shown.
 
-| Window | Starts / lasts |
-|---|---|
-| `dpf` | raw regeneration request status ≠ 0 until a fresh 0; shown as "Regenerationsanforderung (Rohwert)", not a confirmed regeneration |
-| `cooling` | upward crossing of 80 °C between consecutive fresh readings; 10 min; re-arms after the condition is false |
-| `turbo` | pedal > 80 % and 20 s after the first fresh reading ≤ 80 % |
-| `rail` | speed 0, coolant ≥ 80 °C, rpm 500..1100; 3 min; re-arms after the condition is false |
-| `egr` | speed 50..80 km/h and load 15..60 % without interruption for 30 s, then 3 min; re-arms after the condition is false |
+The Rust planner (`smart_planner.rs`, REQ-039) plans the measurements. The mobile core drives it
+through the closed offline actions `smart.plan.start`, `smart.plan.observe`, `smart.plan.step` and
+`smart.plan.stop` (`mobile/coverage/live/plan.rs`): the core builds the catalog from its own signal
+catalog (the app only reports the standard PIDs the vehicle does not support, so no caller can add a
+target), the planner reads the vehicle ledger when one is attached, else the run ledger, and the
+run stays on the definition versions it started with. The service plans a step once every signal of
+the previous selection was attempted, at the latest after 10 s (the REQ-036.1 limit of 32 signals
+per step applies), selects the keys and records every plan change. The goals are cooling
+(warm-up, warm driving), dpf (warm driving, raw regeneration request), turbo, rail, egr and the
+technical baseline of every safely readable signal; a goal is active only while its condition holds
+(no fixed windows, no timed rotation). Thresholds, priorities and retry timings are constants of the
+planner; Knowledge, profiles, presets, MCP calls and AI prompts cannot change them. The component
+presets (REQ-035) only say which signals belong to a goal.
 
-Priority is dpf > cooling > turbo > rail > egr: a higher window interrupts a lower one, windows
-keep their own time while interrupted, a still-valid lower window resumes and an expired one does
-not. With no valid window the sets rotate in that order, 3 min each. Each set change (with time,
-reason and the trigger readings behind it) is shown in the Live tab, written into the running
-automatic recording (across file rotation) and replayed offline. The latency from trigger
-reading to changed selection depends on the serial adapter and is reported, not promised.
-Results stay in the private recording and the app's memory: no trigger value ever goes into
-the app log (only set names and reasons), and nothing is exported, shared or published as
-vehicle evidence automatically. Behaviour while driving is not validated and belongs to the
-separate #178 gate.
+A reading counts toward every goal context whose condition holds at its own time and always toward
+the baseline: the service writes one `coverage.fact` per context and a `coverage.context_end` when a
+goal's contiguous interval ends. Missing, stale (older than 10 s), rejected or unanswered readings
+make a condition unknown, never zero, a crossing, a release or a holding condition. A signal that fails
+is skipped and retried after 30 s, 2 min, then once per drive, with the reason shown and recorded.
+
+The Live card names the goals in progress ("wird gemessen", "pausiert · Vorrang: …", "wartet auf neuen
+Versuch"), the one remaining time the planner defines (the EGR time still missing for 30 contiguous
+seconds; the retry time of a skipped signal), "Warm noch nicht erreicht" without any verdict, unknown
+conditions and unreachable goals with their reason, skipped signals and the latest plan changes. The raw
+DPF regeneration request is shown as "Regenerationsanforderung (Rohwert)", never as a confirmed
+regeneration. Every plan change is written into the running automatic recording as a `smart.plan`
+action (`kind`: `started`, `interrupted`, `resumed`, `completed`, `expired`, `not_reachable`, `skipped`,
+`stopped`, plus `selection` with the chosen keys and `resume` at the start of a rotated file), with the
+wallclock time and offset of the record, `at_us` (the run clock), `goal`, `reason`, the condition readings
+(`inputs`: signal, value or reason) and the definition versions, continues across file rotation and is
+replayed offline without adapter traffic. Records of the earlier set switching (`smart.set`) are skipped on
+replay. Results stay in the private recording and the app's memory: no condition value ever goes into the
+app log (only goal names and reasons), and nothing is exported, shared or published as vehicle
+evidence automatically. Behaviour while driving is not validated and belongs to the separate #178 gate.
 
 **Messlücken (REQ-037).** In a ready live session the Live tab shows "Keine aktuellen
 Messwerte" when selected reads have produced no finite value for at least 10 seconds while
@@ -323,15 +336,14 @@ more; the raw read events in the same recording allow offline correlation of the
 value and first failure. Offline replay and
 `obdentic-mobile-report` show the gaps from the recording without adapter traffic and keep the
 raw TX/RX evidence; recordings made before this change contain no such events and open as
-before. DPF priority in Smart-Analyse is unchanged and remains covered by its existing
-deterministic replay tests. Gap behaviour on a real vehicle (how long values are missing,
+before. The priority of the DPF goal is covered by the planner's deterministic replay tests. Gap behaviour on a real vehicle (how long values are missing,
 whether the first probe recovers) is not validated and belongs to the separate #178 hardware
 acceptance; until then the thresholds above are the specified behaviour, not measured results.
 
 ## Coverage facts in the recording (REQ-038.9)
 
 A Smart run writes the facts that rebuild its run ledger (`coverage_ledger.rs`, REQ-038) into the running
-automatic recording, as three action events in the existing envelope (empty `argument`, result
+automatic recording, as four action events in the existing envelope (empty `argument`, result
 `{"ok":true,"data":{…}}`; the record's own `at` is the wallclock time and `offset_us` the file offset; the header
 format version stays 1):
 
@@ -340,7 +352,7 @@ format version stays 1):
   it names no vehicle or adapter. `run_offset_us` is the monotonic run clock since the Smart start and is never reset
   by a rotation.
 - `coverage.fact`: one record per read attempt, written right after the raw `read` record and classified by the Rust
-  core (`coverage.fact`, a closed read-only action without transport access): `signal_key`, `context` (`baseline`),
+  core (`coverage.fact`, a closed read-only action without transport access): `signal_key`, `context` (a goal context id or `baseline`; one fact per context the read counts toward, REQ-039.2),
   `ecu_target`, `session` (`default`/`extended`), `outcome` (`decoded` with `value_kind` and `finite`/`nonempty`,
   `unsupported`, `rejected` with `response_code`, `empty`, `error`/`no_answer`/`session_restricted` with `reason`),
   `implausible`, `static_identity`, `identity_confirmed`, versions, `run_offset_us` and `evidence` (the `at` and
@@ -358,8 +370,10 @@ format version stays 1):
 - `coverage.boundary`: `class` `gap` (with the start of a `measurement.gap`), `disconnect` (before the end of a
   session by disconnect or link failure), `run_end` (with the Smart stop; always the run's last record) and
   `reconnect` (accepted on read, not written yet).
+- `coverage.context_end`: `context`, `run`, versions, `run_offset_us`; written when the planner reports that a goal's
+  contiguous interval ended (REQ-039.12); it ends only that context's segments, before any later reading of it.
 
-A rotation (REQ-028.3) keeps a Smart run going: the new file starts, after the header and the `smart.set` and
+A rotation (REQ-028.3) keeps a Smart run going: the new file starts, after the header and the `smart.plan` and
 `measurement.gap` resume records, with `coverage.run` `resume`, so every file is understandable on its own and a long
 run is a chain of parts. `previous_part_records` is the number of `coverage.*` records written into the previous part
 (its own `start`/`resume` included). Parts are identified by run id and `part`, never by file name, file time or
@@ -413,7 +427,7 @@ checked first: on connect, on every refresh and at a run's start and end the car
 Every entry point (connect, vehicle selection, an inventory that switches the vehicle, delete, reset, unreadable store, stop/job/disconnect/lost link ending a run, the
 30 s save) refreshes the same card and is covered by `ComponentSmartAcceptance`.
 
-The Live tab shows an "ABDECKUNG" card below the tiles and the Smart card (the first eight tiles keep their space, #239): per goal context (today only the
+The Live tab shows an "ABDECKUNG" card below the tiles and the Smart card (the first eight tiles keep their space, #239): per goal context (the goals of REQ-039.2 by name and the
 "Technische Basisabdeckung") the covered, partial and not covered counts, the summed measured time, the longest segment and the latest non-success states,
 as plain text for the run, the vehicle in total and, without a run, the selected vehicle's stored ledger. In replay it shows the derived run; a partial set
 says "nur die gelieferten Teile, nicht der ganze Lauf" with its reasons and an invalid one only its reason. Nothing here is a diagnosis or a health claim.

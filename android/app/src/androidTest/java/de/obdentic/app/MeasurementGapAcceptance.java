@@ -279,17 +279,17 @@ final class MeasurementGapAcceptance {
             waitFor(() -> !service.snapshot().optString("autoRecording").equals(afterRecovery) && !service.snapshot().optString("autoRecording").isEmpty(), "rotation after recovery", 30_000);
             service.rotateMs = savedRotateMs;
             service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started", 15_000);
-            waitFor(() -> "fresh".equals(trigger(service, RPM).optString("state")) && "fresh".equals(trigger(service, COOLANT).optString("state")) && "fresh".equals(trigger(service, "vehicle.speed").optString("state")), "fresh trigger readings", 20_000);
-            int changesBefore = nonAvailabilityChanges(service);
-            String setBefore = smart(service).optString("component");
+            waitFor(() -> baselineServed(service), "the baseline goal is served", 20_000);
+            SystemClock.sleep(3_000); // a few planning steps with live readings
+            int changesBefore = shownChanges(service);
             link.silentAll = true;
             waitFor(() -> gap(service).optBoolean("active"), "gap while the analysis runs", 25_000);
-            SystemClock.sleep(1500);
-            for (String key : new String[] {RPM, COOLANT, "vehicle.speed", "vehicle.accelerator_pedal_e", "engine.load"}) {
-                JSONObject row = trigger(service, key);
-                require(!"fresh".equals(row.optString("state")) && !row.has("value"), "REQ-037.2 a missing or stale trigger reading is unknown, never zero: " + row);
+            SystemClock.sleep(14_000); // at least one planning step (at most 10 s apart) sees the readings stale
+            JSONArray changesNow = smart(service).optJSONArray("changes");
+            for (int i = changesBefore; changesNow != null && i < changesNow.length(); i++) {
+                JSONObject change = changesNow.getJSONObject(i);
+                require(!"started".equals(change.optString("kind")) && !"condition_ended".equals(change.optString("reason")), "REQ-039.6 unknown readings neither start a goal nor count as a release: " + change);
             }
-            require(nonAvailabilityChanges(service) == changesBefore && setBefore.equals(smart(service).optString("component")), "REQ-037.2 unknown triggers neither trigger, release nor re-arm a set: " + smart(service).optJSONArray("changes"));
             require(smart(service).optBoolean("active") && MainActivity.gapText(service.snapshot()).equals(TEXT), "the analysis keeps running with the notice shown");
 
             // REQ-037.3: the stop ends the open gap in the recording without claiming recovery
@@ -324,12 +324,12 @@ final class MeasurementGapAcceptance {
             for (int i = 1; i < recordedProbes.size(); i++) require(recordedProbes.get(i) - recordedProbes.get(i - 1) >= 4_500, "REQ-037.2 recorded probes are at least 5 s apart: " + recordedProbes);
             boolean readsAfter = false; for (JSONObject e : files.get(files.size() - 1)) if ("read".equals(e.optString("action")) && e.optLong("at") > endAt) readsAfter = true;
             require(readsAfter, "normal reads follow the recorded recovery");
-            // the unknown trigger readings of the analysis in the second gap carry no value unless fresh
+            // REQ-039.6/.8: the condition readings of the plan changes in the second gap carry a reason and never a value when they are unknown
             for (List<JSONObject> f : files) for (JSONObject e : f) {
-                JSONObject smartData = "smart.set".equals(e.optString("action")) && e.optJSONObject("result") != null ? e.getJSONObject("result").optJSONObject("data") : null;
-                JSONObject readings = smartData == null ? null : smartData.optJSONObject("readings");
-                for (java.util.Iterator<String> names = readings == null ? Collections.<String>emptyIterator() : readings.keys(); names.hasNext(); ) { JSONObject r = readings.optJSONObject(names.next());
-                    require(r == null || !r.has("value") || "fresh".equals(r.optString("state")), "REQ-037.2 a missing or stale trigger reading carries no value in the recording: " + r); }
+                JSONObject smartData = "smart.plan".equals(e.optString("action")) && e.optJSONObject("result") != null ? e.getJSONObject("result").optJSONObject("data") : null;
+                JSONArray inputs = smartData == null ? null : smartData.optJSONArray("inputs");
+                for (int i = 0; inputs != null && i < inputs.length(); i++) { JSONObject input = inputs.getJSONObject(i);
+                    require(input.isNull("value") != input.isNull("reason"), "REQ-039.6 an unknown condition reading carries its reason and no value in the recording: " + input); }
             }
 
             // REQ-037.3: offline replay shows the gap without any adapter traffic; the raw evidence stays
@@ -435,15 +435,14 @@ final class MeasurementGapAcceptance {
     }
     private static JSONObject gap(ObdService service) { JSONObject g = service.snapshot().optJSONObject("gap"); return g == null ? new JSONObject() : g; }
     private static JSONObject smart(ObdService service) { return service.snapshot().optJSONObject("smart"); }
-    private static JSONObject trigger(ObdService service, String semantic) {
-        JSONArray rows = smart(service).optJSONArray("triggers");
-        for (int i = 0; rows != null && i < rows.length(); i++) if (semantic.equals(rows.optJSONObject(i).optString("semantic"))) return rows.optJSONObject(i);
-        return new JSONObject();
+    private static int shownChanges(ObdService service) {
+        JSONArray changes = smart(service).optJSONArray("changes");
+        return changes == null ? 0 : changes.length();
     }
-    private static int nonAvailabilityChanges(ObdService service) {
-        JSONArray changes = smart(service).optJSONArray("changes"); int n = 0;
-        for (int i = 0; changes != null && i < changes.length(); i++) if (!"availability".equals(changes.optJSONObject(i).optString("kind"))) n++;
-        return n;
+    private static boolean baselineServed(ObdService service) {
+        JSONArray goals = smart(service).optJSONArray("goals");
+        for (int i = 0; goals != null && i < goals.length(); i++) if ("baseline".equals(goals.optJSONObject(i).optString("goal"))) return "serving".equals(goals.optJSONObject(i).optString("phase"));
+        return false;
     }
     private static String status(ObdService service, String semantic) {
         JSONArray catalog = service.snapshot().optJSONArray("signals");

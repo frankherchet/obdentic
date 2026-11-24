@@ -62,8 +62,6 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("Private signal presets, persisted ECU/learning results, UDS demo gate and simulated UDS activation, mixed Mode 01 + UDS polling in the active session (interleaved reads, tester present keeps recurring, session neither left nor re-armed, no 'OBD2 paused' text), another job (DTC read) leaving the session while the OBD2 selection keeps polling, explicit re-activation, session-marked recording, default-session return before disconnect and offline replay");
             AvailabilityUiAcceptance.run(this::onMain, activity, service, getTargetContext());
             passed("Availability in the selector and on tiles (REQ-031): measured states, hidden-count and 'Nur verfügbare' filter, every signal selectable, tiles state their reason instead of a dash");
-            SmartAnalysisAcceptance.run();
-            passed("REQ-036 smart analysis state machine on a supplied clock: DPF > cooling > turbo > rail > EGR, one-shot triggers re-arm, three-minute rotation, missing trigger signals reported as unavailable and never read as zero");
             ComponentPresetsAcceptance.run();
             passed("REQ-035 component presets (DPF, EGR, cooling, turbo, rail): semantics resolve to unique live keys, standard key wins, unavailable/ambiguous/session-only/pending-UDS semantics reported with their reason, no vehicle traffic");
 
@@ -233,9 +231,9 @@ public final class AcceptanceRunner extends Instrumentation {
             AutoDtcAcceptance.run(service,getTargetContext());
             passed("Automatic fault-code scan (REQ-034): stored (Mode 03) and pending (Mode 07) codes once after inventory and the automatic survey, also on reconnect, setting off and demo never scan, no clearing service, TX/RX in the running automatic recording, replay shows both without traffic, a failed scan stays an explicit result and keeps the connection");
             ComponentSmartAcceptance.run(service,getTargetContext());
-            passed("#291/#297 component preset and smart analysis through the service: component preset applied by id with automatic extended session only when needed, one-time smart start/stop, set changes with reason, trigger ages and unavailable triggers in the snapshot, replay shows the recorded set changes, no traffic beyond reads");
+            passed("#291/#382 component preset and the Smart planner through the service: component preset applied by id with automatic extended session only when needed, one-time Smart start/stop, goals start/end with their condition (raw dpf request, pedal, rail), an unanswered trigger ends its goal as unknown and never as a release, plan changes with wallclock time, offset, goal, reason, condition readings and definition versions in the recording across file rotation, one coverage fact per holding goal context, replay shows the recorded plan without traffic");
             smartAndComponentUiText();
-            passed("#291/#297 UI text: a replay that ends with the stop event (empty set) shows the recorded history and the stop reason instead of 'no smart analysis', a replay without events says so, an active smart run shows the component label and reason, a named recording of the selection is refused with a reason while smart is active (not in replay or when inactive), every unselected component entry is listed with its own reason and detail rather than counted");
+            passed("#382 UI text (REQ-039.6/.7/.8/.11): the card names goals in progress with their remaining time, a goal that waits for a higher one, 'warm not yet reached' without a verdict, unknown conditions and unreachable goals with their reason, skipped signals with their retry time and the stop reason; a replay that ends with the stop shows the recorded history, a replay without events says so; a named recording of the selection is refused with a reason while smart is active; every unselected component entry is listed with its own reason");
             MeasurementGapAcceptance.run(service,getTargetContext(),tab -> tabText(activity,tab));
             passed("REQ-037 measurement gap (#314): rules on a supplied clock (10 s of attempted reads without a finite value, unsupported/never-successful/unselected signals never start one, a fast signal failing is no gap until the slow previously successful signal also failed or while it succeeds, 5 s probes of previously successful signals only, first finite value recovers, selection change and stop); real service against a fake adapter: values, individual unsupported and failing signals next to successes without a gap, sustained silence gives 'Keine aktuellen Messwerte' with no ignition/adapter/vehicle claim, probe cadence at most one per 5 s across a selection change and a job, recovery restores polling, unknown trigger values never zero; recording holds measurement.gap start / resume after a forced rotation / end recovered / end stopped, replay shows each file without traffic, older recordings open without a gap");
             ThroughputAcceptance.run(service,getTargetContext(),new ThroughputAcceptance.Ui(){
@@ -305,16 +303,17 @@ public final class AcceptanceRunner extends Instrumentation {
     /** The pure texts behind the Live tab's smart and component cards (MainActivity): no vehicle, no service state. */
     private void smartAndComponentUiText() throws Exception {
         JSONArray changes=new JSONArray()
-            .put(new JSONObject().put("at",1000L).put("change","start").put("set","dpf").put("previous_set","").put("reason","dpf: request").put("remaining_ms",-1))
-            .put(new JSONObject().put("at",2000L).put("change","stop").put("set","").put("previous_set","dpf").put("reason","Smart-Analyse beendet").put("remaining_ms",-1));
-        JSONObject stopped=new JSONObject().put("mode","replay").put("smart",new JSONObject().put("active",false).put("component","").put("replay",true).put("reason","").put("changes",changes));
+            .put(new JSONObject().put("at",1000L).put("kind","started").put("goal","dpf.raw_request").put("reason",JSONObject.NULL))
+            .put(new JSONObject().put("at",2000L).put("kind","stopped").put("goal","").put("reason","user"));
+        JSONObject stopped=new JSONObject().put("mode","replay").put("smart",new JSONObject().put("active",false).put("replay",true).put("reason","user").put("goals",new JSONArray()).put("skipped",new JSONArray()).put("changes",changes));
         String history=MainActivity.smartSummaryText(stopped);
-        require(!history.contains("keine Smart-Analyse")&&history.contains("beendet")&&history.contains("Smart-Analyse beendet"),"replay ending with the stop event shows the recorded history and the stop reason: "+history);
+        require(!history.contains("keine Smart-Analyse")&&history.startsWith("Aus der Aufnahme")&&history.contains("beendet: vom Nutzer gestoppt"),"replay ending with the stop event shows the recorded history and the stop reason: "+history);
         String none=MainActivity.smartSummaryText(new JSONObject().put("mode","replay").put("smart",new JSONObject().put("active",false).put("changes",new JSONArray())));
         require(none.contains("keine Smart-Analyse"),"replay without smart events says so: "+none);
-        JSONObject live=new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",true).put("component","dpf").put("reason","dpf: request").put("remaining_ms",-1).put("selected_count",5).put("changes",changes));
+        JSONObject live=new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",true).put("selected_count",5).put("goals",new JSONArray().put(new JSONObject().put("goal","dpf.raw_request").put("phase","serving"))).put("changes",changes));
         String active=MainActivity.smartSummaryText(live);
-        require(active.contains(MainActivity.componentLabel("dpf"))&&active.contains("dpf: request")&&active.startsWith("Aktiv"),"active smart run shows component and reason: "+active);
+        require(active.contains(MainActivity.REGEN_REQUEST_LABEL)&&active.startsWith("Aktiv"),"active smart run shows the goal (a raw request, never a confirmed regeneration): "+active);
+        require(MainActivity.smartSummaryText(new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",false).put("reason","Verbindung nicht mehr bereit"))).contains("Zuletzt beendet: Verbindung nicht mehr bereit"),"after a stop the card says why it ended");
         require(MainActivity.smartRecordingBlocker(live)!=null,"named recording refused while smart is active");
         require(MainActivity.smartRecordingBlocker(new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",false)))==null,"named recording allowed when smart is inactive");
         require(MainActivity.smartRecordingBlocker(stopped.put("mode","replay"))==null,"replay never blocked by the live gate");
@@ -336,15 +335,29 @@ public final class AcceptanceRunner extends Instrumentation {
         require(reasoned.size()==1&&reasoned.get(0).contains("mehrdeutig"),"the service's reason per semantic is rendered: "+reasoned);
         String regen="dpf.field_regeneration_request_status";
         require("Regenerationsanforderung (Rohwert)".equals(MainActivity.semanticLabel(regen,new JSONArray())),"the raw DPF request has its exact label, never a confirmed regeneration");
-        JSONObject trigger=new JSONObject().put("missing",new JSONArray().put(regen)).put("unavailable",new JSONArray().put(regen).put("dpf.surface_temperature"))
-            .put("reasons",new JSONObject().put("dpf.surface_temperature","session_excluded"))
-            .put("triggers",new JSONArray().put(new JSONObject().put("semantic",regen).put("state","stale").put("age_ms",42000L)));
-        String gone=MainActivity.smartUnavailableText(trigger,new JSONArray());
-        require(gone.indexOf("Regenerationsanforderung (Rohwert)")==gone.lastIndexOf("Regenerationsanforderung (Rohwert)")&&gone.contains("dpf.surface_temperature")&&gone.contains("erweiterte Sitzung"),"a missing trigger is not repeated and the unavailable set entry has its reason: "+gone);
-        String triggerText=MainActivity.smartTriggerText(trigger,new JSONArray());
-        require(triggerText.contains("Regenerationsanforderung (Rohwert)")&&triggerText.contains("veraltet")&&triggerText.contains("vor 42 s"),"trigger line shows label, state and sample age: "+triggerText);
-        String empty=MainActivity.smartSummaryText(new JSONObject().put("mode","live").put("smart",new JSONObject().put("active",true).put("component","").put("reason","rotation: none available").put("remaining_ms",0).put("changes",new JSONArray())));
-        require(empty.contains("kein Satz verfügbar")&&!empty.contains("Zeitablauf in etwa")&&!empty.contains("0,0 s"),"an empty smart set shows 'none available', not a 0 s countdown: "+empty);
+        // REQ-039.8: the card names goals in progress with their remaining time, waiting and unreachable goals with the reason, skipped signals, never a value
+        JSONObject plan=new JSONObject().put("active",true).put("selected_count",24).put("recording","x-auto.jsonl").put("session_targets",3)
+            .put("goals",new JSONArray()
+                .put(new JSONObject().put("goal","egr").put("phase","serving").put("contiguous_ms",12000L).put("contiguous_missing_ms",18000L).put("warm",JSONObject.NULL))
+                .put(new JSONObject().put("goal","rail").put("phase","interrupted").put("by","dpf.raw_request"))
+                .put(new JSONObject().put("goal","cooling.warm_driving").put("phase","waiting_for_warm").put("warm","not_yet_reached"))
+                .put(new JSONObject().put("goal","turbo").put("phase","condition_unknown").put("reason","stale"))
+                .put(new JSONObject().put("goal","dpf.raw_request").put("phase","not_reachable").put("reason","condition_input_unavailable"))
+                .put(new JSONObject().put("goal","baseline").put("phase","serving")))
+            .put("skipped",new JSONArray().put(new JSONObject().put("signal","engine.maf").put("reason","rejected").put("retry_at_mono",android.os.SystemClock.elapsedRealtime()+90_000L)))
+            .put("changes",new JSONArray());
+        String card=MainActivity.smartSummaryText(new JSONObject().put("mode","live").put("smart",plan).put("signals",new JSONArray()));
+        require(card.startsWith("Aktiv · 24 Messwerte gewählt")&&card.contains("● Planänderungen werden aufgezeichnet"),"REQ-039.8 the card says what runs and that changes are recorded: "+card);
+        require(card.contains("AGR · gleichmäßige Teillast: wird gemessen · noch 18 s bis 30 s zusammenhängend"),"REQ-039.8 the remaining EGR time is shown: "+card);
+        require(card.contains("Rail · warmer Leerlauf: pausiert · Vorrang: "+MainActivity.REGEN_REQUEST_LABEL)&&card.contains("Technische Basisabdeckung: wird gemessen"),"REQ-039.13 a goal that waits for a higher one says so, the baseline is a technical baseline: "+card);
+        require(card.contains("Warm noch nicht erreicht")&&card.contains("keine Aussage über den Zustand"),"REQ-039.11 'warm not yet reached' is no verdict: "+card);
+        require(card.contains("Bedingung unbekannt")&&card.contains("Messwert veraltet")&&card.contains("In dieser Fahrt nicht erreichbar: "+MainActivity.REGEN_REQUEST_LABEL+" (Eingangswert der Bedingung nicht verfügbar)"),"REQ-039.6/.7 an unknown condition and an unreachable goal show their reason: "+card);
+        require(card.contains("Übersprungen: 1 Messwerte")&&card.contains("lehnt ab")&&card.contains("neuer Versuch in")&&card.contains("3 Messwerte brauchen die erweiterte Sitzung"),"REQ-039.7 a skipped signal shows its reason and retry time: "+card);
+        require(!card.contains("Komponente")&&!card.contains("Rotation")&&!card.contains("Auslöser"),"no set switching, no rotation, no windows any more: "+card);
+        String changesText=MainActivity.smartChangesText(new JSONObject().put("changes",new JSONArray()
+            .put(new JSONObject().put("at",1000L).put("kind","interrupted").put("goal","rail").put("by","dpf.raw_request").put("reason","higher_priority"))
+            .put(new JSONObject().put("at",2000L).put("kind","expired").put("goal","turbo").put("reason","stale"))));
+        require(changesText.contains("LETZTE PLANÄNDERUNGEN")&&changesText.contains("unterbrochen")&&changesText.contains("Vorrang eines anderen Ziels")&&changesText.contains("Messwert veraltet"),"REQ-039.8 each change names goal, class and reason: "+changesText);
     }
     private void job(String action) throws Exception {
         waitIdle(); service.runJob(action); waitIdle();

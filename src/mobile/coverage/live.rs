@@ -14,11 +14,15 @@ use std::{collections::BTreeSet, time::Duration};
 use serde_json::{json, Map, Value};
 
 use super::{parse, summarize, text, token, Item, Parsed, REASONS};
+
+mod plan;
 use crate::coverage_ledger::{
     DefinitionVersions, EntryKey, EvidenceRef, Fact, FactBody, GoalContext, IdentityKey,
-    IdentityObservation, Latest, LatestState, Ledger, Rules, RunId, SessionKind, SessionState,
-    SmartRun, BASELINE_LABEL,
+    IdentityObservation, Latest, LatestState, Ledger, RunId, SessionKind, SessionState, SmartRun,
+    BASELINE_LABEL,
 };
+use crate::smart_planner::goal_rules;
+use plan::PlanRun;
 
 /// Version of the exported vehicle ledger.
 const LEDGER_VERSION: u64 = 1;
@@ -45,13 +49,18 @@ pub(in crate::mobile) struct Live {
     run: Option<Active>,
     vehicle: Option<Ledger>,
     invalid: bool,
+    /// The Smart planner of the running run (`smart.plan.*`); gone with the run.
+    planner: Option<PlanRun>,
 }
 
 impl Live {
     /// Executes one `coverage.live.*` or `coverage.ledger.summary` action.
     pub(in crate::mobile) fn act(&mut self, action: &str, argument: &str) -> Result<Value, String> {
         match action {
-            "coverage.live.start" => self.start(&parse_argument(argument)?),
+            "coverage.live.start" => {
+                self.planner = None;
+                self.start(&parse_argument(argument)?)
+            }
             "coverage.live.record" => self.record(&parse_argument(argument)?),
             "coverage.live.snapshot" => Ok(self.snapshot()),
             "coverage.live.export" => Ok(self.vehicle.as_ref().map_or(Value::Null, export)),
@@ -63,6 +72,7 @@ impl Live {
                 if let Some(run) = &mut self.run {
                     run.ended = true;
                 }
+                self.planner = None;
                 Ok(json!({"active":false}))
             }
             "coverage.ledger.summary" => {
@@ -95,11 +105,7 @@ impl Live {
         };
         let available = vehicle.is_some();
         self.run = Some(Active {
-            smart: SmartRun::new(
-                Rules::generic_baseline(),
-                RunId(run.to_owned()),
-                SessionKind::Live,
-            ),
+            smart: SmartRun::new(goal_rules(), RunId(run.to_owned()), SessionKind::Live),
             versions: DefinitionVersions {
                 goal_definition,
                 knowledge_revision: knowledge_revision.to_owned(),
@@ -131,7 +137,7 @@ impl Live {
             }
             let fact = match parsed.parsed {
                 Parsed::Run { .. } => return Ok(false),
-                Parsed::Item(Item::Read(fact)) => fact,
+                Parsed::Item(Item::Fact(fact)) => fact,
                 Parsed::Item(Item::Break {
                     boundary,
                     offset,
@@ -186,7 +192,7 @@ fn parse_argument(argument: &str) -> Result<Value, String> {
 
 /// Per-entry and per-context figures of a ledger under the generic baseline rules.
 fn summary(ledger: &Ledger) -> Value {
-    let (entries, contexts) = summarize(ledger, &Rules::generic_baseline());
+    let (entries, contexts) = summarize(ledger, &goal_rules());
     json!({"contexts":contexts,"entries":entries})
 }
 

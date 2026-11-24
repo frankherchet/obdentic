@@ -138,6 +138,7 @@ impl<E: Exchange> MobileCore<E> {
         let offline_action = action.starts_with("replay.")
             || action.starts_with("assistant.")
             || action.starts_with("coverage.")
+            || action.starts_with("smart.plan.")
             || matches!(action, "vin.describe" | "catalog");
         if result.is_err() && self.uds.is_active() && !offline_action {
             let cleanup = self.disable_uds_outcome();
@@ -182,6 +183,15 @@ impl<E: Exchange> MobileCore<E> {
         if action.starts_with("coverage.live.") || action == "coverage.ledger.summary" {
             // REQ-038.6/.8/.10: the live coverage ledger; pure state, no transport access.
             return self.coverage_live.act(action, argument);
+        }
+        if action == "smart.plan.start" {
+            // REQ-039.1/.3: the planner's catalog is the core's own; the caller can only report
+            // unsupported standard PIDs. Pure state, no transport access.
+            let catalog = self.catalog();
+            return self.coverage_live.plan_start(&catalog, argument);
+        }
+        if action.starts_with("smart.plan.") {
+            return self.coverage_live.plan_act(action, argument);
         }
         if action == "coverage.run" {
             return coverage::run_data(argument);

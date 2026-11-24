@@ -305,7 +305,6 @@ public final class ObdService extends Service {
             JSONArray signals=state.optJSONArray("signals"); for(int i=0;i<signals.length();i++) signals.optJSONObject(i).remove("status");
         }
         synchronized(due) { due.clear(); }
-        fresh.clear();
         synchronized(stateLock) { put(state,"smart",idleSmart()); put(state,"component",new JSONObject()); put(state,"sessionCandidates",new JSONArray()); gapChanges.clear(); put(state,"gap",idleGap()); }
         gap.reset(); gapOpen=false; gapOutcome=""; gapProbes=0; // REQ-037.2: a fresh initialization starts without a gap and without a history of successful signals
     }
@@ -501,7 +500,6 @@ public final class ObdService extends Service {
             }
             Set<String> available=new HashSet<>();
             for(int i=0;i<next.length();i++) available.add(next.optJSONObject(i).optString("semantic"));
-            fresh.keySet().retainAll(available);
             values.keySet().retainAll(available);
             put(state,"values",new JSONArray(values.values()));
         }
@@ -511,7 +509,7 @@ public final class ObdService extends Service {
         for(int i=0;i<candidates.length();i++) identify(candidates.optJSONObject(i));
         set("sessionCandidates",candidates); // REQ-035.2: metadata only, never selectable before the session is active
         JSONObject knowledgeInfo=new JSONObject(); put(knowledgeInfo,"repository",text(data,"knowledge_repository")); put(knowledgeInfo,"revision",text(data,"knowledge_revision"));
-        set("knowledge",knowledgeInfo); catalogVersion++;
+        set("knowledge",knowledgeInfo);
         set("profiles",data.optJSONArray("profiles") == null ? new JSONArray() : data.optJSONArray("profiles"));
         JSONArray selected; synchronized(stateLock) { selected=state.optJSONArray("selected"); }
         selectSignals(selected);
@@ -585,7 +583,7 @@ public final class ObdService extends Service {
         final boolean[] succeeded={false};
         worker.execute(() -> { try {
             if(token!=generation) return;
-            if(smart!=null) smartEnd("Auftrag gestartet: "+action,true); // REQ-036.1
+            if(smartRunning) smartEnd("Auftrag gestartet: "+action,"conflicting_work",true); // REQ-036.1
             String argument=action.startsWith("read:") ? action.substring(5) : "";
             if(knowledge) execute("uds.disable","");
             // REQ-028.4/REQ-030.5: Knowledge jobs write into the running automatic recording; the throughput test sequence keeps its own file
@@ -712,14 +710,13 @@ public final class ObdService extends Service {
             }
             put(row,"history",history);
             values.put(semantic,row); put(state,"values",new JSONArray(values.values()));
-            noteFresh(semantic,row);
         } changed();
     }
     public void startRecording(String profileId) { worker.execute(() -> startRecordingNow(profileId)); }
     private void startRecordingNow(String profileId) {
         if(!phase().equals("ready")) { message("Zum Aufzeichnen zuerst verbinden"); return; }
         if(busy) { message("Zuerst laufenden Auftrag beenden"); return; }
-        if(smart!=null) { message("Smart-Analyse läuft · benannte Aufzeichnung erst nach dem Stopp"); return; } // the analysis owns the selection and the recording; never silently ended
+        if(smartRunning) { message("Smart-Analyse läuft · benannte Aufzeichnung erst nach dem Stopp"); return; } // the analysis owns the selection and the recording; never silently ended
         JSONArray signals=null, periods=null; synchronized(stateLock) { JSONArray profiles=state.optJSONArray("profiles");
             for(int i=0;i<profiles.length();i++) if(profileId.equals(profiles.optJSONObject(i).optString("id"))) { signals=profiles.optJSONObject(i).optJSONArray("signals"); periods=profiles.optJSONObject(i).optJSONArray("intervals_ms"); } }
         if(profileId.equals("live-selection")) synchronized(stateLock) {
@@ -769,7 +766,7 @@ public final class ObdService extends Service {
     private void closeRecording(String reason,String detail) { closeRecording(reason,detail,true); }
     private void closeRecording(String reason,String detail,boolean resumeAuto) {
         if(reason.equals("disconnected") || reason.equals("error")) coverageBoundary("disconnect"); // REQ-038.9: before the stop event and the end marker
-        if(smart!=null) smartEnd("Aufzeichnung beendet: "+reason+(detail.isEmpty()?"":" ("+detail+")"),false); // the stop event precedes session_end
+        if(smartRunning) smartEnd("Aufzeichnung beendet: "+reason+(detail.isEmpty()?"":" ("+detail+")"),reason.equals("disconnected") ? "disconnect" : reason.equals("error") ? "error" : "recording_lost",false); // the stop event precedes session_end
         synchronized(recordLock) { for(int i=0;i<2 && fileGap && writer!=null;i++) recordGap("end","stopped"); } // REQ-037.3: this file ends inside the gap; no recovery is claimed (a rotation inside the write continues it, so once more)
         boolean wasAuto=recordingProfile.equals(AUTO_PROFILE);
         recordingProfile=""; synchronized(due) { due.clear(); intervals.clear(); }
@@ -925,7 +922,8 @@ public final class ObdService extends Service {
                             updateValue(event.optString("argument"),decoded); result=decoded;
                         }
                         else if(action.equals("catalog")) { applyCatalog(result); continue; } // REQ-028.10: automatic files start before the handshake
-                        else if(action.equals("smart.set")) { replaySmart(event); continue; } // REQ-036.5: shown from the file, never sent
+                        else if(action.equals("smart.plan")) { replaySmart(event); continue; } // REQ-039.8: shown from the file, never sent
+                        else if(action.equals("smart.set")) continue; // the set switching of REQ-036 was replaced by the planner: such records are skipped and never sent
                         else if(action.equals("measurement.gap")) { replayGap(event); continue; } // REQ-037.3: shown from the file, never sent
                         else if(action.equals("component.apply")) { JSONObject applied=result.optJSONObject("data"); if(applied!=null) { put(applied,"replay",true); set("component",applied); } continue; }
                         else if(action.equals("initialize")) { JSONObject support=result.optJSONObject("data"); if(support!=null) { restoreVehicle(support); applySupport(support); } continue; }
@@ -1038,31 +1036,24 @@ public final class ObdService extends Service {
         set("vehicle",vehicle);
     }
     public void onDestroy() { AppLog.i("service","destroy"); disconnect(); try { unregisterReceiver(bluetoothReceiver); } catch(IllegalArgumentException ignored) {} worker.execute(this::destroyCore); worker.shutdown(); exporter.shutdown(); listener=null; current=null; super.onDestroy(); }
-    // ---- #291 / #297 (REQ-035, REQ-036): OBDentic component presets and the user-started smart analysis -----------------
-    /** REQ-036.2: a trigger reading older than this is stale; it is shown as such and never read as a value. */
-    static final long SMART_STALE_MS=10_000L;
-    private static final int SMART_CHANGES=20, SMART_MAX_SIGNALS=32;
-    private static final long SMART_AVAILABILITY_GAP_MS=5_000L;
-    private static final class Fresh { final long at, wall; final double value; Fresh(long at,long wall,double value) { this.at=at; this.wall=wall; this.value=value; } }
-    private final Map<String,Fresh> fresh=new ConcurrentHashMap<>(); // signal key -> last good numeric reading (monotonic and wall time)
+    // ---- #291 / #382 (REQ-035, REQ-039): OBDentic component presets and the user-started Smart planner -----------------
+    private static final int SMART_CHANGES=20;
+    /** REQ-039.5: a planning step ends when every signal of its selection was attempted, at the latest after this long. */
+    private static final long SMART_STEP_MAX_MS=10_000L;
     private volatile boolean smartOn;
-    private volatile int catalogVersion;
-    private volatile JSONObject smartLast; // the set data of the latest tick; immutable once published (read by the writer thread on file rotation)
-    private volatile long smartLatencyMs=-1;
-    private SmartAnalysis smart; // worker thread only, like the fields below
+    private volatile JSONObject smartLast; // goals and selection of the latest step; immutable once published (read by the writer thread on file rotation)
+    private boolean smartRunning; // worker thread only, like the fields below
     private JSONArray smartSaved;
-    private String smartComponent, smartSelection="", smartMissing="";
-    private boolean smartLastTriggered;
-    private long smartStartedWall, smartLastAvailability;
-    private int smartCatalogSeen=-1;
-    private Map<String,String> smartTrig=new LinkedHashMap<>();
-    private final Map<String,JSONObject> smartSets=new LinkedHashMap<>();
+    private volatile JSONObject smartVersions; // the definition versions the run started with (REQ-039.10); null while no planner runs; read by the writer thread on rotation
+    private String smartSelection="";
+    private long smartStartedWall, smartLastStep;
+    private final Set<String> smartAwaiting=new HashSet<>(); // keys of the selection not yet attempted since the last step
+    private final Map<String,JSONObject> smartSkipped=new LinkedHashMap<>(); // signal key -> its latest skip with reason
     private final ArrayList<JSONObject> smartChanges=new ArrayList<>();
 
     private static String text(JSONObject object,String key) { return object==null || object.isNull(key) ? "" : object.optString(key); }
     private static JSONObject idleSmart() {
-        JSONObject idle=new JSONObject(); put(idle,"active",false); put(idle,"component",""); put(idle,"reason",""); put(idle,"remaining_ms",-1L);
-        put(idle,"changes",new JSONArray()); put(idle,"unavailable",new JSONArray()); put(idle,"missing",new JSONArray()); put(idle,"trigger_ages",new JSONObject()); put(idle,"triggers",new JSONArray());
+        JSONObject idle=new JSONObject(); put(idle,"active",false); put(idle,"reason",""); put(idle,"changes",new JSONArray()); put(idle,"goals",new JSONArray()); put(idle,"skipped",new JSONArray());
         return idle;
     }
     private JSONArray copyOf(String stateKey) {
@@ -1078,11 +1069,6 @@ public final class ObdService extends Service {
         JSONArray list=ComponentPresets.list();
         for(int i=0;i<list.length();i++) if(list.optJSONObject(i).optString("id").equals(id)) return list.optJSONObject(i).optString("label");
         return null;
-    }
-    private static List<String> componentIds() {
-        JSONArray list=ComponentPresets.list(); List<String> ids=new ArrayList<>();
-        for(int i=0;i<list.length();i++) ids.add(list.optJSONObject(i).optString("id"));
-        return ids;
     }
     /** REQ-031.1: the measured availability entry of a Knowledge signal (this session first, else the selected vehicle record), or null. */
     private JSONObject availabilityEntry(String key) {
@@ -1217,11 +1203,6 @@ public final class ObdService extends Service {
         synchronized(stateLock) { JSONObject component=state.optJSONObject("component"); if(component==null || component.length()==0) return; put(state,"component",new JSONObject()); }
         changed();
     }
-    private void noteFresh(String key,JSONObject row) {
-        if(mode.equals("replay")) return;
-        double number=row.has("value") && !row.has("error") && !"unavailable".equals(row.optString("status")) ? row.optDouble("value",Double.NaN) : Double.NaN;
-        if(Double.isFinite(number)) fresh.put(key,new Fresh(SystemClock.elapsedRealtime(),row.optLong("updatedAt"),number)); else fresh.remove(key); // an error or silence never leaves an old value behind
-    }
     /** REQ-036.1: German reason why the smart analysis cannot start now, or null. A running analysis is never blocked by itself. */
     public static String smartBlocker(JSONObject state) {
         String mode=state.optString("mode","live"), phase=state.optString("phase","idle");
@@ -1235,172 +1216,172 @@ public final class ObdService extends Service {
         return null;
     }
     public void startSmart() { if(!worker.isShutdown()) worker.execute(this::startSmartNow); }
-    public void stopSmart() { if(!worker.isShutdown()) worker.execute(() -> { if(smart==null) message("Smart-Analyse läuft nicht"); else smartEnd("vom Nutzer gestoppt",true); }); }
+    public void stopSmart() { if(!worker.isShutdown()) worker.execute(() -> { if(!smartRunning) message("Smart-Analyse läuft nicht"); else smartEnd("vom Nutzer gestoppt","user",true); }); }
 
     private void startSmartNow() {
-        if(smart!=null) { message("Smart-Analyse läuft bereits"); return; }
+        if(smartRunning) { message("Smart-Analyse läuft bereits"); return; }
         String blocked=smartBlocker(snapshot()); if(blocked!=null) { message("Smart-Analyse nicht gestartet: "+blocked); return; }
-        smartRefreshSets();
-        boolean any=!smartTrig.isEmpty(); for(JSONObject set:smartSets.values()) if(set.optJSONArray("selected").length()>0) any=true;
-        if(!any) { message("Smart-Analyse nicht gestartet: weder Trigger- noch Komponenten-Messwerte verfügbar"); return; }
+        if(copyOf("signals").length()==0) { message("Smart-Analyse nicht gestartet: keine Messwerte im Katalog"); return; }
         boolean open; String profile; synchronized(recordLock) { open=writer!=null; profile=recordingProfile; }
         if(open && !profile.equals(AUTO_PROFILE)) { message("Smart-Analyse nicht gestartet: benannte Aufzeichnung läuft"); return; }
         JSONArray userSelection=copyOf("selected");
         // REQ-036.1: the analysis only runs inside a running automatic recording; with the switch off it starts (and later ends) its own
         if(!open && !beginRecording(AUTO_PROFILE,userSelection)) { message("Smart-Analyse nicht gestartet: Aufzeichnung konnte nicht begonnen werden"); return; }
-        smart=new SmartAnalysis(SystemClock.elapsedRealtime()); smartSaved=userSelection; smartComponent=null; smartSelection=""; smartMissing=""; smartLastTriggered=false;
-        smartStartedWall=System.currentTimeMillis(); smartLastAvailability=0; smartLatencyMs=-1; smartChanges.clear(); smartLast=null; smartCatalogSeen=-1; smartOn=true;
+        smartRunning=true; smartSaved=userSelection; smartSelection=""; smartVersions=null; smartLastStep=0; smartStartedWall=System.currentTimeMillis();
+        smartChanges.clear(); smartSkipped.clear(); smartAwaiting.clear(); smartLast=null; smartOn=true;
         coverageStart(); // REQ-038.9: the facts of this run go into the recording from here
-        clearComponent(); // the analysis chooses the selection from now on
+        clearComponent(); // the planner chooses the selection from now on
         AppLog.i("smart","start"+(open ? "" : " in own recording"));
+        JSONObject argument=new JSONObject(); put(argument,"unsupported",smartUnsupported());
+        smartVersions=coverageCore("smart.plan.start",argument); // REQ-039.3: the core builds the catalog itself; the app only reports unsupported PIDs
+        if(smartVersions==null) { smartEnd("Planer nicht gestartet: kein Abdeckungslauf","error",true); message("Smart-Analyse nicht gestartet: Aufzeichnung oder Abdeckungslauf nicht verfügbar"); return; }
         smartStep();
-        if(smart!=null) message("Smart-Analyse gestartet · Standard-Sitzung, nur Lesen"+(open ? "" : " · eigene Aufzeichnung (Dauer-Aufzeichnung ist aus)"));
+        if(smartRunning) message("Smart-Analyse gestartet · Standard-Sitzung, nur Lesen"+(open ? "" : " · eigene Aufzeichnung (Dauer-Aufzeichnung ist aus)"));
     }
-    /** The effective trigger key per semantic (standard PID wins, a single Knowledge signal otherwise); absent = unavailable. Meaning-based, session-only signals never count. */
-    private Map<String,String> smartTriggerKeys(JSONArray catalog) {
-        Map<String,String> keys=new LinkedHashMap<>();
-        for(String semantic:SmartAnalysis.triggerSemantics()) {
-            String standard=null, knowledge=null; int knowledgeCount=0;
-            for(int i=0;i<catalog.length();i++) { JSONObject signal=catalog.optJSONObject(i);
-                if(!semantic.equals(signal.optString("meaning",signal.optString("semantic"))) || "unsupported".equals(signal.optString("status")) || signal.optBoolean("extended_session_required")) continue;
-                String key=signal.optString("semantic");
-                if(!signal.has("key") && !signal.has("definition_id")) { if(standard==null) standard=key; }
-                else if(measuredUnavailable(catalog,key,new String[]{""}).isEmpty()) { knowledge=key; knowledgeCount++; }
-            }
-            String key=standard!=null ? standard : knowledgeCount==1 ? knowledge : null;
-            if(key!=null) keys.put(semantic,key);
-        }
-        return keys;
+    /** The standard PIDs the vehicle does not report as supported: the only catalog fact the planner takes from the app. */
+    private JSONArray smartUnsupported() {
+        JSONArray unsupported=new JSONArray(), catalog=copyOf("signals");
+        for(int i=0;i<catalog.length();i++) { JSONObject signal=catalog.optJSONObject(i); if(signal!=null && "unsupported".equals(signal.optString("status"))) unsupported.put(signal.optString("semantic")); }
+        return unsupported;
     }
-    private void smartRefreshSets() {
-        int version=catalogVersion; smartTrig=smartTriggerKeys(copyOf("signals")); smartSets.clear(); Set<String> available=new HashSet<>();
-        List<String> triggerNames=Arrays.asList(SmartAnalysis.triggerSemantics());
-        for(String id:componentIds()) { JSONObject set=resolveComponent(id,false); smartSets.put(id,set); JSONArray entries=set.optJSONArray("entries");
-            for(int i=0;i<entries.length();i++) { JSONObject entry=entries.optJSONObject(i); if("selected".equals(entry.optString("status")) && !triggerNames.contains(entry.optString("semantic"))) { available.add(id); break; } } } // a set of triggers alone is no component set
-        if(smart!=null) smart.setAvailable(available);
-        smartCatalogSeen=version;
-    }
-    private JSONArray smartSelectionFor(String id) {
-        LinkedHashSet<String> keys=new LinkedHashSet<>(smartTrig.values()); JSONObject set=smartSets.get(id);
-        if(set!=null) { JSONArray selected=set.optJSONArray("selected"); for(int i=0;i<selected.length();i++) keys.add(selected.optString(i)); }
-        JSONArray out=new JSONArray(); for(String key:keys) if(out.length()<SMART_MAX_SIGNALS) out.put(key);
-        return out;
-    }
-    private String smartStopReason() {
-        if(!mode.equals("live") || !phase().equals("ready")) return "Verbindung nicht mehr bereit";
-        if(udsActive()) return "Erweiterte Sitzung aktiv";
+    /** The run clock of the coverage facts, in microseconds: the one time base of readings and plan steps. */
+    private long smartNowUs() { synchronized(recordLock) { return coverageOffset(); } }
+    /** {reason shown, token recorded} why the running analysis must end now, or null. REQ-039.1: user stop, disconnect, loss of the recording, error and conflicting work end it. */
+    private String[] smartStop() {
+        if(!mode.equals("live") || !phase().equals("ready")) return new String[]{"Verbindung nicht mehr bereit","disconnect"};
+        if(udsActive()) return new String[]{"Erweiterte Sitzung aktiv","conflicting_work"};
         boolean open; String profile; synchronized(recordLock) { open=writer!=null; profile=recordingProfile; }
-        if(!open) return "Aufzeichnung verloren";
-        if(!profile.equals(AUTO_PROFILE)) return "Benannte Aufnahme läuft";
+        if(!open) return new String[]{"Aufzeichnung verloren","recording_lost"};
+        if(!profile.equals(AUTO_PROFILE)) return new String[]{"Benannte Aufnahme läuft","conflicting_work"};
         return null;
     }
     private void smartTick() {
-        if(smart==null) return;
-        try { smartStep(); } catch(RuntimeException e) { AppLog.e("smart","step failed",e); smartEnd("Interner Fehler",true); }
+        if(!smartRunning) return;
+        try { smartStep(); } catch(RuntimeException e) { AppLog.e("smart","step failed",e); smartEnd("Interner Fehler","error",true); }
     }
-    /** The change class of REQ-036.5, from the order of the previous and the new set and the analysis' own reason; also remembers whether a trigger window is shown. */
-    private String smartKind(String id,String reason) {
-        boolean trigger=!id.isEmpty() && !reason.startsWith("rotation:") && !reason.startsWith("unavailable:"), wasTrigger=smartLastTriggered; smartLastTriggered=trigger;
-        if(smartComponent==null) return "start";
-        if(id.isEmpty() || reason.startsWith("unavailable:")) return "unavailability";
-        if(!trigger) return wasTrigger ? "expiry" : "rotation";
-        if(!wasTrigger) return "trigger";
-        List<String> order=componentIds();
-        return order.indexOf(id)<order.indexOf(smartComponent) ? "interruption" : "resumption";
-    }
-    /** One evaluation: fresh readings only (never zero, never stale), the set the analysis picks, selection and recording of changes. Worker thread. */
+    /**
+     * One planning step (REQ-039.5): asks the core for the next selection once every signal of the previous one was attempted (at most
+     * {@link #SMART_STEP_MAX_MS} later, so a gap or a silent adapter cannot stall it), applies it and records the plan changes. Worker thread.
+     */
     private void smartStep() {
-        String stop=smartStopReason(); if(stop!=null) { smartEnd(stop,true); return; }
-        long now=SystemClock.elapsedRealtime();
-        if(smartCatalogSeen!=catalogVersion) smartRefreshSets();
-        Map<String,Double> readings=new HashMap<>(); JSONObject byName=new JSONObject(), ages=new JSONObject(); JSONArray rows=new JSONArray(), missing=new JSONArray();
-        long newest=Long.MIN_VALUE, newestWall=0;
-        for(String semantic:SmartAnalysis.triggerSemantics()) {
-            String key=smartTrig.get(semantic); Fresh reading=key==null ? null : fresh.get(key);
-            String status=key==null ? "unavailable" : reading==null ? "missing" : now-reading.at>SMART_STALE_MS ? "stale" : "fresh";
-            JSONObject row=new JSONObject(); put(row,"semantic",semantic); put(row,"state",status);
-            if(reading!=null) { put(row,"age_ms",now-reading.at); put(row,"reading_at",reading.wall); }
-            if(status.equals("fresh")) { readings.put(semantic,reading.value); put(row,"value",reading.value); if(reading.at>newest) { newest=reading.at; newestWall=reading.wall; } }
-            else missing.put(semantic);
-            put(ages,semantic,reading==null ? -1L : now-reading.at); rows.put(row);
-            JSONObject named=copyOf(row); named.remove("semantic"); put(byName,semantic,named);
-        }
-        String id=smart.update(now,readings), reason=smart.reason(); long remaining=smart.remainingMs(now);
-        JSONArray selection=smartSelectionFor(id); String selectionKey=selection.toString();
-        boolean first=smartComponent==null, idChanged=first || !id.equals(smartComponent), selectionChanged=!selectionKey.equals(smartSelection);
-        if(selectionChanged) { selectSignals(selection); smartSelection=selectionKey; }
-        String missingKey=missing.toString(), kind=null;
-        if(idChanged) kind=smartKind(id,reason);
-        else if(selectionChanged || (!missingKey.equals(smartMissing) && now-smartLastAvailability>=SMART_AVAILABILITY_GAP_MS)) kind="availability";
-        LinkedHashSet<String> unavailable=new LinkedHashSet<>(); JSONObject set=smartSets.get(id), why=new JSONObject();
-        if(set!=null) { JSONArray names=set.optJSONArray("unavailable"); for(int i=0;i<names.length();i++) unavailable.add(names.optString(i)); why=set.optJSONObject("reasons"); }
-        JSONObject data=new JSONObject(); put(data,"set",id); put(data,"reason",reason); put(data,"remaining_ms",remaining); put(data,"readings",byName); put(data,"reading_at",newestWall);
-        put(data,"unavailable",new JSONArray(unavailable)); put(data,"reasons",why); put(data,"selected",selection); put(data,"missing",missing);
-        if(kind!=null) {
-            String previous=first ? "" : smartComponent; put(data,"kind",kind); put(data,"change",kind.equals("start") ? "start" : kind.endsWith("availability") ? "availability" : "change"); put(data,"previous_set",previous); // change: start|change|availability; kind names trigger, interruption, resumption, expiry, rotation, unavailability
-            if(idChanged && newest!=Long.MIN_VALUE) smartLatencyMs=now-newest; // reported, not promised: depends on the adapter
-            if(kind.endsWith("availability")) smartLastAvailability=now;
-            smartMissing=missingKey; smartComponent=id;
-            JSONObject current=copyOf(data); current.remove("change"); current.remove("kind"); current.remove("previous_set"); smartLast=current; // before record(): a rotation inside it continues with this very set
-            recordSmart(data);
-            AppLog.i("smart",kind+" -> "+(id.isEmpty() ? "none" : id)); // the set only; trigger readings stay out of the log
-        }
-        JSONObject shown=copyOf(data); shown.remove("change"); shown.remove("kind"); shown.remove("previous_set"); smartLast=shown;
-        JSONObject view=new JSONObject(); put(view,"active",true); put(view,"component",id); put(view,"label",id.isEmpty() ? "" : componentLabel(id)); put(view,"reason",reason); put(view,"remaining_ms",remaining);
-        put(view,"since",smartStartedWall); put(view,"selected_count",selection.length()); put(view,"latency_ms",smartLatencyMs); put(view,"unavailable",new JSONArray(unavailable));
-        put(view,"missing",missing); put(view,"reasons",why); put(view,"trigger_ages",ages); put(view,"triggers",rows); put(view,"changes",new JSONArray(smartChanges));
+        String[] stop=smartStop(); if(stop!=null) { smartEnd(stop[0],stop[1],true); return; }
+        long mono=SystemClock.elapsedRealtime();
+        if(smartLastStep!=0 && !smartAwaiting.isEmpty() && mono-smartLastStep<SMART_STEP_MAX_MS) return;
+        JSONObject argument=new JSONObject(); put(argument,"now_us",smartNowUs());
+        JSONObject plan=coverageCore("smart.plan.step",argument);
+        if(plan==null) { smartEnd("Planer nicht verfügbar","error",true); return; }
+        smartLastStep=mono;
+        JSONArray chosen=new JSONArray(), selection=plan.optJSONArray("selection");
+        for(int i=0;selection!=null && i<selection.length();i++) chosen.put(selection.optJSONObject(i).optString("key"));
+        String selectionKey=chosen.toString(); boolean changedSelection=!selectionKey.equals(smartSelection);
+        if(changedSelection) { selectSignals(chosen); smartSelection=selectionKey; }
+        smartAwaiting.clear(); JSONArray applied=copyOf("selected"); for(int i=0;i<applied.length();i++) smartAwaiting.add(applied.optString(i));
+        JSONArray goals=plan.optJSONArray("goals"); if(goals==null) goals=new JSONArray();
+        JSONObject last=new JSONObject(); put(last,"goals",goals); put(last,"selected",applied); smartLast=last; // before the records: a rotation inside them continues with this very plan
+        if(changedSelection) recordSmart(smartData("selection",applied)); // the plan's selection: replay shows the tiles of what was read
+        JSONArray events=plan.optJSONArray("events");
+        for(int i=0;events!=null && i<events.length();i++) smartEvent(events.optJSONObject(i));
+        JSONObject view=new JSONObject(); put(view,"active",true); put(view,"since",smartStartedWall); put(view,"selected_count",applied.length());
+        put(view,"goals",goals); put(view,"session_targets",plan.optInt("session_targets")); put(view,"skipped",new JSONArray(smartSkipped.values()));
+        put(view,"changes",new JSONArray(smartChanges)); put(view,"reason","");
         synchronized(stateLock) { put(view,"recording",activeRecording()); put(state,"smart",view); }
     }
-    /** REQ-036.5: one set change into the running recording (action envelope, replay shows it without traffic) and into the visible history. */
-    private void recordSmart(JSONObject data) {
-        if(!rotateAfterSmart.isEmpty() && rotateAfterSmart.equals(text(data,"change"))) { rotateAfterSmart=""; synchronized(recordLock) { recordingStartedAt=SystemClock.elapsedRealtime()-rotateMs-1; } }
+    /** The data of a plan record that is no goal event: kind, the definition versions in force and, for a selection, the keys. */
+    private JSONObject smartData(String kind,JSONArray selected) {
+        JSONObject data=new JSONObject(); put(data,"kind",kind); put(data,"goal",JSONObject.NULL); put(data,"reason",JSONObject.NULL); put(data,"inputs",new JSONArray());
+        JSONObject versions=smartVersions; if(versions!=null) { put(data,"goal_definition",versions.optInt("goal_definition")); put(data,"knowledge_revision",versions.optString("knowledge_revision")); }
+        if(selected!=null) put(data,"selected",selected);
+        return data;
+    }
+    /** One plan event of the core: a context end is a coverage fact, everything else a recorded and shown plan change (REQ-039.8). */
+    private void smartEvent(JSONObject event) {
+        String kind=event.optString("kind");
+        if(kind.equals("context_ended")) { smartContextEnd(event); return; }
+        recordSmart(event);
         JSONObject change=new JSONObject(); put(change,"at",System.currentTimeMillis()); put(change,"mono_ms",SystemClock.elapsedRealtime());
-        for(String name:new String[]{"change","kind","set","previous_set","reason"}) put(change,name,text(data,name)); put(change,"remaining_ms",data.optLong("remaining_ms",-1));
-        smartChanges.add(change); while(smartChanges.size()>SMART_CHANGES) smartChanges.remove(0);
-        JSONObject envelope=new JSONObject(), result=new JSONObject(); put(envelope,"type","action"); put(envelope,"action","smart.set"); put(envelope,"argument","");
+        for(String name:new String[]{"kind","goal","by","reason","signal"}) put(change,name,text(event,name));
+        if(event.has("retry_in_ms") && !event.isNull("retry_in_ms")) put(change,"retry_at_mono",SystemClock.elapsedRealtime()+event.optLong("retry_in_ms"));
+        if(kind.equals("skipped")) smartSkipped.put(text(event,"signal"),change);
+        else { smartChanges.add(change); while(smartChanges.size()>SMART_CHANGES) smartChanges.remove(0); }
+        AppLog.i("smart",kind+" "+(event.isNull("goal") ? "-" : event.optString("goal"))+" "+text(event,"reason")); // goals and reasons only; no signal, no reading
+    }
+    /** REQ-039.12: a goal context whose contiguous interval ended; the ledger ends its segments at the run clock (the readings after it were never counted toward it). */
+    private void smartContextEnd(JSONObject event) {
+        synchronized(recordLock) {
+            if(coverageRun==null || writer==null) return;
+            JSONObject data=new JSONObject(); put(data,"run",coverageRun); put(data,"context",event.optString("goal")); put(data,"goal_definition",event.optInt("goal_definition"));
+            put(data,"knowledge_revision",event.optString("knowledge_revision")); put(data,"run_offset_us",coverageOffset());
+            coverageWrite("coverage.context_end",data);
+        }
+    }
+    /** REQ-039.8: one plan change into the running recording (the action envelope; replay shows it without traffic). */
+    private void recordSmart(JSONObject data) {
+        String seam=text(data,"kind"); if(seam.equals("stopped") && !data.isNull("goal")) seam=""; // test seam: "stopped" is the run's own stop record, not a goal's end
+        if(!rotateAfterSmart.isEmpty() && rotateAfterSmart.equals(seam)) { rotateAfterSmart=""; synchronized(recordLock) { recordingStartedAt=SystemClock.elapsedRealtime()-rotateMs-1; } }
+        JSONObject envelope=new JSONObject(), result=new JSONObject(); put(envelope,"type","action"); put(envelope,"action","smart.plan"); put(envelope,"argument","");
         put(result,"ok",true); put(result,"data",copyOf(data)); put(envelope,"result",result); record(envelope);
     }
-    /** Writer thread or worker: the new file of a rotation starts with the set it continues. */
+    /** Writer thread or worker: the new file of a rotation starts with the goals and the selection it continues. */
     private void smartResume() {
         JSONObject last=smartLast; if(last==null) return;
-        JSONObject data=copyOf(last); put(data,"change","resume"); put(data,"kind","resume"); put(data,"previous_set",last.optString("set"));
-        JSONObject envelope=new JSONObject(), result=new JSONObject(); put(envelope,"type","action"); put(envelope,"action","smart.set"); put(envelope,"argument","");
+        JSONObject data=smartData("resume",last.optJSONArray("selected")); put(data,"goals",last.optJSONArray("goals"));
+        JSONObject envelope=new JSONObject(), result=new JSONObject(); put(envelope,"type","action"); put(envelope,"action","smart.plan"); put(envelope,"argument","");
         put(result,"ok",true); put(result,"data",data); put(envelope,"result",result); record(envelope);
     }
-    /** Ends the analysis (user, error, disconnect, recording loss, job, extended session): stop event first, user selection restored, own recording closed. */
-    private void smartEnd(String reason,boolean closeOwned) {
-        if(smart==null) return;
-        JSONObject last=smartLast==null ? new JSONObject() : copyOf(smartLast), data=copyOf(last);
-        put(data,"change","stop"); put(data,"kind","stop"); put(data,"previous_set",smartComponent==null ? "" : smartComponent); put(data,"set",""); put(data,"reason",reason); put(data,"remaining_ms",-1L);
-        JSONArray saved=smartSaved==null ? new JSONArray() : smartSaved; put(data,"selected",saved);
-        smartOn=false; // before the stop event: a rotation inside record() must not resume this analysis in the new file
-        selectSignals(saved); // the user's own selection, restored before the stop event: a rotation inside that write must start its header with it; nothing the analysis chose was ever stored
-        recordSmart(data);
+    /** The counting side of a read: the planner takes the reading and says which goal contexts it counts toward (REQ-039.2). null: no planner, the fact counts as the baseline. */
+    private JSONArray smartObserve(String key,JSONObject fact,JSONObject result) {
+        if(!smartRunning || smartVersions==null) return null;
+        JSONObject data=result.optJSONObject("data"), argument=new JSONObject(); put(argument,"fact",fact);
+        Object value=result.optBoolean("ok") && data!=null && !data.isNull("value") ? data.opt("value") : null;
+        if(value instanceof Number) put(argument,"value",((Number)value).doubleValue());
+        smartAwaiting.remove(key);
+        JSONObject observed=coverageCore("smart.plan.observe",argument);
+        return observed==null ? null : observed.optJSONArray("contexts");
+    }
+    /**
+     * Ends the analysis (user, error, disconnect, recording loss, job, extended session): the goals in progress end with the reason, the
+     * user's selection is restored, an own recording is closed. The stop events precede the run's last record.
+     */
+    private void smartEnd(String reason,String token,boolean closeOwned) {
+        if(!smartRunning) return;
+        smartOn=false; // before the stop events: a rotation inside record() must not resume this analysis in the new file
+        JSONArray saved=smartSaved==null ? new JSONArray() : smartSaved;
+        selectSignals(saved); // the user's own selection, restored before the stop events: a rotation inside those writes must start its header with it; nothing the planner chose was ever stored
+        JSONObject argument=new JSONObject(); put(argument,"now_us",smartNowUs()); put(argument,"reason",token);
+        JSONObject stopped=coverageCore("smart.plan.stop",argument); JSONArray events=stopped==null ? null : stopped.optJSONArray("events");
+        for(int i=0;events!=null && i<events.length();i++) smartEvent(events.optJSONObject(i));
+        JSONObject end=smartData("stopped",saved); put(end,"reason",token); recordSmart(end);
         coverageEnd(); // REQ-038.9: the run's last record; a rotation inside the stop event above already continued the run in the new file
         coverageLedgerFinish(); // #340: that record counts, then the vehicle ledger is stored
-        smart=null; smartComponent=null; smartSaved=null; smartLast=null;
-        JSONObject idle=idleSmart(); put(idle,"reason",reason); put(idle,"changes",new JSONArray(smartChanges)); put(idle,"latency_ms",smartLatencyMs);
+        smartRunning=false; smartSaved=null; smartLast=null; smartVersions=null; smartAwaiting.clear();
+        JSONObject idle=idleSmart(); put(idle,"reason",reason); put(idle,"changes",new JSONArray(smartChanges));
         synchronized(stateLock) { put(state,"smart",idle); }
-        AppLog.i("smart","end: "+reason);
+        AppLog.i("smart","end: "+token);
         message("Smart-Analyse beendet · "+reason+coverageSaveNotice());
         if(closeOwned && !autoRecordEnabled(this) && recordingProfile.equals(AUTO_PROFILE)) closeRecording("stopped","",false);
     }
-    /** REQ-036.5: shows a recorded set change from the file; the selection follows the recorded set. Nothing is sent. */
+    /** REQ-039.8: shows a recorded plan change from the file, never sent. Goals are rebuilt from the changes; a resume record restates them; the selection follows the recorded plan. */
     private void replaySmart(JSONObject event) {
         JSONObject result=event.optJSONObject("result"), data=result==null ? null : result.optJSONObject("data"); if(data==null) return;
+        String kind=data.optString("kind"), goal=text(data,"goal");
         synchronized(stateLock) {
             JSONObject current=state.optJSONObject("smart");
-            if(current==null || !current.optBoolean("replay")) { current=idleSmart(); put(current,"replay",true); put(state,"smart",current); put(state,"component",new JSONObject()); } // the first recorded set replaces the selection the header's preset described
-            JSONObject change=new JSONObject(); put(change,"at",event.optLong("at")); put(change,"mono_ms",event.optLong("offset_us")/1000);
-            for(String name:new String[]{"change","kind","set","previous_set","reason"}) put(change,name,text(data,name)); put(change,"remaining_ms",data.optLong("remaining_ms",-1));
-            JSONArray changes=current.optJSONArray("changes"); changes.put(change); while(changes.length()>SMART_CHANGES) changes.remove(0);
-            String set=text(data,"set"); put(current,"component",set); put(current,"label",set.isEmpty() ? "" : componentLabel(set)==null ? "" : componentLabel(set));
-            put(current,"reason",text(data,"reason")); put(current,"remaining_ms",data.optLong("remaining_ms",-1));
-            put(current,"unavailable",data.optJSONArray("unavailable")==null ? new JSONArray() : data.optJSONArray("unavailable")); put(current,"missing",data.optJSONArray("missing")==null ? new JSONArray() : data.optJSONArray("missing"));
-            JSONObject readings=data.optJSONObject("readings"), ages=new JSONObject(); JSONArray rows=new JSONArray();
-            if(readings!=null) { Iterator<String> names=readings.keys(); while(names.hasNext()) { String name=names.next(); JSONObject reading=readings.optJSONObject(name); if(reading==null) continue;
-                put(ages,name,reading.optLong("age_ms",-1)); JSONObject row=copyOf(reading); put(row,"semantic",name); rows.put(row); } }
-            put(current,"trigger_ages",ages); put(current,"triggers",rows);
+            if(current==null || !current.optBoolean("replay")) { current=idleSmart(); put(current,"replay",true); put(state,"smart",current); put(state,"component",new JSONObject()); } // the first recorded plan replaces the selection the header's preset described
+            if(!kind.equals("selection")) {
+                JSONArray goals=current.optJSONArray("goals"), next=new JSONArray();
+                if(kind.equals("resume")) { JSONArray stated=data.optJSONArray("goals"); for(int i=0;stated!=null && i<stated.length();i++) next.put(stated.optJSONObject(i)); }
+                else {
+                    for(int i=0;goals!=null && i<goals.length();i++) { JSONObject row=goals.optJSONObject(i); if(goal.equals(row.optString("goal")) || kind.equals("stopped") && goal.isEmpty()) continue; next.put(row); }
+                    String phase=kind.equals("started") || kind.equals("resumed") ? "serving" : kind.equals("interrupted") ? "interrupted" : kind.equals("completed") ? "complete" : "";
+                    if(!phase.isEmpty()) { JSONObject row=new JSONObject(); put(row,"goal",goal); put(row,"phase",phase); put(row,"by",text(data,"by")); put(row,"reason",JSONObject.NULL); put(row,"warm",JSONObject.NULL); next.put(row); }
+                }
+                put(current,"goals",next);
+                JSONObject change=new JSONObject(); put(change,"at",event.optLong("at")); put(change,"mono_ms",event.optLong("offset_us")/1000);
+                for(String name:new String[]{"kind","goal","by","reason","signal"}) put(change,name,text(data,name));
+                if(kind.equals("skipped")) { JSONArray skipped=current.optJSONArray("skipped"); if(skipped==null) { skipped=new JSONArray(); put(current,"skipped",skipped); } skipped.put(change); }
+                else if(!kind.equals("resume")) { JSONArray changes=current.optJSONArray("changes"); changes.put(change); while(changes.length()>SMART_CHANGES) changes.remove(0); }
+                if(kind.equals("stopped") && goal.isEmpty()) put(current,"reason",text(data,"reason"));
+            }
         }
         JSONArray selected=data.optJSONArray("selected"); if(selected!=null) selectSignals(selected);
         changed();
@@ -1469,17 +1450,19 @@ public final class ObdService extends Service {
         JSONObject argument=new JSONObject(); put(argument,"run",run); put(argument,"key",key); put(argument,"run_offset_us",origin); put(argument,"session",session);
         put(argument,"identity_confirmed",confirmed); put(argument,"evidence",evidence); put(argument,"read",outcome);
         JSONObject fact=coverageCore("coverage.fact",argument);
+        if(fact==null) { // fail closed: an unclassified read still ends the segments of its signal
+            AppLog.w("coverage","classification failed");
+            fact=new JSONObject(); put(fact,"run",run); put(fact,"signal_key",key); put(fact,"context","baseline"); put(fact,"ecu_target",JSONObject.NULL); put(fact,"session",session);
+            put(fact,"outcome","error"); put(fact,"reason","classification_failed"); put(fact,"implausible",false); put(fact,"static_identity",false); put(fact,"identity_confirmed",confirmed);
+            put(fact,"goal_definition",1); put(fact,"knowledge_revision",coverageRevision); put(fact,"evidence",evidence); put(fact,"run_offset_us",origin);
+        }
+        JSONArray contexts=smartObserve(key,fact,result); // REQ-039.2: the read counts toward every goal context whose condition holds, and always toward the baseline
         synchronized(recordLock) {
             if(!run.equals(coverageRun) || writer==null) return;
-            if(fact==null) { // fail closed: an unclassified read still ends the segments of its signal
-                AppLog.w("coverage","classification failed");
-                fact=new JSONObject(); put(fact,"run",run); put(fact,"signal_key",key); put(fact,"context","baseline"); put(fact,"ecu_target",JSONObject.NULL); put(fact,"session",session);
-                put(fact,"outcome","error"); put(fact,"reason","classification_failed"); put(fact,"implausible",false); put(fact,"static_identity",false); put(fact,"identity_confirmed",confirmed);
-                put(fact,"goal_definition",1); put(fact,"knowledge_revision",coverageRevision); put(fact,"evidence",evidence);
-            }
             JSONObject reference=fact.optJSONObject("evidence"); if(reference!=null && fileSerial!=serialBefore) put(reference,"in_previous_file",true); // a rotation fell between the raw read and this fact (decided now, in the file that receives it)
-            put(fact,"run_offset_us",coverageOffset());
-            coverageWrite("coverage.fact",fact);
+            int count=contexts==null ? 0 : contexts.length();
+            if(count==0) { put(fact,"run_offset_us",coverageOffset()); coverageWrite("coverage.fact",fact); }
+            else for(int i=0;i<count;i++) { JSONObject one=copyOf(fact); put(one,"context",contexts.optString(i)); put(one,"run_offset_us",coverageOffset()); coverageWrite("coverage.fact",one); }
         }
         coverageLedgerPump();
     }

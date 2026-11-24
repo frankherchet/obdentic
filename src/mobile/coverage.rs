@@ -1,8 +1,10 @@
 //! Coverage facts in the recording and the offline re-derivation of the run ledger (REQ-038.9).
 //!
-//! A Smart run writes three action records into the analysis recording: `coverage.run` (`start`,
-//! `resume`), `coverage.fact` (one read attempt, never a value) and `coverage.boundary` (`gap`,
-//! `disconnect`, `reconnect`, `run_end`). A long run is a chain of parts, one per rotated file.
+//! A Smart run writes four action records into the analysis recording: `coverage.run` (`start`,
+//! `resume`), `coverage.fact` (one read attempt, never a value; one per goal context it counts
+//! toward), `coverage.context_end` (a goal context's contiguous intervals end, REQ-039.12) and
+//! `coverage.boundary` (`gap`, `disconnect`, `reconnect`, `run_end`). A long run is a chain of
+//! parts, one per rotated file.
 //! [`derive`] is the only place that validates, orders and folds those records: the desktop report
 //! and the Android replay both call it, so they cannot disagree. It only reads recorded facts
 //! (never the raw reads next to them), takes time only from their monotonic offsets and folds them
@@ -30,8 +32,8 @@ pub(in crate::mobile) mod live;
 
 /// The most parts one run may have; more invalidates it.
 pub const MAX_PARTS: usize = 64;
-/// Goal-definition version of the baseline until the goal catalogue exists (REQ-039).
-pub const GOAL_DEFINITION: u32 = 1;
+/// Goal-definition version of the facts: the planner's goal catalogue (REQ-039.10).
+pub const GOAL_DEFINITION: u32 = crate::smart_planner::GOAL_DEFINITION_VERSION;
 
 /// The raw `coverage.*` records of one recording file in file order, never pre-filtered, and how
 /// the file ended: the `session_end` reason, or `None` when it was interrupted or cut at an
@@ -54,7 +56,7 @@ struct Invalid {
 }
 
 enum Item {
-    Read(Fact),
+    Fact(Fact),
     Break {
         boundary: Boundary,
         offset: Duration,
@@ -116,7 +118,7 @@ fn parse(record: &Value) -> Result<Record, Invalid> {
     let action = record["action"].as_str().unwrap_or("");
     if !matches!(
         action,
-        "coverage.fact" | "coverage.boundary" | "coverage.run"
+        "coverage.fact" | "coverage.boundary" | "coverage.run" | "coverage.context_end"
     ) {
         return Err(Invalid {
             run: None,
@@ -202,6 +204,21 @@ fn parse(record: &Value) -> Result<Record, Invalid> {
                 offset,
                 at,
             })
+        }
+        "coverage.context_end" => {
+            let versions = versions().ok_or_else(|| invalid("definition versions are missing"))?;
+            let context = data
+                .get("context")
+                .and_then(text)
+                .ok_or_else(|| invalid("context is missing"))?;
+            Parsed::Item(Item::Fact(Fact {
+                run: RunId(run.clone()),
+                wall_clock_unix_ms: at,
+                offset,
+                versions,
+                identity_confirmed: false,
+                body: FactBody::ContextEnd(GoalContext::new(context)),
+            }))
         }
         _ => {
             let versions = versions().ok_or_else(|| invalid("definition versions are missing"))?;
@@ -292,7 +309,7 @@ fn parse(record: &Value) -> Result<Record, Invalid> {
                 evidence_at.to_string().trim_matches('"'),
                 if previous_file { ":previous_file" } else { "" }
             ));
-            Parsed::Item(Item::Read(Fact {
+            Parsed::Item(Item::Fact(Fact {
                 run: RunId(run.clone()),
                 wall_clock_unix_ms: at,
                 offset,
@@ -378,7 +395,11 @@ fn pieces_of(
             }
             Parsed::Item(item) => {
                 let kind = match item {
-                    Item::Read(_) => "coverage.fact",
+                    Item::Fact(Fact {
+                        body: FactBody::ContextEnd(_),
+                        ..
+                    }) => "coverage.context_end",
+                    Item::Fact(_) => "coverage.fact",
                     Item::Break { .. } => "coverage.boundary",
                 };
                 let Some(piece) = open.get_mut(&parsed.run) else {
@@ -494,10 +515,10 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
 
     // One fact per read attempt, across every part of the run: its evidence reference names the raw read
     // it classifies, in its own file or (`in_previous_file`) in the part before it.
-    let mut classified: BTreeSet<(&str, u64, &str)> = BTreeSet::new();
+    let mut classified: BTreeSet<(&str, &str, u64, &str)> = BTreeSet::new();
     for piece in &pieces {
         for item in &piece.items {
-            let Item::Read(Fact {
+            let Item::Fact(Fact {
                 body: FactBody::Reading(reading),
                 ..
             }) = item
@@ -508,7 +529,12 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
                 Some(raw) => (raw, piece.part.saturating_sub(1)),
                 None => (reading.evidence.0.as_str(), piece.part),
             };
-            if !classified.insert((reading.signal_key.as_str(), owner, raw)) {
+            if !classified.insert((
+                reading.signal_key.as_str(),
+                reading.context.id(),
+                owner,
+                raw,
+            )) {
                 issues.push("coverage.fact: a second fact for the same read of a signal".into());
             }
         }
@@ -530,7 +556,7 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
         }
         for item in &piece.items {
             facts.push(match item {
-                Item::Read(fact) => fact.clone(),
+                Item::Fact(fact) => fact.clone(),
                 Item::Break {
                     boundary,
                     offset,
@@ -546,7 +572,7 @@ fn derive_run(run: &str, mut pieces: Vec<Piece>) -> Result<Value, Vec<String>> {
             });
         }
     }
-    let rules = Rules::generic_baseline();
+    let rules = crate::smart_planner::goal_rules();
     let ledger = SmartRun::fold(
         rules.clone(),
         RunId(run.to_owned()),
@@ -883,6 +909,21 @@ pub(super) fn fact_data(
     }
     put("evidence", reference);
     Ok(Value::Object(data))
+}
+
+/// The classified reading inside the `data` of a `coverage.fact` (as the core returns it) and its
+/// run offset, read through the same [`parse`] the ledger folds with.
+fn reading_of(data: &Value) -> Result<(Duration, Reading), String> {
+    let record = json!({"type":"action","action":"coverage.fact","at":0,
+        "result":{"ok":true,"data":data}});
+    match parse(&record).map_err(|invalid| invalid.reason)?.parsed {
+        Parsed::Item(Item::Fact(Fact {
+            offset,
+            body: FactBody::Reading(reading),
+            ..
+        })) => Ok((offset, reading)),
+        _ => Err("not a classified reading".into()),
+    }
 }
 
 /// The core action `coverage.run`: the `data` of one `coverage.run` record. Android supplies the run,
