@@ -1232,8 +1232,7 @@ requirements:
       The user can inspect actual model exchanges and tool activity without
       reopening a connection, account or model. A versioned JSONL audit is
       distinct from the vehicle recording and remains honest after interruption.
-      On 2026-11-24 the maintainer retired the REQ-045.33 latency budget;
-      see ADR 0010. Durable-before-dispatch and fail-closed rules remain.
+      REQ-045.33 (25 ms audit-write budget) was retired on 2026-11-24 by ADR 0010; the ID is not reused.
     acceptance:
       - id: REQ-045.1
         text: "Normal flow: A synthetic diagnosis with two turns, one retry and multiple tool calls reconstructs chronologically from versioned JSONL alone. The start records runtime, build and model versions, Knowledge pin, opaque vehicle reference, configuration and budgets; a monotone sequence, wall and monotonic times, and applicable session_id, turn_id, request_id and tool_call_id correlate events without conflating attempts."
@@ -1299,9 +1298,6 @@ requirements:
         text: "Failure condition an encoded JSONL event would exceed 2 MiB → safe stop: Accept an event at the byte limit if the other budgets allow it; refuse a larger event without truncation and follow the persistence stop rules."
       - id: REQ-045.32
         text: "Failure condition a session would record more than 10,000 events → safe stop: The 10,000th event can be written; do not begin work that requires an event beyond the cap. Mark an interrupted audit honestly if an end marker cannot be persisted."
-      - id: REQ-045.33
-        text: "Normal flow: On the supported Android reference configuration, durable outbound appends of up to 64 KiB have p95 latency of at most 25 ms, measured from the write request through durability confirmation. This benchmark target never permits dispatch before the write is durable."
-        status: obsolete
 
   - id: REQ-046
     title: Reproduce agent and vehicle-session outcomes offline through the real core

@@ -1,6 +1,6 @@
 # 0007. Shared internal storage for the agent audit
 Date: 2026-11-19
-Status: proposed
+Status: proposed; latency criterion retired by ADR 0010 (REQ-045.33 removed)
 
 ## Context
 

@@ -33,8 +33,7 @@
             "additionalProperties": false,
             "properties": {
               "id": { "type": "string", "pattern": "^REQ-[0-9]{3,}\\.[0-9]+$" },
-              "text": { "type": "string", "minLength": 1 },
-              "status": { "enum": ["draft", "accepted", "obsolete"] }
+              "text": { "type": "string", "minLength": 1 }
             }
           }
         },

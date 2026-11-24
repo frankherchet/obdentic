@@ -4,7 +4,7 @@ Status: accepted
 
 ## Context
 
-Spike #378 follows #363 (ADR 0007). At the start of the spike, REQ-045.33 specified durable outbound append of up to 64 KiB, p95 ≤ 25 ms, measured from the write request through durability confirmation, never dispatching before durability; REQ-045.28 specified fail closed. The measured SAF numbers in #363 (cold existing file p95 ≈ 58–60 ms, cold new file p95 ≈ 113 ms, on the same device class) missed the budget, so this spike asks whether another write strategy on a supported destination meets it.
+Spike #378 follows #363 (ADR 0007). This ADR retires the latency criterion investigated in ADR 0007; ADR 0007 otherwise remains proposed. At the start of the spike, REQ-045.33 specified durable outbound append of up to 64 KiB, p95 ≤ 25 ms, measured from the write request through durability confirmation, never dispatching before durability; REQ-045.28 specified fail closed. The measured SAF numbers in #363 (cold existing file p95 ≈ 58–60 ms, cold new file p95 ≈ 113 ms, on the same device class) missed the budget, so this spike asks whether another write strategy on a supported destination meets it.
 
 Maintainer-approved amendments A1–A6 (issue #378, 2026-11-23) are the criteria and are not changed here:
 
@@ -73,7 +73,7 @@ Deviations and harness defects found during the session (each affects only the c
 Paths beginning with `results/` in this section refer to `spikes/378/results/` in this repository.
 
 
-Device: Mi 9T, Android 16 (API 36.1), build with LineageOS properties present (a custom build, not a stock vendor image; hypothesis: the stock-looking vendor fingerprint is stale). `/data` f2fs, `/storage/emulated` FUSE; on mains power, screen kept awake by the existing setting; battery 50 % at the start, 80 % at the end; battery temperature 19.0 °C at the start, 33.4 °C at the maximum between blocks, 30.8 °C at the end (`spikes/378/results/context-*.txt`; the first lines of `context-run.txt` are the smoke runs of the earlier session); ≈ 77.7 GB free at the end. The commands `scripts/idle.sh`, `scripts/cold.sh`, `scripts/gc.sh`, `scripts/interrupt.py i1|i2`, and `scripts/stats.py` (nearest-rank, `ceil(q·n)`-th value) are in the [`spike-378-audit-write` branch](https://github.com/frankherchet/obdentic/tree/spike-378-audit-write/spikes/378/scripts), not on main. All numbers are request-to-ack milliseconds in the app; no failures occurred in any stratum (0 of 100 in each).
+Device: Mi 9T, Android 16 (API 36.1), build with LineageOS properties present (a custom build, not a stock vendor image; hypothesis: the stock-looking vendor fingerprint is stale). `/data` f2fs, `/storage/emulated` FUSE; on mains power, screen kept awake by the existing setting; battery 57 % at the start, 80 % at the end; battery temperature 23.6 °C at the start, 33.4 °C at the maximum between blocks, 30.8 °C at the end (`spikes/378/results/context-*.txt`; the first lines of `context-run.txt` are the smoke runs of the earlier session); ≈ 77.7 GB free at the end. The commands `scripts/idle.sh`, `scripts/cold.sh`, `scripts/gc.sh`, `scripts/interrupt.py i1|i2`, and `scripts/stats.py` (nearest-rank, `ceil(q·n)`-th value) are in the [`spike-378-audit-write` branch](https://github.com/frankherchet/obdentic/tree/spike-378-audit-write/spikes/378/scripts), not on main. All numbers are request-to-ack milliseconds in the app; no failures occurred in any stratum (0 of 100 in each).
 
 **Cold process (every sample: `am force-stop`, fresh process, one first append), p95 in ms, 100 samples per cell** (1 KiB / 16 KiB / 64 KiB):
 
@@ -93,7 +93,7 @@ Device: Mi 9T, Android 16 (API 36.1), build with LineageOS properties present (a
 | baseline filesDir wa | 30.2 / 29.9 / 30.3 | 24.1 / 24.4 / 25.1 |
 | baseline cache wa | 30.0 / 29.9 / 30.2 | 27.9 / 24.7 / 25.4 |
 
-p50, p99, max, the count above 25 ms and the component medians (create, open, scan, prealloc, write, sync, dirsync) per stratum are in `results/summary-cold.csv`. Every candidate stratum has more than 90 of 100 samples above 25 ms except saf/path `wa`/`wfd` existing, where 71–94 of 100 are above 25 ms (lowest: path wa existing 1 KiB, 72). Component medians, 16 KiB: saf new: create ≈ 51 ms, open ≈ 11 ms, directory sync ≈ 90 ms; saf existing: open ≈ 17–19 ms, data sync ≈ 20 ms; path new: create ≈ 19–20 ms, open ≈ 2 ms, data sync ≈ 21 ms (wa) or ≈ 1.7 ms after the full `force(true)` of the preallocation (pre), directory sync ≈ 5 ms; path existing: open ≈ 4 ms, data sync ≈ 21 ms. With `pre`, the 20 ms is paid by the preallocation `force(true)` in the new-file case instead of the data sync. The `prescan` strata grow with the logical prefix over the 100 samples (the file is never truncated); they are reported as an implementation cost, not a steady state.
+p50, p99, max, the count above 25 ms and the component medians (create, open, scan, prealloc, write, sync, dirsync) per stratum are in `results/summary-cold.csv`. Every candidate stratum has more than 90 of 100 samples above 25 ms except saf/path `wa`/`wfd` existing, where 71–94 of 100 are above 25 ms (lowest: path wfd existing 1 KiB, 71). Component medians, 16 KiB: saf new: create ≈ 51 ms, open ≈ 11 ms, directory sync ≈ 90 ms; saf existing: open ≈ 17–19 ms, data sync ≈ 20 ms; path new: create ≈ 19–20 ms, open ≈ 2 ms, data sync ≈ 21 ms (wa) or ≈ 1.7 ms after the full `force(true)` of the preallocation (pre), directory sync ≈ 5 ms; path existing: open ≈ 4 ms, data sync ≈ 21 ms. With `pre`, the 20 ms is paid by the preallocation `force(true)` in the new-file case instead of the data sync. The `prescan` strata grow with the logical prefix over the 100 samples (the file is never truncated); they are reported as an implementation cost, not a steady state.
 
 **Control rerun at the end (saf wa, 16 KiB, 100 samples):** new p95 221.2 ms (first run 221.9), existing p95 52.8 ms (first run 50.1).
 
@@ -139,9 +139,9 @@ p50, p99, max, the count above 25 ms and the component medians (create, open, sc
 
 ## Decision
 
-**Accepted finding (maintainer decision, 2026-11-24):** on the reference device the A4 Refute condition is met on latency for all six declared candidates (shared directory via SAF or direct path; `wa`, `wfd`, `pre`); no candidate meets 25 ms p95 cold. Confirm cannot be reached in this setting. Even app-private baselines sit at 24–25 ms (existing) and ≈ 30 ms (new) p95, suggesting a floor of one first sync after a pause of ≈ 20–24 ms on this storage; the data do not isolate its cause (H2 above). Durability remains inconclusive: no power-loss test was performed.
+**Accepted finding (maintainer decision, 2026-11-24):** on the reference device the A4 Refute condition is met on latency for all six declared candidates (shared directory via SAF or direct path; `wa`, `wfd`, `pre`); no candidate meets 25 ms p95 cold. Confirm cannot be reached in this setting. App-private baselines span 24–30.4 ms p95 for existing files and about 30–33.4 ms for new files, consistent with a first sync after a pause of ≈ 20–24 ms on this storage; the data do not isolate its cause (H2 above). Durability remains inconclusive: no power-loss test was performed.
 
-The maintainer retired the REQ-045.33 latency budget, setting it to `obsolete`. The SAF folder choice remains the destination (REQ-045.23); durable-before-dispatch and fail-closed rules remain (REQ-045.10 and REQ-045.28).
+The maintainer retired the REQ-045.33 latency budget and removed the criterion; its ID is not reused. The SAF folder choice remains the destination (REQ-045.23); durable-before-dispatch and fail-closed rules remain (REQ-045.10 and REQ-045.28).
 
 ## Consequences
 
