@@ -28,6 +28,8 @@ final class ComponentSmartAcceptance {
         SESSION_SIGNAL = "dpf.surface_temperature", USER = "engine.maf";
     private static final Set<String> STATUSES = new HashSet<>(Arrays.asList("selected", "unsupported", "missing", "no_ecu", "ambiguous", "rejected", "not_answered",
         "uds_unavailable", "uds_ended", "pending_uds", "session_excluded"));
+    /** The ledger contexts of REQ-039.2: the five goal groups' conditions and the generic baseline. */
+    private static final Set<String> GOAL_CONTEXTS = new HashSet<>(Arrays.asList("baseline", "cooling.warm_up", "cooling.warm_driving", "dpf.warm_driving", "dpf.raw_request", "turbo", "rail", "egr"));
 
     /** Answers like the demo adapter, except for the steered trigger inputs and the engine's DIDs; every command is logged with its target. */
     private static final class Link implements ObdService.Link {
@@ -243,9 +245,9 @@ final class ComponentSmartAcceptance {
         }
     }
 
-    // ---- REQ-036 ---------------------------------------------------------------------------------------------------------------------
+    // ---- REQ-039 (the planner on the live session; REQ-036.1 end conditions) ----------------------------------------------------------
 
-    /** Switch of the continuous recording off: the analysis starts and ends its own recording. Returns the chain of files it wrote. */
+    /** Switch of the continuous recording off: the planner starts and ends its own recording. Returns the chain of files it wrote. */
     private static List<String> smartWithOwnRecording(ObdService service, Link l, File dir, String vin, JSONArray user) throws Exception {
         service.setAutoRecord(false);
         waitFor(() -> service.snapshot().optString("autoRecording").isEmpty() && !service.snapshot().optBoolean("autoRecord"), "continuous recording off");
@@ -256,18 +258,18 @@ final class ComponentSmartAcceptance {
         String owned = service.snapshot().optString("autoRecording");
         require(owned.endsWith("-auto.jsonl") && !service.snapshot().optBoolean("autoRecord"), "REQ-036.1 with the switch off the analysis writes its own recording: " + owned);
         waitFor(() -> service.snapshot().optString("message").contains("eigene Aufzeichnung"), "start message names the own recording");
-        waitFor(() -> smart(service).optJSONArray("missing").length() == 0 && smart(service).optJSONArray("triggers").length() == 6, "all six triggers have fresh readings");
-        require(smart(service).optJSONArray("triggers").length() == 6, "REQ-036.2 six trigger rows are shown");
-        waitFor(() -> "rail".equals(smart(service).optString("component")), "rail window (standstill, warm, idle rpm)");
+        waitFor(() -> "serving".equals(goalPhase(service, "rail")) && "serving".equals(goalPhase(service, "baseline")), "REQ-039.2 the rail goal (standstill, warm, idle rpm) and the baseline are served");
 
-        // REQ-036.2: every set holds all triggers; the user's own selection is not part of it and is not touched
+        // REQ-039.4/.5: the monitored triggers are in the selection; the user's own selection is not part of it and is not touched
         JSONArray selected = service.snapshot().getJSONArray("selected");
-        for (String t : new String[] {"engine.rpm", "vehicle.speed", "engine.coolant_temperature", PEDAL, "engine.load"}) require(contains(selected, t), "REQ-036.2 trigger " + t + " is selected: " + selected);
-        require(containsMeaning(service, selected, REGEN), "REQ-036.2 the Knowledge trigger is selected by its key: " + selected);
-        require(selected.length() <= 32 && !contains(selected, USER), "REQ-036.1 at most 32 signals, the user's selection is replaced for the run: " + selected);
+        for (String t : new String[] {"engine.rpm", "vehicle.speed", "engine.coolant_temperature", PEDAL, "engine.load"}) require(contains(selected, t), "REQ-039.4 trigger " + t + " is selected: " + selected);
+        require(containsMeaning(service, selected, REGEN), "REQ-039.4 the Knowledge trigger is selected by its key: " + selected);
+        require(selected.length() <= 32 && !contains(selected, USER), "REQ-039.5 at most 32 signals, the user's selection is replaced for the run: " + selected);
         JSONObject view = smart(service);
-        require(!view.optString("reason").isEmpty() && view.optLong("remaining_ms", -2) != -2 && view.optString("recording").equals(owned), "REQ-036.5 the view shows set, reason, remaining time and recording: " + view);
-        // the selection belongs to the analysis while it runs
+        require(view.optString("recording").equals(owned) && view.optJSONArray("goals").length() > 0 && view.optInt("selected_count") == selected.length(), "REQ-039.8 the view shows the goals and the recording: " + view);
+        String summary = MainActivity.smartSummaryText(service.snapshot());
+        require(summary.contains(MainActivity.goalLabel("rail")) && summary.contains("bis die Bedingung endet") && !summary.contains("Komponente"), "REQ-039.8 the card names the goal with its reason and remaining time: " + summary);
+        // the selection belongs to the planner while it runs
         long base = seq(service); service.setSignals(new JSONArray().put("engine.rpm")); String refused = awaitMessage(service, base);
         require(refused.contains("Smart-Analyse") && sameSelection(service, selected), "REQ-036.1 the selection is locked while the analysis runs: " + refused);
         base = seq(service); service.applyComponentPreset("egr"); refused = awaitMessage(service, base);
@@ -275,40 +277,38 @@ final class ComponentSmartAcceptance {
         base = seq(service); service.applySignalPreset("component:dpf"); refused = awaitMessage(service, base);
         require(refused.contains("Smart-Analyse"), "a stored preset is refused while the analysis runs: " + refused);
 
-        // priority: dpf request interrupts rail, resumes rail when it ends; pressing the pedal interrupts rail again (rotation of the file inside that very write)
-        l.regen = 1; waitFor(() -> "dpf".equals(smart(service).optString("component")), "dpf request shows dpf");
-        JSONObject change = lastChange(service);
-        require("interruption".equals(change.optString("kind")) && "rail".equals(change.optString("previous_set")) && "dpf".equals(change.optString("set")) && change.optString("reason").contains("dpf"), "REQ-036.4 dpf interrupts rail: " + change);
-        l.regen = 0; waitFor(() -> "rail".equals(smart(service).optString("component")), "rail resumes");
-        change = lastChange(service);
-        require("resumption".equals(change.optString("kind")) && "dpf".equals(change.optString("previous_set")), "REQ-036.4 the valid lower window resumes: " + change);
-        service.rotateAfterSmart = "change"; l.pedal = "FF";
-        waitFor(() -> "turbo".equals(smart(service).optString("component")), "pedal shows turbo");
-        change = lastChange(service);
-        require("interruption".equals(change.optString("kind")) && "rail".equals(change.optString("previous_set")), "REQ-036.4 turbo interrupts rail: " + change);
+        // REQ-039.4: a nonzero raw request starts the dpf goal at once and ends with the first fresh 0
+        l.regen = 1; waitFor(() -> isActive(goalPhase(service, "dpf.raw_request")), "REQ-039.4 a raw request shows the dpf goal");
+        JSONObject change = lastChangeOf(service, "dpf.raw_request");
+        require("started".equals(change.optString("kind")) && change.optLong("at") > 0, "REQ-039.8 the goal start is shown with its time: " + change);
+        require(MainActivity.smartSummaryText(service.snapshot()).contains(MainActivity.REGEN_REQUEST_LABEL), "REQ-039.4 the request is shown as a raw request status");
+        l.regen = 0; waitFor(() -> !isActive(goalPhase(service, "dpf.raw_request")), "REQ-039.12 the dpf goal ends with a fresh reading of 0");
+        change = lastChangeOf(service, "dpf.raw_request");
+        require("expired".equals(change.optString("kind")) && "condition_ended".equals(change.optString("reason")), "REQ-039.12 the goal ends because its condition ended: " + change);
+        // REQ-039.12: pressing the pedal starts the turbo goal (rotation of the file inside that very write)
+        service.rotateAfterSmart = "started"; l.pedal = "FF";
+        waitFor(() -> isActive(goalPhase(service, "turbo")), "REQ-039.2 the pedal starts the turbo goal");
         require(service.rotateAfterSmart.isEmpty(), "the forced rotation happened inside the record of the change");
         waitFor(() -> !service.snapshot().optString("autoRecording").equals(owned), "the recording rotated while the analysis runs");
         require(smart(service).optBoolean("active"), "REQ-036.5 the analysis continues across the file rotation");
 
-        // a trigger reading that is missing is shown as such and never as zero (REQ-036.2)
+        // REQ-039.6: a trigger reading that is missing makes its condition unknown: the goal ends with that reason, never as a release
         l.pedalMissing = true;
-        waitFor(() -> contains(smart(service).optJSONArray("missing"), PEDAL), "missing pedal reported");
-        JSONObject row = triggerRow(service, PEDAL);
-        require(!"fresh".equals(row.optString("state")) && !row.has("value") && smart(service).optJSONObject("trigger_ages").optLong(PEDAL, 0) < 0, "REQ-036.2 the missing reading carries no value and no age: " + row);
-        require(smart(service).optString("reason").contains(PEDAL) && contains(smart(service).optJSONArray("missing"), PEDAL) && !contains(smart(service).optJSONArray("unavailable"), PEDAL) && smart(service).has("reasons"), "REQ-036.2 the trigger problem is in missing/triggers, the set's own reasons stay in reasons: " + smart(service));
+        waitFor(() -> !isActive(goalPhase(service, "turbo")), "REQ-039.6 an unanswered pedal reading ends the turbo goal");
+        change = lastChangeOf(service, "turbo");
+        require("expired".equals(change.optString("kind")) && !"condition_ended".equals(change.optString("reason")) && !change.optString("reason").isEmpty(), "REQ-039.6 an unknown condition is no release: " + change);
         l.pedalMissing = false; l.pedal = "20";
-        waitFor(() -> !contains(smart(service).optJSONArray("missing"), PEDAL), "pedal reading returns");
 
-        // stop: the stop event is the last event of its file, even when the recording rotates in that very write; nothing the analysis chose was stored
-        service.rotateAfterSmart = "stop"; service.stopSmart();
+        // stop: the stop event is the last event of its file, even when the recording rotates in that very write; nothing the planner chose was stored
+        service.rotateAfterSmart = "stopped"; service.stopSmart();
         waitFor(() -> !smart(service).optBoolean("active") && service.snapshot().optString("autoRecording").isEmpty(), "analysis stopped and own recording closed");
-        require(service.snapshot().optString("message").startsWith("Smart-Analyse beendet") && smart(service).optString("reason").length() > 0, "REQ-036.5 the end is visible with its reason: " + service.snapshot().optString("message"));
+        require(service.snapshot().optString("message").startsWith("Smart-Analyse beendet") && smart(service).optString("reason").length() > 0, "REQ-039.1 the end is visible with its reason: " + service.snapshot().optString("message"));
         require(sameSelection(service, user) && sameSelection(service.vehicles.selection(vin), user), "REQ-036.1 the user's selection (shown and stored) is back: " + service.snapshot().getJSONArray("selected"));
         require(count(l.commands, "1003") == sessions && count(l.commands, "1001") == returns && count(l.commands, "3E80") == testers, "REQ-036.1 the analysis never touches the session: " + l.commands);
-        require(smart(service).optJSONArray("changes").length() > 0, "REQ-036.5 the latest changes stay visible after the stop");
+        require(smart(service).optJSONArray("changes").length() > 0, "REQ-039.8 the latest changes stay visible after the stop");
 
         List<String> chain = new ArrayList<>(names(dir)); chain.removeAll(filesBefore); chain.removeIf(n -> !n.endsWith("-auto.jsonl")); Collections.sort(chain);
-        require(chain.size() == 3 && chain.get(0).equals(owned), "own recording rotated twice (turbo change, stop): " + chain);
+        require(chain.size() == 3 && chain.get(0).equals(owned), "own recording rotated twice (turbo start, stop): " + chain);
         List<List<JSONObject>> files = new ArrayList<>(); for (String n : chain) files.add(read(new File(dir, n)));
         for (List<JSONObject> events : files) {
             require("session".equals(events.get(0).optString("type")) && "session_end".equals(events.get(events.size() - 1).optString("type")), "every file has its header and end marker");
@@ -316,31 +316,31 @@ final class ComponentSmartAcceptance {
         }
         JSONObject headerComponent = files.get(0).get(0).optJSONObject("component");
         require(headerComponent == null || headerComponent.length() == 0, "REQ-035.4 a preset replaced by a manual selection is not claimed by the next header: " + headerComponent);
-        // per-transition order across the files
+        // REQ-039.8: every plan change with wallclock time, monotonic offset, goal, reason, the condition readings and the definition versions, in order across the files
         List<String> sequence = new ArrayList<>(); long lastOffset;
         for (int f = 0; f < files.size(); f++) { lastOffset = -1;
             for (JSONObject e : files.get(f)) { JSONObject data = smartData(e); if (data == null) continue;
-                require(e.has("at") && e.optLong("offset_us", -1) >= lastOffset, "REQ-036.5 wall time and monotonic offset on every change, ascending: " + e); lastOffset = e.optLong("offset_us");
-                String kind = data.optString("kind"); JSONObject readings = data.optJSONObject("readings");
-                for (java.util.Iterator<String> names = readings == null ? Collections.<String>emptyIterator() : readings.keys(); names.hasNext(); ) { String name = names.next(); JSONObject r = readings.optJSONObject(name);
-                    require(r == null || !r.has("value") || "fresh".equals(r.optString("state")), "REQ-036.2 only a fresh reading carries a value, a missing or stale one never shows zero: " + r); }
-                if (!kind.equals("availability") && !kind.equals("resume")) sequence.add(kind + ":" + data.optString("set")); } }
-        int dpfAt = sequence.indexOf("interruption:dpf"), turboAt = sequence.indexOf("interruption:turbo");
-        require(sequence.get(0).startsWith("start:") && (sequence.contains("trigger:rail") || sequence.get(0).equals("start:rail")) && dpfAt > 0 && turboAt > dpfAt, "REQ-036.3 start, then the rail trigger, before the interruption: " + sequence);
-        require(sequence.subList(dpfAt, turboAt + 1).equals(Arrays.asList("interruption:dpf", "resumption:rail", "interruption:turbo")), "REQ-036.4 transitions in order: " + sequence);
-        List<String> tail = new ArrayList<>(sequence.subList(turboAt + 1, sequence.size())); tail.removeAll(Collections.singleton("resumption:rail")); // the missing pedal may end the turbo window before the stop
-        require(tail.equals(Arrays.asList("stop:")), "REQ-036.4 the stop ends the sequence: " + sequence);
-        JSONObject dpfEvent = null; for (JSONObject e : files.get(0)) { JSONObject d = smartData(e); if (d != null && "interruption".equals(d.optString("kind")) && "dpf".equals(d.optString("set"))) dpfEvent = d; }
-        JSONObject reading = dpfEvent.getJSONObject("readings").getJSONObject(REGEN);
-        require(dpfEvent.getLong("reading_at") > 0 && "fresh".equals(reading.optString("state")) && reading.optDouble("value") == 1.0 && reading.getLong("age_ms") >= 0 && !dpfEvent.getString("reason").isEmpty(), "REQ-036.5 the change records the reading behind it with its time stamp: " + dpfEvent);
-        require("change".equals(dpfEvent.optString("change")), "the change class of an interruption is 'change': " + dpfEvent);
+                require(e.has("at") && e.optLong("offset_us", -1) >= lastOffset, "REQ-039.8 wall time and monotonic offset on every change, ascending: " + e); lastOffset = e.optLong("offset_us");
+                String kind = data.optString("kind");
+                require(data.optInt("goal_definition", -1) == 1 && !data.optString("knowledge_revision").isEmpty() && data.has("inputs") && data.has("reason") && data.has("goal"), "REQ-039.8 every change names the definition versions, the inputs, the goal and the reason: " + data);
+                JSONArray inputs = data.getJSONArray("inputs");
+                for (int i = 0; i < inputs.length(); i++) { JSONObject input = inputs.getJSONObject(i);
+                    require(input.isNull("value") != input.isNull("reason"), "REQ-039.6 an unknown condition reading carries its reason and never a value, zero included: " + input); }
+                if (!kind.equals("selection") && !kind.equals("resume") && !kind.equals("skipped")) sequence.add(kind + ":" + (data.isNull("goal") ? "" : data.optString("goal"))); } }
+        int railAt = sequence.indexOf("started:rail"), dpfAt = sequence.indexOf("started:dpf.raw_request"), dpfEnd = sequence.indexOf("expired:dpf.raw_request"), turboAt = sequence.indexOf("started:turbo"), turboEnd = sequence.indexOf("expired:turbo");
+        require(railAt >= 0 && railAt < dpfAt && dpfAt < dpfEnd && dpfEnd < turboAt && turboAt < turboEnd, "REQ-039.8 start, the raw request, its end, the pedal and its unknown end in order: " + sequence);
+        require(sequence.get(sequence.size() - 1).equals("stopped:"), "REQ-039.1 the stop ends the sequence: " + sequence);
+        JSONObject dpfEvent = null; for (JSONObject e : files.get(0)) { JSONObject d = smartData(e); if (d != null && "started".equals(d.optString("kind")) && "dpf.raw_request".equals(d.optString("goal"))) dpfEvent = d; }
+        JSONArray dpfInputs = dpfEvent.getJSONArray("inputs"); boolean regenInput = false;
+        for (int i = 0; i < dpfInputs.length(); i++) regenInput |= dpfInputs.getJSONObject(i).optString("signal").startsWith(REGEN) && dpfInputs.getJSONObject(i).optDouble("value") == 1.0;
+        require(regenInput && dpfEvent.getLong("at_us") > 0, "REQ-039.8 the change records the condition reading behind it: " + dpfEvent);
         int reads = 0; for (JSONObject e : files.get(0)) if ("read".equals(e.optString("action")) && e.optString("argument").startsWith(REGEN)) reads++;
-        require(reads >= 3, "REQ-036.5 the raw read events stay in the recording: " + reads);
-        // P2: the rotation inside the record of the interruption continues with that very set; the stop is last and nothing resumes after it
+        require(reads >= 3, "REQ-039.8 the raw read events stay in the recording: " + reads);
+        // the rotation inside the record of the turbo start continues with the goals and the selection of that very step; the stop is last and nothing resumes after it
         JSONObject first = firstSmart(files.get(1));
-        require(first != null && "resume".equals(first.optString("change")) && "turbo".equals(first.optString("set")) && first.getJSONObject("readings").length() == 6, "REQ-036.5 the continuation file starts with the set it continues: " + first);
+        require(first != null && "resume".equals(first.optString("kind")) && first.getJSONArray("goals").length() > 0 && first.getJSONArray("selected").length() > 0, "REQ-039.8 the continuation file starts with the plan it continues: " + first);
         List<JSONObject> second = files.get(1); JSONObject lastSmart = null; for (JSONObject e : second) if (smartData(e) != null) lastSmart = smartData(e);
-        require("stop".equals(lastSmart.optString("change")) && "rotated".equals(second.get(second.size() - 1).optString("reason")), "REQ-036.5 the stop is the last change of its file: " + lastSmart);
+        require("stopped".equals(lastSmart.optString("kind")) && lastSmart.isNull("goal") && "rotated".equals(second.get(second.size() - 1).optString("reason")), "REQ-039.8 the stop is the last change of its file: " + lastSmart);
         require(firstSmart(files.get(2)) == null && "stopped".equals(files.get(2).get(files.get(2).size() - 1).optString("reason")), "REQ-036.5 a rotation inside the stop never resumes the analysis");
         require(sameSelection(files.get(2).get(0).optJSONArray("selected"), new JSONArray().put(USER)), "REQ-036.1 the file that a rotation inside the stop write opens starts with the user's restored selection: " + files.get(2).get(0).optJSONArray("selected"));
         service.setAutoRecord(true);
@@ -353,10 +353,9 @@ final class ComponentSmartAcceptance {
         String running = service.snapshot().optString("autoRecording"); require(!running.isEmpty() && service.snapshot().optBoolean("autoRecord"), "continuous recording runs");
         service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started in the running recording");
         require(running.equals(service.snapshot().optString("autoRecording")) && !service.snapshot().optString("message").contains("eigene Aufzeichnung"), "REQ-036.1 the analysis continues the running recording");
-        waitFor(() -> contains(smart(service).optJSONArray("missing"), REGEN) && smart(service).optJSONArray("triggers").length() == 6, "unavailable Knowledge trigger reported");
-        JSONObject regen = triggerRow(service, REGEN);
-        require("unavailable".equals(regen.optString("state")) && !regen.has("value") && smart(service).optJSONObject("trigger_ages").optLong(REGEN, 0) < 0 && contains(smart(service).optJSONArray("missing"), REGEN) && !contains(smart(service).optJSONArray("unavailable"), REGEN),
-            "REQ-036.2 a trigger without a vehicle signal is unavailable, never zero: " + regen);
+        waitFor(() -> "not_reachable".equals(goalPhase(service, "dpf.raw_request")), "REQ-039.7 a goal whose condition input is unavailable is reported as not reachable");
+        JSONObject regen = goalRow(service, "dpf.raw_request");
+        require("condition_input_unavailable".equals(regen.optString("reason")) && MainActivity.smartSummaryText(service.snapshot()).contains("nicht erreichbar"), "REQ-039.7 the reason is shown, never zero or a healthy state: " + regen);
         service.runJob("dtc.scan");
         waitFor(() -> !smart(service).optBoolean("active") && !service.snapshot().optBoolean("busy"), "a job ends the analysis");
         require(smart(service).optString("reason").contains("Auftrag") && sameSelection(service, user) && running.equals(service.snapshot().optString("autoRecording")), "REQ-036.1 a job ends it, the selection is back and the recording goes on: " + smart(service).optString("reason"));
@@ -365,7 +364,7 @@ final class ComponentSmartAcceptance {
         l.drop(); // the link is lost: the analysis ends, the recording stays partial
         waitFor(() -> "error".equals(service.snapshot().optString("phase")) && !smart(service).optBoolean("active"), "lost link ends the analysis");
         require(sameSelection(service, user) && sameSelection(service.vehicles.selection(vin), user), "REQ-036.1 the user's selection survives a lost link");
-        endsWithStop(new File(dir, running), "error");
+        endsWithStop(new File(dir, running), "error", "error");
 
         reconnect(service, link, false); l = link[0];
         String next = service.snapshot().optString("autoRecording");
@@ -373,18 +372,35 @@ final class ComponentSmartAcceptance {
         require(count(l.commands, "1003") == 0 && count(l.commands, "1001") == 0, "REQ-036.1 neither connecting nor starting the analysis opens a session");
         service.disconnect(); waitFor(() -> "disconnected".equals(service.snapshot().optString("phase")) && !smart(service).optBoolean("active") && service.snapshot().optString("autoRecording").isEmpty(), "disconnect ends the analysis");
         waitFor(() -> sameSelection(service, user), "selection restored after the disconnect");
-        endsWithStop(new File(dir, next), "disconnected");
+        endsWithStop(new File(dir, next), "disconnected", "disconnect");
         require(sameSelection(service.vehicles.selection(vin), user) && count(l.commands, "1003") == 0, "REQ-036.1 the stored selection is the user's, no session was ever opened");
+        // every other way out of the live session ends a running analysis: opening a recording and switching to the demo (a restart of the app keeps nothing of it)
+        reconnect(service, link, false); l = link[0];
+        String viaReplay = service.snapshot().optString("autoRecording");
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started before a replay is opened");
+        open(service, running);
+        require(!smart(service).optBoolean("active") && !service.snapshot().optBoolean("busy"), "REQ-036.1 opening a recording ends the analysis: " + smart(service));
+        endsWithStop(new File(dir, viaReplay), "disconnected", "disconnect");
+        reconnect(service, link, false); l = link[0];
+        String viaDemo = service.snapshot().optString("autoRecording");
+        service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started before the demo");
+        service.setDemo();
+        waitFor(() -> "demo".equals(service.snapshot().optString("mode")) && "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"), "demo");
+        require(!smart(service).optBoolean("active") && !MainActivity.smartSummaryText(service.snapshot()).startsWith("Aktiv"), "REQ-036.1 the demo cannot run the analysis: " + smart(service));
+        endsWithStop(new File(dir, viaDemo), "disconnected", "disconnect");
+        long refusedBase = seq(service); service.startSmart(); String refusedInDemo = awaitMessage(service, refusedBase);
+        require(refusedInDemo.contains("Smart-Analyse nicht gestartet") && refusedInDemo.contains("Demo") && !smart(service).optBoolean("active"), "REQ-036.1 a start in the demo is refused with its reason: " + refusedInDemo);
+        reconnect(service, link, false);
     }
 
-    private static void endsWithStop(File file, String reason) throws Exception {
+    private static void endsWithStop(File file, String reason, String token) throws Exception {
         waitFor(() -> { List<JSONObject> e = read(file); return "session_end".equals(e.get(e.size() - 1).optString("type")); }, "recording closed " + file.getName());
         List<JSONObject> events = read(file); JSONObject end = events.get(events.size() - 1);
         require(reason.equals(end.optString("reason")), "the recording ends with " + reason + ": " + end);
         int at = events.size() - 2; // REQ-038.9: the run's own end record (coverage.boundary run_end) may follow the stop event; nothing else may
         if ("coverage.boundary".equals(events.get(at).optString("action")) && "run_end".equals(events.get(at).getJSONObject("result").getJSONObject("data").optString("class"))) at--;
         JSONObject before = events.get(at), data = smartData(before);
-        require(data != null && "stop".equals(data.optString("change")) && !data.optString("reason").isEmpty() && before.optLong("offset_us") <= end.optLong("offset_us"), "REQ-036.5 the stop event comes right before the end marker (or the run's end record): " + before);
+        require(data != null && "stopped".equals(data.optString("kind")) && data.isNull("goal") && token.equals(data.optString("reason")) && before.optLong("offset_us") <= end.optLong("offset_us"), "REQ-039.8 the stop event with its reason comes right before the end marker (or the run's end record): " + before);
     }
 
     // ---- replay ----------------------------------------------------------------------------------------------------------------------
@@ -402,18 +418,29 @@ final class ComponentSmartAcceptance {
             && "uds_unavailable".equals(entry(component, SESSION_SIGNAL).optString("status")), "REQ-035.4 replay shows the preset, its statuses and the failed activation without traffic: " + component);
         // the analysis: first file of the own recording, its continuation and the stop file
         open(service, chain.get(0));
-        JSONObject view = smart(service); List<JSONObject> events = read(new File(dir, chain.get(0))); JSONObject lastData = null; int count = 0;
-        for (JSONObject e : events) if (smartData(e) != null) { lastData = smartData(e); count++; }
-        require(view.optBoolean("replay") && !view.optBoolean("active") && view.optJSONArray("changes").length() == Math.min(count, 20) && lastData.optString("set").equals(view.optString("component"))
-            && "turbo".equals(view.optString("component")) && service.snapshot().getJSONObject("component").length() == 0, "REQ-036.5 replay shows the recorded changes and claims no stale preset: " + view);
-        require(sameSelection(service, lastData.getJSONArray("selected")), "REQ-036.5 replay selects the recorded set");
+        JSONObject view = smart(service); List<JSONObject> events = read(new File(dir, chain.get(0))); JSONObject lastSelection = null; int count = 0;
+        for (JSONObject e : events) { JSONObject d = smartData(e); if (d == null) continue; if ("selection".equals(d.optString("kind"))) lastSelection = d; else if (!"skipped".equals(d.optString("kind")) && !"resume".equals(d.optString("kind"))) count++; }
+        require(view.optBoolean("replay") && !view.optBoolean("active") && view.optJSONArray("changes").length() == Math.min(count, 20) && isActive(goalPhase(service, "turbo")) && "serving".equals(goalPhase(service, "baseline"))
+            && service.snapshot().getJSONObject("component").length() == 0, "REQ-039.8 replay shows the recorded changes and goals and claims no stale preset: " + view);
+        require(lastSelection != null && sameSelection(service, lastSelection.getJSONArray("selected")), "REQ-039.8 replay selects the recorded plan");
         JSONArray changes = view.getJSONArray("changes"); JSONObject lastShown = changes.getJSONObject(changes.length() - 1);
-        require("interruption".equals(lastShown.optString("kind")) && "rail".equals(lastShown.optString("previous_set")) && lastShown.optLong("at") > 0, "REQ-036.5 the history names the class and time of each change: " + lastShown);
+        require("started".equals(lastShown.optString("kind")) && "turbo".equals(lastShown.optString("goal")) && lastShown.optLong("at") > 0, "REQ-039.8 the history names goal, class and time of each change: " + lastShown);
+        require(MainActivity.smartSummaryText(service.snapshot()).startsWith("Aus der Aufnahme") && MainActivity.smartSummaryText(service.snapshot()).contains(MainActivity.goalLabel("turbo")), "REQ-039.8 the card says it shows a recording: " + MainActivity.smartSummaryText(service.snapshot()));
         open(service, chain.get(1));
         view = smart(service); changes = view.getJSONArray("changes");
-        require("resume".equals(changes.getJSONObject(0).optString("change")) && "stop".equals(changes.getJSONObject(changes.length() - 1).optString("change")) && sameSelection(service, new JSONArray().put(USER)), "REQ-036.5 the continuation file replays resume ... stop and the user's selection: " + changes);
+        require("stopped".equals(changes.getJSONObject(changes.length() - 1).optString("kind")) && "user".equals(view.optString("reason")) && view.getJSONArray("goals").length() == 0 && sameSelection(service, new JSONArray().put(USER)), "REQ-039.8 the continuation file replays ... stop and the user's selection: " + changes);
         open(service, chain.get(2));
         require(sameSelection(service, new JSONArray().put(USER)) && smart(service).optJSONArray("changes").length() == 0 && !smart(service).optBoolean("active"), "REQ-036.1 replay of the file after the stop shows the restored selection and no analysis: " + service.snapshot().getJSONArray("selected"));
+        // REQ-039.8: legacy set changes are skipped visibly, without sending an adapter command.
+        String legacy = "synthetic-legacy-smart.jsonl";
+        JSONObject header = read(new File(dir, chain.get(2))).get(0);
+        JSONObject oldSet = new JSONObject().put("type", "action").put("action", "smart.set").put("result", new JSONObject().put("ok", true));
+        JSONObject end = new JSONObject().put("type", "session_end").put("reason", "stopped");
+        java.nio.file.Files.write(new File(dir, legacy).toPath(), (header.toString()+"\n"+oldSet+"\n"+end+"\n").getBytes(StandardCharsets.UTF_8));
+        open(service, legacy);
+        require(MainActivity.smartSummaryText(service.snapshot()).contains("Ältere Smart-Analyse in dieser Aufnahme nicht angezeigt"), "REQ-039.8 legacy analysis skip is visible in replay");
+        open(service, chain.get(2));
+        require(!MainActivity.smartSummaryText(service.snapshot()).contains("Ältere Smart-Analyse"), "REQ-039.8 the legacy note does not leak to another replay");
         require(link[0].commands.size() == traffic, "replay sent nothing to an adapter: " + link[0].commands.subList(traffic, link[0].commands.size()));
     }
 
@@ -426,6 +453,7 @@ final class ComponentSmartAcceptance {
         int traffic = link[0].commands.size();
         List<List<JSONObject>> files = new ArrayList<>(); for (String n : chain) files.add(read(new File(dir, n)));
         String run = null; int[] counts = new int[files.size()]; int facts = 0;
+        Set<String> contexts = new HashSet<>();
         for (int f = 0; f < files.size(); f++) {
             Set<Long> reads = new HashSet<>(); for (JSONObject e : files.get(f)) if ("read".equals(e.optString("action"))) reads.add(e.optLong("offset_us"));
             List<JSONObject> own = new ArrayList<>(); for (JSONObject e : files.get(f)) if (e.optString("action").startsWith("coverage.")) own.add(e);
@@ -441,7 +469,8 @@ final class ComponentSmartAcceptance {
                 require(!data.has("value") && !data.has("response") && !data.has("vin"), "REQ-038.9 facts carry classes and references, never a value: " + e);
                 if ("coverage.fact".equals(e.optString("action"))) {
                     facts++; JSONObject evidence = data.getJSONObject("evidence");
-                    require("baseline".equals(data.optString("context")) && data.optInt("goal_definition") == 1 && !data.optString("knowledge_revision").isEmpty() && !data.optString("outcome").isEmpty()
+                    contexts.add(data.optString("context"));
+                    require(GOAL_CONTEXTS.contains(data.optString("context")) && data.optInt("goal_definition") == 1 && !data.optString("knowledge_revision").isEmpty() && !data.optString("outcome").isEmpty()
                         && data.has("session") && data.has("identity_confirmed") && data.has("implausible") && data.has("static_identity"), "REQ-038.9 the fact has every field of the ledger: " + e);
                     if (!evidence.optBoolean("in_previous_file")) require(reads.contains(evidence.getLong("offset_us")), "REQ-038.9 the evidence reference names the raw read record in the same file: " + e);
                 }
@@ -450,6 +479,7 @@ final class ComponentSmartAcceptance {
             require(ended == (f == files.size() - 1), "REQ-038.9 only the last part ends the run: file " + f);
         }
         require(facts > 0, "REQ-038.9 the reads of the run left facts");
+        require(contexts.contains("baseline") && contexts.size() > 1, "REQ-039.2 a read counts toward every goal context whose condition holds and always toward the baseline: " + contexts);
         for (int f : new int[] {1, 0, 2}) {
             open(service, chain.get(f)); JSONObject set = service.snapshot().optJSONObject("coverage");
             require(set != null && set.getJSONArray("runs").length() == 1, "REQ-038.9 replay of part " + (f + 1) + " derives the run: " + set);
@@ -478,7 +508,7 @@ final class ComponentSmartAcceptance {
         Set<String> known = names(dir);
         reconnect(service, link, false);
         service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started for the rotation race");
-        waitFor(() -> smart(service).optJSONArray("triggers").length() == 6, "trigger rows before the race");
+        waitFor(() -> smart(service).optJSONArray("goals").length() > 0, "goals before the race");
         String owned = service.snapshot().optString("autoRecording"); require(!owned.isEmpty(), "the run records into an automatic file");
         service.rotateBeforeRead = true;
         waitFor(() -> !service.rotateBeforeRead && !owned.equals(service.snapshot().optString("autoRecording")), "the file rotated right before a raw read record");
@@ -522,7 +552,7 @@ final class ComponentSmartAcceptance {
         Set<String> known = names(dir);
         reconnect(service, link, false);
         service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started for the negative response");
-        waitFor(() -> smart(service).optJSONArray("triggers").length() == 6, "trigger rows before the negative response");
+        waitFor(() -> smart(service).optJSONArray("goals").length() > 0, "goals before the negative response");
         link[0].pedalRejected = true;
         waitFor(() -> { for (JSONObject e : autoEvents(dir, known)) if (rejectedPedal(e)) return true; return false; }, "the rejected pedal read left its fact");
         link[0].pedalRejected = false;
@@ -948,14 +978,17 @@ final class ComponentSmartAcceptance {
     }
     private static long seq(ObdService service) { return service.snapshot().optLong("messageSeq"); }
     private static JSONObject smart(ObdService service) { return service.snapshot().optJSONObject("smart"); }
-    private static JSONObject lastChange(ObdService service) {
-        JSONArray changes = smart(service).optJSONArray("changes");
-        for (int i = changes.length() - 1; i >= 0; i--) if (!changes.optJSONObject(i).optString("kind").equals("availability")) return changes.optJSONObject(i);
+    private static JSONObject goalRow(ObdService service, String goal) {
+        JSONArray goals = smart(service).optJSONArray("goals");
+        for (int i = 0; goals != null && i < goals.length(); i++) if (goal.equals(goals.optJSONObject(i).optString("goal"))) return goals.optJSONObject(i);
         return new JSONObject();
     }
-    private static JSONObject triggerRow(ObdService service, String semantic) {
-        JSONArray rows = smart(service).optJSONArray("triggers");
-        for (int i = 0; i < rows.length(); i++) if (semantic.equals(rows.optJSONObject(i).optString("semantic"))) return rows.optJSONObject(i);
+    private static String goalPhase(ObdService service, String goal) { return goalRow(service, goal).optString("phase"); }
+    private static boolean isActive(String phase) { return phase.equals("serving") || phase.equals("interrupted") || phase.equals("awaiting_retry") || phase.equals("complete"); }
+    /** The latest shown plan change of the goal. */
+    private static JSONObject lastChangeOf(ObdService service, String goal) {
+        JSONArray changes = smart(service).optJSONArray("changes");
+        for (int i = changes.length() - 1; i >= 0; i--) if (goal.equals(changes.optJSONObject(i).optString("goal"))) return changes.optJSONObject(i);
         return new JSONObject();
     }
     private static JSONObject entry(JSONObject component, String semantic) {
@@ -983,7 +1016,7 @@ final class ComponentSmartAcceptance {
     private static int count(List<String> commands, String command) { int n = 0; synchronized (commands) { for (String c : commands) if (c.endsWith(":" + command)) n++; } return n; }
     private static JSONObject copy(JSONObject o) throws Exception { return new JSONObject(o.toString()); }
     private static JSONObject smartData(JSONObject event) {
-        if (!"smart.set".equals(event.optString("action"))) return null;
+        if (!"smart.plan".equals(event.optString("action"))) return null;
         JSONObject result = event.optJSONObject("result"); return result == null ? null : result.optJSONObject("data");
     }
     private static JSONObject firstSmart(List<JSONObject> events) { for (JSONObject e : events) if (smartData(e) != null) return smartData(e); return null; }

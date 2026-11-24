@@ -35,10 +35,10 @@ public final class RecordingAuditRunner extends Instrumentation {
                         if(type.equals("action")) {
                             String action=event.optString("action");JSONObject envelope=event.optJSONObject("result");if(envelope==null) {invalid=true;continue;}
                             if(!envelope.optBoolean("ok")) {failures++;continue;}
-                            if(action.equals("smart.set")) {
-                                // REQ-036.5: recorded evidence only; counted and shape-checked, never replayed through NativeCore, never logged.
-                                JSONObject data=envelope.optJSONObject("data");String change=data==null?null:data.optString("change",null);
-                                if(change==null||change.isEmpty()||!(change.equals("start")||change.equals("change")||change.equals("resume")||change.equals("availability")||change.equals("stop"))) {smartMalformed++;continue;}
+                            if(action.equals("smart.plan")) {
+                                // REQ-039.8: recorded evidence only; counted and shape-checked, never replayed through NativeCore, never logged.
+                                JSONObject data=envelope.optJSONObject("data");String kind=data==null?null:data.optString("kind",null);
+                                if(kind==null||kind.isEmpty()||!(kind.equals("started")||kind.equals("interrupted")||kind.equals("resumed")||kind.equals("completed")||kind.equals("expired")||kind.equals("not_reachable")||kind.equals("stopped")||kind.equals("skipped")||kind.equals("selection")||kind.equals("resume"))) {smartMalformed++;continue;}
                                 Object offsetValue=event.opt("offset_us");long offset=(offsetValue instanceof Integer||offsetValue instanceof Long)?((Number)offsetValue).longValue():-1;
                                 if(offset<0||offset<lastSmartOffset) {smartOrderErrors++;continue;}
                                 lastSmartOffset=offset;smartSets++;

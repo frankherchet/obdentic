@@ -100,13 +100,13 @@ Goals use the component preset memberships; the planner evaluates conditions as 
 applies re-arm, turbo hold, strict priority, the baseline share and retry policy, and reports plan changes with reasons.
 A context-end event, emitted whenever a goal stops being active, must be folded as a context-end fact into the coverage
 ledger before later readings, so a short interruption cannot join contiguous segments. The planner only reads, cannot add a target, and has no I/O,
-clock, Android or adapter; session-flagged signals are handed to REQ-040. Android integration and recording of plan
-changes are separate.
+clock, Android or adapter; session-flagged signals are handed to REQ-040. The mobile core drives it for a live Smart run
+(`smart.plan.*`, `mobile/coverage/live/plan.rs`); Android selects what it plans and records and replays every plan change (`smart.plan`, REQ-039.8).
 
 `coverage_ledger.rs` is the pure measurement-coverage model of REQ-038: facts folded into a run ledger and a
 vehicle ledger count qualifying samples, valid measured time and contiguous segments per signal and goal
 context, keep the latest availability state apart, and make no health claim. It has no I/O, clock or adapter.
-A Smart run writes its facts (`coverage.run`, `coverage.fact`, `coverage.boundary`) into the running recording, and
+A Smart run writes its facts (`coverage.run`, `coverage.fact` per goal context, `coverage.context_end`, `coverage.boundary`) into the running recording, and
 `mobile/coverage.rs` re-derives the whole run from the set of rotated recording parts without an adapter, marking a
 single part or an incomplete set as partial: `obdentic-mobile-report part1.jsonl part2.jsonl …` (one or more files, any
 order) prints it in the `coverage` section, and Android replay publishes the same result (details in the

@@ -97,7 +97,7 @@ public class MainActivity extends Activity {
     private ScrollView scroll;
     private TextView pageTitle, status, udsIndicator, udsRemaining;
     private Button back, modeButton;
-    private TextView smartSummary, smartMissing, smartTriggers, smartChanges;
+    private TextView smartSummary, smartChanges;
     private String lastSmartSet="";
     public volatile Dialog activeSignalSelector;
     private Button chip;
@@ -393,7 +393,7 @@ public class MainActivity extends Activity {
                 total+=e.optLong("valid_time_ms");longest=Math.max(longest,e.optLong("longest_segment_ms"));
                 JSONObject latest=e.optJSONObject("latest");String state=latest==null?"":latest.optString("state");String name=latestState(state);if(!name.isEmpty())states.merge(name,1,Integer::sum);}
             if(b.length()>0&&b.charAt(b.length()-1)!='\n')b.append('\n');
-            b.append(title).append(" · ").append(id.equals("baseline")?"Technische Basisabdeckung":id).append(": ")
+            b.append(title).append(" · ").append(goalLabel(id)).append(": ")
                 .append(c.optInt("covered")).append(" abgedeckt · ").append(c.optInt("partial")).append(" teilweise · ").append(c.optInt("not_covered")).append(" nicht abgedeckt")
                 .append("\nMesszeit ").append(duration(total)).append(" · längstes Segment ").append(duration(longest));
             if(!states.isEmpty()){StringBuilder latest=new StringBuilder();for(java.util.Map.Entry<String,Integer> e:states.entrySet()){if(latest.length()>0)latest.append(" · ");latest.append(e.getValue()).append(' ').append(e.getKey());}b.append("\nZuletzt: ").append(latest);}
@@ -403,7 +403,7 @@ public class MainActivity extends Activity {
         switch(state){case "rejected":return "abgelehnt";case "error":return "Fehler";case "no_answer":return "ohne Antwort";case "unsupported":return "nicht unterstützt";case "empty":return "leer";case "gap":return "Messlücke";case "session_restricted":return "Sitzung nötig";case "implausible":return "unplausibel";case "context_not_fresh":return "Kontext veraltet";default:return "";}
     }
     private static String duration(long ms){long s=ms/1000;return s>=60?(s/60)+" min "+(s%60)+" s":s+" s";}
-    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();udsRemaining=null;coverageView=null;smartSummary=smartMissing=smartTriggers=smartChanges=null;
+    private void render(){body.removeAllViews();valueViews.clear();freshnessViews.clear();graphViews.clear();rangeViews.clear();udsRemaining=null;coverageView=null;smartSummary=smartChanges=null;
         switch(screen){case LIVE:live();break;case DIAGNOSE:diagnose();break;case AUFNAHMEN:recordings();break;case ADAPTER:connection();break;case FAHRZEUGE:vehicles();break;default:accountTab();}}
     private void live(){
         title("Live");
@@ -500,10 +500,8 @@ public class MainActivity extends Activity {
             String blocker=active||pend?null:ObdService.smartBlocker(state);
             actionButton(c,spec,"",active?"Smart-Analyse beenden":"Smart-Analyse starten",active||blocker==null,()->perform(spec,"",()->{if(active)service().stopSmart();else service().startSmart();}));
             if(blocker!=null)note(c,blocker,MUTED);
-            smallNote(c,active?"Die Messwerte werden automatisch gewählt; die Auswahl ist gesperrt, bis du die Smart-Analyse beendest. Es ist keine Bedienung während der Fahrt nötig.":"Einmal starten: wählt die Messwerte automatisch nach Auslösern (DPF, Kühlung, Turbo, Rail, AGR) oder im Wechsel alle 3 Minuten. Nur Lesen, keine Bedienung während der Fahrt nötig.",MUTED);
+            smallNote(c,active?"Die Messwerte werden automatisch gewählt; die Auswahl ist gesperrt, bis du die Smart-Analyse beendest. Es ist keine Bedienung während der Fahrt nötig.":"Einmal starten: plant die Messwerte automatisch nach dem Fahrzustand (Kühlung, DPF, Turbo, Rail, AGR) und deckt über mehrere Fahrten alle lesbaren Messwerte ab. Nur Lesen, keine Bedienung während der Fahrt nötig.",MUTED);
         }
-        smartMissing=text("",13,0xffffca75);smartMissing.setPadding(0,dp(4),0,dp(4));c.addView(smartMissing);
-        smartTriggers=text("",12,MUTED);smartTriggers.setPadding(0,dp(4),0,dp(4));c.addView(smartTriggers);
         smartChanges=text("",12,MUTED);smartChanges.setPadding(0,dp(4),0,dp(4));c.addView(smartChanges);
         updateSmartStatus();
     }
@@ -515,59 +513,122 @@ public class MainActivity extends Activity {
         return id;
     }
     private static String ageText(long ms){return ms<10000?String.format(java.util.Locale.GERMANY,"%.1f s",ms/1000.0):ms<120000?(ms/1000)+" s":(ms/60000)+" min";}
-    private static String triggerState(String s){switch(s){case "fresh":return "aktuell";case "stale":return "veraltet";case "missing":return "nicht gelesen";case "unavailable":return "nicht verfügbar";default:return s;}}
-    private static String smartSet(String id){return id.isEmpty()?"kein Satz":componentLabel(id);}
+    /** German name of a planner goal context id (REQ-039.2). The baseline is a technical baseline, never a diagnosis. */
+    public static String goalLabel(String id){
+        switch(id){
+            case "cooling.warm_up":return "Kühlung · Warmlauf";case "cooling.warm_driving":return "Kühlung · warme Fahrt";case "dpf.warm_driving":return "DPF · warme Fahrt";
+            case "dpf.raw_request":return REGEN_REQUEST_LABEL;case "turbo":return "Turbo · hohe Last";case "rail":return "Rail · warmer Leerlauf";
+            case "egr":return "AGR · gleichmäßige Teillast";case "baseline":return "Technische Basisabdeckung";default:return id;
+        }
+    }
+    /** German wording of a planner reason or stop token; unknown tokens are shown as they are. */
+    public static String smartReason(String token){
+        switch(token){
+            case "no_reading":return "kein Messwert";case "stale":return "Messwert veraltet";case "gap":return "Messlücke";case "unsupported":return "vom Fahrzeug nicht unterstützt";
+            case "rejected":return "Steuergerät lehnt ab";case "empty":return "leere Antwort";case "unanswered":return "keine Antwort";case "read_error":return "Lesefehler";
+            case "session_restricted":return "braucht die erweiterte Sitzung";case "implausible":return "unplausibler Wert";case "non_finite":return "ungültiger Wert";
+            case "condition_ended":return "Bedingung beendet";case "warm_not_yet_reached":return "Warm noch nicht erreicht";case "rearming":return "wartet auf erneute Bereitschaft";
+            case "higher_priority":return "Vorrang eines anderen Ziels";case "no_signals_in_catalog":return "keine Messwerte im Katalog";case "all_signals_unavailable":return "alle Messwerte nicht verfügbar";
+            case "condition_input_unavailable":return "Eingangswert der Bedingung nicht verfügbar";case "user_stop":case "user":return "vom Nutzer gestoppt";
+            case "disconnect":return "Verbindung getrennt";case "recording_lost":return "Aufzeichnung verloren";case "error":return "Fehler";case "conflicting_work":return "anderer Auftrag gestartet";
+            default:return token;
+        }
+    }
+    /** A signal key as the user knows it: short name, else catalog title, else the key. */
+    private static String signalLabel(String key,JSONArray catalog){
+        String label=semanticLabel(key,catalog);if(!label.equals(key))return label;
+        for(int i=0;catalog!=null&&i<catalog.length();i++){JSONObject s=catalog.optJSONObject(i);if(s!=null&&key.equals(s.optString("semantic"))&&!s.optString("title").isEmpty())return s.optString("title");}
+        return key;
+    }
     /** Why a named recording of the selection is not offered while smart analysis drives the selection (it records on its own), or null. */
-    public static String smartRecordingBlocker(JSONObject state){return smartActive(state)&&!state.optString("mode","live").equals("replay")?"Während der Smart-Analyse nicht verfügbar: Sie zeichnet selbst auf, eine Aufzeichnung der Auswahl würde den vorherigen statt des angezeigten Satzes festhalten.":null;}
-    /** The smart card's headline. A replay whose last event is the stop (empty set) still shows the recorded history and the stop reason. */
+    public static String smartRecordingBlocker(JSONObject state){return smartActive(state)&&!state.optString("mode","live").equals("replay")?"Während der Smart-Analyse nicht verfügbar: Sie zeichnet selbst auf, eine Aufzeichnung der Auswahl würde die vom Planer gewählten Messwerte nicht festhalten.":null;}
+    /** What a goal in progress is doing, with the one remaining time the planner defines: the EGR time still missing for 30 contiguous seconds (REQ-039.2). */
+    private static String goalPhaseText(JSONObject goal){
+        String id=goal.optString("goal");
+        switch(goal.optString("phase")){
+            case "interrupted":{String by=goal.optString("by");return "pausiert"+(by.isEmpty()?"":" · Vorrang: "+goalLabel(by));}
+            case "awaiting_retry":return "wartet auf neuen Versuch einzelner Messwerte";
+            case "complete":return "alle lesbaren Messwerte erfasst";
+            default:{
+                if(id.equals("baseline"))return "wird gemessen";
+                long missing=goal.has("contiguous_missing_ms")&&!goal.isNull("contiguous_missing_ms")?goal.optLong("contiguous_missing_ms",-1):-1;
+                if(id.equals("egr")&&missing>0)return "wird gemessen · noch "+ageText(missing)+" bis 30 s zusammenhängend";
+                return "wird gemessen · bis die Bedingung endet";
+            }
+        }
+    }
+    /** The smart card's headline: goals in progress with reason and remaining time, goals that wait or cannot be reached, skipped signals and, after a stop, why it ended. */
     public static String smartSummaryText(JSONObject state){
         JSONObject smart=state.optJSONObject("smart");boolean replay=state.optString("mode","live").equals("replay"),active=smartActive(state);
-        String component=smart==null?"":smart.optString("component");JSONArray changes=smart==null?null:smart.optJSONArray("changes");
-        JSONObject last=changes==null||changes.length()==0?null:changes.optJSONObject(changes.length()-1);
+        JSONArray goals=smart==null?null:smart.optJSONArray("goals"),skipped=smart==null?null:smart.optJSONArray("skipped"),catalog=state.optJSONArray("signals"),changes=smart==null?null:smart.optJSONArray("changes");
+        boolean recorded=replay&&smart!=null&&smart.optBoolean("replay")&&((changes!=null&&changes.length()>0)||(goals!=null&&goals.length()>0)||(skipped!=null&&skipped.length()>0)||!smart.optString("reason").isEmpty());
         StringBuilder s=new StringBuilder();
         if(active){
-            String label=smart.optString("label");if(label.isEmpty())label=smartSet(component);
-            s.append(replay?"Aus der Aufnahme · Komponente: ":"Aktiv · ").append(!replay&&component.isEmpty()?"kein Satz verfügbar":(replay?"":"Komponente: ")+label);
-            if(!smart.optString("reason").isEmpty())s.append("\nGrund: ").append(smart.optString("reason"));
-            if(!replay&&component.isEmpty())s.append("\nKeine Komponente hat im Moment verfügbare Messwerte · kein Zeitablauf, bis sich das ändert");
-            else if(!replay){
-                long remaining=smart.optLong("remaining_ms",-1);
-                s.append("\n").append(remaining<0?"Kein Zeitablauf · Wechsel nur durch einen neuen Auslöser":"Wechsel durch Zeitablauf in etwa "+ageText(remaining));
-                if(smart.optInt("selected_count")>0)s.append("\n").append(smart.optInt("selected_count")).append(" Messwerte gewählt");
-                if(smart.optLong("latency_ms",-1)>=0)s.append(" · Umstellung nach ").append(smart.optLong("latency_ms")).append(" ms");
-                if(smart.optBoolean("recording"))s.append("\n● Satzwechsel werden aufgezeichnet");
+            s.append("Aktiv · ").append(smart.optInt("selected_count")).append(" Messwerte gewählt");
+            if(!smart.optString("recording").isEmpty())s.append("\n● Planänderungen werden aufgezeichnet");
+        }else if(recorded){
+            s.append("Aus der Aufnahme");
+            if(!smart.optString("reason").isEmpty())s.append(" · beendet: ").append(smartReason(smart.optString("reason")));
+        }else{
+            s.append(replay?(state.optBoolean("replayLegacySmart")?"Ältere Smart-Analyse in dieser Aufnahme nicht angezeigt":"In dieser Aufnahme wurde keine Smart-Analyse mitgeschnitten."):"Nicht aktiv");
+            if(!replay&&smart!=null&&!smart.optString("reason").isEmpty())s.append("\nZuletzt beendet: ").append(smart.optString("reason"));
+            return s.toString();
+        }
+        if(replay&&state.optBoolean("replayLegacySmart"))s.append("\nÄltere Smart-Analyse in dieser Aufnahme nicht angezeigt");
+        boolean warmWaiting=false;StringBuilder gone=new StringBuilder(),unknown=new StringBuilder();
+        for(int i=0;goals!=null&&i<goals.length();i++){
+            JSONObject goal=goals.optJSONObject(i);if(goal==null)continue;String label=goalLabel(goal.optString("goal")),reason=smartReason(goal.optString("reason"));
+            switch(goal.optString("phase")){
+                case "serving":case "interrupted":case "awaiting_retry":case "complete":s.append("\n• ").append(label).append(": ").append(goalPhaseText(goal));break;
+                case "not_reachable":if(gone.length()>0)gone.append(", ");gone.append(label).append(" (").append(reason).append(")");break;
+                case "condition_unknown":if(unknown.length()>0)unknown.append(", ");unknown.append(label).append(" (").append(reason).append(")");break;
+                default:break;
             }
-        }else if(replay&&(!component.isEmpty()||last!=null)){
-            String shown=!component.isEmpty()?component:last.optString("set");
-            s.append("Aus der Aufnahme · letzter Satz: ").append(shown.isEmpty()?"Smart-Analyse beendet":smartSet(shown));
-            String reason=shown.isEmpty()&&last!=null&&!last.optString("reason").isEmpty()?last.optString("reason"):!smart.optString("reason").isEmpty()?smart.optString("reason"):last==null?"":last.optString("reason");
-            if(!reason.isEmpty())s.append("\nGrund: ").append(reason);
-        }else s.append(replay?"In dieser Aufnahme wurde keine Smart-Analyse mitgeschnitten.":"Nicht aktiv");
+            if("not_yet_reached".equals(goal.optString("warm")))warmWaiting=true;
+        }
+        if(warmWaiting)s.append("\nWarm noch nicht erreicht · technische Grenze 80 °C Kühlmitteltemperatur, keine Aussage über den Zustand");
+        if(unknown.length()>0)s.append("\nBedingung unbekannt, kein Messwert zählt dafür: ").append(unknown);
+        if(gone.length()>0)s.append("\nIn dieser Fahrt nicht erreichbar: ").append(gone);
+        if(skipped!=null&&skipped.length()>0){
+            s.append("\nÜbersprungen: ").append(skipped.length()).append(" Messwerte");
+            for(int i=0;i<skipped.length()&&i<3;i++){JSONObject skip=skipped.optJSONObject(i);if(skip==null)continue;
+                s.append("\n• ").append(signalLabel(skip.optString("signal"),catalog)).append(" · ").append(smartReason(skip.optString("reason")));
+                long retry=skip.has("retry_at_mono")?skip.optLong("retry_at_mono")-android.os.SystemClock.elapsedRealtime():-1;
+                if(retry>0)s.append(" · neuer Versuch in ").append(ageText(retry));}
+        }
+        if(smart!=null&&smart.optInt("session_targets")>0)s.append("\n").append(smart.optInt("session_targets")).append(" Messwerte brauchen die erweiterte Sitzung · hier nicht verwendet");
         return s.toString();
+    }
+    /** The latest plan changes: time, goal, what happened and why. */
+    public static String smartChangesText(JSONObject smart){
+        JSONArray changes=smart==null?null:smart.optJSONArray("changes");StringBuilder h=new StringBuilder();int shown=0;
+        for(int i=changes==null?-1:changes.length()-1;i>=0&&shown<5;i--){JSONObject change=changes.optJSONObject(i);if(change==null)continue;shown++;
+            Object at=change.opt("at");String when=at instanceof Number&&((Number)at).longValue()>0?new java.text.SimpleDateFormat("HH:mm:ss",java.util.Locale.GERMANY).format(new java.util.Date(((Number)at).longValue())):"";
+            String goal=change.optString("goal"),reason=change.optString("reason"),by=change.optString("by");
+            String what;switch(change.optString("kind")){
+                case "started":what="gestartet";break;case "interrupted":what="unterbrochen"+(by.isEmpty()?"":" · Vorrang: "+goalLabel(by));break;case "resumed":what="fortgesetzt";break;
+                case "completed":what="abgeschlossen";break;case "expired":what="beendet";break;case "not_reachable":what="in dieser Fahrt nicht erreichbar";break;
+                case "stopped":what="gestoppt";break;default:what=change.optString("kind");}
+            if(h.length()==0)h.append("LETZTE PLANÄNDERUNGEN");
+            h.append("\n• ").append(when.isEmpty()?"":when+" · ").append(goal.isEmpty()?"Smart-Analyse":goalLabel(goal)).append(" · ").append(what);
+            if(!reason.isEmpty())h.append("\n   ").append(smartReason(reason));}
+        return h.toString();
     }
     private void updateSmartStatus(){
         if(smartSummary==null)return;
         JSONObject smart=state.optJSONObject("smart");boolean replay=state.optString("mode","live").equals("replay"),active=smartActive(state);
-        JSONArray changes=smart==null?null:smart.optJSONArray("changes");
         smartSummary.setText(smartSummaryText(state));smartSummary.setTextColor(active&&!replay?ACCENT:MUTED);
-        String unavailableText=smartUnavailableText(smart,array("signals"));
-        smartMissing.setText(unavailableText);smartMissing.setVisibility(unavailableText.isEmpty()?View.GONE:View.VISIBLE);
-        String triggerText=smartTriggerText(smart,array("signals"));
-        smartTriggers.setText(triggerText);smartTriggers.setVisibility(triggerText.isEmpty()?View.GONE:View.VISIBLE);
-        StringBuilder h=new StringBuilder();int shown=0;
-        for(int i=changes==null?-1:changes.length()-1;i>=0&&shown<5;i--){JSONObject change=changes.optJSONObject(i);if(change==null)continue;shown++;
-            Object at=change.opt("at");String when=at instanceof Number&&((Number)at).longValue()>0?new java.text.SimpleDateFormat("HH:mm:ss",java.util.Locale.GERMANY).format(new java.util.Date(((Number)at).longValue())):at instanceof String?(String)at:"";
-            if(h.length()==0)h.append("LETZTE WECHSEL");
-            h.append("\n• ").append(when.isEmpty()?"":when+" · ").append(smartSet(change.optString("set")));
-            if(change.has("previous_set")&&!change.isNull("previous_set"))h.append(" (vorher: ").append(smartSet(change.optString("previous_set"))).append(")");
-            if(!change.optString("reason").isEmpty())h.append("\n   ").append(change.optString("reason"));}
-        smartChanges.setText(h.toString());smartChanges.setVisibility(h.length()==0?View.GONE:View.VISIBLE);
+        String changes=smartChangesText(smart);
+        smartChanges.setText(changes);smartChanges.setVisibility(changes.isEmpty()?View.GONE:View.VISIBLE);
     }
-    /** Announces a change of the shown smart set once; nothing else is announced, so a driving user is not interrupted. */
+    /** Announces a change of the goals in progress once; nothing else is announced, so a driving user is not interrupted. */
     private void announceSmartSet(){
-        JSONObject smart=state.optJSONObject("smart");String set=smartActive(state)&&smart!=null?smart.optString("component"):"";
+        JSONObject smart=state.optJSONObject("smart");JSONArray goals=smartActive(state)&&smart!=null?smart.optJSONArray("goals"):null;StringBuilder now=new StringBuilder(),labels=new StringBuilder();
+        for(int i=0;goals!=null&&i<goals.length();i++){JSONObject goal=goals.optJSONObject(i);if(goal==null||goal.optString("goal").equals("baseline"))continue;String phase=goal.optString("phase");
+            if(phase.equals("serving")||phase.equals("interrupted")||phase.equals("awaiting_retry")||phase.equals("complete")){now.append(goal.optString("goal")).append(',');if(labels.length()>0)labels.append(", ");labels.append(goalLabel(goal.optString("goal")));}}
+        String set=now.toString();
         if(set.equals(lastSmartSet))return;String previous=lastSmartSet;lastSmartSet=set;
-        if(set.isEmpty()&&previous.isEmpty())return;announce(set.isEmpty()?"Smart-Analyse beendet":"Smart-Analyse zeigt "+componentLabel(set));
+        if(set.isEmpty()&&previous.isEmpty())return;announce(set.isEmpty()?(smartActive(state)?"Smart-Analyse: nur Grundabdeckung":"Smart-Analyse beendet"):"Smart-Analyse zeigt "+labels);
     }
     private static int count(JSONObject o,String key){Object v=o.opt(key);return v instanceof JSONArray?((JSONArray)v).length():o.optInt(key);}
     private static String componentReason(String status){
@@ -597,24 +658,6 @@ public class MainActivity extends Activity {
         for(int i=0;catalog!=null&&i<catalog.length();i++){JSONObject s=catalog.optJSONObject(i);if(s==null)continue;if(semantic.equals(s.optString("meaning",s.optString("semantic")))){matches++;title=s.optString("title");}}
         for(int i=0;catalog!=null&&!title.isEmpty()&&i<catalog.length();i++){JSONObject s=catalog.optJSONObject(i);if(s!=null&&title.equals(s.optString("title")))sameTitle++;}
         return matches==1&&!title.isEmpty()&&sameTitle==1?title:semantic;
-    }
-    /** Trigger signals that cannot be read, and the unavailable semantics of the current set (without the triggers already named). */
-    public static String smartUnavailableText(JSONObject smart,JSONArray catalog){
-        JSONArray missing=smart==null?null:smart.optJSONArray("missing"),unavailable=smart==null?null:smart.optJSONArray("unavailable");JSONObject reasons=smart==null?null:smart.optJSONObject("reasons");
-        StringBuilder gone=new StringBuilder(),none=new StringBuilder();
-        for(int i=0;missing!=null&&i<missing.length();i++){if(gone.length()>0)gone.append(", ");gone.append(semanticLabel(missing.optString(i),catalog));}
-        for(int i=0;unavailable!=null&&i<unavailable.length();i++){String semantic=unavailable.optString(i);boolean duplicate=false;for(int j=0;missing!=null&&j<missing.length();j++)duplicate|=semantic.equals(missing.optString(j));if(duplicate)continue;if(none.length()>0)none.append(", ");String reason=reasons==null?"":reasons.optString(semantic);none.append(semanticLabel(semantic,catalog));if(!reason.isEmpty())none.append(" · ").append(componentReason(reason));}
-        return (gone.length()==0?"":"Nicht lesbare Auslöser: "+gone+"\nDiese Bedingungen gelten als unbekannt, nicht als 0.")+(none.length()==0?"":(gone.length()==0?"":"\n")+"Im aktuellen Satz nicht verfügbar: "+none);
-    }
-    /** Every trigger with its state and sample age. */
-    public static String smartTriggerText(JSONObject smart,JSONArray catalog){
-        JSONArray triggers=smart==null?null:smart.optJSONArray("triggers");StringBuilder t=new StringBuilder();
-        for(int i=0;triggers!=null&&i<triggers.length();i++){JSONObject trigger=triggers.optJSONObject(i);if(trigger==null)continue;
-            String semantic=trigger.optString("semantic"),detail=trigger.optString("detail");long age=trigger.has("age_ms")&&!trigger.isNull("age_ms")?trigger.optLong("age_ms",-1):-1;
-            if(t.length()==0)t.append("AUSLÖSER · Alter der Messwerte");
-            t.append("\n• ").append(semanticLabel(semantic,catalog)).append(" · ").append(triggerState(trigger.optString("state"))).append(age>=0?" · vor "+ageText(age):" · noch kein Messwert");
-            if(!detail.isEmpty())t.append(" · ").append(detail);}
-        return t.toString();
     }
     /** #291: the applied component preset: counts, extended-session state and every semantic with its status; unavailable ones first, each with its reason. */
     private void componentCard(){

@@ -173,6 +173,13 @@ fn inspect_part(reader: impl BufRead) -> Result<(Value, coverage::Part), String>
                     }
                     continue;
                 }
+                if action == "smart.plan" {
+                    match smart_plan_change(&event, &recorded["data"], &mut last_smart_offset) {
+                        Ok(change) => smart_changes.push(change),
+                        Err(reason) => issues.push(format!("smart.plan: {reason}")),
+                    }
+                    continue;
+                }
                 if action == "measurement.gap" {
                     // REQ-037.3: a recorded live measurement gap is shown as recorded. It is
                     // pure evidence: never replayed, never sent anywhere and never given a cause.
@@ -293,6 +300,41 @@ fn smart_change(event: &Value, data: &Value, last_offset: &mut u64) -> Result<Va
     ] {
         change.entry(key).or_insert(Value::Null);
     }
+    change.insert("at".into(), event["at"].clone());
+    change.insert("offset_us".into(), event["offset_us"].clone());
+    Ok(Value::Object(change))
+}
+
+/// REQ-039.8: retain planner changes as recorded, with a closed event vocabulary and ordered offsets.
+fn smart_plan_change(
+    event: &Value,
+    data: &Value,
+    last_offset: &mut u64,
+) -> Result<Value, &'static str> {
+    const KINDS: &[&str] = &[
+        "started",
+        "interrupted",
+        "resumed",
+        "completed",
+        "context_ended",
+        "expired",
+        "not_reachable",
+        "stopped",
+        "skipped",
+        "selection",
+        "resume",
+    ];
+    let mut change = data.as_object().ok_or("data is not an object")?.clone();
+    match change.get("kind").and_then(Value::as_str) {
+        None => return Err("kind is missing"),
+        Some(kind) if !KINDS.contains(&kind) => return Err("kind is not a known change"),
+        Some(_) => {}
+    }
+    let offset = event["offset_us"].as_u64().ok_or("offset_us is missing")?;
+    if offset < *last_offset {
+        return Err("offset_us goes backwards");
+    }
+    *last_offset = offset;
     change.insert("at".into(), event["at"].clone());
     change.insert("offset_us".into(), event["offset_us"].clone());
     Ok(Value::Object(change))
@@ -563,6 +605,37 @@ mod tests {
         json!({"type":"action","action":"smart.set","argument":"","at":at,"offset_us":offset_us,
             "result":{"ok":true,"data":data}})
         .to_string()
+    }
+
+    #[test]
+    fn req_039_8_planner_changes_are_reported_and_validated() {
+        let event = |offset, kind| {
+            json!({"type":"action","action":"smart.plan","at":1234,
+            "offset_us":offset,"result":{"ok":true,"data":{"kind":kind,"goal":"egr",
+            "reason":"condition_holds","inputs":[{"signal":"engine.load","value":42}]}}})
+            .to_string()
+        };
+        let recording = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"session","schema":"OBDENTIC-MOBILE","version":1,"mode":"live"}"#,
+            event(100, "started"),
+            event(99, "stopped"),
+            event(101, "invented"),
+            r#"{"type":"session_end","reason":"stopped"}"#
+        );
+        let report = inspect(recording.as_bytes()).unwrap();
+        assert_eq!(
+            report["smart_changes"],
+            json!([{"at":1234,"offset_us":100,"kind":"started",
+            "goal":"egr","reason":"condition_holds","inputs":[{"signal":"engine.load","value":42}]}])
+        );
+        let issues = report["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues[0]
+            .as_str()
+            .unwrap()
+            .contains("offset_us goes backwards"));
+        assert!(issues[1].as_str().unwrap().contains("kind"));
     }
 
     #[test]

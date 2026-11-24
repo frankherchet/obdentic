@@ -50,6 +50,21 @@ final class MeasurementGapAcceptance {
         for (long t = 500; t < 60_000; t += 500) require(g.observe(IAT, false, t, t + 100, 1000) == none, "REQ-037.1 a previously successful signal that is no longer selected cannot start a gap");
         require(!g.active(), "no gap without a selected, previously successful signal");
 
+        // REQ-037.1: Smart changes selections without erasing the continuous failed-read window.
+        g = new MeasurementGap(); g.select(Arrays.asList(RPM), true); g.observe(RPM, true, 0, 100, 1000);
+        g.observe(RPM, false, 500, 600, 1000);
+        for (long t = 1000; t < 10_500; t += 500) {
+            g.select(t % 1000 == 0 ? Arrays.asList(RPM, IAT) : Arrays.asList(RPM), true);
+            require(g.observe(RPM, false, t, t + 100, 1000) == none, "Smart selection changes do not start a gap early");
+        }
+        require(g.observe(RPM, false, 10_500, 10_600, 1000) == MeasurementGap.Change.START, "REQ-037.1 Smart selection changes preserve the ten-second window");
+        // REQ-037.1/.2: retry waits do not suspend Smart's gap clock; a formerly selected signal can recover by probe.
+        g = new MeasurementGap(); g.select(Arrays.asList(RPM), true); g.observe(RPM, true, 0, 100, 1000);
+        g.observe(RPM, false, 500, 600, 1000); g.select(Collections.emptyList(), true);
+        require(g.tick(10_499) == none && g.tick(10_500) == MeasurementGap.Change.START, "REQ-037.1 Smart retry wait reaches the gap at ten seconds");
+        require(g.nextProbe(15_499) == null && RPM.equals(g.nextProbe(15_500)), "REQ-037.2 Smart probes a retry-waiting previously successful signal after five seconds");
+        require(g.observe(RPM, true, 15_500, 15_600, 1000) == MeasurementGap.Change.RECOVERED, "REQ-037.2 a finite probe recovers Smart");
+
         // REQ-037.1: exactly 10 s of attempted reads without a finite value
         g = new MeasurementGap(); g.select(Arrays.asList(RPM, COOLANT, IAT));
         require(g.observe(RPM, true, 0, 100, 1000) == none, "first value");
@@ -279,18 +294,32 @@ final class MeasurementGapAcceptance {
             waitFor(() -> !service.snapshot().optString("autoRecording").equals(afterRecovery) && !service.snapshot().optString("autoRecording").isEmpty(), "rotation after recovery", 30_000);
             service.rotateMs = savedRotateMs;
             service.startSmart(); waitFor(() -> smart(service).optBoolean("active"), "smart analysis started", 15_000);
-            waitFor(() -> "fresh".equals(trigger(service, RPM).optString("state")) && "fresh".equals(trigger(service, COOLANT).optString("state")) && "fresh".equals(trigger(service, "vehicle.speed").optString("state")), "fresh trigger readings", 20_000);
-            int changesBefore = nonAvailabilityChanges(service);
-            String setBefore = smart(service).optString("component");
+            waitFor(() -> baselineServed(service), "the baseline goal is served", 20_000);
+            SystemClock.sleep(3_000); // a few planning steps with live readings
+            int changesBefore = shownChanges(service);
             link.silentAll = true;
             waitFor(() -> gap(service).optBoolean("active"), "gap while the analysis runs", 25_000);
-            SystemClock.sleep(1500);
-            for (String key : new String[] {RPM, COOLANT, "vehicle.speed", "vehicle.accelerator_pedal_e", "engine.load"}) {
-                JSONObject row = trigger(service, key);
-                require(!"fresh".equals(row.optString("state")) && !row.has("value"), "REQ-037.2 a missing or stale trigger reading is unknown, never zero: " + row);
+            SystemClock.sleep(14_000); // at least one planning step (at most 10 s apart) sees the readings stale
+            JSONArray changesNow = smart(service).optJSONArray("changes");
+            for (int i = changesBefore; changesNow != null && i < changesNow.length(); i++) {
+                JSONObject change = changesNow.getJSONObject(i);
+                require(!"started".equals(change.optString("kind")) && !"condition_ended".equals(change.optString("reason")), "REQ-039.6 unknown readings neither start a goal nor count as a release: " + change);
             }
-            require(nonAvailabilityChanges(service) == changesBefore && setBefore.equals(smart(service).optString("component")), "REQ-037.2 unknown triggers neither trigger, release nor re-arm a set: " + smart(service).optJSONArray("changes"));
             require(smart(service).optBoolean("active") && MainActivity.gapText(service.snapshot()).equals(TEXT), "the analysis keeps running with the notice shown");
+            // REQ-039.14 / #381: repeated five-second gap probes over the whole retry schedule
+            // neither advance retry deadlines nor mark any of the skipped signals unavailable.
+            String skippedBefore = smart(service).getJSONArray("skipped").toString();
+            require(!"[]".equals(skippedBefore), "the initial failed reads establish retry state");
+            int gapProbesBefore = gap(service).optInt("probes");
+            SystemClock.sleep(155_000);
+            require(gap(service).optBoolean("active") && gap(service).optInt("probes") >= gapProbesBefore + 28, "REQ-039.14 the gap outlasts both retry delays with repeated probes");
+            require(skippedBefore.equals(smart(service).getJSONArray("skipped").toString()), "REQ-039.14 gap probes leave signal availability and retry deadlines unchanged");
+            // REQ-037.2: the retry-waiting Smart selection can recover through the bounded probe.
+            int probesBefore = gap(service).optInt("probes"); link.silentAll = false; link.silent.clear();
+            waitFor(() -> !gap(service).optBoolean("active"), "Smart probe recovery", 12_000);
+            require(gap(service).optInt("probes") > probesBefore && "recovered".equals(gap(service).optString("outcome")), "REQ-037.2 a finite probe recovers the Smart gap");
+            link.silentAll = true;
+            waitFor(() -> gap(service).optBoolean("active"), "second Smart gap", 40_000);
 
             // REQ-037.3: the stop ends the open gap in the recording without claiming recovery
             service.disconnect();
@@ -304,10 +333,10 @@ final class MeasurementGapAcceptance {
             require(chain.size() >= 2, "the forced rotation produced at least two files: " + chain);
             List<List<JSONObject>> files = new ArrayList<>(); for (String n : chain) files.add(read(new File(dir, n)));
             String sequence = checkChain(files);
-            require(sequence.matches("start:no_values(,resume:no_values)+,end:recovered,start:no_values(,resume:no_values)*,end:stopped"), "REQ-037.3 start, a resume in the rotated file, recovery, a second gap and its end by the stop, nothing else: " + sequence);
+            require(sequence.matches("start:no_values(,resume:no_values)+,end:recovered,start:no_values(,resume:no_values)*,end:recovered,start:no_values(,resume:no_values)*,end:stopped"), "REQ-037.3 the Smart probe recovery and later gap are recorded without inferring a cause: " + sequence);
             List<JSONObject> gapEvents = new ArrayList<>(); for (List<JSONObject> f : files) for (JSONObject e : f) if (isGap(e)) gapEvents.add(e);
             JSONObject start = gapEvents.get(0), recovered = null;
-            for (JSONObject e : gapEvents) if ("recovered".equals(data(e).optString("reason"))) recovered = e;
+            for (JSONObject e : gapEvents) if (recovered == null && "recovered".equals(data(e).optString("reason"))) recovered = e;
             require(start.optLong("at") - last.wall >= 10_000 && start.optLong("at") <= System.currentTimeMillis(), "REQ-037.3 the start is timestamped no earlier than 10 s after the last value: " + (start.optLong("at") - last.wall) + " ms");
             require(recovered.optLong("at") - start.optLong("at") >= 16_000, "REQ-037.3 the recorded recovery follows the 17 s silence: " + (recovered.optLong("at") - start.optLong("at")) + " ms");
             JSONObject stoppedEnd = gapEvents.get(gapEvents.size() - 1);
@@ -324,12 +353,12 @@ final class MeasurementGapAcceptance {
             for (int i = 1; i < recordedProbes.size(); i++) require(recordedProbes.get(i) - recordedProbes.get(i - 1) >= 4_500, "REQ-037.2 recorded probes are at least 5 s apart: " + recordedProbes);
             boolean readsAfter = false; for (JSONObject e : files.get(files.size() - 1)) if ("read".equals(e.optString("action")) && e.optLong("at") > endAt) readsAfter = true;
             require(readsAfter, "normal reads follow the recorded recovery");
-            // the unknown trigger readings of the analysis in the second gap carry no value unless fresh
+            // REQ-039.6/.8: the condition readings of the plan changes in the second gap carry a reason and never a value when they are unknown
             for (List<JSONObject> f : files) for (JSONObject e : f) {
-                JSONObject smartData = "smart.set".equals(e.optString("action")) && e.optJSONObject("result") != null ? e.getJSONObject("result").optJSONObject("data") : null;
-                JSONObject readings = smartData == null ? null : smartData.optJSONObject("readings");
-                for (java.util.Iterator<String> names = readings == null ? Collections.<String>emptyIterator() : readings.keys(); names.hasNext(); ) { JSONObject r = readings.optJSONObject(names.next());
-                    require(r == null || !r.has("value") || "fresh".equals(r.optString("state")), "REQ-037.2 a missing or stale trigger reading carries no value in the recording: " + r); }
+                JSONObject smartData = "smart.plan".equals(e.optString("action")) && e.optJSONObject("result") != null ? e.getJSONObject("result").optJSONObject("data") : null;
+                JSONArray inputs = smartData == null ? null : smartData.optJSONArray("inputs");
+                for (int i = 0; inputs != null && i < inputs.length(); i++) { JSONObject input = inputs.getJSONObject(i);
+                    require(input.isNull("value") != input.isNull("reason"), "REQ-039.6 an unknown condition reading carries its reason and no value in the recording: " + input); }
             }
 
             // REQ-037.3: offline replay shows the gap without any adapter traffic; the raw evidence stays
@@ -435,15 +464,14 @@ final class MeasurementGapAcceptance {
     }
     private static JSONObject gap(ObdService service) { JSONObject g = service.snapshot().optJSONObject("gap"); return g == null ? new JSONObject() : g; }
     private static JSONObject smart(ObdService service) { return service.snapshot().optJSONObject("smart"); }
-    private static JSONObject trigger(ObdService service, String semantic) {
-        JSONArray rows = smart(service).optJSONArray("triggers");
-        for (int i = 0; rows != null && i < rows.length(); i++) if (semantic.equals(rows.optJSONObject(i).optString("semantic"))) return rows.optJSONObject(i);
-        return new JSONObject();
+    private static int shownChanges(ObdService service) {
+        JSONArray changes = smart(service).optJSONArray("changes");
+        return changes == null ? 0 : changes.length();
     }
-    private static int nonAvailabilityChanges(ObdService service) {
-        JSONArray changes = smart(service).optJSONArray("changes"); int n = 0;
-        for (int i = 0; changes != null && i < changes.length(); i++) if (!"availability".equals(changes.optJSONObject(i).optString("kind"))) n++;
-        return n;
+    private static boolean baselineServed(ObdService service) {
+        JSONArray goals = smart(service).optJSONArray("goals");
+        for (int i = 0; goals != null && i < goals.length(); i++) if ("baseline".equals(goals.optJSONObject(i).optString("goal"))) return "serving".equals(goals.optJSONObject(i).optString("phase"));
+        return false;
     }
     private static String status(ObdService service, String semantic) {
         JSONArray catalog = service.snapshot().optJSONArray("signals");
