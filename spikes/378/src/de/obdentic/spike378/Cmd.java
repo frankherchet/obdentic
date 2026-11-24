@@ -47,6 +47,7 @@ public class Cmd extends BroadcastReceiver {
   String killPoint = "";
   long killSeq = -1;
   String preMethod = "";
+  boolean noExtra;
 
   @Override public void onReceive(Context c, Intent i) {
     final PendingResult pr = goAsync();
@@ -72,6 +73,7 @@ public class Cmd extends BroadcastReceiver {
     int n = in.getIntExtra("n", 100);
     killPoint = in.hasExtra("kill") ? in.getStringExtra("kill") : "";
     killSeq = in.getIntExtra("killseq", -1);
+    noExtra = in.getBooleanExtra("noextra", false);
     Log.i(T, "CMD " + cmd + " run=" + run + " dest=" + dest + " strat=" + strat + " size=" + size + " n=" + n
         + " procAgeMs=" + (SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime()));
     switch (cmd) {
@@ -344,8 +346,10 @@ public class Cmd extends BroadcastReceiver {
       Log.i(T, "ACK run=" + run + " seq=0 sz=" + size + " ms=" + String.format("%.3f", total / 1e6));
       // c: create, open, scan, prealloc, write, sync, dirsync, a2, a3 ... (verdict uses total only)
       long[] c = {h.createNs, h.openNs, h.scanNs, h.preNs, tm[0], tm[1], h.dirNs, 0, 0};
-      long a = System.nanoTime(); h.append(r2); c[7] = System.nanoTime() - a;
-      a = System.nanoTime(); h.append(r3); c[8] = System.nanoTime() - a;
+      if (!noExtra) {   // noextra: keeps a preallocated 8 MiB file from overflowing at 64 KiB (3 x 64 KiB x 100 > 8 MiB)
+        long a = System.nanoTime(); h.append(r2); c[7] = System.nanoTime() - a;
+        a = System.nanoTime(); h.append(r3); c[8] = System.nanoTime() - a;
+      }
       csv(label, size, 0, total, c, "ok:" + preMethod + ":age=" + age);
     } catch (Throwable e) {
       csv(label, size, 0, -1, null, "ERR " + e.getClass().getSimpleName());

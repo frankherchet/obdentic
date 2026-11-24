@@ -1,0 +1,10 @@
+i2,saf,pre,force_stop,i2spreforce08471,acked=35,present=35,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce19112,acked=22,present=22,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce22241,acked=87,present=87,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce31346,acked=72,present=72,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce4706,acked=52,present=52,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce53393,acked=69,present=69,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce67525,acked=49,present=49,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce71057,acked=39,present=39,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce84856,acked=62,present=62,lost=0,unacked_present=0,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True
+i2,saf,pre,force_stop,i2spreforce95587,acked=69,present=70,lost=0,unacked_present=1,corrupt_lines=0,torn_bytes=0,dispatch_before_ack=0,killed=True

@@ -21,6 +21,7 @@ for combo in "$@"; do
       clean $dest "cold-existing-$dest-$strat.jsonl"; bc mk-$combo --es cmd mkexisting --es dest $dest --es strat $strat --es csv mk >/dev/null
       ex="--ez existing true"
     fi
+    [ -n "${NOEXTRA:-}" ] && ex="$ex --ez noextra true"
     $A shell "for i in \$(seq 1 $N); do am force-stop $PK; am broadcast --include-stopped-packages -n $PK/.Cmd --es run c\$i --es csv $csv --es cmd cold --es dest $dest --es strat $strat --ei size $size $ex >/dev/null; done"
     pull $csv > raw-$csv.csv; echo "$csv $(wc -l < raw-$csv.csv) lines"
     clean $dest "cold-c*"

@@ -50,7 +50,7 @@ Baselines only (A1): app-private `noBackupFilesDir` with wa, wfd and pre; `files
 - I2: `am force-stop` at a random time during continuous 4 KiB appends (interval 20 ms to keep the logcat oracle below its rate limit), 10 runs per candidate.
 - **Not run, hence inconclusive for the matching claims:** abrupt power or storage-controller loss (it needs a power cut, and power/sleep keys, reboot and any other touch of the device are out of bounds), full storage, short-write and fsync-failure injection, OEM-independence. Process death does not drop the kernel page cache; I1/I2 test application ordering, not persistence on stable media.
 
-**Publication:** raw per-sample durations stay local (assignment for this run); the ADR publishes aggregates and a SHA-256 of every raw file. A6 asks for raw durations to be published; the ADR records that this is not met and why.
+**Publication:** see addendum 2 (superseded the original plan to keep raw durations local).
 
 ## Addendum to the protocol (after the smoke runs, before any verdict sample)
 
@@ -58,48 +58,93 @@ Baselines only (A1): app-private `noBackupFilesDir` with wa, wfd and pre; `files
 - Added command `idle` (warm process, fixed pause between appends) to test the hypothesis that the ≈ 20 ms first-sync cost is related to storage idle time rather than to the fresh process.
 - Private-directory cleanup uses an in-app command because `run-as` is denied on this build.
 
+## Addendum 2 to the protocol (second device session, after the first sample of that session)
+
+Maintainer decisions of 2026-11-24: direct path access with all-files permission is a measured candidate with no product commitment (REQ-045.23 unchanged until this ADR is decided); raw synthetic durations may be published as CSV after a scan for device identifiers. Published under `spikes/378/results/` (`raw/` per-sample CSVs, `SHA256SUMS`, `summary-*.csv`); the scan covered the serial, model/device/build identifiers beyond "Mi 9T", the account and home-path names, and found none. A6 is therefore met for publication.
+
+Deviations and harness defects found during the session (each affects only the cells named):
+1. Run order: baselines were measured after group commit and I1/I2 (not directly after the candidates), so a cut session would have left the candidate evidence. No effect on values.
+2. `am broadcast` to a `goAsync` receiver is limited to about 60 s; the first `idle` run with 3000 ms pauses stalled for that reason. The 3000 ms stratum was run as 3 × (3 warm-up + 10) appends in three fresh processes (30 samples, not 100); the 50/600 ms pauses had 100/60 samples. The `idle` test is a hypothesis test, not a verdict stratum.
+3. Existing-file strata with `pre` at 64 KiB **overflowed the 8 MiB preallocation**: three appends (verdict + two component appends) × 64 KiB × 100 samples exceeds 8 MiB, contradicting the protocol sentence that 100 samples stay within it. After about 42 samples the logical-end scan degenerates (≈ 770 ms). The affected files `raw-cold-saf-pre-existing-65536.csv` and `raw-cold-path-pre-existing-65536.csv` are kept but invalid; both strata were rerun with the two extra appends disabled (`noextra`, files `*-noextra.csv`) and only the reruns count. The same rerun was taken for the `prescan` strata at 64 KiB.
+4. The first I2 attempt did not interrupt anything, because the harness awaited the blocking broadcast and the runs ended by completion or timeout; a second attempt overlapped with a stale job. Both were discarded (not published) and I2 was rerun alone, one run at a time. Interval 20 ms as protocol; force-stop delay uniform 1.0–3.0 s after the broadcast.
+5. Group commit was measured at 16 KiB only (sizes 1/64 KiB not run) and on warm, closed-loop appenders without pauses.
+
 ## Measurements
 
-The device session was cut short at the request of the user (the phone had to be unplugged). **No verdict-grade stratum was measured**: no stratum reached 100 samples, no group-commit run, idle run, interruption run (I1/I2) or control rerun was taken. Only 3-sample smoke runs of the prototype exist; they are sanity checks of the harness, not measurements under A6, and are recorded here as observations only. They were taken with the commands `cold.sh` (`N=3`) and a single `probe`, on the Mi 9T, Android 16 (API 36.1), on mains power, `/data` f2fs mounted with `fsync_mode=nobarrier`, /storage/emulated a FUSE mount, ≈ 78 GB free.
+Device: Mi 9T, Android 16 (API 36.1), build with LineageOS properties present (a custom build, not a stock vendor image; hypothesis: the stock-looking vendor fingerprint is stale). `/data` f2fs, `/storage/emulated` FUSE; on mains power, screen kept awake by the existing setting; battery 50 % at the start, 80 % at the end; battery temperature 19.0 °C at the start, 33.4 °C at the maximum between blocks, 30.8 °C at the end (`results/context-*.txt`; the first lines of `context-run.txt` are the smoke runs of the earlier session); ≈ 77.7 GB free at the end. Commands: `scripts/idle.sh`, `scripts/cold.sh`, `scripts/gc.sh`, `scripts/interrupt.py i1|i2`, `scripts/stats.py` (nearest-rank, `ceil(q·n)`-th value). All numbers are request-to-ack milliseconds in the app; no failures occurred in any stratum (0 of 100 in each).
 
-- `probe`: `posix_fallocate` of 1 MiB succeeded (2048 blocks allocated) on the SAF descriptor, on the path, and in `noBackupFilesDir`, `filesDir` and cache; `FileChannel.force(true)` succeeded everywhere. A parent-directory `fsync` returned OK in 126 ms through a SAF-opened directory descriptor (first call), 4.2 ms through the path (all-files access), 0.6–2.8 ms for the private directories. Call results, not proof of persistence.
-- Smoke, cold process, total request-to-ack time over 3 samples (ms, range): saf-pre new 107–180 (create ≈ 45–87, open ≈ 11–16, dirsync ≈ 46–69); saf-pre existing ≈ 51–80 (open ≈ 20–37, scan ≈ 5.4 with the binary search); path-wa new ≈ 45–52 (create ≈ 18–41); path-wa existing ≈ 24–27; path-pre existing ≈ 32.4–32.9; nobackup-pre new ≈ 29–32; files-wa new ≈ 11–30; files-wa existing ≈ 6–24. In most samples a single data or full sync call took ≈ 20–22 ms and the second and third append in the same process ≈ 1.5–3 ms.
-- `idle` with pause 0 ms (path, pre, 16 KiB, 12 samples, printed to the console only, no file kept): 1.4–2.0 ms per append. The pauses 50/600/3000 ms did not complete (the interval run was interrupted when the phone was unplugged), so H2 below is untested.
-- The 4 KiB and 64 KiB smoke samples showed no visible size dependence. Three samples cannot support a percentile.
+**Cold process (every sample: `am force-stop`, fresh process, one first append), p95 in ms, 100 samples per cell** (1 KiB / 16 KiB / 64 KiB):
 
-Raw files (local only, not published; `spikes/378/data/device-pull/`) are smoke outputs plus an empty `idle-t.csv` from the interrupted run.
+| destination, strategy | new file | existing file |
+|---|---|---|
+| saf, wa (control) | 200.3 / 221.9 / 241.5 | 46.1 / 50.1 / 54.1 |
+| saf, wfd | 210.2 / 207.6 / 231.9 | 50.7 / 54.5 / 53.8 |
+| saf, pre (binary-search end) | 213.8 / 220.9 / 224.7 | 52.9 / 62.0 / 57.1 (noextra rerun) |
+| path, wa | 55.4 / 53.7 / 55.0 | 27.9 / 28.0 / 28.4 |
+| path, wfd | 54.1 / 54.5 / 55.8 | 28.0 / 28.1 / 29.1 |
+| path, pre | 56.0 / 56.3 / 59.5 | 32.6 / 33.5 / 34.3 (noextra rerun) |
+| saf, prescan (sequential scan) | not run | 478 / 939 / 917 (noextra) |
+| path, prescan | not run | 454 / 966 / 863 (noextra) |
+| baseline noBackupFilesDir wa | 30.4 / 29.8 / 30.0 | 24.2 / 24.6 / 25.2 |
+| baseline noBackupFilesDir wfd | 30.4 / 30.5 / 30.1 | 24.8 / 24.4 / 25.2 |
+| baseline noBackupFilesDir pre (noextra) | 33.4 / 31.5 / 32.6 | 29.5 / 29.9 / 30.4 |
+| baseline filesDir wa | 30.2 / 29.9 / 30.3 | 24.1 / 24.4 / 25.1 |
+| baseline cache wa | 30.0 / 29.9 / 30.2 | 27.9 / 24.7 / 25.4 |
+
+p50, p99, max, the count above 25 ms and the component medians (create, open, scan, prealloc, write, sync, dirsync) per stratum are in `results/summary-cold.csv`. Every candidate stratum has more than 90 of 100 samples above 25 ms except saf/path `wa`/`wfd` existing, where 71–94 of 100 are above 25 ms (lowest: path wa existing 1 KiB, 72). Component medians, 16 KiB: saf new: create ≈ 51 ms, open ≈ 11 ms, directory sync ≈ 90 ms; saf existing: open ≈ 17–19 ms, data sync ≈ 20 ms; path new: create ≈ 19–20 ms, open ≈ 2 ms, data sync ≈ 21 ms (wa) or ≈ 1.7 ms after the full `force(true)` of the preallocation (pre), directory sync ≈ 5 ms; path existing: open ≈ 4 ms, data sync ≈ 21 ms. With `pre`, the 20 ms is paid by the preallocation `force(true)` in the new-file case instead of the data sync. The `prescan` strata grow with the logical prefix over the 100 samples (the file is never truncated); they are reported as an implementation cost, not a steady state.
+
+**Control rerun at the end (saf wa, 16 KiB, 100 samples):** new p95 221.2 ms (first run 221.9), existing p95 52.8 ms (first run 50.1).
+
+**Idle test (warm process, held descriptor, 16 KiB, pause between appends; per candidate path-pre, saf-pre, path-wa, saf-wa; 100 samples at 0 and 50 ms, 60 at 600 ms, 30 at 3000 ms, 3 warm-ups excluded):**
+
+| pause | p50 range over the 4 candidates | p95 range | samples above 25 ms (of 4 × n) |
+|---|---|---|---|
+| 0 ms | 1.4–1.6 ms | 2.1–2.5 ms | 0 of 400 |
+| 50 ms | 5.2–5.6 ms | 23.7–23.8 ms | 0 of 400 |
+| 600 ms | 23.5–24.0 ms | 24.7–25.0 ms | 11 of 240 |
+| 3000 ms | 18.5 (path-pre), 23.5–24.1 ms | 24.2–26.5 ms | 6 of 120 |
+
+**Group commit (warm, 16 KiB, closed loop, 100 appends per writer after 5 warm-ups; per row each of saf-wa, path-wa, saf-pre, path-pre):** one writer, window 0: p95 1.8–3.3 ms; one writer, window 5 ms: p95 8.7–9.4 ms (the batch wait is included). Eight writers, window 0: p95 6.2–8.4 ms (mean batch ≈ 4.1–4.2 entries), p99 ≤ 15 ms, with 4 of 800 samples above 25 ms (path pre); eight writers, window 5 ms: p95 14.9–16.2 ms (mean batch ≈ 8), 8 of 800 above 25 ms (saf wa; max 29.3 ms). Two and four writers lie between (`results/summary-gc.csv`). No cold or post-pause group-commit run was taken.
+
+**Interruption (A3), host oracle = `ACK` line in logcat after the sync call returned, file read afterwards with `adb shell cat`:**
+- I1, self-`SIGKILL`, 6 candidates × 4 points × 20 runs = 480 runs, 1200 acknowledged records: 0 acknowledged records missing, 0 corrupt lines, 0 torn tails, 0 dispatches before the ack of the same sequence number. At `after_write` and `after_sync` the unacknowledged record was present in the file in all 120 + 120 runs; at `after_create` and `after_ack` nothing unacknowledged was present.
+- I2, `am force-stop` during 4 KiB appends every 20 ms, 6 candidates × 10 runs: 3536 acknowledged records, 0 missing, 0 corrupt lines, 0 torn tails, 0 dispatches before ack; 10 runs had one extra unacknowledged record present (allowed).
+- Per candidate and point: `results/summary-interruption.csv`.
 
 ## Criteria verdict
 
 | Predeclared criterion (A1–A6) | Verdict | Rests on |
 |---|---|---|
-| A4: a candidate has p95 ≤ 25 ms in both cold file cases, 1/16/64 KiB | inconclusive | no stratum has ≥ 100 samples; smoke ranges suggest SAF cold new/existing exceed 25 ms, but this is not a percentile |
-| A4: proven durability | inconclusive | unprovable by design without a power-loss oracle (A3) |
-| A3: no loss after force-stop or process kill | inconclusive | I1/I2 not run |
-| A3: abrupt power/storage interruption with independent oracle | not measured | cannot be produced within the session constraints |
-| A5: batching with and without concurrent writers | not measured | group commit runs not taken |
-| A6: ≥ 100 samples per stratum, raw durations published | not met | sample count not reached; raw durations kept local by assignment |
-| Refute (every candidate exceeds 25 ms p95 or loses an entry) | inconclusive | no candidate fully measured |
-| Confirm | not reached | see above |
+| A4, per candidate: p95 ≤ 25 ms in both cold file cases (1/16/64 KiB) | **not met by all 6 candidates** | Best candidates path wa/wfd: new p95 53.7–55.8 ms, existing 27.9–29.1 ms; saf candidates new 208–242 ms, existing 46–62 ms. Every candidate stratum above 25 ms. |
+| Refute: every candidate fails at least one of {p95 ≤ 25 ms in both cases, proven durability, no loss} | **met on the latency part** (judged on this device, these candidates and strategies only) | all 6 candidates × (new, existing) strata above 25 ms p95; no durability evidence needed for this limb |
+| Confirm | **not reachable** | A3 needs a power/storage interruption; not produced |
+| A3: no loss after force-stop or process kill | met for the application ordering, 0 loss | I1 480 runs, I2 60 runs. Counts as inconclusive for durability by A3 itself |
+| A3: abrupt power/storage interruption with independent oracle | not measured | cannot be produced within the session limits |
+| A5: batching with and without concurrent writers | measured (warm, 16 KiB only) | batching reduces per-entry latency of concurrent warm writers; cold and post-pause single appends not covered, so no statement about the budget case |
+| A6: ≥ 100 successful samples per stratum, nearest-rank p95, failures counted, raw durations published | met for the cold strata (the idle 600 ms and 3000 ms strata have 60 and 30 samples and are hypothesis tests only); published in `results/` | `results/raw`, `SHA256SUMS`; two published files are invalid (addendum 2, item 3) |
 
 ## Uncertainty
 
-- Everything above the smoke level is unmeasured. The smoke ranges are 3 samples per stratum and do not decide any criterion.
-- Hypotheses, untested: (H1) a fresh process pays ≈ 20 ms on its first data/full sync because of per-process or provider/FUSE handle setup; (H2) the ≈ 20 ms is storage idle wake-up, so every audit append after a pause (LLM turns last seconds) would pay it even in a warm process. H2 would invalidate the earlier warm numbers of #363 for real usage. Experiment: the prototype command `idle` with pauses 0/50/600/3000 ms on the path and SAF destinations (prepared, never completed).
-- The SAF provider round trips (create ≈ 45–87 ms, open ≈ 20–37 ms, directory sync ≈ 46–126 ms) are large compared with the budget in the smoke runs; whether any SAF write strategy can meet 25 ms cold is unmeasured.
-- Path-based access needs all-files access, a different permission mechanism from the SAF selection of REQ-045.23; whether it is acceptable is a product decision, not measured.
-- Abrupt power loss is not testable in these session constraints; durability stays inconclusive for every candidate regardless of latency (A3).
-- A6's raw-duration publication is not satisfied by the assignment to keep raw data local.
+- The refute is a statement about the six declared candidates on one device (Mi 9T, Android 16 custom build). It is not a statement about other write strategies (for example a retained descriptor opened at app start with pause-free warm appends, or asynchronous or io_uring based syncs), other devices, or other storage states. On any other device the verdict is "not measured" (A2).
+- Durability is unproven for every candidate (A3). Process death does not drop the kernel page cache; I1/I2 test application ordering only. Full storage, short-write and fsync-failure injection, and OEM independence were not run.
+- Hypothesis H2 (the ≈ 20–24 ms of the first sync after a pause is storage idle wake-up, not process freshness): consistent with the data (warm appends with a 600 ms or 3000 ms pause take ≈ 24 ms, appends without pause ≈ 1.4 ms, 50 ms pause is bimodal: p50 5 ms, p95 23.7 ms), but not isolated; the experiment that would isolate it (a storage-independent sync timing, for example against a tmpfs file, or a read-only touch of the device before the append) was not run. H1 (fresh process needed) is not needed to explain the numbers, since a warm process after a pause pays the same cost.
+- Consequence if H2 holds: the warm numbers of #363 for back-to-back appends do not represent an audit append after an LLM turn; this is not established for the real app.
+- The cold-new strata include file creation and the parent-directory sync. A variant with the file created before the first request was promised separately; it was not measured as its own stratum. A derived estimate from the component medians (total minus create and directory sync, path wa new 16 KiB ≈ 49 − 19 − 5 ≈ 25 ms) is arithmetic on medians, not a percentile.
+- The `pre` strategy needs a logical-end recovery: the sequential scan costs 0.35–1.0 s, the binary search ≈ 5 ms, and relies on the gap-free prefix assumption; the preallocation of 8 MiB was larger than the strata first assumed (addendum 2, item 3).
+- Group commit was not measured with idle pauses, cold processes, or sizes other than 16 KiB.
+- Whether path access with all-files permission is acceptable is a product decision; REQ-045.23 is unchanged.
+- Only the app's own timer was used; the logcat `ACK` times were not used for latency.
 
 ## Decision
 
-**No decision.** The spike is parked for the next device session. The ADR stays `proposed`.
+**Proposed finding (not decided; accepting this ADR is a human decision):** on the reference device the A4 Refute condition is met on latency for all six declared candidates (shared directory via SAF or direct path; `wa`, `wfd`, `pre`), and Confirm cannot be reached in this setting. The budget of REQ-045.33 (p95 ≤ 25 ms, cold first append, durable before dispatch) is not attainable by write-strategy changes on the shared directory on this device. Even app-private baselines sit at 24–25 ms (existing) and ≈ 30 ms (new) p95, which suggests a floor of one first sync after a pause of ≈ 20–24 ms on this storage; the data do not isolate its cause (H2 above). No requirement is changed by this ADR.
 
 ## Consequences
 
-Next session (Mi 9T connected, unlocked, no vehicle/adapter), in this order, with the committed prototype `spikes/378/` and `scripts/cold.sh`:
-1. `idle` hypothesis test (H2), 5 minutes.
-2. Cold strata for the saf and path candidates, then baselines, 100 samples each, plus the control rerun (≈ 70 min).
-3. Group commit with 1/2/4/8 writers, windows 0 and 5 ms.
-4. I1/I2 interruption runs per candidate.
-Question for the maintainer: is path access with all-files permission an acceptable candidate beside the SAF selection, and may the synthetic raw durations be published (A6)?
+Options for the maintainer (none of them measured as a solution here):
+1. Change REQ-045.33: a budget above the measured floor with a stated workload (new file creation counted or not), or measure the budget from a pre-opened session file (not the cold-process case). Needs maintainer approval.
+2. Keep the 25 ms budget and the durability-before-dispatch rule and find another mechanism (a retained descriptor opened at app start; a deliberately different experiment, including H2's isolating test).
+3. Path access with all-files permission is not a latency solution on this device: new-file p95 ≈ 54–59 ms, existing ≈ 28–34 ms, and it requires a different permission mechanism than REQ-045.23.
+4. Batching helps only concurrent warm writers, not a single outbound call after a pause.
+
+Open for the issue: the harness (`spikes/378/`) can rerun any stratum with `scripts/cold.sh`; the spike has no product code to merge.
