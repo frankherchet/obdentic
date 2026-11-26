@@ -33,6 +33,10 @@ public final class AppLog {
     public static void e(String tag, String message, Throwable error) { write("ERROR", tag, message, error); }
     public static void logUncaught(Thread thread, Throwable error) { write("FATAL", "uncaught", "thread " + thread.getName(), error); }
 
+    /** The credential shapes used by the audit's fail-closed payload check. */
+    public static boolean containsCredentialShape(String text) {
+        return text != null && (JWT.matcher(text).find() || BEARER.matcher(text).find());
+    }
     /** REQ-029.4; REQ-043.2: text shaped like a JWT or a 'Bearer' value is replaced as well. */
     public static String scrub(String text) {
         if (text == null) return "";

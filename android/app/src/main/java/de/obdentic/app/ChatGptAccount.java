@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.net.Uri;
 import android.system.OsConstants;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -155,6 +156,8 @@ public final class ChatGptAccount {
     /** The attempt that started the sign-in service and has not stopped it; only that attempt may stop it. */
     private long keepaliveOwner;
     private AccountStore.Record record;
+    /** Secrets belonging to still-running sign-in attempts, guarded by {@code state}. */
+    private final Map<Long, ArrayList<String>> signInSecrets = new LinkedHashMap<>();
     private LoopbackListener listener;
     private volatile JSONObject discovery;
 
@@ -196,6 +199,20 @@ public final class ChatGptAccount {
             Status s = r == null ? (expired ? Status.EXPIRED : Status.NOT_CONNECTED)
                 : !r.hasPlan() ? Status.PLAN_MISSING : unreachable ? Status.UNREACHABLE : Status.CONNECTED;
             return new Snapshot(s, phase, r == null ? "" : r.email, message, version, revocationUnconfirmed);
+        }
+    }
+    /** Current credential values for the audit's pre-dispatch rejection boundary. Never log the result. */
+    public String[] auditSecrets() {
+        synchronized (state) {
+            ArrayList<String> secrets = new ArrayList<>();
+            String clientId = store.clientId();
+            if (clientId != null) secrets.add(clientId);
+            AccountStore.Record r = current();
+            if (r != null) {
+                secrets.add(r.clientId); secrets.add(r.accessToken); secrets.add(r.refreshToken); secrets.add(r.idToken);
+            }
+            for (ArrayList<String> attempt : signInSecrets.values()) secrets.addAll(attempt);
+            return secrets.toArray(new String[0]);
         }
     }
 
@@ -297,6 +314,7 @@ public final class ChatGptAccount {
         } finally {
             closeListener(id);
             synchronized (state) {
+                signInSecrets.remove(id);
                 if (keepaliveOwner == id) { // a newer attempt owns the service when the user disconnected and signed in again meanwhile
                     keepaliveOwner = 0;
                     config.keepalive.stop(); // REQ-044.5: within 2 s after the attempt ends
@@ -324,6 +342,9 @@ public final class ChatGptAccount {
         String hostId = store.hostId();
         String saved = store.clientId();
         String oauthState = Oidc.random(), nonce = Oidc.random(), verifier = Oidc.random();
+        synchronized (state) {
+            signInSecrets.put(id, new ArrayList<>(Arrays.asList(oauthState, verifier)));
+        }
         LoopbackListener l;
         try {
             l = config.opener.open(config.preferredPort, config.callbackTimeoutMs, config.returnLink);
@@ -361,6 +382,10 @@ public final class ChatGptAccount {
             throw new CancellationException();
         }
         synchronized (state) {
+            ArrayList<String> secrets = signInSecrets.get(id);
+            if (secrets != null) { secrets.add(callback.get("code")); secrets.add(callback.get("client_id")); }
+        }
+        synchronized (state) {
             if (signInId != id || cancelRequested) throw new CancellationException(); // a cancel after the callback arrived still wins (REQ-042.5)
             phase = Phase.EXCHANGING;
             changed();
@@ -376,6 +401,10 @@ public final class ChatGptAccount {
         JSONObject t = r.json();
         if (t == null) throw new Stop("Antwort ungültig", "json");
         String access = t.optString("access_token", ""), refresh = t.optString("refresh_token", ""), idToken = t.optString("id_token", "");
+        synchronized (state) {
+            ArrayList<String> secrets = signInSecrets.get(id);
+            if (secrets != null) { secrets.add(access); secrets.add(refresh); secrets.add(idToken); }
+        }
         if (access.isEmpty() || refresh.isEmpty() || idToken.isEmpty()) {
             revokeQuietly(refresh, clientId);
             throw new Stop("Antwort ungültig", "tokens");

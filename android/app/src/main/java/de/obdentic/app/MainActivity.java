@@ -277,6 +277,18 @@ public class MainActivity extends Activity {
         if(offerSignIn)accountButton(c,"Continue with ChatGPT","Anmeldung läuft …",signingIn,s.phase==ChatGptAccount.Phase.IDLE,()->{account.signIn();structure="";refresh();});
         if(s.phase==ChatGptAccount.Phase.WAITING)addButton(c,"Anmeldung abbrechen",()->{account.cancel();structure="";refresh();});
         if(connected)accountButton(c,"Trennen …","Trenne …",s.phase==ChatGptAccount.Phase.DISCONNECTING,s.phase==ChatGptAccount.Phase.IDLE,this::confirmDisconnect);
+        LinearLayout audit=card();note(audit,"AGENTENPROTOKOLL",ACCENT);
+        String folder=AgentAuditStorage.folder(this);
+        smallNote(audit,folder.isEmpty()?"Noch kein Protokollordner gewählt":"Protokollordner: "+folderName(folder),MUTED);
+        addButton(audit,"Protokollordner auswählen",this::chooseAuditFolder);
+    }
+    private void chooseAuditFolder(){
+        new AlertDialog.Builder(this).setTitle("Agentenprotokoll speichern")
+            .setMessage("Die vollständigen Protokolle werden unverschlüsselt im Dateimanager sichtbar. Andere Apps oder Backups können sie ohne die Exportvorschau kopieren. Wähle einen Ordner im internen Gerätespeicher.")
+            .setPositiveButton("Ordner wählen",(d,w)->{
+                Intent open=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                try{startActivityForResult(open,43);}catch(Exception e){toast("Ordnerauswahl nicht möglich");}
+            }).setNegativeButton("Abbrechen",null).show();
     }
     /** REQ-042.12: a button with immediate pending feedback (disabled, text, progress indicator, content description) like {@link #actionButton}. */
     private void accountButton(LinearLayout parent,String idle,String pendingText,boolean pending,boolean enabled,Runnable onTap){
@@ -1103,6 +1115,14 @@ public class MainActivity extends Activity {
     }
     @Override protected void onActivityResult(int request,int result,Intent data) {
         super.onActivityResult(request,result,data);
+        if(request==43){
+            Uri tree=result==RESULT_OK&&data!=null?data.getData():null;if(tree==null)return;
+            if(!AgentAuditStorage.isLocalTree(tree)){toast("Nur ein Ordner im internen Gerätespeicher ist erlaubt");return;}
+            int flags=Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+            try{getContentResolver().takePersistableUriPermission(tree,flags);AgentAuditStorage.select(this,tree);}
+            catch(SecurityException|java.io.IOException e){toast("Protokollordner nicht dauerhaft nutzbar");return;}
+            toast("Protokollordner gespeichert");structure="";refresh();return;
+        }
         if(request==42){
             Uri tree=result==RESULT_OK&&data!=null?data.getData():null;if(tree==null)return;
             int flags=Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
