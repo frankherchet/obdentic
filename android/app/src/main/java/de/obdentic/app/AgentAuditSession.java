@@ -20,6 +20,7 @@ public final class AgentAuditSession {
     public static final long SESSION_LIMIT = 32L * 1024 * 1024;
     public static final int EVENT_LIMIT = 2 * 1024 * 1024, COUNT_LIMIT = 10000;
     private static final String PREFIX = "obdentic-agent-", MIME = "application/x-ndjson";
+    public static final String MIME_TYPE = "application/x-ndjson";
     private static final Object LOCK = new Object();
     private static AgentAuditSession active;
     private final Context context;
@@ -75,6 +76,31 @@ public final class AgentAuditSession {
             } catch (JSONException e) { throw new IOException("Offenlegung konnte nicht protokolliert werden"); }
         }
     }
+    /** A typed failure of the model request: timeout, network_error, usage_limit. Received events stay in the audit. */
+    public static final class ModelFailure extends RuntimeException {
+        public final String outcome;
+        public ModelFailure(String outcome) { super(outcome); this.outcome = outcome; }
+    }
+
+    /** Synchronized end marker; the diagnosis outcome is separate from the audit being complete. A failed end leaves the audit incomplete. */
+    public void finish(String diagnosisStatus) throws IOException {
+        synchronized (LOCK) {
+            try { append("session_end", new JSONObject().put("diagnosis_status", diagnosisStatus), null, null, null); }
+            catch (JSONException e) { throw new IOException("Ende konnte nicht protokolliert werden"); }
+        }
+    }
+
+    /** Cancel or disconnect: no further work for this diagnosis; the open request, if any, is ended with the reason. */
+    public void stop(String reason) throws IOException {
+        synchronized (LOCK) {
+            try {
+                if (inFlightRequest != null) append("request_end", new JSONObject().put("status", reason), null, inFlightRequest, null);
+            } catch (JSONException e) { throw new IOException("Abbruch konnte nicht protokolliert werden"); }
+            finish(reason);
+        }
+    }
+
+    public String sessionId() { return id; }
     public interface ModelDispatch { void send(String requestJson); }
     /** Audit the actual request before the synchronous synthetic client receives it. */
     public void runModelRequest(JSONObject request, String requestId, ModelDispatch dispatch) throws IOException {
@@ -102,7 +128,8 @@ public final class AgentAuditSession {
             synchronized (LOCK) { failed = true; active = null; }
             throw new IOException("Anfrage konnte nicht protokolliert werden");
         } catch (RuntimeException e) {
-            try { append("request_end", new JSONObject().put("status", "error"), null, requestId, null); }
+            String status = e instanceof ModelFailure ? ((ModelFailure) e).outcome : "error";
+            try { append("request_end", new JSONObject().put("status", status), null, requestId, null); }
             catch (JSONException impossible) { throw new IOException("Protokoll fehlgeschlagen"); }
             throw new IOException("Anfrage fehlgeschlagen");
         } finally {

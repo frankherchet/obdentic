@@ -143,6 +143,45 @@ public final class AgentAuditAcceptanceRunner extends Instrumentation {
             android.provider.DocumentsContract.deleteDocument(resolver, intruderFile);
             AgentAuditCatalog.remember(getTargetContext(), treeNow);
             if (!appendRefused) throw new AssertionError("append must fail closed after an outside change");
+            // REQ-045.13/.14/.15/.16/.17: typed outcomes are recorded, a cancel or disconnect stops all further work.
+            for (String outcome : new String[]{"timeout", "network_error", "usage_limit"}) {
+                AgentAuditSession failing = AgentAuditSession.begin(getTargetContext(), metadata());
+                failing.disclosure(true);
+                String failId = java.util.UUID.randomUUID().toString();
+                boolean failed = false;
+                try { failing.runModelRequest(new org.json.JSONObject(), failId, json -> { throw new AgentAuditSession.ModelFailure(outcome); }); }
+                catch (java.io.IOException expected) { failed = true; }
+                org.json.JSONArray failEvents = eventsBy(getTargetContext(), "request_id", failId);
+                if (!failed || !outcome.equals(failEvents.getJSONObject(failEvents.length() - 1).getJSONObject("data").optString("status")))
+                    throw new AssertionError("outcome must be recorded: " + outcome);
+                failing.finish("failed");
+            }
+            for (String stop : new String[]{"cancelled", "disconnected"}) {
+                AgentAuditSession stopping = AgentAuditSession.begin(getTargetContext(), metadata());
+                stopping.disclosure(true);
+                stopping.stop(stop);
+                java.util.concurrent.atomic.AtomicBoolean ran = new java.util.concurrent.atomic.AtomicBoolean();
+                boolean refusedAfterStop = false;
+                try { stopping.runModelRequest(new org.json.JSONObject(), java.util.UUID.randomUUID().toString(), json -> ran.set(true)); }
+                catch (java.io.IOException expected) { refusedAfterStop = true; }
+                if (!refusedAfterStop || ran.get()) throw new AssertionError("no work after " + stop);
+            }
+            // REQ-045.24/.25: export needs confirmation; cancelling creates nothing and the source stays unchanged.
+            AgentAuditSession exporting = AgentAuditSession.begin(getTargetContext(), metadata());
+            exporting.append("disclosure", new org.json.JSONObject().put("approved", true).put("note", "SYNTHETIC-VIN"), null, null, null);
+            String exportId = exporting.sessionId();
+            exporting.finish("success");
+            org.json.JSONObject knownValues = new org.json.JSONObject().put("vin", new org.json.JSONArray().put("SYNTHETIC-VIN"));
+            org.json.JSONArray categories = new org.json.JSONArray().put("vin");
+            org.json.JSONObject exportPreview = AgentAuditExport.preview(getTargetContext(), exportId, knownValues, categories);
+            if (exportPreview.getJSONArray("matches").length() != 1 || !exportPreview.getString("warning").contains("Erkannt werden nur Werte, die die App kennt."))
+                throw new AssertionError("export preview must show matches and warning");
+            int before = documentCount(getTargetContext());
+            if (AgentAuditExport.confirm(getTargetContext(), exportPreview, false) != null || documentCount(getTargetContext()) != before)
+                throw new AssertionError("cancelled export must create nothing");
+            android.net.Uri exported = AgentAuditExport.confirm(getTargetContext(), exportPreview, true);
+            if (exported == null || exportedText(getTargetContext(), exported).contains("SYNTHETIC-VIN"))
+                throw new AssertionError("confirmed export must be redacted");
             // REQ-045.8: initial denial is recorded and prevents the request from starting.
             AgentAuditSession denied = AgentAuditSession.begin(getTargetContext(), metadata());
             try {
@@ -227,6 +266,18 @@ public final class AgentAuditAcceptanceRunner extends Instrumentation {
             }
         }
         return events;
+    }
+    private static int documentCount(android.content.Context context) throws Exception {
+        android.net.Uri tree = AgentAuditStorage.selected(context);
+        android.net.Uri children = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, android.provider.DocumentsContract.getTreeDocumentId(tree));
+        try (android.database.Cursor c = context.getContentResolver().query(children, new String[]{android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID}, null, null, null)) {
+            return c == null ? -1 : c.getCount();
+        }
+    }
+    private static String exportedText(android.content.Context context, android.net.Uri uri) throws Exception {
+        try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
+            return new java.util.Scanner(in, "UTF-8").useDelimiter("\\A").next();
+        }
     }
     private static void retentionCheck(android.content.Context context) throws Exception {
         android.net.Uri tree = AgentAuditStorage.selected(context);

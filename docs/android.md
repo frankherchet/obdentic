@@ -882,6 +882,24 @@ existing tests are in `src/mobile/uds.rs` (`req_027_*`). Neither the matrix nor 
 Totals: 7 production now (all partial), 3 reference model only, 25 awaits #321. A "production now" row is not
 vehicle acceptance, and no row is a hardware result.
 
+## Agent session audit (REQ-045)
+
+The synthetic-client audit (`AgentAuditSession`, no real model wiring: #326/#328) writes one versioned JSONL file per diagnosis into a
+folder the user selects once (Konto → "Protokollordner auswählen"; internal-storage SAF tree of the local external-storage provider only,
+with a warning that the files are unencrypted and visible in the file manager). An entry counts as stored when its write and
+`FileDescriptor.sync()` returned; every request and tool call is persisted before it is dispatched, and any failure, a missing or revoked
+folder, a secret (current tokens, client id, sign-in code/verifier/state, 16-character substrings, JWT/Bearer shapes), an exceeded cap
+(256 MiB total, 32 MiB per session, 2 MiB per event, 10,000 events) or an outside change of the folder (`AgentAuditCatalog`: unknown file,
+other size, other file identity) stops all further work. Retention deletes only structurally verified completed sessions 30 days after
+their end. Export (`AgentAuditExport`) needs a selected session, shows the warning and a redaction preview of the known values, and
+creates nothing when cancelled. The change detection assumes nobody but OBDentic changes the folder; a change racing the check is a
+residual risk, as is power loss at the moment of a write (ADR 0010).
+
+Offline inspection needs no model, tool or vehicle: `obdentic-mobile-report --agent-audit <session.jsonl>` prints the timeline, whether
+the audit is complete (end marker, no sequence gap, no torn line, no open attempt), the separate diagnosis status, the last evidenced
+action, and recording references (always `unresolved` here; the recording is a separate file). The focused acceptance run is
+`am instrument -w de.obdentic.app.debug.test/de.obdentic.app.AgentAuditAcceptanceRunner` on `obdentic-acc` after choosing a folder.
+
 ## Acceptance
 
 Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals).

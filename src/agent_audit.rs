@@ -7,17 +7,22 @@ pub fn inspect(path: &Path) -> Result<Value, String> {
     let bytes = fs::read(path).map_err(|_| "audit cannot be read".to_owned())?;
     let mut events = Vec::new();
     let mut session = None;
-    let mut expected = 1u64;
     let mut last_time = 0u64;
     let mut damaged = !bytes.is_empty() && !bytes.ends_with(b"\n");
     let mut open = HashMap::new();
     let mut ended = false;
     let mut diagnosis = Value::Null;
-    for line in bytes.split_inclusive(|b| *b == b'\n') {
-        if !line.ends_with(b"\n") { break; }
+    let mut references = Vec::new();
+    for (expected, line) in (1u64..).zip(bytes.split_inclusive(|b| *b == b'\n')) {
+        if !line.ends_with(b"\n") {
+            break;
+        }
         let event: Value = match serde_json::from_slice(&line[..line.len() - 1]) {
             Ok(v) => v,
-            Err(_) => { damaged = true; break; }
+            Err(_) => {
+                damaged = true;
+                break;
+            }
         };
         let id = event.get("session_id").and_then(Value::as_str);
         let kind = event.get("type").and_then(Value::as_str);
@@ -28,35 +33,80 @@ pub fn inspect(path: &Path) -> Result<Value, String> {
             && event.get("wall_ms").and_then(Value::as_u64).is_some()
             && mono.is_some_and(|m| m >= last_time)
             && id.is_some_and(|id| !id.is_empty() && session.as_deref().is_none_or(|s| s == id))
-            && kind.is_some() && event.get("data").is_some_and(Value::is_object)
-            && !ended && (expected != 1 || kind == Some("session_start"));
-        if !valid { damaged = true; break; }
-        if session.is_none() { session = id.map(str::to_owned); }
+            && kind.is_some()
+            && event.get("data").is_some_and(Value::is_object)
+            && !ended
+            && (expected != 1 || kind == Some("session_start"));
+        if !valid {
+            damaged = true;
+            break;
+        }
+        if session.is_none() {
+            session = id.map(str::to_owned);
+        }
         last_time = mono.unwrap();
         let kind = kind.unwrap();
         let key = match kind {
-            "request_intent" | "request_dispatched" | "request_end" => event.get("request_id").and_then(Value::as_str),
-            "tool_intent" | "tool_dispatched" | "tool_end" => event.get("tool_call_id").and_then(Value::as_str),
+            "request_intent" | "request_dispatched" | "request_end" => {
+                event.get("request_id").and_then(Value::as_str)
+            }
+            "tool_intent" | "tool_dispatched" | "tool_end" => {
+                event.get("tool_call_id").and_then(Value::as_str)
+            }
             _ => None,
         };
         if matches!(kind, "request_intent" | "tool_intent") {
-            if let Some(key) = key { if open.insert((kind == "tool_intent", key.to_owned()), false).is_some() { damaged = true; break; } }
-            else { damaged = true; break; }
+            if let Some(key) = key {
+                if open
+                    .insert((kind == "tool_intent", key.to_owned()), false)
+                    .is_some()
+                {
+                    damaged = true;
+                    break;
+                }
+            } else {
+                damaged = true;
+                break;
+            }
         } else if matches!(kind, "request_dispatched" | "tool_dispatched") {
             if let Some(key) = key {
-                if let Some(dispatched) = open.get_mut(&(kind == "tool_dispatched", key.to_owned())) {
-                    if *dispatched { damaged = true; break; }
+                if let Some(dispatched) = open.get_mut(&(kind == "tool_dispatched", key.to_owned()))
+                {
+                    if *dispatched {
+                        damaged = true;
+                        break;
+                    }
                     *dispatched = true;
-                } else { damaged = true; break; }
-            } else { damaged = true; break; }
+                } else {
+                    damaged = true;
+                    break;
+                }
+            } else {
+                damaged = true;
+                break;
+            }
         } else if matches!(kind, "request_end" | "tool_end") {
-            if let Some(key) = key { if open.remove(&(kind == "tool_end", key.to_owned())).is_none() { damaged = true; break; } }
-            else { damaged = true; break; }
+            if let Some(key) = key {
+                if open.remove(&(kind == "tool_end", key.to_owned())).is_none() {
+                    damaged = true;
+                    break;
+                }
+            } else {
+                damaged = true;
+                break;
+            }
         } else if kind == "session_end" {
             ended = true;
-            diagnosis = event["data"].get("diagnosis_status").cloned().unwrap_or(Value::Null);
+            diagnosis = event["data"]
+                .get("diagnosis_status")
+                .cloned()
+                .unwrap_or(Value::Null);
         }
-        expected += 1;
+        if let Some(reference) = event["data"].get("recording_ref").and_then(Value::as_str) {
+            // The recording is a separate file; the inspector never opens it, so the link stays unresolved here.
+            references
+                .push(json!({"seq": expected, "recording_ref": reference, "status": "unresolved"}));
+        }
         events.push(event);
     }
     let last = events.last().and_then(|e| e["type"].as_str());
@@ -67,5 +117,6 @@ pub fn inspect(path: &Path) -> Result<Value, String> {
         "last_evidenced_action": last,
         "dispatch_status": if open.is_empty() { "not_applicable" } else if open.values().all(|sent| *sent) { "dispatched" } else { "unknown" },
         "events": events,
+        "source_references": references,
     }))
 }
