@@ -147,10 +147,20 @@ fn recording_reference_resolves_only_when_present() {
         "\"data\":{}",
         "\"data\":{\"evidence_ref\":{\"recording_ref\":\"capture.jsonl\",\"offset\":42}}",
     );
-    fs::write(&audit, event(1, "session_start", "") + &event(2, "tool_intent", ",\"tool_call_id\":\"c1\"") + &tool + &event(4, "session_end", "")).unwrap();
+    fs::write(
+        &audit,
+        event(1, "session_start", "")
+            + &event(2, "tool_intent", ",\"tool_call_id\":\"c1\"")
+            + &tool
+            + &event(4, "session_end", ""),
+    )
+    .unwrap();
     let inspect = || {
         let out = Command::new(env!("CARGO_BIN_EXE_obdentic-mobile-report"))
-            .arg("--agent-audit").arg(&audit).output().unwrap();
+            .arg("--agent-audit")
+            .arg(&audit)
+            .output()
+            .unwrap();
         assert!(out.status.success());
         serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
     };
@@ -158,7 +168,10 @@ fn recording_reference_resolves_only_when_present() {
     fs::write(dir.join("capture.jsonl"), "{}\n").unwrap();
     let present = inspect();
     assert_eq!(present["source_references"][0]["status"], "resolved");
-    assert_eq!(present["source_references"][0]["evidence_ref"]["offset"], 42);
+    assert_eq!(
+        present["source_references"][0]["evidence_ref"]["offset"],
+        42
+    );
     let _ = fs::remove_file(dir.join("capture.jsonl"));
     let _ = fs::remove_file(audit);
     let _ = fs::remove_dir(dir);

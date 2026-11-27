@@ -113,8 +113,15 @@ pub fn inspect(path: &Path) -> Result<Value, String> {
             let resolved = reference.is_some_and(|reference| {
                 let source = Path::new(reference);
                 source.components().count() == 1
-                    && matches!(source.components().next(), Some(std::path::Component::Normal(_)))
-                    && path.parent().unwrap_or(Path::new(".")).join(source).is_file()
+                    && matches!(
+                        source.components().next(),
+                        Some(std::path::Component::Normal(_))
+                    )
+                    && path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(source)
+                        .is_file()
             });
             references.push(json!({"seq": expected, "evidence_ref": evidence,
                 "status": if resolved { "resolved" } else { "unresolved" }}));
