@@ -28,7 +28,7 @@ public final class AgentAuditSession {
     /** REQ-045.29: from 80 % of the total budget on, a warning is due before more work. Counts every audit byte, active and incomplete included. */
     public static boolean storageWarning(Context context) throws IOException {
         Context app = context.getApplicationContext();
-        synchronized (LOCK) { return bytes(app.getContentResolver(), AgentAuditStorage.selected(app)) >= (TOTAL_LIMIT * 4 + 4) / 5; }
+        return bytes(app.getContentResolver(), AgentAuditStorage.selected(app)) >= (TOTAL_LIMIT * 4 + 4) / 5;
     }
     public boolean failed() { synchronized (LOCK) { return failed; } }
     private static final String PREFIX = "obdentic-agent-", MIME = "application/x-ndjson";
@@ -41,6 +41,8 @@ public final class AgentAuditSession {
     private long sequence, size;
     private boolean failed, ended, disclosureApproved, disclosureDenied;
     private String inFlightRequest;
+    private String inFlightTool;
+    private Thread toolThread;
     private final java.util.HashSet<String> requests = new java.util.HashSet<>(), tools = new java.util.HashSet<>();
 
     private AgentAuditSession(Context context, Uri tree, Uri document, String id) {
@@ -105,10 +107,13 @@ public final class AgentAuditSession {
     /** Cancel or disconnect: no further work for this diagnosis; the open request, if any, is ended with the reason. */
     public void stop(String reason) throws IOException {
         synchronized (LOCK) {
+            Thread cancel = toolThread;
             try {
                 if (inFlightRequest != null) append("request_end", new JSONObject().put("status", reason), null, inFlightRequest, null);
+                if (inFlightTool != null) append("tool_end", new JSONObject().put("status", reason), null, null, inFlightTool);
+                finish(reason);
             } catch (JSONException e) { throw new IOException("Abbruch konnte nicht protokolliert werden"); }
-            finish(reason);
+            finally { if (cancel != null) cancel.interrupt(); }
         }
     }
 
@@ -169,7 +174,7 @@ public final class AgentAuditSession {
 
     public void runTool(String callId, String name, String arguments, boolean allowed, String reason, java.util.concurrent.Callable<ToolResult> work) throws IOException {
         synchronized (LOCK) {
-            if (active != this || failed || ended || disclosureDenied || callId == null || callId.isEmpty()
+            if (active != this || failed || ended || disclosureDenied || inFlightTool != null || callId == null || callId.isEmpty()
                     || tools.contains(callId) || sequence > COUNT_LIMIT - (allowed ? 5 : 2))
                 throw new IOException("Protokoll erlaubt keinen weiteren Auftrag");
             try {
@@ -178,23 +183,34 @@ public final class AgentAuditSession {
                 append("tool_decision", new JSONObject().put("allowed", allowed).put("reason", reason), null, null, callId);
                 if (!allowed) return;
                 append("tool_intent", new JSONObject().put("operation", name), null, null, callId);
-                ToolResult result;
-                try {
-                    result = work.call();
-                    if (result == null || result.local == null) throw new IllegalStateException("tool returned no result");
-                } catch (Exception e) {
-                    append("tool_end", new JSONObject().put("status", "error"), null, null, callId);
-                    throw new IOException("Werkzeug fehlgeschlagen");
-                }
+                inFlightTool = callId;
+                toolThread = Thread.currentThread();
+            } catch (JSONException e) {
+                failed = true; active = null;
+                throw new IOException("Werkzeug konnte nicht protokolliert werden");
+            }
+        }
+        try {
+            ToolResult result = work.call();
+            if (result == null || result.local == null) throw new IllegalStateException("tool returned no result");
+            synchronized (LOCK) {
+                if (active != this || failed || ended) throw new IOException("Werkzeug abgebrochen");
                 append("tool_dispatched", new JSONObject(), null, null, callId);
                 JSONObject end = new JSONObject().put("status", "completed").put("result", result.local);
                 if (result.sentExternally != null) end.put("sent_external", result.sentExternally);
                 if (result.evidenceRef != null) end.put("evidence_ref", result.evidenceRef);
                 append("tool_end", end, null, null, callId);
-            } catch (JSONException e) {
-                failed = true; active = null;
-                throw new IOException("Werkzeug konnte nicht protokolliert werden");
             }
+        } catch (Exception e) {
+            synchronized (LOCK) {
+                if (active == this && !failed && !ended) {
+                    try { append("tool_end", new JSONObject().put("status", "error"), null, null, callId); }
+                    catch (JSONException invalid) { throw new IOException("Werkzeug konnte nicht protokolliert werden"); }
+                }
+            }
+            throw new IOException("Werkzeug fehlgeschlagen");
+        } finally {
+            synchronized (LOCK) { if (callId.equals(inFlightTool)) { inFlightTool = null; toolThread = null; } }
         }
     }
 
@@ -229,6 +245,7 @@ public final class AgentAuditSession {
                 if ("session_end".equals(type)) { ended = true; active = null; }
             } catch (IOException | JSONException | RuntimeException e) {
                 failed = true; active = null;
+                if (toolThread != null && toolThread != Thread.currentThread()) toolThread.interrupt();
                 throw new IOException("Protokoll konnte nicht dauerhaft gespeichert werden");
             }
         }

@@ -50,6 +50,7 @@ final class AgentAuditAcceptance {
             fresh();
             sessionAndRequest();
             fresh(); tools();
+            fresh(); stopRunningTool();
             fresh(); disclosure();
             fresh(); persistenceFailureAndInterruption();
             fresh(); outcomes();
@@ -154,6 +155,38 @@ final class AgentAuditAcceptance {
                 "REQ-045.7 " + kind + " uses the same lifecycle and separates the local outcome from the subset sent out");
         }
         s.finish("success");
+    }
+
+    /** REQ-045.11/.16/.17: stop must not wait behind an in-flight tool. */
+    private void stopRunningTool() throws Exception {
+        for (String reason : new String[]{"cancelled", "disconnected"}) {
+            AgentAuditSession session = begin();
+            String call = id();
+            java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+            Thread worker = new Thread(() -> {
+                try {
+                    session.runTool(call, "synthetic", "{}", true, "allowed", () -> {
+                        entered.countDown();
+                        release.await();
+                        return new AgentAuditSession.ToolResult(new JSONObject(), null, null);
+                    });
+                } catch (Exception ignored) { /* stopped work is expected to fail */ }
+            });
+            worker.start();
+            require(entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "tool started");
+            java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+            java.util.concurrent.Future<?> stopped = executor.submit(() -> { try { session.stop(reason); } catch (IOException e) { throw new IllegalStateException(e); } });
+            boolean timely;
+            try { stopped.get(2, java.util.concurrent.TimeUnit.SECONDS); timely = true; }
+            catch (java.util.concurrent.TimeoutException e) { timely = false; }
+            finally { release.countDown(); executor.shutdown(); worker.join(5000); }
+            require(timely, "REQ-045.16/.17 stop must not wait for a running tool");
+            JSONArray logged = events("tool_call_id", call);
+            JSONObject end = last(logged).getJSONObject("data");
+            require("tool_end".equals(type(logged, logged.length() - 1)) && reason.equals(end.optString("status")) && !end.has("result"),
+                "stopped tool records reason without a result");
+        }
     }
 
     /** REQ-045.8: initial and renewed denial are recorded, earlier exchanges stay, nothing more is sent. */
