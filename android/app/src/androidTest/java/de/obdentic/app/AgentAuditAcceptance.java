@@ -40,6 +40,18 @@ final class AgentAuditAcceptance {
     static void run(Instrumentation inst) throws Exception {
         new AgentAuditAcceptance(inst).all();
     }
+    static void runShared(Instrumentation inst) throws Exception {
+        AgentAuditAcceptance check = new AgentAuditAcceptance(inst);
+        String previous = AgentAuditStorage.folder(check.target);
+        AgentAuditStorage.allowTestProvider(check.authority);
+        check.tree = DocumentsContract.buildTreeDocumentUri(check.authority, AuditTestProvider.ROOT_ID);
+        try { check.grant(); check.fresh(); check.sharedDiagnosis(); }
+        finally {
+            try { check.clear(); } catch (Exception ignored) { }
+            AgentAuditStorage.allowTestProvider("");
+            check.target.getSharedPreferences("agent-audit", 0).edit().putString("folder", previous).commit();
+        }
+    }
 
     private void all() throws Exception {
         String previous = AgentAuditStorage.folder(target);
@@ -546,6 +558,108 @@ final class AgentAuditAcceptance {
     }
 
     // ------------------------------------------------------------------------------------------------ helpers
+    /** REQ-046.23: real JNI and audit around the shared synthetic vehicle. */
+    private void sharedDiagnosis() throws Exception {
+        ObdService service = ObdService.current;
+        ObdService.Connector connector = service.connector;
+        VehicleStore vehicles = service.vehicles;
+        Boolean permission = service.permissionOverride, bluetooth = service.bluetoothOverride;
+        boolean autoRecord = ObdService.autoRecordEnabled(target);
+        SharedFixtureLink link = new SharedFixtureLink(own, service);
+        AgentAuditSession audit = null;
+        try {
+            service.setAutoConnect(false); service.disconnect();
+            awaitShared(() -> "disconnected".equals(service.snapshot().optString("phase")));
+            service.permissionOverride = true; service.bluetoothOverride = true;
+            service.vehicles = new VehicleStore(new java.io.File(target.getCacheDir(), "shared-diagnosis-" + System.nanoTime() + ".json"));
+            service.connector = address -> link;
+            service.setAutoRecord(true); service.connect("AA:BB:CC:00:00:62");
+            awaitShared(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"));
+            service.setSignals(new JSONArray());
+            java.lang.reflect.Field field = ObdService.class.getDeclaredField("worker"); field.setAccessible(true);
+            java.util.concurrent.ExecutorService worker = (java.util.concurrent.ExecutorService) field.get(service);
+            java.lang.reflect.Method execute = ObdService.class.getDeclaredMethod("execute", String.class, String.class); execute.setAccessible(true);
+            require(sharedCore(worker, execute, service, "ecu.discover", "").optBoolean("ok"), "fixture ECU discovery");
+            require(sharedCore(worker, execute, service, "assistant.tools", "").optBoolean("ok"), "fixture tools");
+            require(sharedCore(worker, execute, service, "assistant.begin", "").optBoolean("ok"), "fixture begin");
+            String recording = service.snapshot().getString("autoRecording");
+            java.io.File source = new java.io.File(target.getFilesDir(), "recordings/" + recording);
+            require(source.isFile(), "fixture recording exists");
+            audit = begin(); audit.disclosure(true);
+            AgentAuditSession session = audit;
+            session.runModelRequest(new JSONObject().put("case", "synthetic EGR/MAF"), "turn1", "request1", request -> {
+                try { session.recordModelEvent("request1", "response_item", new JSONObject().put("text", "Read signals and stored codes.")); }
+                catch (Exception e) { throw new IllegalStateException(e); }
+            });
+            JSONObject listing = sharedTool(session, worker, execute, service, source, recording, "list", new JSONObject().put("tool", "signal_list"));
+            String rpm = sharedSignalId(listing, "engine.rpm"), maf = sharedSignalId(listing, "engine.maf");
+            String knowledge = sharedSignalId(listing, "air.charge_limit_overcharge");
+            JSONObject rpmResult = sharedTool(session, worker, execute, service, source, recording, "rpm", sharedRead(rpm));
+            JSONObject scan = sharedTool(session, worker, execute, service, source, recording, "dtc", new JSONObject().put("tool", "dtc_scan"));
+            require(scan.toString().contains("P0401"), "fixture EGR code drives follow-up");
+            session.runModelRequest(new JSONObject().put("finding", "P0401").put("follow_up", "MAF and Knowledge"), "turn2", "request2", request -> {
+                try { session.recordModelEvent("request2", "response_item", new JSONObject().put("text", "Read MAF and Knowledge; EGR position is missing.")); }
+                catch (Exception e) { throw new IllegalStateException(e); }
+            });
+            JSONObject mafResult = sharedTool(session, worker, execute, service, source, recording, "maf", sharedRead(maf));
+            JSONObject knowledgeResult = sharedTool(session, worker, execute, service, source, recording, "knowledge", sharedRead(knowledge));
+            JSONObject egrResult = sharedTool(session, worker, execute, service, source, recording, "egr", sharedRead("engine.egr.commanded"));
+            require(rpmResult.optDouble("value") == 1726 && mafResult.optDouble("value") == 10
+                && "ok".equals(knowledgeResult.optString("outcome")) && "unknown_signal".equals(egrResult.optString("reason")),
+                "fixture measured values and missing EGR fact");
+            int before = link.commands.size();
+            session.runTool("turn2", "request2", "denied", "raw", "{\"command\":\"04\"}", false, "not allowed",
+                () -> { throw new AssertionError("denied tool dispatched"); });
+            require(link.commands.size() == before, "REQ-046.23 denied tool emits zero TX");
+            session.finish("unknown");
+            java.io.File destination = new java.io.File(target.getFilesDir(), "req-046-23");
+            if (!destination.isDirectory() && !destination.mkdirs()) throw new IOException("fixture output directory");
+            java.nio.file.Files.write(new java.io.File(destination, "audit.jsonl").toPath(), text(sessionFile(session.sessionId())).getBytes(StandardCharsets.UTF_8));
+            service.disconnect();
+            awaitShared(() -> "disconnected".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"));
+            java.nio.file.Files.copy(source.toPath(), new java.io.File(destination, recording).toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            if (audit != null) try { audit.stop("cancelled"); } catch (IOException ignored) { }
+            service.disconnect(); service.connector = connector; service.vehicles = vehicles;
+            service.permissionOverride = permission; service.bluetoothOverride = bluetooth;
+            service.setAutoRecord(autoRecord); service.setDemo();
+            awaitShared(() -> "ready".equals(service.snapshot().optString("phase")) && !service.snapshot().optBoolean("busy"));
+        }
+    }
+    private interface SharedReady { boolean get() throws Exception; }
+    private static void awaitShared(SharedReady ready) throws Exception {
+        long end = android.os.SystemClock.elapsedRealtime() + 60000;
+        while (android.os.SystemClock.elapsedRealtime() < end) {
+            if (ready.get()) return;
+            android.os.SystemClock.sleep(100);
+        }
+        throw new AssertionError("shared diagnosis timed out");
+    }
+    private static JSONObject sharedCore(java.util.concurrent.ExecutorService worker, java.lang.reflect.Method execute, ObdService service, String action, String argument) throws Exception {
+        return worker.submit(() -> (JSONObject) execute.invoke(service, action, argument)).get(60, java.util.concurrent.TimeUnit.SECONDS);
+    }
+    private static JSONObject sharedRead(String id) throws Exception {
+        return new JSONObject().put("tool", "signal_read").put("arguments", new JSONObject().put("signal", id));
+    }
+    private static String sharedSignalId(JSONObject listing, String semantic) throws Exception {
+        JSONArray signals = listing.getJSONArray("signals");
+        for (int i = 0; i < signals.length(); i++) if (semantic.equals(signals.getJSONObject(i).optString("semantic"))) return signals.getJSONObject(i).getString("id");
+        throw new AssertionError("missing signal " + semantic);
+    }
+    private static JSONObject sharedTool(AgentAuditSession audit, java.util.concurrent.ExecutorService worker, java.lang.reflect.Method execute,
+        ObdService service, java.io.File source, String recording, String id, JSONObject request) throws Exception {
+        JSONObject[] result = new JSONObject[1];
+        String turn = id.equals("maf") || id.equals("knowledge") || id.equals("egr") ? "turn2" : "turn1";
+        audit.runTool(turn, turn.equals("turn1") ? "request1" : "request2", id, request.getString("tool"), request.toString(), true, "allowed", () -> {
+            long offset = source.length();
+            JSONObject envelope = sharedCore(worker, execute, service, "assistant.tool", request.toString());
+            require(envelope.optBoolean("ok"), "assistant tool failed: " + envelope);
+            result[0] = envelope.getJSONObject("data");
+            return new AgentAuditSession.ToolResult(result[0], null, new JSONObject().put("recording_ref", recording).put("offset", offset));
+        });
+        return result[0];
+    }
+
 
     private static void require(boolean ok, String what) {
         if (!ok) throw new AssertionError(what);

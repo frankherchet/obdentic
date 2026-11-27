@@ -131,7 +131,15 @@ fn req_046_1_3_20_the_same_scenario_gives_the_same_trace_and_tool_results() {
         .iter()
         .map(|t| t.wire.as_str())
         .collect();
-    assert_eq!(wires, EXPECTED_DIAGNOSIS_TX);
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../tests/fixtures/virtual-vehicle.json")).unwrap();
+    let expected: Vec<&str> = fixture["diagnosis_tx"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(wires, expected);
     assert_eq!(first.outcomes[0]["value"].as_f64(), Some(1726.0));
     assert_eq!(first.outcomes[0]["provenance"]["responder"], "7E8");
     assert!(first.outcomes[1].to_string().contains("P0401"));
@@ -180,25 +188,6 @@ const EXPECTED_INVENTORY_TX: [&str; 23] = [
     "ATSH 7E0\r",
     "ATCRA 7E8\r",
     "010C\r",
-];
-
-const EXPECTED_DIAGNOSIS_TX: [&str; 16] = [
-    "ATSH 7E0\r",
-    "ATCRA 7E8\r",
-    "010C\r",
-    "ATZ\r",
-    "ATE0\r",
-    "ATL0\r",
-    "ATS1\r",
-    "ATH1\r",
-    "ATSP0\r",
-    "0100\r",
-    "03\r",
-    "07\r",
-    "ATSH 7E0\r",
-    "ATCRA 7E8\r",
-    "0110\r",
-    "221356\r",
 ];
 
 #[test]

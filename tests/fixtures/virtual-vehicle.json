@@ -1,0 +1,12 @@
+{
+  "vin": "WVWZZZ1KZAM123456",
+  "request_id": "7E0",
+  "response_id": "7E8",
+  "pids": { "0C": "1AF8", "10": "03E8" },
+  "dids": { "1356": "0064", "1628": "0B54", "F187": "313233" },
+  "identification": "313233",
+  "extended_dids": ["1628"],
+  "stored_dtcs": ["0401"],
+  "pending_dtcs": [],
+  "diagnosis_tx": ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r", "0100\r", "03\r", "07\r", "ATSH 7E0\r", "ATCRA 7E8\r", "0110\r", "221356\r"]
+}
