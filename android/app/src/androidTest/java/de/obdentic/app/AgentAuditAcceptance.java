@@ -281,14 +281,17 @@ final class AgentAuditAcceptance {
         AgentAuditCatalog.remember(target, tree);
         long old = 31L * 86400000L;
         Uri intruder = create("intruder.txt");
+        resetCatalogMemory();
         expectNoDeletion(old, complete, "REQ-045.26 an unknown file");
         delete(intruder);
         AgentAuditCatalog.remember(target, tree);
         try (OutputStream out = resolver.openOutputStream(incomplete, "wa")) { out.write('x'); }
+        resetCatalogMemory();
         expectNoDeletion(old, complete, "REQ-045.26 another size");
         AgentAuditCatalog.remember(target, tree);
         delete(incomplete);
         incomplete = oldAudit(false, 2, false);
+        resetCatalogMemory();
         expectNoDeletion(old, complete, "REQ-045.26 another file identity");
         AgentAuditCatalog.remember(target, tree);
         AgentAuditSession.expire(target, old);
@@ -297,12 +300,21 @@ final class AgentAuditAcceptance {
         require(exists(incomplete), "REQ-045.26 nothing expires before 30 days");
         AgentAuditSession s = begin();
         Uri outsider = create("outsider.txt");
+        resetCatalogMemory();
         require(refused(() -> s.disclosure(true)) != null && s.failed(), "REQ-045.30 an outside change stops every further append");
         delete(outsider);
         AgentAuditCatalog.remember(target, tree);
         AgentAuditSession running = begin();
         require(AgentAuditSession.storageWarning(target) == false, "REQ-045.28 a valid destination needs no warning");
         running.finish("success");
+    }
+
+    /** REQ-045.26/.30: simulate a fresh process without deleting the persisted catalog. */
+    private static void resetCatalogMemory() throws Exception {
+        java.lang.reflect.Field expected = AgentAuditCatalog.class.getDeclaredField("expected");
+        java.lang.reflect.Field tree = AgentAuditCatalog.class.getDeclaredField("expectedTree");
+        expected.setAccessible(true); tree.setAccessible(true);
+        expected.set(null, null); tree.set(null, "");
     }
 
     /** REQ-045.27, .29: warning from 80 % of the budget; a full folder stops the run without deleting unexpired history. */

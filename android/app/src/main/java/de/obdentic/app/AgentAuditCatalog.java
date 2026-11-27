@@ -36,16 +36,28 @@ public final class AgentAuditCatalog {
         return true;
     }
 
-    /** Fails closed when the folder differs from what the app left; the first sight of a folder is adopted. */
+    /** Restore the durable catalog before comparing the folder, including on the first operation in a new process. */
     public static synchronized void verify(Context context, Uri tree) throws IOException {
         JSONObject now = snapshot(context.getContentResolver(), tree);
-        if (!tree.toString().equals(expectedTree) || expected == null) { expected = now; expectedTree = tree.toString(); return; }
+        if (!tree.toString().equals(expectedTree) || expected == null) {
+            String saved = context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).getString(tree.toString(), null);
+            if (saved == null) {
+                if (now.length() != 0) throw new IOException("Unbekannter Inhalt im Protokollordner");
+                remember(context, tree);
+            } else {
+                try { expected = new JSONObject(saved); expectedTree = tree.toString(); }
+                catch (JSONException e) { throw new IOException("Protokollkatalog nicht lesbar"); }
+            }
+        }
         if (!unchanged(expected, now)) throw new IOException("Protokollordner wurde von außen verändert");
     }
 
     /** After the app's own change (create, append, delete) the new state is the expected one. */
     public static synchronized void remember(Context context, Uri tree) throws IOException {
-        expected = snapshot(context.getContentResolver(), tree);
+        JSONObject next = snapshot(context.getContentResolver(), tree);
+        if (!context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).edit().putString(tree.toString(), next.toString()).commit())
+            throw new IOException("Protokollkatalog konnte nicht gespeichert werden");
+        expected = next;
         expectedTree = tree.toString();
     }
 
@@ -58,8 +70,11 @@ public final class AgentAuditCatalog {
                     DocumentsContract.Document.COLUMN_LAST_MODIFIED}, null, null, null)) {
                 if (c == null) throw new IOException("Protokollordner nicht lesbar");
                 while (c.moveToNext()) {
-                    files.put(c.getString(1), new JSONObject().put("id", c.getString(0))
-                        .put("size", c.isNull(2) ? -1 : c.getLong(2)).put("modified", c.isNull(3) ? -1 : c.getLong(3)));
+                    String name = c.getString(1);
+                    if (name == null || c.isNull(0) || c.isNull(2) || c.isNull(3) || files.has(name) || c.getLong(2) < 0)
+                        throw new IOException("Protokollinhalt nicht eindeutig");
+                    files.put(name, new JSONObject().put("id", c.getString(0))
+                        .put("size", c.getLong(2)).put("modified", c.getLong(3)));
                 }
             }
         } catch (JSONException | SecurityException | IllegalArgumentException | UnsupportedOperationException e) {
