@@ -106,6 +106,8 @@ public final class AcceptanceRunner extends Instrumentation {
             passed("ChatGPT account HTTPS transport against a local TLS server (REQ-042.7, REQ-044.2): form POST, app-name-only User-Agent, redirects not followed, 1 MiB read limit, error codes, read timeout, plain HTTP and untrusted certificates refused");
             AccountUiAcceptance.run(this, (MainActivity) activity, service, getTargetContext());
             passed("ChatGPT account section (#327): reachable in two taps, card and single sign-in button, pending feedback, cancel, status and e-mail, Using ChatGPT plan with Manage usage, one-time dialog, disconnect confirmation, inactive plan state, expired and unreachable states, return link takes no value, sign-in service type, notification, stop within 2 s and debug switch");
+            AgentAuditAcceptance.run(this);
+            passed("Agent session audit (#355, REQ-045) against a test document provider: no folder, non-local provider and revoked grant refuse; versioned start; exact request stored before dispatch, ordered stream, distinct retries; tool lifecycle with denial, failure and local-vs-sent separation; initial and renewed denial; persistence failure, torn prefix and inspection without work; typed timeout/network/usage outcomes, cancel and disconnect; secrets rejected before sending and absent from JSONL, export and errors; confirmed redacted export and cancelled export; 30-day retention that fails closed on unknown file, other size or identity; 80 % warning and full folder; exact event, session, total and count cap boundaries");
 
             job("inventory");
             require(service.snapshot().optJSONObject("vehicle").optBoolean("engine_target_validated"), "Evidenced engine target");

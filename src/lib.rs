@@ -1,4 +1,5 @@
 pub(crate) mod adapter;
+pub mod agent_audit;
 pub mod audit;
 pub mod ble;
 pub mod cache_validation;

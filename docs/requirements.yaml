@@ -1297,7 +1297,7 @@ requirements:
       - id: REQ-045.25
         text: "Failure condition the user cancels export → safe stop: No export is created."
       - id: REQ-045.26
-        text: "Normal flow: Automatic retention deletes only whole completed sessions once 30 days have elapsed since their recorded end. A session without a verified end is not automatically expired. No active session is evicted; manual audit deletion remains separate from vehicle recordings and memos."
+        text: "Normal flow: Automatic retention deletes only whole completed sessions once 30 days have elapsed since their recorded end. A session without a verified end is not automatically expired. No active session is evicted; manual audit deletion remains separate from vehicle recordings and memos. This guarantee applies while nobody but OBDentic changes the selected folder. If a third-party change is detectable, including a different size, different file identity or unknown file, delete nothing and fail closed. The user may deliberately re-select the folder; show the existing unencrypted-storage warning and 'Der Ordner wurde außerhalb von OBDentic verändert. Neu übernehmen?'. Only after confirmation does its current content become the new baseline, without deleting anything. Automatic retention then applies only to sessions created afterwards; no pre-existing file is ever expired automatically. A change racing the check remains a residual risk."
       - id: REQ-045.27
         text: "Failure condition storage is full → safe stop: Report storage exhaustion and follow the persistence stop rules; do not silently discard older sessions to make room."
       - id: REQ-045.28
@@ -1305,7 +1305,7 @@ requirements:
       - id: REQ-045.29
         text: "Normal flow: Starting at 80% of the 256 MiB total audit budget, show a storage warning before more work. Count persisted audit bytes in the selected directory, including active and incomplete sessions."
       - id: REQ-045.30
-        text: "Failure condition an append would exceed 256 MiB total or 32 MiB for one session → safe stop: An append fitting exactly is allowed; the first append exceeding a cap is refused without truncating an event or deleting unexpired history. Apply the persistence stop rules."
+        text: "Failure condition an append would exceed 256 MiB total or 32 MiB for one session → safe stop: An append fitting exactly is allowed; the first append exceeding a cap is refused without truncating an event or deleting unexpired history. Apply the persistence stop rules. This guarantee applies while nobody but OBDentic changes the selected folder. If a third-party change is detectable, including a different size, different file identity or unknown file, append nothing more and fail closed. A change racing the check remains a residual risk."
       - id: REQ-045.31
         text: "Failure condition an encoded JSONL event would exceed 2 MiB → safe stop: Accept an event at the byte limit if the other budgets allow it; refuse a larger event without truncation and follow the persistence stop rules."
       - id: REQ-045.32
