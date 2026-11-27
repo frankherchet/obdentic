@@ -19,7 +19,9 @@ use crate::mobile::execute_nonblocking;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 const S3_MS: u64 = 5_000;
-const VIN: &[u8; 17] = b"WVWZZZ1KZAM123456";
+fn vehicle_fixture() -> Value {
+    serde_json::from_str(include_str!("../../../tests/fixtures/virtual-vehicle.json")).unwrap()
+}
 
 // ------------------------------------------------------------------------------------------------------
 // public-to-parent API
@@ -335,26 +337,57 @@ struct VEcu {
 
 impl VEcu {
     fn engine() -> Self {
+        let fixture = vehicle_fixture();
         let catalog = KnowledgeCatalog::embedded_pinned().unwrap();
+        let identification = parse_hex(fixture["identification"].as_str().unwrap()).unwrap();
+        let extended = fixture["extended_dids"].as_array().unwrap();
         let mut dids = BTreeMap::new();
         for candidate in EcuIdentificationPlan::from_catalog(&catalog)
             .unwrap()
             .candidates()
         {
-            dids.insert(candidate.did(), (b"123".to_vec(), false));
+            dids.insert(candidate.did(), (identification.clone(), false));
         }
-        dids.insert(0xF187, (b"123".to_vec(), false));
-        dids.insert(0x1356, (vec![0x00, 0x64], false));
-        dids.insert(0x1628, (vec![0x0B, 0x54], true));
+        for (key, value) in fixture["dids"].as_object().unwrap() {
+            dids.insert(
+                u16::from_str_radix(key, 16).unwrap(),
+                (
+                    parse_hex(value.as_str().unwrap()).unwrap(),
+                    extended.iter().any(|v| v.as_str() == Some(key)),
+                ),
+            );
+        }
+        let pids = fixture["pids"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    u8::from_str_radix(key, 16).unwrap(),
+                    parse_hex(value.as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        let codes = |field: &str| {
+            fixture[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| {
+                    let bytes = parse_hex(value.as_str().unwrap()).unwrap();
+                    [bytes[0], bytes[1]]
+                })
+                .collect()
+        };
         Self {
-            req: "7E0".into(),
-            resp: "7E8".into(),
+            req: fixture["request_id"].as_str().unwrap().into(),
+            resp: fixture["response_id"].as_str().unwrap().into(),
             extended: false,
             last_ms: 0,
             dids,
-            pids: BTreeMap::from([(0x0C, vec![0x1A, 0xF8]), (0x10, vec![0x03, 0xE8])]),
-            stored: vec![[0x04, 0x01]],
-            pending: Vec::new(),
+            pids,
+            stored: codes("stored_dtcs"),
+            pending: codes("pending_dtcs"),
         }
     }
 
@@ -385,7 +418,7 @@ impl VEcu {
             [0x07] => Some(dtc_payload(0x47, &self.pending)),
             [0x09, 0x02] => {
                 let mut payload = vec![0x49, 0x02, 0x01];
-                payload.extend_from_slice(VIN);
+                payload.extend_from_slice(vehicle_fixture()["vin"].as_str().unwrap().as_bytes());
                 Some(payload)
             }
             [0x22, high, low] => {
