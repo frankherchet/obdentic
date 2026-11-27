@@ -215,6 +215,13 @@ public final class ChatGptAccount {
             return secrets.toArray(new String[0]);
         }
     }
+    /** Known account identifiers for an explicitly requested audit-export preview. */
+    public String[] auditRedactionIdentity() {
+        synchronized (state) {
+            AccountStore.Record r = current();
+            return r == null ? new String[0] : new String[]{r.email, r.subject};
+        }
+    }
 
     private void changed() { version++; }
 

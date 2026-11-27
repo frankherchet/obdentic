@@ -258,7 +258,7 @@ final class AgentAuditAcceptance {
         listed.finish("success");
         String before = text(sessionFile(listed.sessionId()));
         AgentAuditSession.storageWarning(target);
-        AgentAuditExport.preview(target, listed.sessionId(), new JSONObject(), new JSONArray());
+        AgentAuditExport.preview(target, listed.sessionId());
         require(before.equals(text(sessionFile(listed.sessionId()))) && ran.get() == false, "REQ-045.9 reading an audit changes nothing and starts no work");
         // REQ-045.18: the prefix a killed process leaves (request, partial stream, torn line) is never expired or completed.
         String killed = UUID.randomUUID().toString();
@@ -321,7 +321,7 @@ final class AgentAuditAcceptance {
             AgentAuditSession ok = begin();
             ok.append("note", new JSONObject().put("vin", "SYNTHETICVIN0000000").put("odometer", 123456), null, null, null);
             require(text(sessionFile(ok.sessionId())).contains("SYNTHETICVIN0000000"), "REQ-045.22 vehicle identifiers are not secret material");
-            JSONObject preview = AgentAuditExport.preview(target, s.sessionId(), new JSONObject(), new JSONArray());
+            JSONObject preview = AgentAuditExport.preview(target, s.sessionId());
             require(!preview.getString("text").contains("marker"), "REQ-045.21 the export holds no marker");
             ok.finish("success");
         } finally {
@@ -332,18 +332,48 @@ final class AgentAuditAcceptance {
 
     /** REQ-045.24, .25: selection, warning, preview of every known match; cancelling creates nothing; the source is unchanged. */
     private void exportPreview() throws Exception {
-        AgentAuditSession s = begin();
-        s.append("note", new JSONObject().put("text", "SYNTHETIC-VIN and SYNTHETIC-VIN again"), null, null, null);
-        s.finish("success");
-        String source = text(sessionFile(s.sessionId()));
-        JSONObject known = new JSONObject().put("vin", new JSONArray().put("SYNTHETIC-VIN"));
-        JSONArray categories = new JSONArray().put("vin");
-        JSONObject preview = AgentAuditExport.preview(target, s.sessionId(), known, categories);
-        require(preview.getJSONArray("matches").length() == 2 && preview.getString("warning").contains("Erkannt werden nur Werte, die die App kennt."), "REQ-045.24 the preview shows every match and the warning");
-        int before = children().size();
-        require(AgentAuditExport.confirm(target, preview, false) == null && children().size() == before, "REQ-045.25 a cancelled export creates nothing");
-        Uri exported = AgentAuditExport.confirm(target, preview, true);
-        require(exported != null && !text(exported).contains("SYNTHETIC-VIN") && source.equals(text(sessionFile(s.sessionId()))), "REQ-045.24 the confirmed copy is redacted and the source is unchanged");
+        java.io.File isolated = new java.io.File(target.getCacheDir(), "audit-export-records");
+        if (!isolated.isDirectory() && !isolated.mkdirs()) throw new IOException("fixture directory");
+        Context records = new android.content.ContextWrapper(target) { @Override public java.io.File getFilesDir() { return isolated; } };
+        VehicleStore vehicles = new VehicleStore(new java.io.File(isolated, "vehicles.json"));
+        String vin = "TESTVIN0000000001", serial = "SYNTH-SERIAL", email = "audit@example.test", subject = "subject-test";
+        android.content.SharedPreferences adapter = target.getSharedPreferences("adapter", 0);
+        String previous = adapter.getString("known_address", "");
+        AccountStore accountStore = new AccountStore(target, "audit-export-fixture");
+        ChatGptAccount.Config config = ChatGptAccount.Config.defaults(target); config.store = accountStore;
+        ChatGptAccount.install(new ChatGptAccount(config));
+        try {
+            AgentAuditSession s = begin();
+            s.append("note", new JSONObject().put("text", vin + " " + serial + " 654321.0 AA:BB:CC:DD:EE:12 " + email + " " + subject), null, null, null);
+            s.finish("success");
+            String source = text(sessionFile(s.sessionId()));
+            java.lang.reflect.Method preview;
+            try { preview = AgentAuditExport.class.getMethod("preview", Context.class, String.class); }
+            catch (NoSuchMethodException e) { throw new AssertionError("REQ-045.24 store-derived export preview missing", e); }
+            JSONObject empty = (JSONObject) preview.invoke(null, records, s.sessionId());
+            require(empty.getJSONArray("matches").length() == 0 && empty.getString("warning").contains("Erkannt werden nur Werte, die die App kennt."), "empty stores do not guess");
+            require("created".equals(vehicles.observe(new JSONObject().put("vin", vin), 1)), "fixture vehicle saved");
+            vehicles.odometer(vin, 654321.0, 2);
+            JSONObject identity = new JSONObject().put("value", serial).put("semantic", "ecu.serial");
+            vehicles.setDiagnostic(vin, "ecu_discovery", new JSONObject().put("targets", new JSONArray().put(new JSONObject().put("identity", new JSONArray().put(identity)))));
+            adapter.edit().putString("known_address", "AA:BB:CC:DD:EE:12").commit();
+            accountStore.save(new AccountStore.Record("synthetic-client", "access-test", "refresh-test", "id-test", ChatGptAccount.SCOPE,
+                email, subject, System.currentTimeMillis() + 3600000, 0, false));
+            ChatGptAccount.install(new ChatGptAccount(config));
+            JSONObject redacted = (JSONObject) preview.invoke(null, records, s.sessionId());
+            require(redacted.getJSONArray("matches").length() == 6, "REQ-045.24 every known value is preselected and matched");
+            String text = redacted.getString("text");
+            require(!text.contains(vin) && !text.contains(serial) && !text.contains("654321.0")
+                && !text.contains("AA:BB:CC:DD:EE:12") && !text.contains(email) && !text.contains(subject), "known values redacted");
+            int before = children().size();
+            require(AgentAuditExport.confirm(target, redacted, false) == null && children().size() == before, "REQ-045.25 cancelled export creates nothing");
+            Uri exported = AgentAuditExport.confirm(target, redacted, true);
+            require(exported != null && !text(exported).contains(vin) && source.equals(text(sessionFile(s.sessionId()))), "confirmed export redacts known values without changing source");
+        } finally {
+            accountStore.deleteAll(); ChatGptAccount.install(null);
+            if (previous.isEmpty()) adapter.edit().remove("known_address").commit(); else adapter.edit().putString("known_address", previous).commit();
+            new java.io.File(isolated, "vehicles.json").delete(); isolated.delete();
+        }
     }
 
     /** REQ-045.26 and .30: retention and appends fail closed on every detectable outside change. */
