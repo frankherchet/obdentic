@@ -49,16 +49,97 @@ public final class AgentAuditCatalog {
                 catch (JSONException e) { throw new IOException("Protokollkatalog nicht lesbar"); }
             }
         }
+        String pending = context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).getString(tree + ":pending", null);
+        if (pending != null) {
+            try {
+                JSONObject operation = new JSONObject(pending);
+                String name = operation.getString("name"), kind = operation.getString("kind");
+                JSONObject before = expected.optJSONObject(name), after = now.optJSONObject(name);
+                JSONObject remainingExpected = new JSONObject(expected.toString()), remainingNow = new JSONObject(now.toString());
+                remainingExpected.remove(name); remainingNow.remove(name);
+                boolean rest = unchanged(remainingExpected, remainingNow);
+                boolean accepted = false;
+                if ("append".equals(kind) && before != null && after != null
+                        && operation.getString("id").equals(before.optString("id"))
+                        && operation.getString("id").equals(after.optString("id"))) {
+                    long actual = after.optLong("size", -1);
+                    accepted = actual == operation.getLong("after")
+                        || (actual == operation.getLong("before") && unchanged(new JSONObject().put(name, before), new JSONObject().put(name, after)));
+                } else if ("create".equals(kind) && before == null) {
+                    accepted = after == null || after.optLong("size", -1) == 0;
+                } else if ("delete".equals(kind) && before != null) {
+                    accepted = after == null || unchanged(new JSONObject().put(name, before), new JSONObject().put(name, after));
+                }
+                if (!rest || !accepted) throw new IOException("Protokollordner wurde von außen verändert");
+                remember(context, tree);
+                return;
+            } catch (JSONException e) { throw new IOException("Protokollkatalog nicht lesbar"); }
+        }
         if (!unchanged(expected, now)) throw new IOException("Protokollordner wurde von außen verändert");
     }
 
     /** After the app's own change (create, append, delete) the new state is the expected one. */
     public static synchronized void remember(Context context, Uri tree) throws IOException {
         JSONObject next = snapshot(context.getContentResolver(), tree);
-        if (!context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).edit().putString(tree.toString(), next.toString()).commit())
+        if (!context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).edit().putString(tree.toString(), next.toString()).remove(tree + ":pending").commit())
             throw new IOException("Protokollkatalog konnte nicht gespeichert werden");
         expected = next;
         expectedTree = tree.toString();
+    }
+
+    /** Persist an append intent before touching the file; recovery accepts only the old or complete new size. */
+    public static synchronized void prepareAppend(Context context, Uri tree, Uri document, long before, long after) throws IOException {
+        verify(context, tree);
+        String id = DocumentsContract.getDocumentId(document), name = find(id);
+        JSONObject entry = expected.optJSONObject(name);
+        if (entry == null || entry.optLong("size", -1) != before || after <= before) throw new IOException("Protokollgröße geändert");
+        try { pending(context, tree, new JSONObject().put("kind", "append").put("name", name).put("id", id).put("before", before).put("after", after)); }
+        catch (JSONException e) { throw new IOException("Protokollkatalog nicht schreibbar"); }
+    }
+
+    public static synchronized void prepareCreate(Context context, Uri tree, String name) throws IOException {
+        verify(context, tree);
+        if (expected.has(name)) throw new IOException("Datei existiert bereits");
+        try { pending(context, tree, new JSONObject().put("kind", "create").put("name", name)); }
+        catch (JSONException e) { throw new IOException("Protokollkatalog nicht schreibbar"); }
+    }
+
+    public static synchronized void prepareDelete(Context context, Uri tree, Uri document) throws IOException {
+        verify(context, tree);
+        String name = find(DocumentsContract.getDocumentId(document));
+        try { pending(context, tree, new JSONObject().put("kind", "delete").put("name", name)); }
+        catch (JSONException e) { throw new IOException("Protokollkatalog nicht schreibbar"); }
+    }
+
+    private static String find(String id) throws IOException {
+        for (Iterator<String> names = expected.keys(); names.hasNext();) {
+            String name = names.next();
+            if (id.equals(expected.optJSONObject(name).optString("id"))) return name;
+        }
+        throw new IOException("Protokolldatei nicht im Katalog");
+    }
+
+    private static void pending(Context context, Uri tree, JSONObject operation) throws IOException {
+        if (!context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).edit().putString(tree + ":pending", operation.toString()).commit())
+            throw new IOException("Protokollkatalog konnte nicht gespeichert werden");
+    }
+
+    /** Explicit user confirmation adopts the current folder without expiring any existing file. */
+    public static synchronized void adopt(Context context, Uri tree) throws IOException {
+        JSONObject now = snapshot(context.getContentResolver(), tree);
+        if (!context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).edit()
+                .putString(tree.toString(), now.toString()).putString(tree + ":protected", now.names() == null ? "[]" : now.names().toString())
+                .remove(tree + ":pending").commit()) throw new IOException("Protokollkatalog konnte nicht gespeichert werden");
+        expected = now; expectedTree = tree.toString();
+    }
+
+    public static synchronized boolean protectedFile(Context context, Uri tree, String name) throws IOException {
+        String saved = context.getSharedPreferences("agent-audit-catalog", Context.MODE_PRIVATE).getString(tree + ":protected", "[]");
+        try {
+            org.json.JSONArray names = new org.json.JSONArray(saved);
+            for (int i = 0; i < names.length(); i++) if (name.equals(names.getString(i))) return true;
+            return false;
+        } catch (JSONException e) { throw new IOException("Protokollkatalog nicht lesbar"); }
     }
 
     private static JSONObject snapshot(ContentResolver resolver, Uri tree) throws IOException {

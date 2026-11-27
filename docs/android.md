@@ -894,6 +894,10 @@ other size, other file identity) stops all further work. Retention deletes only 
 their end. Export (`AgentAuditExport`) needs a selected session, shows the warning and a redaction preview of the known values, and
 creates nothing when cancelled. The change detection assumes nobody but OBDentic changes the folder; a change racing the check is a
 residual risk, as is power loss at the moment of a write (ADR 0010).
+If an outside change blocks the folder, re-select it and confirm **Neu übernehmen** to adopt its current contents. Nothing already in
+the folder is deleted by that confirmation or by later automatic retention; only sessions created afterwards can expire automatically.
+Interrupted app writes are reconciled against a persisted intent (old or complete new size), without treating arbitrary changes as app writes.
+
 
 Offline inspection needs no model, tool or vehicle: `obdentic-mobile-report --agent-audit <session.jsonl>` prints the timeline, whether
 the audit is complete (end marker, no sequence gap, no torn line, no open attempt), the separate diagnosis status, the last evidenced

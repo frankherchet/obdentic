@@ -34,6 +34,8 @@ public final class AgentAuditSession {
     private static final String PREFIX = "obdentic-agent-", MIME = "application/x-ndjson";
     public static final String MIME_TYPE = "application/x-ndjson";
     private static final Object LOCK = new Object();
+    interface Sync { void sync(java.io.FileDescriptor fd) throws IOException; }
+    static Sync sync = java.io.FileDescriptor::sync;
     private static AgentAuditSession active;
     private final Context context;
     private final Uri tree, document;
@@ -67,9 +69,10 @@ public final class AgentAuditSession {
             String id = UUID.randomUUID().toString();
             try {
                 Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                AgentAuditCatalog.prepareCreate(context, tree, PREFIX + id + ".jsonl");
                 Uri document = DocumentsContract.createDocument(context.getContentResolver(), parent, MIME, PREFIX + id + ".jsonl");
                 if (document == null) throw new IOException("Protokolldatei konnte nicht angelegt werden");
-                AgentAuditCatalog.remember(context, tree); // the app's own new file is part of the expected folder
+                AgentAuditCatalog.verify(context, tree);
                 AgentAuditSession session = new AgentAuditSession(context, tree, document, id);
                 active = session;
                 try { session.append("session_start", metadata, null, null, null); }
@@ -238,13 +241,14 @@ public final class AgentAuditSession {
                 long total = bytes(context.getContentResolver(), tree);
                 if (line.length > EVENT_LIMIT || size + line.length > SESSION_LIMIT || total + line.length > TOTAL_LIMIT)
                     throw new IOException("Protokollspeichergrenze erreicht");
+                AgentAuditCatalog.prepareAppend(context, tree, document, size, size + line.length);
                 ParcelFileDescriptor fd = context.getContentResolver().openFileDescriptor(document, "wa");
                 if (fd == null) throw new IOException("Protokolldatei nicht verfügbar");
                 try (FileOutputStream output = new ParcelFileDescriptor.AutoCloseOutputStream(fd)) {
-                    output.write(line); output.flush(); output.getFD().sync();
+                    output.write(line); output.flush(); sync.sync(output.getFD());
                 }
                 sequence++; size += line.length;
-                AgentAuditCatalog.remember(context, tree);
+                AgentAuditCatalog.verify(context, tree);
                 if ("session_end".equals(type)) { ended = true; active = null; }
             } catch (IOException | JSONException | RuntimeException e) {
                 failed = true; active = null;
@@ -270,6 +274,7 @@ public final class AgentAuditSession {
                     while (c.moveToNext()) {
                         String name = c.getString(1);
                         if (name == null || !name.startsWith(PREFIX) || !name.endsWith(".jsonl") || c.isNull(2) || c.getLong(2) > SESSION_LIMIT) continue;
+                        if (AgentAuditCatalog.protectedFile(context, tree, name)) continue;
                         String id = name.substring(PREFIX.length(), name.length() - 6);
                         try { if (!UUID.fromString(id).toString().equals(id)) continue; }
                         catch (IllegalArgumentException e) { continue; }
@@ -280,13 +285,16 @@ public final class AgentAuditSession {
                 }
                 for (int i = 0; i < candidates.size(); i++) {
                     long end = verifiedEnd(resolver, candidates.get(i), ids.get(i));
-                    if (end >= 0 && end <= cutoff && !DocumentsContract.deleteDocument(resolver, candidates.get(i)))
-                        throw new IOException("Altes Protokoll konnte nicht gelöscht werden");
+                    if (end >= 0 && end <= cutoff) {
+                        AgentAuditCatalog.prepareDelete(context, tree, candidates.get(i));
+                        if (!DocumentsContract.deleteDocument(resolver, candidates.get(i))) throw new IOException("Altes Protokoll konnte nicht gelöscht werden");
+                        AgentAuditCatalog.verify(context, tree);
+                    }
                 }
             } catch (SecurityException | IllegalArgumentException | UnsupportedOperationException e) {
                 throw new IOException("Protokollordner nicht verfügbar");
             }
-            AgentAuditCatalog.remember(context, tree);
+            AgentAuditCatalog.verify(context, tree);
         }
     }
 

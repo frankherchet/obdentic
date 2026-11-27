@@ -1120,8 +1120,19 @@ public class MainActivity extends Activity {
             Uri tree=result==RESULT_OK&&data!=null?data.getData():null;if(tree==null)return;
             if(!AgentAuditStorage.isLocalTree(tree)){toast("Nur ein Ordner im internen Gerätespeicher ist erlaubt");return;}
             int flags=Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
-            try{getContentResolver().takePersistableUriPermission(tree,flags);AgentAuditStorage.select(this,tree);}
-            catch(SecurityException|java.io.IOException e){toast("Protokollordner nicht dauerhaft nutzbar");return;}
+            try{
+                getContentResolver().takePersistableUriPermission(tree,flags);
+                try{AgentAuditCatalog.verify(this,tree);}
+                catch(java.io.IOException changed){
+                    new AlertDialog.Builder(this).setMessage("Die vollständigen Protokolle werden unverschlüsselt im Dateimanager sichtbar. Andere Apps oder Backups können sie ohne die Exportvorschau kopieren.\n\nDer Ordner wurde außerhalb von OBDentic verändert. Neu übernehmen?")
+                        .setPositiveButton("Neu übernehmen",(dialog,which)->{
+                            try{AgentAuditCatalog.adopt(this,tree);AgentAuditStorage.select(this,tree);toast("Protokollordner gespeichert");structure="";refresh();}
+                            catch(java.io.IOException e){toast("Protokollordner nicht dauerhaft nutzbar");}
+                        }).setNegativeButton("Abbrechen",null).show();
+                    return;
+                }
+                AgentAuditStorage.select(this,tree);
+            }catch(SecurityException|java.io.IOException e){toast("Protokollordner nicht dauerhaft nutzbar");return;}
             toast("Protokollordner gespeichert");structure="";refresh();return;
         }
         if(request==42){

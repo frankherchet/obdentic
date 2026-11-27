@@ -58,6 +58,8 @@ final class AgentAuditAcceptance {
             fresh(); secrets();
             fresh(); exportPreview();
             fresh(); retentionAndOutsideChanges();
+            fresh(); interruptedAppendRecovery();
+            fresh(); confirmedFolderRecovery();
             fresh(); storage();
             fresh(); boundaries();
         } finally {
@@ -408,6 +410,55 @@ final class AgentAuditAcceptance {
         AgentAuditSession running = begin();
         require(AgentAuditSession.storageWarning(target) == false, "REQ-045.28 a valid destination needs no warning");
         running.finish("success");
+    }
+
+    /** REQ-045.26/.30: a crash or sync error after the write must not permanently block the folder. */
+    private void interruptedAppendRecovery() throws Exception {
+        java.lang.reflect.Method prepare;
+        try { prepare = AgentAuditCatalog.class.getMethod("prepareAppend", Context.class, Uri.class, Uri.class, long.class, long.class); }
+        catch (NoSuchMethodException e) { throw new AssertionError("REQ-045.30 durable pending append missing", e); }
+        for (int scenario = 0; scenario < 3; scenario++) {
+            AgentAuditSession s = begin();
+            Uri file = sessionFile(s.sessionId());
+            if (scenario == 2) {
+                AgentAuditSession.sync = fd -> { fd.sync(); throw new IOException("synthetic sync failure"); };
+                try {
+                    require(refused(() -> s.append("note", new JSONObject(), null, null, null)) != null && s.failed(),
+                        "REQ-045.28 a throwing sync stops the session");
+                } finally { AgentAuditSession.sync = java.io.FileDescriptor::sync; }
+            } else {
+                byte[] line = "{\"type\":\"synthetic\"}\n".getBytes(StandardCharsets.UTF_8);
+                long before = size(file);
+                prepare.invoke(null, target, tree, file, before, before + line.length);
+                if (scenario == 1) {
+                    try (java.io.FileOutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(resolver.openFileDescriptor(file, "wa"))) {
+                        out.write(line); out.getFD().sync();
+                    }
+                }
+                java.lang.reflect.Field active = AgentAuditSession.class.getDeclaredField("active");
+                active.setAccessible(true); active.set(null, null);
+            }
+            resetCatalogMemory();
+            AgentAuditSession recovered = begin();
+            recovered.finish("success");
+        }
+    }
+
+    /** REQ-045.26: a deliberate folder re-selection preserves everything already there. */
+    private void confirmedFolderRecovery() throws Exception {
+        Uri complete = oldAudit(true);
+        AgentAuditCatalog.remember(target, tree);
+        Uri foreign = create("foreign.txt");
+        resetCatalogMemory();
+        require(refused(() -> AgentAuditSession.begin(target, metadata())) != null, "REQ-045.26 outside change blocks work before confirmation");
+        java.lang.reflect.Method adopt;
+        try { adopt = AgentAuditCatalog.class.getMethod("adopt", Context.class, Uri.class); }
+        catch (NoSuchMethodException e) { throw new AssertionError("REQ-045.26 explicit folder adoption missing", e); }
+        adopt.invoke(null, target, tree);
+        AgentAuditSession recovered = begin();
+        recovered.finish("success");
+        AgentAuditSession.expire(target, System.currentTimeMillis() + 31L * 86400000L);
+        require(exists(complete) && exists(foreign), "REQ-045.26 adoption never deletes pre-existing files");
     }
 
     /** REQ-045.26/.30: simulate a fresh process without deleting the persisted catalog. */

@@ -48,15 +48,21 @@ public final class AgentAuditExport {
         if (!confirmed) return null;
         Uri tree = AgentAuditStorage.selected(context);
         try {
+            String name = "obdentic-export-" + preview.getString("session_id") + ".jsonl";
+            byte[] text = preview.getString("text").getBytes(StandardCharsets.UTF_8);
+            AgentAuditCatalog.prepareCreate(context, tree, name);
             Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
-            Uri copy = DocumentsContract.createDocument(context.getContentResolver(), parent, AgentAuditSession.MIME_TYPE,
-                "obdentic-export-" + preview.getString("session_id") + ".jsonl");
+            Uri copy = DocumentsContract.createDocument(context.getContentResolver(), parent, AgentAuditSession.MIME_TYPE, name);
             if (copy == null) throw new IOException("Export konnte nicht angelegt werden");
-            try (OutputStream out = context.getContentResolver().openOutputStream(copy, "w")) {
-                if (out == null) throw new IOException("Export konnte nicht geschrieben werden");
-                out.write(preview.getString("text").getBytes(StandardCharsets.UTF_8));
+            AgentAuditCatalog.verify(context, tree);
+            if (text.length > 0) {
+                AgentAuditCatalog.prepareAppend(context, tree, copy, 0, text.length);
+                try (OutputStream out = context.getContentResolver().openOutputStream(copy, "wa")) {
+                    if (out == null) throw new IOException("Export konnte nicht geschrieben werden");
+                    out.write(text);
+                }
+                AgentAuditCatalog.verify(context, tree);
             }
-            AgentAuditCatalog.remember(context, tree);
             return copy;
         } catch (JSONException | SecurityException | IllegalArgumentException e) {
             throw new IOException("Export nicht möglich");
