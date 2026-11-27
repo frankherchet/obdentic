@@ -280,6 +280,7 @@ public class MainActivity extends Activity {
         LinearLayout audit=card();note(audit,"AGENTENPROTOKOLL",ACCENT);
         String folder=AgentAuditStorage.folder(this);
         smallNote(audit,folder.isEmpty()?"Noch kein Protokollordner gewählt":"Protokollordner: "+folderName(folder),MUTED);
+        try{if(!folder.isEmpty()&&AgentAuditSession.storageWarning(this))smallNote(audit,"Warnung: der Protokollspeicher ist zu mehr als 80 % belegt",0xffffca75);}catch(java.io.IOException ignored){/* an unreadable folder is reported when work starts */}
         addButton(audit,"Protokollordner auswählen",this::chooseAuditFolder);
     }
     private void chooseAuditFolder(){

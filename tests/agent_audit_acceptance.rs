@@ -106,3 +106,33 @@ fn missing_recording_reference_is_unresolved_but_readable() {
     assert_eq!(r["source_references"][0]["status"], "unresolved");
     assert_eq!(r["events"].as_array().unwrap().len(), 4);
 }
+
+// REQ-045.9: inspecting only reads the audit; the file stays byte-identical and no work is started.
+#[test]
+fn inspection_leaves_the_audit_untouched() {
+    let text = event(1, "session_start", "") + &event(2, "request_intent", ",\"request_id\":\"r\"");
+    let path = std::env::temp_dir().join(format!("obdentic-audit-ro-{}.jsonl", std::process::id()));
+    fs::write(&path, &text).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_obdentic-mobile-report"))
+        .arg("--agent-audit")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let after = fs::read_to_string(&path).unwrap();
+    let _ = fs::remove_file(path);
+    assert!(out.status.success());
+    assert_eq!(after, text);
+}
+
+// REQ-045.18: the prefix of a process killed mid-stream (open request, partial delta, torn line) is incomplete, with no invented end.
+#[test]
+fn killed_mid_stream_shows_the_prefix_and_no_terminal_response() {
+    let text = event(1, "session_start", "")
+        + &event(2, "request_intent", ",\"request_id\":\"r\"")
+        + &event(3, "response_delta", ",\"request_id\":\"r\"")
+        + "{\"schema\":\"obdentic-agent-au";
+    let r = report("killed", &text);
+    assert_eq!(r["audit_status"], "incomplete");
+    assert_eq!(r["last_evidenced_action"], "response_delta");
+    assert_eq!(r["events"].as_array().unwrap().len(), 3);
+}

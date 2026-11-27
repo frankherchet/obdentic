@@ -10,6 +10,10 @@ import java.io.IOException;
 public final class AgentAuditStorage {
     private static final String PREFS = "agent-audit", FOLDER = "folder";
     private static final String INTERNAL_PROVIDER = "com.android.externalstorage.documents";
+    private static volatile String testProvider = "";
+
+    /** Acceptance seam: the test APK's own file-backed document provider counts as a local provider. Never set in the app. */
+    public static void allowTestProvider(String authority) { testProvider = authority == null ? "" : authority; }
     private AgentAuditStorage() {}
 
     public static String folder(Context context) {
@@ -18,7 +22,8 @@ public final class AgentAuditStorage {
 
     /** Only the primary internal-storage tree is supported, not removable storage or cloud providers. */
     public static boolean isLocalTree(Uri tree) {
-        if (tree == null || !"content".equals(tree.getScheme()) || !INTERNAL_PROVIDER.equals(tree.getAuthority())) return false;
+        if (tree == null || !"content".equals(tree.getScheme())
+                || !(INTERNAL_PROVIDER.equals(tree.getAuthority()) || (!testProvider.isEmpty() && testProvider.equals(tree.getAuthority())))) return false;
         try {
             String id = DocumentsContract.getTreeDocumentId(tree);
             return id.startsWith("primary:") && DocumentsContract.isTreeUri(tree);

@@ -16,9 +16,21 @@ import org.json.JSONObject;
 
 /** One append-only agent audit in the explicitly chosen local SAF tree. */
 public final class AgentAuditSession {
-    public static final long TOTAL_LIMIT = 256L * 1024 * 1024;
-    public static final long SESSION_LIMIT = 32L * 1024 * 1024;
-    public static final int EVENT_LIMIT = 2 * 1024 * 1024, COUNT_LIMIT = 10000;
+    public static final long DEFAULT_TOTAL_LIMIT = 256L * 1024 * 1024, DEFAULT_SESSION_LIMIT = 32L * 1024 * 1024;
+    public static final int DEFAULT_EVENT_LIMIT = 2 * 1024 * 1024, DEFAULT_COUNT_LIMIT = 10000;
+    /** The REQ-045.29/.30/.31/.32 budgets; only the acceptance tests change them, to hit the exact boundaries cheaply. */
+    public static volatile long TOTAL_LIMIT = DEFAULT_TOTAL_LIMIT, SESSION_LIMIT = DEFAULT_SESSION_LIMIT;
+    public static volatile int EVENT_LIMIT = DEFAULT_EVENT_LIMIT, COUNT_LIMIT = DEFAULT_COUNT_LIMIT;
+
+    public static void setLimits(long total, long session, int event, int count) { TOTAL_LIMIT = total; SESSION_LIMIT = session; EVENT_LIMIT = event; COUNT_LIMIT = count; }
+    public static void resetLimits() { setLimits(DEFAULT_TOTAL_LIMIT, DEFAULT_SESSION_LIMIT, DEFAULT_EVENT_LIMIT, DEFAULT_COUNT_LIMIT); }
+
+    /** REQ-045.29: from 80 % of the total budget on, a warning is due before more work. Counts every audit byte, active and incomplete included. */
+    public static boolean storageWarning(Context context) throws IOException {
+        Context app = context.getApplicationContext();
+        synchronized (LOCK) { return bytes(app.getContentResolver(), AgentAuditStorage.selected(app)) >= (TOTAL_LIMIT * 4 + 4) / 5; }
+    }
+    public boolean failed() { synchronized (LOCK) { return failed; } }
     private static final String PREFIX = "obdentic-agent-", MIME = "application/x-ndjson";
     public static final String MIME_TYPE = "application/x-ndjson";
     private static final Object LOCK = new Object();
@@ -147,7 +159,13 @@ public final class AgentAuditSession {
         }
     }
     /** Record a proposal and policy decision before starting the permitted operation. */
-    public void runTool(String callId, String name, String arguments, boolean allowed, String reason, java.util.concurrent.Callable<JSONObject> work) throws IOException {
+    /** What a tool produced locally and the exact subset that went out of the app (REQ-045.7); the subset is null when nothing was sent. */
+    public static final class ToolResult {
+        public final JSONObject local, sentExternally;
+        public ToolResult(JSONObject local, JSONObject sentExternally) { this.local = local; this.sentExternally = sentExternally; }
+    }
+
+    public void runTool(String callId, String name, String arguments, boolean allowed, String reason, java.util.concurrent.Callable<ToolResult> work) throws IOException {
         synchronized (LOCK) {
             if (active != this || failed || ended || disclosureDenied || callId == null || callId.isEmpty()
                     || tools.contains(callId) || sequence > COUNT_LIMIT - (allowed ? 5 : 2))
@@ -158,16 +176,18 @@ public final class AgentAuditSession {
                 append("tool_decision", new JSONObject().put("allowed", allowed).put("reason", reason), null, null, callId);
                 if (!allowed) return;
                 append("tool_intent", new JSONObject().put("operation", name), null, null, callId);
-                JSONObject result;
+                ToolResult result;
                 try {
                     result = work.call();
-                    if (result == null) throw new IllegalStateException("tool returned no result");
+                    if (result == null || result.local == null) throw new IllegalStateException("tool returned no result");
                 } catch (Exception e) {
                     append("tool_end", new JSONObject().put("status", "error"), null, null, callId);
                     throw new IOException("Werkzeug fehlgeschlagen");
                 }
                 append("tool_dispatched", new JSONObject(), null, null, callId);
-                append("tool_end", new JSONObject().put("status", "completed").put("result", result), null, null, callId);
+                JSONObject end = new JSONObject().put("status", "completed").put("result", result.local);
+                if (result.sentExternally != null) end.put("sent_external", result.sentExternally);
+                append("tool_end", end, null, null, callId);
             } catch (JSONException e) {
                 failed = true; active = null;
                 throw new IOException("Werkzeug konnte nicht protokolliert werden");

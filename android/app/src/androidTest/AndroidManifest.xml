@@ -8,4 +8,11 @@
         android:targetPackage="${testedApp}"
         android:label="OBDentic live vehicle acceptance"
         android:functionalTest="true" />
+    <application>
+        <provider android:name="de.obdentic.app.AuditTestProvider" android:authorities="de.obdentic.app.debug.test.audit"
+            android:exported="true" android:grantUriPermissions="true" android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter><action android:name="android.content.action.DOCUMENTS_PROVIDER" /></intent-filter>
+        </provider>
+        <receiver android:name="de.obdentic.app.AuditGrantReceiver" android:exported="true" />
+    </application>
 </manifest>
