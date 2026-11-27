@@ -121,16 +121,23 @@ final class AgentAuditAcceptance {
         s.disclosure(true);
         AtomicBoolean ran = new AtomicBoolean();
         String denied = id();
-        s.runTool(denied, "synthetic_tool", "{\"raw\": 1}", false, "denied by policy", () -> { ran.set(true); return new AgentAuditSession.ToolResult(new JSONObject(), null); });
+        s.runTool(denied, "synthetic_tool", "{\"raw\": 1}", false, "denied by policy", () -> { ran.set(true); return new AgentAuditSession.ToolResult(new JSONObject(), null, null); });
         JSONArray d = events("tool_call_id", denied);
         require(!ran.get() && d.length() == 2 && type(d, 0).equals("tool_proposal") && type(d, 1).equals("tool_decision")
             && d.getJSONObject(0).getJSONObject("data").getString("arguments").equals("{\"raw\": 1}"), "REQ-045.5 a denied call keeps its original arguments and has no execution");
         String allowed = id();
-        s.runTool(allowed, "synthetic_tool", "{\"x\":1}", true, "allowed", () -> new AgentAuditSession.ToolResult(new JSONObject().put("value", "synthetic"), null));
+        java.lang.reflect.Constructor<AgentAuditSession.ToolResult> withEvidence;
+        try { withEvidence = AgentAuditSession.ToolResult.class.getConstructor(JSONObject.class, JSONObject.class, JSONObject.class); }
+        catch (NoSuchMethodException e) { throw new AssertionError("REQ-045.4 missing evidence reference", e); }
+        s.runTool(allowed, "synthetic_tool", "{\"x\":1}", true, "allowed", () ->
+            withEvidence.newInstance(new JSONObject().put("value", "synthetic"), null,
+                new JSONObject().put("recording_ref", "synthetic.jsonl").put("offset", 42)));
         JSONArray a = events("tool_call_id", allowed);
         require(a.length() == 5 && type(a, 0).equals("tool_proposal") && type(a, 1).equals("tool_decision") && type(a, 2).equals("tool_intent")
             && type(a, 3).equals("tool_dispatched") && type(a, 4).equals("tool_end")
-            && "synthetic".equals(a.getJSONObject(4).getJSONObject("data").getJSONObject("result").optString("value")), "REQ-045.4 proposal, decision, start, end and result");
+            && "synthetic".equals(a.getJSONObject(4).getJSONObject("data").getJSONObject("result").optString("value"))
+            && a.getJSONObject(4).getJSONObject("data").getJSONObject("evidence_ref").optLong("offset") == 42,
+            "REQ-045.4 proposal, decision, start, end, result and exact evidence reference");
         String failing = id();
         String message = refused(() -> s.runTool(failing, "synthetic_tool", "{}", true, "allowed", () -> { throw new IllegalStateException("boom"); }));
         JSONArray f = events("tool_call_id", failing);
@@ -139,7 +146,7 @@ final class AgentAuditAcceptance {
         for (String kind : new String[]{"memo_read", "memo_write", "knowledge_lookup", "recording_query"}) {
             String call = id();
             s.runTool(call, kind, "{}", true, "allowed", () -> new AgentAuditSession.ToolResult(
-                new JSONObject().put("complete_local", kind + "-everything").put("mutated", kind.equals("memo_write")), new JSONObject().put("subset", kind)));
+                new JSONObject().put("complete_local", kind + "-everything").put("mutated", kind.equals("memo_write")), new JSONObject().put("subset", kind), null));
             JSONArray k = events("tool_call_id", call);
             JSONObject end = k.getJSONObject(k.length() - 1).getJSONObject("data");
             require(k.length() == 5 && type(k, 2).equals("tool_intent") && type(k, 3).equals("tool_dispatched") && type(k, 4).equals("tool_end")

@@ -161,8 +161,10 @@ public final class AgentAuditSession {
     /** Record a proposal and policy decision before starting the permitted operation. */
     /** What a tool produced locally and the exact subset that went out of the app (REQ-045.7); the subset is null when nothing was sent. */
     public static final class ToolResult {
-        public final JSONObject local, sentExternally;
-        public ToolResult(JSONObject local, JSONObject sentExternally) { this.local = local; this.sentExternally = sentExternally; }
+        public final JSONObject local, sentExternally, evidenceRef;
+        public ToolResult(JSONObject local, JSONObject sentExternally, JSONObject evidenceRef) {
+            this.local = local; this.sentExternally = sentExternally; this.evidenceRef = evidenceRef;
+        }
     }
 
     public void runTool(String callId, String name, String arguments, boolean allowed, String reason, java.util.concurrent.Callable<ToolResult> work) throws IOException {
@@ -187,6 +189,7 @@ public final class AgentAuditSession {
                 append("tool_dispatched", new JSONObject(), null, null, callId);
                 JSONObject end = new JSONObject().put("status", "completed").put("result", result.local);
                 if (result.sentExternally != null) end.put("sent_external", result.sentExternally);
+                if (result.evidenceRef != null) end.put("evidence_ref", result.evidenceRef);
                 append("tool_end", end, null, null, callId);
             } catch (JSONException e) {
                 failed = true; active = null;

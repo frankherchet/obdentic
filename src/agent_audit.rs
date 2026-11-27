@@ -102,10 +102,22 @@ pub fn inspect(path: &Path) -> Result<Value, String> {
                 .cloned()
                 .unwrap_or(Value::Null);
         }
-        if let Some(reference) = event["data"].get("recording_ref").and_then(Value::as_str) {
-            // The recording is a separate file; the inspector never opens it, so the link stays unresolved here.
-            references
-                .push(json!({"seq": expected, "recording_ref": reference, "status": "unresolved"}));
+        let data = &event["data"];
+        let evidence = data.get("evidence_ref").cloned().or_else(|| {
+            data.get("recording_ref")
+                .and_then(Value::as_str)
+                .map(|reference| json!({"recording_ref": reference}))
+        });
+        if let Some(evidence) = evidence {
+            let reference = evidence.get("recording_ref").and_then(Value::as_str);
+            let resolved = reference.is_some_and(|reference| {
+                let source = Path::new(reference);
+                source.components().count() == 1
+                    && matches!(source.components().next(), Some(std::path::Component::Normal(_)))
+                    && path.parent().unwrap_or(Path::new(".")).join(source).is_file()
+            });
+            references.push(json!({"seq": expected, "evidence_ref": evidence,
+                "status": if resolved { "resolved" } else { "unresolved" }}));
         }
         events.push(event);
     }

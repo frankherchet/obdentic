@@ -136,3 +136,30 @@ fn killed_mid_stream_shows_the_prefix_and_no_terminal_response() {
     assert_eq!(r["last_evidenced_action"], "response_delta");
     assert_eq!(r["events"].as_array().unwrap().len(), 3);
 }
+
+// REQ-045.19/.20: a source file alongside the audit resolves, and its absence remains readable.
+#[test]
+fn recording_reference_resolves_only_when_present() {
+    let dir = std::env::temp_dir().join(format!("audit-evidence-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let audit = dir.join("audit.jsonl");
+    let tool = event(3, "tool_end", ",\"tool_call_id\":\"c1\"").replace(
+        "\"data\":{}",
+        "\"data\":{\"evidence_ref\":{\"recording_ref\":\"capture.jsonl\",\"offset\":42}}",
+    );
+    fs::write(&audit, event(1, "session_start", "") + &event(2, "tool_intent", ",\"tool_call_id\":\"c1\"") + &tool + &event(4, "session_end", "")).unwrap();
+    let inspect = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_obdentic-mobile-report"))
+            .arg("--agent-audit").arg(&audit).output().unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(inspect()["source_references"][0]["status"], "unresolved");
+    fs::write(dir.join("capture.jsonl"), "{}\n").unwrap();
+    let present = inspect();
+    assert_eq!(present["source_references"][0]["status"], "resolved");
+    assert_eq!(present["source_references"][0]["evidence_ref"]["offset"], 42);
+    let _ = fs::remove_file(dir.join("capture.jsonl"));
+    let _ = fs::remove_file(audit);
+    let _ = fs::remove_dir(dir);
+}
