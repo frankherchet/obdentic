@@ -897,8 +897,11 @@ residual risk, as is power loss at the moment of a write (ADR 0010).
 
 Offline inspection needs no model, tool or vehicle: `obdentic-mobile-report --agent-audit <session.jsonl>` prints the timeline, whether
 the audit is complete (end marker, no sequence gap, no torn line, no open attempt), the separate diagnosis status, the last evidenced
-action, and recording references (always `unresolved` here; the recording is a separate file). The focused acceptance run is
-`am instrument -w de.obdentic.app.debug.test/de.obdentic.app.AgentAuditAcceptanceRunner` on `obdentic-acc` after choosing a folder.
+action, and recording references (always `unresolved` here; the recording is a separate file). From 80 % of the 256 MiB budget the
+audit card in the account section shows a storage warning. Acceptance (`AgentAuditAcceptance`, part of the full `AcceptanceRunner` and
+runnable alone as `am instrument -w de.obdentic.app.debug.test/de.obdentic.app.AgentAuditAcceptanceRunner`) needs no manual folder
+choice: the test APK carries a file-backed document provider (`AuditTestProvider`, registered through `AgentAuditStorage.allowTestProvider`)
+and a receiver that grants its tree to the app. A process kill is simulated by the prefix such a process leaves; power loss is not tested.
 
 ## Acceptance
 

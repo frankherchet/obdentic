@@ -99,7 +99,7 @@ final class AgentAuditAcceptance {
             });
         });
         JSONArray events = events("request_id", id);
-        require(persistedBefore.get(), "REQ-045.2/.10 the exact request is stored (write and sync) before the client receives it");
+        require(persistedBefore.get(), "REQ-045.2 and REQ-045.10: the exact request is stored (write and sync) before the client receives it");
         require(events.length() == 5 && type(events, 0).equals("request_intent") && type(events, 1).equals("response_delta") && type(events, 2).equals("response_delta")
             && type(events, 3).equals("request_dispatched") && type(events, 4).equals("request_end")
             && "first".equals(events.getJSONObject(1).getJSONObject("data").optString("text")) && "second".equals(events.getJSONObject(2).getJSONObject("data").optString("text")),
@@ -210,7 +210,7 @@ final class AgentAuditAcceptance {
             JSONArray e = events("request_id", id);
             require(outcome.equals(e.getJSONObject(e.length() - 1).getJSONObject("data").optString("status")) && "partial".equals(e.getJSONObject(1).getJSONObject("data").optString("text"))
                 && !e.getJSONObject(e.length() - 1).getJSONObject("data").has("usage"),
-                "REQ-045.13/.14/.15 " + outcome + " keeps the received evidence, is no success and invents no usage");
+                "REQ-045.13, REQ-045.14, REQ-045.15: " + outcome + " keeps the received evidence, is no success and invents no usage");
             String retry = id();
             s.runModelRequest(new JSONObject(), retry, json -> { });
             require(!retry.equals(id) && events("request_id", retry).length() == 3, "REQ-045.14 a permitted retry has its own identity");
@@ -222,7 +222,7 @@ final class AgentAuditAcceptance {
             s.stop(stop);
             AtomicBoolean ran = new AtomicBoolean();
             require(refused(() -> s.runModelRequest(new JSONObject(), id(), json -> ran.set(true))) != null && !ran.get()
-                && stop.equals(last(events("session_id", s.sessionId())).getJSONObject("data").optString("diagnosis_status")), "REQ-045.16/.17 " + stop + " ends the diagnosis without further work");
+                && stop.equals(last(events("session_id", s.sessionId())).getJSONObject("data").optString("diagnosis_status")), "REQ-045.16 and REQ-045.17: " + stop + " ends the diagnosis without further work");
         }
     }
 
