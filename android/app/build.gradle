@@ -27,6 +27,7 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     packaging { jniLibs { useLegacyPackaging = false } }
+    sourceSets { androidTest.assets.srcDir '../../tests/fixtures' }
     lint { abortOnError true }
     signingConfigs {
         if (releaseSigningReady) {

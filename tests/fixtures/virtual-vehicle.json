@@ -7,5 +7,6 @@
   "identification": "313233",
   "extended_dids": ["1628"],
   "stored_dtcs": ["0401"],
-  "pending_dtcs": []
+  "pending_dtcs": [],
+  "diagnosis_tx": ["ATSH 7E0\r", "ATCRA 7E8\r", "010C\r", "ATZ\r", "ATE0\r", "ATL0\r", "ATS1\r", "ATH1\r", "ATSP0\r", "0100\r", "03\r", "07\r", "ATSH 7E0\r", "ATCRA 7E8\r", "0110\r", "221356\r"]
 }

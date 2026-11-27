@@ -19,8 +19,11 @@ use crate::mobile::execute_nonblocking;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 const S3_MS: u64 = 5_000;
-fn vehicle_fixture() -> Value {
+static VEHICLE_FIXTURE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
     serde_json::from_str(include_str!("../../../tests/fixtures/virtual-vehicle.json")).unwrap()
+});
+fn vehicle_fixture() -> &'static Value {
+    &VEHICLE_FIXTURE
 }
 
 // ------------------------------------------------------------------------------------------------------

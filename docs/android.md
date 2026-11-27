@@ -907,6 +907,14 @@ runnable alone as `am instrument -w de.obdentic.app.debug.test/de.obdentic.app.A
 choice: the test APK carries a file-backed document provider (`AuditTestProvider`, registered through `AgentAuditStorage.allowTestProvider`)
 and a receiver that grants its tree to the app. A process kill is simulated by the prefix such a process leaves; power loss is not tested.
 
+REQ-046.23 also runs the synthetic EGR/MAF case through the real JNI core, automatic recording and agent-audit boundary using
+`tests/fixtures/virtual-vehicle.json`. `SharedDiagnosisRunner` runs that case alone; `AcceptanceRunner` includes it. To inspect the
+result offline, copy the debug app's `files/req-046-23` directory into a private local directory (for example with
+`adb -s emulator-5584 exec-out run-as de.obdentic.app.debug tar -C files/req-046-23 -cf - .`), build
+`obdentic-mobile-report`, then run `python3 tools/check-shared-diagnosis.py <directory> <path-to-obdentic-mobile-report>`.
+The verifier checks the audited attempts and results against their recording offsets and the shared TX sequence, including an incomplete
+audit prefix. The generated data is synthetic; it is not adapter or vehicle evidence.
+
 ## Acceptance
 
 Live cards and the signal chooser show short German names from `SignalNames` (no semantic ids, at most two decimals).
