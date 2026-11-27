@@ -49,6 +49,7 @@ final class AgentAuditAcceptance {
             selection();
             fresh();
             sessionAndRequest();
+            fresh(); turnCorrelation();
             fresh(); tools();
             fresh(); stopRunningTool();
             fresh(); disclosure();
@@ -92,7 +93,7 @@ final class AgentAuditAcceptance {
         String id = id();
         JSONObject request = new JSONObject("{\"message\":\"synthetic\",\"items\":[3,1,2],\"text\":\"exact \\u00e4 string\"}");
         AtomicBoolean persistedBefore = new AtomicBoolean();
-        s.runModelRequest(request, id, json -> {
+        s.runModelRequest(request, "turn1", id, json -> {
             quiet(() -> persistedBefore.set(json.equals(request.toString()) && intentOf(s, id) != null && intentOf(s, id).getJSONObject("data").getJSONObject("request").toString().equals(json)));
             quiet(() -> {
                 s.recordModelEvent(id, "response_delta", new JSONObject().put("text", "first"));
@@ -106,7 +107,7 @@ final class AgentAuditAcceptance {
             && "first".equals(events.getJSONObject(1).getJSONObject("data").optString("text")) && "second".equals(events.getJSONObject(2).getJSONObject("data").optString("text")),
             "REQ-045.3 deltas stay in arrival order between the request and its end");
         AtomicBoolean reused = new AtomicBoolean();
-        require(refused(() -> s.runModelRequest(new JSONObject(), id, json -> reused.set(true))) != null && !reused.get(), "REQ-045.14 a retry cannot reuse a request identity");
+        require(refused(() -> s.runModelRequest(new JSONObject(), "turn1", id, json -> reused.set(true))) != null && !reused.get(), "REQ-045.14 a retry cannot reuse a request identity");
         JSONArray all = events("session_id", s.sessionId());
         long last = 0;
         for (int i = 0; i < all.length(); i++) {
@@ -116,13 +117,43 @@ final class AgentAuditAcceptance {
         s.finish("success");
     }
 
+    /** REQ-045.1: two turns, a retry and tool calls preserve all correlation identities. */
+    private void turnCorrelation() throws Exception {
+        AgentAuditSession session = begin(); session.disclosure(true);
+        java.lang.reflect.Method request;
+        java.lang.reflect.Method tool;
+        try {
+            request = AgentAuditSession.class.getMethod("runModelRequest", JSONObject.class, String.class, String.class, AgentAuditSession.ModelDispatch.class);
+            tool = AgentAuditSession.class.getMethod("runTool", String.class, String.class, String.class, String.class, String.class,
+                boolean.class, String.class, java.util.concurrent.Callable.class);
+        } catch (NoSuchMethodException e) { throw new AssertionError("REQ-045.1 turn correlation API missing", e); }
+        for (String[] pair : new String[][]{{"turn1", "request1"}, {"turn1", "retry1"}, {"turn2", "request2"}}) {
+            request.invoke(session, new JSONObject(), pair[0], pair[1], (AgentAuditSession.ModelDispatch) json -> {});
+            JSONArray entries = events("request_id", pair[1]);
+            require(entries.length() == 3, "request lifecycle complete");
+            for (int i = 0; i < entries.length(); i++) require(pair[0].equals(entries.getJSONObject(i).optString("turn_id")), "request turn identity");
+        }
+        for (int i = 0; i < 2; i++) {
+            String turn = "turn" + (i + 1), req = "request" + (i + 1), call = "tool" + (i + 1);
+            tool.invoke(session, turn, req, call, "synthetic", "{}", true, "allowed",
+                (java.util.concurrent.Callable<AgentAuditSession.ToolResult>) () -> new AgentAuditSession.ToolResult(new JSONObject(), null, null));
+            JSONArray entries = events("tool_call_id", call);
+            require(entries.length() == 5, "tool lifecycle complete");
+            for (int j = 0; j < entries.length(); j++) {
+                JSONObject e = entries.getJSONObject(j);
+                require(turn.equals(e.optString("turn_id")) && req.equals(e.optString("request_id")) && call.equals(e.optString("tool_call_id")), "tool correlation identity");
+            }
+        }
+        session.finish("success");
+    }
+
     /** REQ-045.4, .5, .6, .7: one tool lifecycle for every tool; denied calls never execute; failures never look successful. */
     private void tools() throws Exception {
         AgentAuditSession s = begin();
         s.disclosure(true);
         AtomicBoolean ran = new AtomicBoolean();
         String denied = id();
-        s.runTool(denied, "synthetic_tool", "{\"raw\": 1}", false, "denied by policy", () -> { ran.set(true); return new AgentAuditSession.ToolResult(new JSONObject(), null, null); });
+        s.runTool("turn1", "request1", denied, "synthetic_tool", "{\"raw\": 1}", false, "denied by policy", () -> { ran.set(true); return new AgentAuditSession.ToolResult(new JSONObject(), null, null); });
         JSONArray d = events("tool_call_id", denied);
         require(!ran.get() && d.length() == 2 && type(d, 0).equals("tool_proposal") && type(d, 1).equals("tool_decision")
             && d.getJSONObject(0).getJSONObject("data").getString("arguments").equals("{\"raw\": 1}"), "REQ-045.5 a denied call keeps its original arguments and has no execution");
@@ -130,7 +161,7 @@ final class AgentAuditAcceptance {
         java.lang.reflect.Constructor<AgentAuditSession.ToolResult> withEvidence;
         try { withEvidence = AgentAuditSession.ToolResult.class.getConstructor(JSONObject.class, JSONObject.class, JSONObject.class); }
         catch (NoSuchMethodException e) { throw new AssertionError("REQ-045.4 missing evidence reference", e); }
-        s.runTool(allowed, "synthetic_tool", "{\"x\":1}", true, "allowed", () ->
+        s.runTool("turn1", "request1", allowed, "synthetic_tool", "{\"x\":1}", true, "allowed", () ->
             withEvidence.newInstance(new JSONObject().put("value", "synthetic"), null,
                 new JSONObject().put("recording_ref", "synthetic.jsonl").put("offset", 42)));
         JSONArray a = events("tool_call_id", allowed);
@@ -140,13 +171,13 @@ final class AgentAuditAcceptance {
             && a.getJSONObject(4).getJSONObject("data").getJSONObject("evidence_ref").optLong("offset") == 42,
             "REQ-045.4 proposal, decision, start, end, result and exact evidence reference");
         String failing = id();
-        String message = refused(() -> s.runTool(failing, "synthetic_tool", "{}", true, "allowed", () -> { throw new IllegalStateException("boom"); }));
+        String message = refused(() -> s.runTool("turn1", "request1", failing, "synthetic_tool", "{}", true, "allowed", () -> { throw new IllegalStateException("boom"); }));
         JSONArray f = events("tool_call_id", failing);
         require(message != null && f.length() == 4 && type(f, 2).equals("tool_intent") && "error".equals(f.getJSONObject(3).getJSONObject("data").optString("status"))
             && !f.getJSONObject(3).getJSONObject("data").has("result"), "REQ-045.6 an allowed tool that fails records its start and a terminal error, not a success");
         for (String kind : new String[]{"memo_read", "memo_write", "knowledge_lookup", "recording_query"}) {
             String call = id();
-            s.runTool(call, kind, "{}", true, "allowed", () -> new AgentAuditSession.ToolResult(
+            s.runTool("turn1", "request1", call, kind, "{}", true, "allowed", () -> new AgentAuditSession.ToolResult(
                 new JSONObject().put("complete_local", kind + "-everything").put("mutated", kind.equals("memo_write")), new JSONObject().put("subset", kind), null));
             JSONArray k = events("tool_call_id", call);
             JSONObject end = k.getJSONObject(k.length() - 1).getJSONObject("data");
@@ -166,7 +197,7 @@ final class AgentAuditAcceptance {
             java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
             Thread worker = new Thread(() -> {
                 try {
-                    session.runTool(call, "synthetic", "{}", true, "allowed", () -> {
+                    session.runTool("turn1", "request1", call, "synthetic", "{}", true, "allowed", () -> {
                         entered.countDown();
                         release.await();
                         return new AgentAuditSession.ToolResult(new JSONObject(), null, null);
@@ -194,17 +225,17 @@ final class AgentAuditAcceptance {
         AgentAuditSession first = begin();
         first.disclosure(false);
         AtomicBoolean sent = new AtomicBoolean();
-        require(refused(() -> first.runModelRequest(new JSONObject(), id(), json -> sent.set(true))) != null && !sent.get(), "REQ-045.8 initial denial: zero external requests");
+        require(refused(() -> first.runModelRequest(new JSONObject(), "turn1", id(), json -> sent.set(true))) != null && !sent.get(), "REQ-045.8 initial denial: zero external requests");
         require(events("session_id", first.sessionId()).getJSONObject(1).getJSONObject("data").optBoolean("approved", true) == false, "REQ-045.8 the denial is recorded");
         first.finish("denied");
         AgentAuditSession second = begin();
         second.disclosure(true);
         String approvedId = id();
-        second.runModelRequest(new JSONObject().put("message", "approved"), approvedId, json -> sent.set(true));
+        second.runModelRequest(new JSONObject().put("message", "approved"), "turn1", approvedId, json -> sent.set(true));
         require(sent.get(), "REQ-045.8 approved exchange runs");
         sent.set(false);
         second.disclosure(false);
-        require(refused(() -> second.runModelRequest(new JSONObject().put("message", "later"), id(), json -> sent.set(true))) != null && !sent.get(), "REQ-045.8 renewed denial: the later request is never dispatched");
+        require(refused(() -> second.runModelRequest(new JSONObject().put("message", "later"), "turn2", id(), json -> sent.set(true))) != null && !sent.get(), "REQ-045.8 renewed denial: the later request is never dispatched");
         require(events("request_id", approvedId).length() == 3, "REQ-045.8 renewed denial keeps the earlier approved exchange");
         second.finish("denied");
     }
@@ -215,12 +246,12 @@ final class AgentAuditAcceptance {
         s.disclosure(true);
         String id = id();
         Uri file = sessionFile(s.sessionId());
-        String message = refused(() -> s.runModelRequest(new JSONObject().put("message", "m"), id, json -> quiet(() -> { // a third party changes the folder: the next write cannot be trusted
+        String message = refused(() -> s.runModelRequest(new JSONObject().put("message", "m"), "turn1", id, json -> quiet(() -> { // a third party changes the folder: the next write cannot be trusted
             try (OutputStream out = resolver.openOutputStream(file, "wa")) { out.write(' '); }
         })));
         AtomicBoolean ran = new AtomicBoolean();
         require(message != null && s.failed(), "REQ-045.11 a failed persistence ends the request");
-        require(refused(() -> s.runModelRequest(new JSONObject(), id(), json -> ran.set(true))) != null && !ran.get(), "REQ-045.11 no later call and no retry starts");
+        require(refused(() -> s.runModelRequest(new JSONObject(), "turn1", id(), json -> ran.set(true))) != null && !ran.get(), "REQ-045.11 no later call and no retry starts");
         require(refused(() -> s.finish("success")) != null && !text(file).contains("\"session_end\""), "REQ-045.11 the audit is never reported as complete");
         clear();
         AgentAuditSession listed = begin();
@@ -243,7 +274,7 @@ final class AgentAuditAcceptance {
             AgentAuditSession s = begin();
             s.disclosure(true);
             String id = id();
-            require(refused(() -> s.runModelRequest(new JSONObject(), id, json -> {
+            require(refused(() -> s.runModelRequest(new JSONObject(), "turn1", id, json -> {
                 quiet(() -> s.recordModelEvent(id, "response_delta", new JSONObject().put("text", "partial")));
                 throw new AgentAuditSession.ModelFailure(outcome);
             })) != null, "REQ-045." + outcome + " the request fails");
@@ -252,7 +283,7 @@ final class AgentAuditAcceptance {
                 && !e.getJSONObject(e.length() - 1).getJSONObject("data").has("usage"),
                 "REQ-045.13, REQ-045.14, REQ-045.15: " + outcome + " keeps the received evidence, is no success and invents no usage");
             String retry = id();
-            s.runModelRequest(new JSONObject(), retry, json -> { });
+            s.runModelRequest(new JSONObject(), "turn1", retry, json -> { });
             require(!retry.equals(id) && events("request_id", retry).length() == 3, "REQ-045.14 a permitted retry has its own identity");
             s.finish("failed");
         }
@@ -261,7 +292,7 @@ final class AgentAuditAcceptance {
             s.disclosure(true);
             s.stop(stop);
             AtomicBoolean ran = new AtomicBoolean();
-            require(refused(() -> s.runModelRequest(new JSONObject(), id(), json -> ran.set(true))) != null && !ran.get()
+            require(refused(() -> s.runModelRequest(new JSONObject(), "turn1", id(), json -> ran.set(true))) != null && !ran.get()
                 && stop.equals(last(events("session_id", s.sessionId())).getJSONObject("data").optString("diagnosis_status")), "REQ-045.16 and REQ-045.17: " + stop + " ends the diagnosis without further work");
         }
     }
@@ -280,7 +311,7 @@ final class AgentAuditAcceptance {
             s.disclosure(true);
             AtomicBoolean ran = new AtomicBoolean();
             String id = id();
-            String m1 = refused(() -> s.runModelRequest(new JSONObject().put("message", "x " + token.substring(4, 24) + " y"), id, json -> ran.set(true)));
+            String m1 = refused(() -> s.runModelRequest(new JSONObject().put("message", "x " + token.substring(4, 24) + " y"), "turn1", id, json -> ran.set(true)));
             require(m1 != null && !ran.get() && events("request_id", id).length() == 0, "REQ-045.22 an outgoing payload with a current secret substring is rejected before sending");
             require(!m1.contains("marker"), "REQ-045.21 the error output carries no secret");
             AgentAuditSession bearer = begin();
@@ -428,7 +459,7 @@ final class AgentAuditAcceptance {
         w.disclosure(true);
         AgentAuditSession.setLimits(big, big, AgentAuditSession.DEFAULT_EVENT_LIMIT, 4);
         AtomicBoolean sent = new AtomicBoolean();
-        require(refused(() -> w.runModelRequest(new JSONObject(), id(), json -> sent.set(true))) != null && !sent.get(), "REQ-045.32 work that needs events beyond the cap is not begun");
+        require(refused(() -> w.runModelRequest(new JSONObject(), "turn1", id(), json -> sent.set(true))) != null && !sent.get(), "REQ-045.32 work that needs events beyond the cap is not begun");
         AgentAuditSession.resetLimits();
         w.finish("success");
     }

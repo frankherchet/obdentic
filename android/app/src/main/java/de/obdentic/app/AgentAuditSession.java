@@ -42,6 +42,7 @@ public final class AgentAuditSession {
     private boolean failed, ended, disclosureApproved, disclosureDenied;
     private String inFlightRequest;
     private String inFlightTool;
+    private String requestTurn, toolTurn, toolRequest;
     private Thread toolThread;
     private final java.util.HashSet<String> requests = new java.util.HashSet<>(), tools = new java.util.HashSet<>();
 
@@ -109,8 +110,8 @@ public final class AgentAuditSession {
         synchronized (LOCK) {
             Thread cancel = toolThread;
             try {
-                if (inFlightRequest != null) append("request_end", new JSONObject().put("status", reason), null, inFlightRequest, null);
-                if (inFlightTool != null) append("tool_end", new JSONObject().put("status", reason), null, null, inFlightTool);
+                if (inFlightRequest != null) append("request_end", new JSONObject().put("status", reason), requestTurn, inFlightRequest, null);
+                if (inFlightTool != null) append("tool_end", new JSONObject().put("status", reason), toolTurn, toolRequest, inFlightTool);
                 finish(reason);
             } catch (JSONException e) { throw new IOException("Abbruch konnte nicht protokolliert werden"); }
             finally { if (cancel != null) cancel.interrupt(); }
@@ -120,18 +121,19 @@ public final class AgentAuditSession {
     public String sessionId() { return id; }
     public interface ModelDispatch { void send(String requestJson); }
     /** Audit the actual request before the synchronous synthetic client receives it. */
-    public void runModelRequest(JSONObject request, String requestId, ModelDispatch dispatch) throws IOException {
+    public void runModelRequest(JSONObject request, String turnId, String requestId, ModelDispatch dispatch) throws IOException {
         String exact;
         synchronized (LOCK) {
             if (active != this || failed || ended || inFlightRequest != null || !disclosureApproved || disclosureDenied
-                    || requestId == null || requestId.isEmpty() || requests.contains(requestId) || sequence > COUNT_LIMIT - 3)
+                    || turnId == null || turnId.isEmpty() || requestId == null || requestId.isEmpty() || requests.contains(requestId) || sequence > COUNT_LIMIT - 3)
                 throw new IOException("Protokoll oder Offenlegung erlaubt keinen weiteren Auftrag");
             try {
                 JSONObject copy = new JSONObject(request.toString());
-                append("request_intent", new JSONObject().put("request", copy), null, requestId, null);
+                append("request_intent", new JSONObject().put("request", copy), turnId, requestId, null);
                 requests.add(requestId);
                 exact = copy.toString();
                 inFlightRequest = requestId;
+                requestTurn = turnId;
             } catch (JSONException e) {
                 failed = true; active = null;
                 throw new IOException("Anfrage konnte nicht protokolliert werden");
@@ -139,18 +141,18 @@ public final class AgentAuditSession {
         }
         try {
             dispatch.send(exact);
-            append("request_dispatched", new JSONObject(), null, requestId, null);
-            append("request_end", new JSONObject().put("status", "completed"), null, requestId, null);
+            append("request_dispatched", new JSONObject(), turnId, requestId, null);
+            append("request_end", new JSONObject().put("status", "completed"), turnId, requestId, null);
         } catch (JSONException e) {
             synchronized (LOCK) { failed = true; active = null; }
             throw new IOException("Anfrage konnte nicht protokolliert werden");
         } catch (RuntimeException e) {
             String status = e instanceof ModelFailure ? ((ModelFailure) e).outcome : "error";
-            try { append("request_end", new JSONObject().put("status", status), null, requestId, null); }
+            try { append("request_end", new JSONObject().put("status", status), turnId, requestId, null); }
             catch (JSONException impossible) { throw new IOException("Protokoll fehlgeschlagen"); }
             throw new IOException("Anfrage fehlgeschlagen");
         } finally {
-            synchronized (LOCK) { inFlightRequest = null; }
+            synchronized (LOCK) { inFlightRequest = null; requestTurn = null; }
         }
     }
 
@@ -160,7 +162,7 @@ public final class AgentAuditSession {
             if (inFlightRequest == null || !inFlightRequest.equals(requestId)
                     || !("response_delta".equals(type) || "response_item".equals(type)))
                 throw new IOException("Kein passender Modellauftrag aktiv");
-            append(type, data, null, requestId, null);
+            append(type, data, requestTurn, requestId, null);
         }
     }
     /** Record a proposal and policy decision before starting the permitted operation. */
@@ -172,18 +174,19 @@ public final class AgentAuditSession {
         }
     }
 
-    public void runTool(String callId, String name, String arguments, boolean allowed, String reason, java.util.concurrent.Callable<ToolResult> work) throws IOException {
+    public void runTool(String turnId, String requestId, String callId, String name, String arguments, boolean allowed, String reason, java.util.concurrent.Callable<ToolResult> work) throws IOException {
         synchronized (LOCK) {
-            if (active != this || failed || ended || disclosureDenied || inFlightTool != null || callId == null || callId.isEmpty()
+            if (active != this || failed || ended || disclosureDenied || inFlightTool != null || turnId == null || turnId.isEmpty() || callId == null || callId.isEmpty()
                     || tools.contains(callId) || sequence > COUNT_LIMIT - (allowed ? 5 : 2))
                 throw new IOException("Protokoll erlaubt keinen weiteren Auftrag");
             try {
-                append("tool_proposal", new JSONObject().put("name", name).put("arguments", arguments), null, null, callId);
+                append("tool_proposal", new JSONObject().put("name", name).put("arguments", arguments), turnId, requestId, callId);
                 tools.add(callId);
-                append("tool_decision", new JSONObject().put("allowed", allowed).put("reason", reason), null, null, callId);
+                append("tool_decision", new JSONObject().put("allowed", allowed).put("reason", reason), turnId, requestId, callId);
                 if (!allowed) return;
-                append("tool_intent", new JSONObject().put("operation", name), null, null, callId);
+                append("tool_intent", new JSONObject().put("operation", name), turnId, requestId, callId);
                 inFlightTool = callId;
+                toolTurn = turnId; toolRequest = requestId;
                 toolThread = Thread.currentThread();
             } catch (JSONException e) {
                 failed = true; active = null;
@@ -195,22 +198,22 @@ public final class AgentAuditSession {
             if (result == null || result.local == null) throw new IllegalStateException("tool returned no result");
             synchronized (LOCK) {
                 if (active != this || failed || ended) throw new IOException("Werkzeug abgebrochen");
-                append("tool_dispatched", new JSONObject(), null, null, callId);
+                append("tool_dispatched", new JSONObject(), turnId, requestId, callId);
                 JSONObject end = new JSONObject().put("status", "completed").put("result", result.local);
                 if (result.sentExternally != null) end.put("sent_external", result.sentExternally);
                 if (result.evidenceRef != null) end.put("evidence_ref", result.evidenceRef);
-                append("tool_end", end, null, null, callId);
+                append("tool_end", end, turnId, requestId, callId);
             }
         } catch (Exception e) {
             synchronized (LOCK) {
                 if (active == this && !failed && !ended) {
-                    try { append("tool_end", new JSONObject().put("status", "error"), null, null, callId); }
+                    try { append("tool_end", new JSONObject().put("status", "error"), turnId, requestId, callId); }
                     catch (JSONException invalid) { throw new IOException("Werkzeug konnte nicht protokolliert werden"); }
                 }
             }
             throw new IOException("Werkzeug fehlgeschlagen");
         } finally {
-            synchronized (LOCK) { if (callId.equals(inFlightTool)) { inFlightTool = null; toolThread = null; } }
+            synchronized (LOCK) { if (callId.equals(inFlightTool)) { inFlightTool = null; toolThread = null; toolTurn = null; toolRequest = null; } }
         }
     }
 
